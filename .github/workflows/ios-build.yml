@@ -46,7 +46,8 @@ jobs:
           ./build-host/difftest --emit-golden /tmp/golden.c >/dev/null
           if ! diff -q core/src/golden_vectors.c /tmp/golden.c >/dev/null; then
             echo "::error::golden_vectors.c is stale -- run: ./build/difftest --emit-golden core/src/golden_vectors.c"
-            diff core/src/golden_vectors.c /tmp/golden.c | head -20
+            diff core/src/golden_vectors.c /tmp/golden.c | head -20 \
+              | while IFS= read -r l; do echo "::error::${l}"; done
             exit 1
           fi
           echo "golden vectors match the CI runner's CPU"

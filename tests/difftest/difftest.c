@@ -66,12 +66,17 @@ typedef struct {
 /* deterministic register soup so preserved-flag and upper-bit bugs surface */
 static uint64_t xs(uint64_t *s) { *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17; return *s; }
 
-static void seed_regs(uint64_t gpr[16], uint64_t *flags, uint64_t seed) {
+static void seed_regs(uint64_t gpr[16], uint64_t *flags, uint64_t seed, int needs_mem) {
     uint64_t s = seed | 1;
     for (int i = 0; i < 16; i++) gpr[i] = xs(&s);
     gpr[XC_RSP] = (uint64_t)(g_stack + STACK_SZ - 256);
-    gpr[XC_RDI] = (uint64_t)g_data;
-    gpr[XC_RSI] = (uint64_t)g_data + 64;
+    /* Only point RDI/RSI at the data buffer when the snippet dereferences
+     * them. For everything else they are ordinary values, and using host
+     * pointers would bake this machine's ASLR layout into the recording. */
+    if (needs_mem) {
+        gpr[XC_RDI] = (uint64_t)g_data;
+        gpr[XC_RSI] = (uint64_t)g_data + 64;
+    }
     *flags = 0x202 | (xs(&s) & XC_ARITH_FLAGS);
 }
 
@@ -83,8 +88,9 @@ static int run_case(const tcase *t, uint64_t seed) {
     memcpy(g_code, t->code, t->len);
     g_code[t->len] = 0xC3;
 
+    const int needs_mem = snippet_touches_memory(t->code, t->len);
     uint64_t gpr[16], flags;
-    seed_regs(gpr, &flags, seed);
+    seed_regs(gpr, &flags, seed, needs_mem);
     if (t->setup) t->setup(gpr, &flags);
 
     /* fill data + stack deterministically, snapshot */
@@ -150,15 +156,20 @@ static int run_case(const tcase *t, uint64_t seed) {
      * Whether the case touched memory is recorded here, where it is known for
      * certain, rather than inferred at replay time from register values. */
     if (g_golden) {
-        int touched = snippet_touches_memory(t->code, t->len);
+        const int touched = needs_mem;
+        /* Memory cases are skipped on replay, and their registers hold host
+         * addresses, so their state is recorded as zero. Non-memory cases
+         * record everything except RSP, which the trampoline owns. Both rules
+         * exist so the file is byte-identical on any machine -- otherwise CI
+         * cannot check it for staleness. */
         fprintf(g_golden, "  { \"%s\", 0x%llxull, { ", t->name, (unsigned long long)seed);
         for (int i = 0; i < 16; i++)
-            fprintf(g_golden, "0x%llxull,", (unsigned long long)gpr[i]);
-        fprintf(g_golden, " }, 0x%llxull, { ", (unsigned long long)flags);
+            fprintf(g_golden, "0x%llxull,", (unsigned long long)(touched || i == XC_RSP ? 0 : gpr[i]));
+        fprintf(g_golden, " }, 0x%llxull, { ", (unsigned long long)(touched ? 0 : flags));
         for (int i = 0; i < 16; i++)
-            fprintf(g_golden, "0x%llxull,", (unsigned long long)n.gpr[i]);
+            fprintf(g_golden, "0x%llxull,", (unsigned long long)(touched || i == XC_RSP ? 0 : n.gpr[i]));
         fprintf(g_golden, " }, 0x%llxull, 0x%llxull, %d,\n    (const uint8_t[]){",
-                (unsigned long long)n.rflags, (unsigned long long)t->flag_mask, touched);
+                (unsigned long long)(touched ? 0 : n.rflags), (unsigned long long)t->flag_mask, touched);
         for (size_t i = 0; i < t->len; i++) fprintf(g_golden, "0x%02x,", t->code[i]);
         fprintf(g_golden, "}, %zu },\n", t->len);
     }
