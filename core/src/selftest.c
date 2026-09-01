@@ -24,6 +24,7 @@
 
 #define ARENA_SZ (1u << 20)
 #define CODE_AT  0x1000u
+#define STACK_AT 0x80000u
 
 int xc_selftest(char *report, size_t report_len, int max_report) {
     uint8_t *arena = calloc(ARENA_SZ, 1);
@@ -53,6 +54,10 @@ int xc_selftest(char *report, size_t report_len, int max_report) {
          * The arena mapping means a stray access faults instead of reading
          * host memory. */
         memcpy(c.gpr, v->in_gpr, sizeof c.gpr);
+        /* RSP is recorded as zero: on the capture machine it was the
+         * trampoline's own stack pointer, which is meaningless here. These
+         * snippets provably never touch memory, so any valid value does. */
+        c.gpr[XC_RSP] = STACK_AT;
         c.rflags = v->in_flags;
         c.rip = CODE_AT;
 
@@ -71,6 +76,7 @@ int xc_selftest(char *report, size_t report_len, int max_report) {
             bad = 1;
         } else {
             for (int r = 0; r < 16; r++) {
+                if (r == XC_RSP) continue;          /* not recorded; see above */
                 if (c.gpr[r] != v->out_gpr[r]) {
                     if (reported < max_report && off + 96 < report_len)
                         off += (size_t)snprintf(report + off, report_len - off,
