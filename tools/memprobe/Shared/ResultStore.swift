@@ -10,11 +10,12 @@ enum ResultStore {
     /// Must match the App Group in both .entitlements files.
     static let appGroup = "group.winios.memprobe"
 
-    static var url: URL? {
-        FileManager.default
-            .containerURL(forSecurityApplicationGroupIdentifier: appGroup)?
-            .appendingPathComponent("ladder.jsonl")
+    /// The shared container. Also where the JIT probe keeps its crash marker.
+    static var containerDir: URL? {
+        FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup)
     }
+
+    static var url: URL? { containerDir?.appendingPathComponent("ladder.jsonl") }
 
     static func append(_ rung: Rung) {
         guard let url,

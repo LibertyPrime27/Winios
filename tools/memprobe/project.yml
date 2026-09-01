@@ -13,6 +13,10 @@ settings:
     SWIFT_VERSION: "5.9"
     TARGETED_DEVICE_FAMILY: "1,2"
     SWIFT_OBJC_BRIDGING_HEADER: Shared/MemProbe-Bridging-Header.h
+    # xcore and Zydis are built by CMake (see CI) into build-xcore-ios/.
+    HEADER_SEARCH_PATHS: $(SRCROOT)/Shared $(SRCROOT)/../../core/include
+    LIBRARY_SEARCH_PATHS: $(SRCROOT)/../../build-xcore-ios/core $(SRCROOT)/../../build-xcore-ios/core/zydis $(SRCROOT)/../../build-xcore-ios/core/zydis/zycore
+    OTHER_LDFLAGS: -lxcore -lZydis -lZycore
     # Unsigned by design -- signing happens locally with Sideloadly.
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"
