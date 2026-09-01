@@ -41,13 +41,20 @@ jobs:
       # Golden vectors are recorded from the CI runner's real CPU. If the
       # interpreter changed, they must be regenerated in the same commit --
       # a stale recording would quietly stop testing the new behaviour.
+      # Vectors are recorded from this runner's real CPU. If the interpreter
+      # changed, they must be regenerated in the same commit -- a stale
+      # recording quietly stops testing whatever just changed.
       - name: Golden vectors are current
+        if: always()
         run: |
+          set +e
           ./build-host/difftest --emit-golden /tmp/golden.c >/dev/null
-          if ! diff -q core/src/golden_vectors.c /tmp/golden.c >/dev/null; then
-            echo "::error::golden_vectors.c is stale -- run: ./build/difftest --emit-golden core/src/golden_vectors.c"
-            diff core/src/golden_vectors.c /tmp/golden.c | head -20 \
-              | while IFS= read -r l; do echo "::error::${l}"; done
+          diff -u core/src/golden_vectors.c /tmp/golden.c > /tmp/gdiff.txt
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            echo "::error::golden_vectors.c differs from this runner's recording"
+            head -40 /tmp/gdiff.txt > /tmp/gd40.txt
+            while IFS= read -r l; do echo "::error::${l}"; done < /tmp/gd40.txt
             exit 1
           fi
           echo "golden vectors match the CI runner's CPU"
