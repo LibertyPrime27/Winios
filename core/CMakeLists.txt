@@ -11,7 +11,9 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/zydis ${CMAKE_CURREN
 
 add_library(xcore STATIC
     src/mem.c
-    src/interp.c)
+    src/interp.c
+    src/selftest.c
+    src/golden_vectors.c)
 target_include_directories(xcore PUBLIC include)
 target_link_libraries(xcore PUBLIC Zydis)
 set_property(TARGET xcore PROPERTY C_STANDARD 11)
