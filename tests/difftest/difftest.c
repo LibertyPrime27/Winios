@@ -189,6 +189,11 @@ static int run_case(const tcase *t, uint64_t seed) {
 #define NO_OF (XC_ARITH_FLAGS & ~XC_OF)
 #define CO   (XC_CF | XC_OF)                       /* MUL/IMUL: only CF/OF defined */
 #define NONE 0
+/* Shifts: the SDM leaves AF undefined, and real CPUs disagree about it --
+ * this was caught by two CI runners producing different recordings. OF is
+ * defined only for a count of exactly 1. */
+#define SH1  (XC_ARITH_FLAGS & ~XC_AF)
+#define SHN  (XC_ARITH_FLAGS & ~(XC_AF | XC_OF))
 
 static void s_div(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RDX] = 0; g[XC_RCX] |= 1; g[XC_RAX] &= 0xFFFFFFFF; }
 static void s_idiv32(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RCX] = 0x1234567 | 1; g[XC_RAX] &= 0x7FFFFFFF; }
@@ -246,13 +251,13 @@ static const tcase cases[] = {
     T("add dword[rdi+4],7",     ALL, 0, 0x83,0x47,0x04,0x07),
 
     /* shifts -- OF is defined only for a count of 1 */
-    T("shl rax,1",              ALL,   0, 0x48,0xD1,0xE0),
-    T("shl rax,3",              NO_OF, 0, 0x48,0xC1,0xE0,0x03),
-    T("shr ecx,5",              NO_OF, 0, 0xC1,0xE9,0x05),
-    T("sar rdx,7",              NO_OF, 0, 0x48,0xC1,0xFA,0x07),
+    T("shl rax,1",              SH1,   0, 0x48,0xD1,0xE0),
+    T("shl rax,3",              SHN,   0, 0x48,0xC1,0xE0,0x03),
+    T("shr ecx,5",              SHN,   0, 0xC1,0xE9,0x05),
+    T("sar rdx,7",              SHN,   0, 0x48,0xC1,0xFA,0x07),
     T("shl rax,cl (cl=0)",      ALL,   s_cl0, 0x48,0xD3,0xE0),
-    T("shl rax,cl (cl=1)",      ALL,   s_cl1, 0x48,0xD3,0xE0),
-    T("shr rax,cl (cl=7)",      NO_OF, s_cl7, 0x48,0xD3,0xE8),
+    T("shl rax,cl (cl=1)",      SH1,   s_cl1, 0x48,0xD3,0xE0),
+    T("shr rax,cl (cl=7)",      SHN,   s_cl7, 0x48,0xD3,0xE8),
     T("rol eax,9",              NO_OF, 0, 0xC1,0xC0,0x09),
     T("ror rcx,13",             NO_OF, 0, 0x48,0xC1,0xC9,0x0D),
     T("rol rax,1",              ALL,   0, 0x48,0xD1,0xC0),
