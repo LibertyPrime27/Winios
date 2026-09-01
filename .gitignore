@@ -1,0 +1,11 @@
+build/
+build-*/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+Payload/
+*.ipa
+*.dSYM/
+.DS_Store
+compile_commands.json
+.cache/
