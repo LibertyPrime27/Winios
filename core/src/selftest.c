@@ -58,7 +58,7 @@ int xc_selftest(char *report, size_t report_len, int max_report) {
          * trampoline's own stack pointer, which is meaningless here. These
          * snippets provably never touch memory, so any valid value does. */
         c.gpr[XC_RSP] = STACK_AT;
-        c.rflags = v->in_flags;
+        c.rflags = v->in_flags | 0x2;   /* recorded masked; bit 1 is always set */
         c.rip = CODE_AT;
 
         int steps = 0; xc_stop st = XC_STOP_NONE;

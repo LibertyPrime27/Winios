@@ -165,11 +165,16 @@ static int run_case(const tcase *t, uint64_t seed) {
         fprintf(g_golden, "  { \"%s\", 0x%llxull, { ", t->name, (unsigned long long)seed);
         for (int i = 0; i < 16; i++)
             fprintf(g_golden, "0x%llxull,", (unsigned long long)(touched || i == XC_RSP ? 0 : gpr[i]));
-        fprintf(g_golden, " }, 0x%llxull, { ", (unsigned long long)(touched ? 0 : flags));
+        fprintf(g_golden, " }, 0x%llxull, { ",
+                (unsigned long long)(touched ? 0 : (flags & XC_ARITH_FLAGS)));
         for (int i = 0; i < 16; i++)
             fprintf(g_golden, "0x%llxull,", (unsigned long long)(touched || i == XC_RSP ? 0 : n.gpr[i]));
+        /* Only the flags we model. The raw RFLAGS carries system bits (IF, AC,
+         * ID, IOPL) whose values depend on the machine and the hypervisor, and
+         * recording them made the file differ between CI runners. */
         fprintf(g_golden, " }, 0x%llxull, 0x%llxull, %d,\n    (const uint8_t[]){",
-                (unsigned long long)(touched ? 0 : n.rflags), (unsigned long long)t->flag_mask, touched);
+                (unsigned long long)(touched ? 0 : (n.rflags & XC_ARITH_FLAGS)),
+                (unsigned long long)t->flag_mask, touched);
         for (size_t i = 0; i < t->len; i++) fprintf(g_golden, "0x%02x,", t->code[i]);
         fprintf(g_golden, "}, %zu },\n", t->len);
     }
