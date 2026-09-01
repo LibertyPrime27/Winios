@@ -1,0 +1,49 @@
+# XcodeGen spec. Generate with:  xcodegen generate --spec tools/memprobe/project.yml
+#
+# Hand-written .xcodeproj files rot; this stays readable and diffable, and CI
+# regenerates it from scratch on every build.
+name: MemProbe
+options:
+  bundleIdPrefix: winios.memprobe
+  deploymentTarget: { iOS: "15.0" }
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    SWIFT_OBJC_BRIDGING_HEADER: tools/memprobe/Shared/MemProbe-Bridging-Header.h
+    # Unsigned by design -- signing happens locally with Sideloadly.
+    CODE_SIGNING_ALLOWED: "NO"
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGN_IDENTITY: ""
+
+targets:
+  MemProbe:
+    type: application
+    platform: iOS
+    sources:
+      - path: Host
+      - path: Shared
+    info: { path: Host/Info.plist }
+    entitlements: { path: Host/Host.entitlements }
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: winios.memprobe.app
+        INFOPLIST_KEY_CFBundleDisplayName: MemProbe
+    dependencies:
+      - target: MemProbeExtension
+        embed: true
+
+  MemProbeExtension:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Probe
+      - path: Shared
+    info: { path: Probe/Info.plist }
+    entitlements: { path: Probe/Probe.entitlements }
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: winios.memprobe.app.probe
+        INFOPLIST_KEY_CFBundleDisplayName: MemProbe

@@ -1,12 +1,8 @@
-# .github/workflows/ios-build.yml
+# Builds the MemProbe measurement app for iOS and publishes an UNSIGNED .ipa.
+# Sign it locally with Sideloadly / AltServer / SideStore using your own Apple ID.
 #
-# Builds a CMake C/C++ project for iOS arm64 on GitHub's macOS runners and
-# publishes an UNSIGNED .ipa as a workflow artifact. You then sign it locally
-# with Sideloadly / AltServer / SideStore using your own Apple ID.
-#
-# Free and unlimited on PUBLIC repos. On private repos macOS burns your included
-# minutes at a 10x multiplier (2,000 free minutes = 200 macOS minutes/month),
-# so keep this repo public or expect to pay.
+# Free and unlimited on PUBLIC repos. On private repos macOS burns included
+# minutes at a 10x multiplier (2,000 free = 200 macOS minutes/month).
 
 name: iOS build
 
@@ -21,105 +17,68 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    # macos-26 is arm64 (M1, 3 cores / 7 GB) and carries the iOS 26 SDK.
-    # Pin the image rather than using macos-latest: a silent image bump that
-    # changes Xcode version will change your SDK under you.
-    runs-on: macos-26
-    timeout-minutes: 90
-
-    env:
-      IOS_DEPLOYMENT_TARGET: "15.0"
-      SCHEME: App
-      CONFIG: Release
-
+  # Fast feedback on the portable core: ~2 minutes on a free Linux runner
+  # instead of ~20 on macOS. Most logic bugs get caught here.
+  core-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          fetch-depth: 0
+      - name: Build and test core
+        run: |
+          cmake -S . -B build-host -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build-host -j"$(nproc)"
+          ctest --test-dir build-host --output-on-failure
+
+  ios:
+    # Pinned, not macos-latest: a silent image bump changes the SDK underneath us.
+    runs-on: macos-26
+    timeout-minutes: 60
+    needs: core-tests
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Select Xcode
         run: |
-          sudo xcode-select -s /Applications/Xcode_26.app
+          sudo xcode-select -s /Applications/Xcode_26.app || true
           xcodebuild -version
           xcodebuild -showsdks | grep -i iphoneos
 
-      - name: Install build tools
-        run: brew install ccache ninja
+      - name: Install XcodeGen
+        run: brew install xcodegen
 
-      # ccache is the difference between a 40-minute and a 6-minute build on a
-      # 3-core runner. Key on the compiler + a hash of your build inputs so the
-      # cache invalidates when the toolchain moves.
-      - name: Restore ccache
-        uses: actions/cache@v4
-        with:
-          path: ~/Library/Caches/ccache
-          key: ccache-ios-${{ runner.os }}-${{ hashFiles('**/CMakeLists.txt') }}-${{ github.sha }}
-          restore-keys: |
-            ccache-ios-${{ runner.os }}-${{ hashFiles('**/CMakeLists.txt') }}-
-            ccache-ios-${{ runner.os }}-
+      - name: Generate project
+        run: xcodegen generate --spec tools/memprobe/project.yml --project tools/memprobe
 
-      - name: Configure ccache
-        run: |
-          ccache --max-size=2G
-          ccache --set-config=compiler_check=content
-          ccache --zero-stats
-
-      # The Xcode generator is what you want here: it produces a real
-      # .xcodeproj you can also open on a Mac for debugging, while keeping all
-      # build logic in CMake. Ninja is faster but gives you nothing to attach
-      # LLDB to from Xcode.
-      - name: Configure (CMake, Xcode generator)
-        run: |
-          cmake -S . -B build -G Xcode \
-            -DCMAKE_SYSTEM_NAME=iOS \
-            -DCMAKE_OSX_ARCHITECTURES=arm64 \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=${IOS_DEPLOYMENT_TARGET} \
-            -DCMAKE_XCODE_ATTRIBUTE_ONLY_ACTIVE_ARCH=NO \
-            -DCMAKE_XCODE_ATTRIBUTE_CC=clang \
-            -DCMAKE_XCODE_ATTRIBUTE_CLANG_ENABLE_MODULE_DEBUGGING=NO \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-
-      # CODE_SIGNING_ALLOWED=NO is both the point (unsigned output) and a
-      # measurable speedup — xcodebuild skips a lot of work.
       - name: Build (unsigned)
         run: |
           set -o pipefail
-          cmake --build build --config ${CONFIG} -- \
+          xcodebuild \
+            -project tools/memprobe/MemProbe.xcodeproj \
+            -scheme MemProbe \
+            -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGN_ENTITLEMENTS="" \
-            | tee build.log
+            -derivedDataPath build-ios \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build | tee build.log
 
-      - name: ccache stats
-        if: always()
-        run: ccache --show-stats
-
-      # An .ipa is just a zip with the .app inside a Payload/ directory.
-      # Nothing signs it here; that happens on your machine.
       - name: Package unsigned IPA
         run: |
-          APP=$(find build -name '*.app' -type d -path "*${CONFIG}-iphoneos*" | head -n1)
-          if [ -z "$APP" ]; then echo "No .app produced"; exit 1; fi
-          echo "Packaging $APP"
-          rm -rf Payload && mkdir -p Payload
-          cp -R "$APP" Payload/
-          # Keep app extensions — LiveContainer's LiveProcess and any JIT-attach
-          # helper live in Payload/*.app/PlugIns and are silently lost if a
-          # packaging step strips them.
-          ls -la "Payload/$(basename "$APP")/PlugIns" || echo "(no PlugIns)"
-          zip -qry "app-unsigned.ipa" Payload
-          unzip -l app-unsigned.ipa | tail -n 5
+          APP=$(find build-ios -name 'MemProbe.app' -type d -path '*Release-iphoneos*' | head -n1)
+          [ -n "$APP" ] || { echo "No .app produced"; exit 1; }
+          # The extension is the entire point of this app. If PlugIns is missing
+          # the build silently measures nothing, so fail loudly here instead.
+          [ -d "$APP/PlugIns" ] || { echo "PlugIns missing -- extension was not embedded"; exit 1; }
+          ls "$APP/PlugIns"
+          rm -rf Payload && mkdir -p Payload && cp -R "$APP" Payload/
+          zip -qry MemProbe-unsigned.ipa Payload
+          unzip -l MemProbe-unsigned.ipa | tail -n 3
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ipa-unsigned-${{ github.sha }}
-          path: app-unsigned.ipa
+          name: MemProbe-unsigned-${{ github.sha }}
+          path: MemProbe-unsigned.ipa
           retention-days: 30
 
       - uses: actions/upload-artifact@v4
@@ -128,20 +87,3 @@ jobs:
           name: build-log-${{ github.sha }}
           path: build.log
           retention-days: 7
-
-  # Build the emulator core natively on Linux and run its tests. This is where
-  # you catch recompiler and MMU bugs — it runs in ~2 minutes on a free runner
-  # instead of ~25 on macOS, and it does not need a device, a signature, or a
-  # Mac. Keep the core in a platform-independent library so this stays possible.
-  core-tests:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - name: Build and test core
-        run: |
-          cmake -S . -B build-host -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_TESTING=ON
-          cmake --build build-host -j"$(nproc)"
-          ctest --test-dir build-host --output-on-failure
