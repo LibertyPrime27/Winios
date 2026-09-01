@@ -14,8 +14,8 @@ Planning and design. No shippable code yet.
 | JIT acquisition and probing design | [`docs/JIT-DESIGN.md`](docs/JIT-DESIGN.md) |
 | CI — unsigned IPA on every push, core tests on Linux | [`.github/workflows/ios-build.yml`](.github/workflows/ios-build.yml) |
 | **MemProbe** — the measurement that gates 64-bit | [`docs/MEMPROBE.md`](docs/MEMPROBE.md), [`tools/memprobe/`](tools/memprobe) |
-| Engine A — 32-bit (Boxedwine core, ARM64 JIT) | not started |
-| Engine B — 64-bit (Wine + dynarec, wineserver as extension) | **blocked** on MemProbe's result |
+| **xcore** — one CPU core for 32- and 64-bit x86, interpreter + differential tests | [`docs/CPU-CORE.md`](docs/CPU-CORE.md), [`core/`](core) — 72 instructions verified against silicon |
+| Engine B — 64-bit process model (wineserver as extension) | **blocked** on MemProbe's result |
 
 ## The two things to know before reading anything else
 

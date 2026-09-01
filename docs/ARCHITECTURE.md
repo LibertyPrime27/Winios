@@ -1,5 +1,16 @@
 # Architecture — running 32-bit and 64-bit Windows games on iOS
 
+> **Revision (Sept 2026).** The "two engines" split below has been superseded
+> on the CPU side by **one core, `xcore`, with two memory mappings** — see
+> `CPU-CORE.md`. The insight in §0 stands and is now built in: a 64-bit guest
+> maps identity, a 32-bit guest maps through a base-register arena, and the same
+> decoder and interpreter serve both. Boxedwine is no longer the 32-bit plan;
+> it topped out at SSE2 and "post-2010 games have limited success", which rules
+> out Fallout 3 and New Vegas as much as Fallout 4. What §2 says about the
+> process model — `wineserver` needs a second process, and MemProbe decides
+> whether an app extension can be that process — is unchanged and still gates
+> everything above the CPU.
+
 **Target:** Fallout 3, Fallout: New Vegas (32-bit), Fallout 4 (64-bit), maximum performance, sideloaded with JIT.
 
 ---
