@@ -1,4 +1,5 @@
 import UIKit
+import os
 
 /// Runs the ladder in the app process, launches it in the extension process,
 /// and reports both. The comparison is the point: the app number on its own
@@ -94,8 +95,8 @@ final class ProbeViewController: UIViewController {
 
         """
         for r in ResultStore.readAll().suffix(24) {
-            text += String(format: "  %-9@ step %3d  resident %5d MB  available %5d MB\n",
-                           r.host as NSString, r.step, r.residentMB, r.availableMB)
+            let who = r.host.padding(toLength: 9, withPad: " ", startingAt: 0)
+            text += "  \(who) step \(r.step)  resident \(r.residentMB) MB  available \(r.availableMB) MB\n"
         }
         results.text = text
     }

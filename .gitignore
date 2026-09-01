@@ -9,3 +9,4 @@ Payload/
 .DS_Store
 compile_commands.json
 .cache/
+_to_delete/
