@@ -31,6 +31,19 @@ jobs:
           cmake --build build-host -j"$(nproc)"
           ctest --test-dir build-host --output-on-failure
 
+      # Golden vectors are recorded from the CI runner's real CPU. If the
+      # interpreter changed, they must be regenerated in the same commit --
+      # a stale recording would quietly stop testing the new behaviour.
+      - name: Golden vectors are current
+        run: |
+          ./build-host/difftest --emit-golden /tmp/golden.c >/dev/null
+          if ! diff -q core/src/golden_vectors.c /tmp/golden.c >/dev/null; then
+            echo "::error::golden_vectors.c is stale -- run: ./build/difftest --emit-golden core/src/golden_vectors.c"
+            diff core/src/golden_vectors.c /tmp/golden.c | head -20
+            exit 1
+          fi
+          echo "golden vectors match the CI runner's CPU"
+
   ios:
     # Pinned, not macos-latest: a silent image bump changes the SDK underneath us.
     runs-on: macos-26
