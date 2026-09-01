@@ -63,6 +63,20 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             build | tee build.log
 
+
+      # GitHub serves raw job logs from a blob host that is unreachable from
+      # some networks. Workflow-command annotations go through the API instead,
+      # so the actual compiler errors stay readable without downloading logs.
+      - name: Surface build errors as annotations
+        if: failure()
+        run: |
+          echo "::group::compiler errors"
+          grep -E "error:|error MT|The following build commands failed" build.log \
+            | sed 's/[[:space:]]*$//' | sort -u | head -30 \
+            | while IFS= read -r line; do echo "::error::${line}"; done
+          echo "::endgroup::"
+          tail -n 40 build.log
+
       - name: Package unsigned IPA
         run: |
           APP=$(find build-ios -name 'MemProbe.app' -type d -path '*Release-iphoneos*' | head -n1)

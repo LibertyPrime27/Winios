@@ -12,7 +12,7 @@ settings:
   base:
     SWIFT_VERSION: "5.9"
     TARGETED_DEVICE_FAMILY: "1,2"
-    SWIFT_OBJC_BRIDGING_HEADER: tools/memprobe/Shared/MemProbe-Bridging-Header.h
+    SWIFT_OBJC_BRIDGING_HEADER: Shared/MemProbe-Bridging-Header.h
     # Unsigned by design -- signing happens locally with Sideloadly.
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"
@@ -30,7 +30,6 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: winios.memprobe.app
-        INFOPLIST_KEY_CFBundleDisplayName: MemProbe
     dependencies:
       - target: MemProbeExtension
         embed: true
@@ -46,4 +45,3 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: winios.memprobe.app.probe
-        INFOPLIST_KEY_CFBundleDisplayName: MemProbe
