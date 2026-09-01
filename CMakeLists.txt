@@ -22,7 +22,7 @@ add_test(NAME arena32 COMMAND test_arena32)
 # Replays the recorded silicon post-states. On CI this is redundant with
 # difftest; on an iPhone it is the only oracle there is.
 add_executable(test_selftest tests/test_selftest.c)
-target_link_libraries(test_selftest PRIVATE xcore)
+target_link_libraries(test_selftest PRIVATE xcore_golden)
 add_test(NAME selftest COMMAND test_selftest)
 
 # --- differential test: needs a real x86-64 to act as the oracle -------------

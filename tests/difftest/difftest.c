@@ -10,10 +10,35 @@
 #define _GNU_SOURCE
 #include "xcore/cpu.h"
 
+#include <Zydis/Zydis.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+
+/* Does this snippet reference memory at all -- read, write, or via the stack?
+ *
+ * Detected by decoding rather than by observing writes: a load like
+ * `mov rax,[rdi+8]` changes no memory and moves no stack pointer, yet its
+ * recorded RDI is a host address that means nothing on another machine. An
+ * earlier write-based check missed exactly those and the replay faulted.
+ * Hidden operands are included, which is what catches PUSH/POP/CALL/RET. */
+static int snippet_touches_memory(const uint8_t *code, size_t len) {
+    ZydisDecoder d;
+    ZydisDecoderInit(&d, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+    size_t off = 0;
+    while (off < len) {
+        ZydisDecodedInstruction in;
+        ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+        if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&d, code + off, len - off, &in, ops)))
+            return 1;                     /* undecodable: assume the worst */
+        for (int i = 0; i < in.operand_count; i++)
+            if (ops[i].type == ZYDIS_OPERAND_TYPE_MEMORY) return 1;
+        off += in.length;
+    }
+    return 0;
+}
 
 typedef struct {
     uint64_t gpr[16];
@@ -120,16 +145,20 @@ static int run_case(const tcase *t, uint64_t seed) {
     if (memcmp(nat_stack, g_stack, STACK_SZ)) { printf("  [%s] stack differs\n", t->name); bad = 1; }
 
     /* Emit a golden vector: the native (silicon) post-state, so the same case
-     * can be replayed on ARM64 where no native oracle exists. */
+     * can be replayed on ARM64 where no native oracle exists.
+     *
+     * Whether the case touched memory is recorded here, where it is known for
+     * certain, rather than inferred at replay time from register values. */
     if (g_golden) {
+        int touched = snippet_touches_memory(t->code, t->len);
         fprintf(g_golden, "  { \"%s\", 0x%llxull, { ", t->name, (unsigned long long)seed);
         for (int i = 0; i < 16; i++)
             fprintf(g_golden, "0x%llxull,", (unsigned long long)gpr[i]);
         fprintf(g_golden, " }, 0x%llxull, { ", (unsigned long long)flags);
         for (int i = 0; i < 16; i++)
             fprintf(g_golden, "0x%llxull,", (unsigned long long)n.gpr[i]);
-        fprintf(g_golden, " }, 0x%llxull, 0x%llxull,\n    (const uint8_t[]){",
-                (unsigned long long)n.rflags, (unsigned long long)t->flag_mask);
+        fprintf(g_golden, " }, 0x%llxull, 0x%llxull, %d,\n    (const uint8_t[]){",
+                (unsigned long long)n.rflags, (unsigned long long)t->flag_mask, touched);
         for (size_t i = 0; i < t->len; i++) fprintf(g_golden, "0x%02x,", t->code[i]);
         fprintf(g_golden, "}, %zu },\n", t->len);
     }

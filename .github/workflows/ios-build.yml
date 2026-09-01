@@ -29,7 +29,14 @@ jobs:
         run: |
           cmake -S . -B build-host -DCMAKE_BUILD_TYPE=RelWithDebInfo
           cmake --build build-host -j"$(nproc)"
-          ctest --test-dir build-host --output-on-failure
+          ctest --test-dir build-host --output-on-failure 2>&1 | tee /tmp/ctest.log
+
+      - name: Surface test failures as annotations
+        if: failure()
+        run: |
+          grep -E "FAILED|mismatch|x86=|stopped |Errors while" /tmp/ctest.log \
+            | head -30 | while IFS= read -r l; do echo "::error::${l}"; done || true
+          tail -n 60 /tmp/ctest.log
 
       # Golden vectors are recorded from the CI runner's real CPU. If the
       # interpreter changed, they must be regenerated in the same commit --
@@ -69,7 +76,7 @@ jobs:
             -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
             -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-xcore-ios --target xcore -j3
+          cmake --build build-xcore-ios --target xcore_golden -j3
           echo "--- static libs produced ---"
           find build-xcore-ios -name '*.a' | sed 's/^/  /'
 

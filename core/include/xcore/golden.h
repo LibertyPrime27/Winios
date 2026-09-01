@@ -25,6 +25,7 @@ typedef struct {
     uint64_t       out_gpr[16];
     uint64_t       out_flags;
     uint64_t       flag_mask;
+    int            touches_mem;   /* recorded, not inferred */
     const uint8_t *code;
     size_t         len;
 } golden_vec;
