@@ -61,13 +61,17 @@ jobs:
 
       # The CPU core has no Xcode project yet; compile it for iOS arm64 here so
       # Apple clang on arm64 checks it on every push, not just Linux gcc.
-      - name: Build xcore for iOS arm64
+      # Makefiles rather than the Xcode generator: predictable output paths,
+      # which project.yml hardcodes in LIBRARY_SEARCH_PATHS.
+      - name: Build xcore + Zydis for iOS arm64
         run: |
-          cmake -S . -B build-xcore-ios -G Xcode \
+          cmake -S . -B build-xcore-ios \
             -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0
-          cmake --build build-xcore-ios --config Release --target xcore -- \
-            -sdk iphoneos CODE_SIGNING_ALLOWED=NO 2>&1 | tail -n 5
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-xcore-ios --target xcore -j3
+          echo "--- static libs produced ---"
+          find build-xcore-ios -name '*.a' | sed 's/^/  /'
 
       - name: Install XcodeGen
         run: brew install xcodegen
