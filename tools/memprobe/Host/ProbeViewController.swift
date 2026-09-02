@@ -27,8 +27,7 @@ final class ProbeViewController: UIViewController {
         let stack = UIStackView(arrangedSubviews: [
             button("1 · Run CPU self-test", #selector(runCPU)),
             button("2 · Memory ladder in app", #selector(runInApp)),
-            button("2b · Memory ladder in extension (direct)", #selector(runInExtensionDirect)),
-            button("2c · … via share sheet (fallback)", #selector(runInExtension)),
+            button("2b · Memory ladder in extension", #selector(runInExtensionDirect)),
             button("3a · Check JIT (safe)", #selector(runJITSafe)),
             button("3b · Attach StikDebug (universal script)", #selector(attachJIT)),
             button("3c · Create blessed arena + execute", #selector(runArena)),
@@ -92,15 +91,6 @@ final class ProbeViewController: UIViewController {
             Ladder.climb(host: "app")
             DispatchQueue.main.async { self.refresh() }
         }
-    }
-
-    /// A share extension can only be entered through the share sheet.
-    /// Pick "MemProbe"; it will climb and most likely be killed — that is the
-    /// measurement, not a crash.
-    @objc private func runInExtension() {
-        let vc = UIActivityViewController(activityItems: ["winios memprobe"], applicationActivities: nil)
-        vc.popoverPresentationController?.sourceView = view
-        present(vc, animated: true)
     }
 
     @objc private func resetLog() { ResultStore.reset(); refresh() }
@@ -235,8 +225,8 @@ final class ProbeViewController: UIViewController {
 
             ►► The EXTENSION figure is the measurement that matters. It decides
             whether wineserver can live in an app extension, and so whether
-            64-bit games are reachable at all. Run 2b: share sheet → MemProbe.
-            The extension vanishing IS the result, not a crash.
+            64-bit games are reachable at all. Run 2b. The extension being
+            KILLED is the result, not a crash — read the last extension rung.
 
             "stopped voluntarily" in the log means the ceiling was reached
             rather than a limit — the process was never killed.

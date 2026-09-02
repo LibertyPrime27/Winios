@@ -9,6 +9,7 @@
 - (void)setRequestInterruptionBlock:(void (^)(NSUUID *uuid))block;
 - (void)setRequestCancellationBlock:(void (^)(NSUUID *uuid, NSError *error))block;
 - (int)pidForRequestIdentifier:(NSUUID *)uuid;
+@property (nonatomic, copy) NSArray *preferredLanguages;
 @end
 
 @implementation ExtensionLauncher
@@ -55,7 +56,13 @@ static NSExtension *g_live;   /* keep the request alive; the blocks fire on it *
     [ext setRequestCancellationBlock:^(NSUUID *uuid, NSError *e) {
         onEvent(@"cancelled", e.localizedDescription ?: @"cancelled");
     }];
-    [ext beginExtensionRequestWithInputItems:@[] completion:^(NSUUID *uuid) {
+    ext.preferredLanguages = @[];
+    /* LiveContainer passes a real item with userInfo; an empty input array is
+     * not guaranteed to be accepted by every extension point. */
+    NSExtensionItem *item = [NSExtensionItem new];
+    item.userInfo = @{ @"purpose": @"memprobe-ladder" };
+    [ext beginExtensionRequestWithInputItems:@[item] completion:^(NSUUID *uuid) {
+        if (!uuid) { onEvent(@"error", @"beginExtensionRequest returned no identifier -- process failed to start"); return; }
         int pid = [weak pidForRequestIdentifier:uuid];
         onEvent(@"launched", [NSString stringWithFormat:@"extension running, pid %d", pid]);
     }];
