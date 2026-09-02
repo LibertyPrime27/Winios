@@ -1,4 +1,5 @@
 #import "memprobe.h"
 #import "jitprobe.h"
+#import "jitarena.h"
 #import "xcore/golden.h"
 #import "xcore/cpu.h"

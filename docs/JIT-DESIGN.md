@@ -5,6 +5,14 @@
 
 ---
 
+> **Measured on hardware, Sept 2026 — M3 iPad and iPhone Air, StikDebug attached
+> with the universal script.** `csops` reported `0x32003005`: `CS_DEBUGGED` set,
+> `CS_KILL`/`CS_HARD` cleared, but `CS_ENFORCEMENT` and `CS_REQUIRE_LV` still
+> set. `mach_vm_remap` returned `KERN_SUCCESS`. `vm_protect(RX)` returned
+> `KERN_SUCCESS`. **Executing from the page faulted anyway.**
+>
+> That is the TXM regime, and it invalidates the classic technique. See §1a.
+
 ## 0. The one rule
 
 **Never trust a flag. Probe the actual capability.**
@@ -14,6 +22,57 @@ Every naive iOS JIT implementation checks `CS_DEBUGGED` and proceeds. That was c
 The probe must execute a real instruction through a real executable mapping. Anything less reports success on devices where the JIT will crash the moment the recompiler emits its first block.
 
 ---
+
+## 1a. TXM: what actually works on A15+/M2+
+
+On Trusted Execution Monitor hardware — every A15 or later, every M2 or later,
+so every M-series iPad — code-signing enforcement moved out of XNU. The kernel
+can no longer unilaterally mark an anonymous page executable, and **`csops`
+cannot see the difference**: enforcement is per-page state, while the flags are
+per-process. This is why `remap_kr=0` and `protect_kr=0` mean nothing here. They
+report that the *mapping* was created, not that its contents may be fetched.
+
+A page becomes executable only after **an attached debugger writes to it**. The
+debug memory-write is the breakpoint-insertion path, which is privileged to
+modify code-signed pages, and one byte per 16 KB page is enough. The app cannot
+do this to itself.
+
+So the protocol is cooperative. The app carries two breakpoint stubs and the
+debugger's script services them:
+
+| `x16` | Meaning |
+|---|---|
+| 0 | detach — ends the session; no further `brk` is safe |
+| 1 | prepare region — `x0` = addr, `x1` = len; debugger writes one byte per page |
+
+The app executes `brk #0xf00d`; the script catches `SIGTRAP`, reads the
+registers, does the work, steps `PC` past the `brk`, and continues.
+
+**The ordering is forced and unforgiving:**
+
+1. Ask StikDebug to attach *with a script* (a bare attach is enough only off TXM).
+2. Wait for `CS_DEBUGGED`. Executing a `brk` before this terminates the process.
+3. `mmap` the RX region.
+4. **Bless it** — `jit26_prepare_region(addr, len)`.
+5. Build the RW alias with `mach_vm_remap`.
+6. Detach — `jit26_detach()`.
+7. Only now write code through RW, `sys_icache_invalidate`, and execute at RX.
+
+Two consequences worth designing around rather than discovering:
+
+- **A region allocated after the detach can never be blessed by that session.**
+  So allocate one large arena up front and sub-allocate from it. A dynarec that
+  wants more memory later has to reconnect a debugger, which is a product
+  constraint, not an implementation detail.
+- **An unhandled `brk` is fatal.** Never call the stubs speculatively.
+
+Implemented in `tools/memprobe/Shared/jit26_stubs.S` and `jitarena.c`; the
+`jit_arena` API is the shape the dynarec will use.
+
+Whether heavy rewriting through the RW alias ever revokes the bless is not
+documented. The architecture implies it does not — one dummy byte authorises the
+mapping, and the app owns the RW view afterwards — but if faults appear after
+sustained code-cache churn, re-blessing under a fresh attach is the fallback.
 
 ## 1. Layered design
 
