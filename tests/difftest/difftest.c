@@ -169,11 +169,14 @@ static int run_case(const tcase *t, uint64_t seed) {
                 (unsigned long long)(touched ? 0 : (flags & XC_ARITH_FLAGS)));
         for (int i = 0; i < 16; i++)
             fprintf(g_golden, "0x%llxull,", (unsigned long long)(touched || i == XC_RSP ? 0 : n.gpr[i]));
-        /* Only the flags we model. The raw RFLAGS carries system bits (IF, AC,
-         * ID, IOPL) whose values depend on the machine and the hypervisor, and
-         * recording them made the file differ between CI runners. */
+        /* Record only the bits this case declares defined. Masking to
+         * XC_ARITH_FLAGS was not enough: it kept architecturally-undefined
+         * bits such as AF after a shift, which real CPUs genuinely differ on,
+         * so the file still varied between runners. Anything outside
+         * flag_mask is not compared at replay either, so recording it can only
+         * cause false mismatches. */
         fprintf(g_golden, " }, 0x%llxull, 0x%llxull, %d,\n    (const uint8_t[]){",
-                (unsigned long long)(touched ? 0 : (n.rflags & XC_ARITH_FLAGS)),
+                (unsigned long long)(touched ? 0 : (n.rflags & t->flag_mask)),
                 (unsigned long long)t->flag_mask, touched);
         for (size_t i = 0; i < t->len; i++) fprintf(g_golden, "0x%02x,", t->code[i]);
         fprintf(g_golden, "}, %zu },\n", t->len);
