@@ -28,7 +28,9 @@ final class ProbeViewController: UIViewController {
             button("1 · Run CPU self-test", #selector(runCPU)),
             button("2 · Memory ladder in app", #selector(runInApp)),
             button("2b · Memory ladder in extension", #selector(runInExtension)),
-            button("3 · Check JIT", #selector(runJIT)),
+            button("3a · Check JIT (safe)", #selector(runJITSafe)),
+            button("3b · JIT execute test (may crash)", #selector(runJITExec)),
+            button("Reset JIT marker", #selector(resetJIT)),
             button("Reset memory log", #selector(resetLog)),
             results,
         ])
@@ -103,16 +105,47 @@ final class ProbeViewController: UIViewController {
 
     // MARK: - 3. JIT
 
-    @objc private func runJIT() {
-        var r = jit_result()
-        // The marker lets a probe that faults last launch be detected instead of
-        // crash-looping the app on every start.
-        let marker = (ResultStore.containerDir?.appendingPathComponent("jit.marker").path) ?? ""
-        marker.withCString { jit_probe(&r, $0) }
-        let detail = withUnsafeBytes(of: r.detail) { raw -> String in
+    private var markerPath: String {
+        (ResultStore.containerDir?.appendingPathComponent("jit.marker").path) ?? ""
+    }
+
+    private func cstr<T>(_ tuple: T) -> String {
+        withUnsafeBytes(of: tuple) { raw in
             String(cString: raw.baseAddress!.assumingMemoryBound(to: CChar.self))
         }
-        jitLine = "\(String(cString: jit_state_name(r.state)))  (CS flags 0x\(String(r.cs_flags, radix: 16)))\n    \(detail)"
+    }
+
+    private func show(_ r: jit_result) {
+        var s = "\(String(cString: jit_state_name(r.state)))"
+        s += "   CS flags 0x\(String(r.cs_flags, radix: 16))"
+        s += "  debugged=\(r.cs_debugged != 0)"
+        s += "  remap_kr=\(r.remap_kr) protect_kr=\(r.protect_kr)"
+        let last = cstr(r.last_step)
+        if !last.isEmpty { s += "\n    last attempt reached: \(last)" }
+        s += "\n    \(cstr(r.detail))"
+        jitLine = s
+        refresh()
+    }
+
+    /// Everything except the jump. Cannot fault, so it is safe to run first and
+    /// tells us most of what we need.
+    @objc private func runJITSafe() {
+        var r = jit_result()
+        markerPath.withCString { jit_probe_safe(&r, $0) }
+        show(r)
+    }
+
+    /// The actual jump. Leaves a breadcrumb before each step so a fault is
+    /// diagnosable on the next launch instead of just "it crashed".
+    @objc private func runJITExec() {
+        var r = jit_result()
+        markerPath.withCString { jit_probe_execute(&r, $0) }
+        show(r)
+    }
+
+    @objc private func resetJIT() {
+        markerPath.withCString { jit_probe_reset($0) }
+        jitLine = "marker cleared — the execute test can be retried"
         refresh()
     }
 
@@ -133,10 +166,13 @@ final class ProbeViewController: UIViewController {
             extension process  \(ext)
             available now      \(avail) MB
 
-            The extension figure is the one that matters: it decides whether
-            wineserver can live in an app extension, and so whether 64-bit
-            games are reachable at all. A ladder that "stopped voluntarily"
-            in the log hit the ceiling rather than a limit.
+            ►► The EXTENSION figure is the measurement that matters. It decides
+            whether wineserver can live in an app extension, and so whether
+            64-bit games are reachable at all. Run 2b: share sheet → MemProbe.
+            The extension vanishing IS the result, not a crash.
+
+            "stopped voluntarily" in the log means the ceiling was reached
+            rather than a limit — the process was never killed.
 
         3 · JIT
         \(jitLine)
