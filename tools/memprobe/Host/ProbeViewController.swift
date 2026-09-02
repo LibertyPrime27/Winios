@@ -29,7 +29,8 @@ final class ProbeViewController: UIViewController {
             button("2 · Memory ladder in app", #selector(runInApp)),
             button("2b · Memory ladder in extension", #selector(runInExtension)),
             button("3a · Check JIT (safe)", #selector(runJITSafe)),
-            button("3b · JIT execute test (may crash)", #selector(runJITExec)),
+            button("3b · Attach StikDebug (universal script)", #selector(attachJIT)),
+            button("3c · Create blessed arena + execute", #selector(runArena)),
             button("Reset JIT marker", #selector(resetJIT)),
             button("Reset memory log", #selector(resetLog)),
             results,
@@ -135,11 +136,44 @@ final class ProbeViewController: UIViewController {
         show(r)
     }
 
-    /// The actual jump. Leaves a breadcrumb before each step so a fault is
-    /// diagnosable on the next launch instead of just "it crashed".
-    @objc private func runJITExec() {
+    /// Ask StikDebug to attach with a script that can service the bless
+    /// breakpoint. On TXM hardware (A15+, M2+, so every M-series iPad) a plain
+    /// attach is not enough — the script has to stay to answer `brk #0xf00d`.
+    @objc private func attachJIT() {
+        let bundle = Bundle.main.bundleIdentifier ?? ""
+        let pid = getpid()
+        let candidates = [
+            "stikdebug://enable-jit?bundle-id=\(bundle)&pid=\(pid)&script-name=universal.js",
+            "stikjit://enable-jit?bundle-id=\(bundle)&pid=\(pid)&script-name=universal.js",
+            "stikjit://attach?pid=\(pid)",
+        ]
+        for s in candidates {
+            if let u = URL(string: s), UIApplication.shared.canOpenURL(u) {
+                UIApplication.shared.open(u)
+                jitLine = "asked StikDebug to attach:\n    \(s)\n    Come back once it reports success, then run 3c."
+                refresh()
+                return
+            }
+        }
+        jitLine = "No StikDebug URL scheme responded. Install StikDebug, or attach it manually and then run 3c."
+        refresh()
+    }
+
+    /// The real protocol: allocate RX, have the debugger bless every 16 KB page,
+    /// build the RW alias, detach, then write and execute. Everything before the
+    /// bless is what my earlier probe was missing.
+    @objc private func runArena() {
         var r = jit_result()
-        markerPath.withCString { jit_probe_execute(&r, $0) }
+        var arena = jit_arena()
+        let ok = markerPath.withCString { jit_arena_create(&arena, 1 << 20, &r, $0) }
+        if ok == 1 {
+            // AArch64 `ret`.
+            var code: UInt32 = 0xD65F03C0
+            _ = withUnsafeBytes(of: &code) { raw in
+                markerPath.withCString { jit_arena_run(&arena, raw.baseAddress, 4, &r, $0) }
+            }
+            jit_arena_free(&arena)
+        }
         show(r)
     }
 
