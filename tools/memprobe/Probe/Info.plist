@@ -2,19 +2,32 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+  <!-- Mirrors LiveContainer's LiveProcess. See ProbeHandler.swift for why each
+       key is here; none of them is decorative. -->
   <key>NSExtension</key>
   <dict>
     <key>NSExtensionPointIdentifier</key>
-    <string>com.apple.share-services</string>
+    <string>com.apple.ar.viewer</string>
     <key>NSExtensionPrincipalClass</key>
-    <string>$(PRODUCT_MODULE_NAME).ShareViewController</string>
+    <string>ProbeHandler</string>
+    <key>NSExtensionContextClass</key>
+    <string>NSExtensionContext</string>
+    <key>NSExtensionContextHostClass</key>
+    <string>NSExtensionContext</string>
     <key>NSExtensionAttributes</key>
     <dict>
       <key>NSExtensionActivationRule</key>
-      <dict>
-        <key>NSExtensionActivationSupportsText</key><true/>
-      </dict>
+      <string>FALSEPREDICATE</string>
     </dict>
+  </dict>
+  <key>XPCService</key>
+  <dict>
+    <key>ServiceType</key>
+    <string>Application</string>
+    <key>_MultipleInstances</key>
+    <true/>
+    <key>_ProcessType</key>
+    <string>App</string>
   </dict>
 </dict>
 </plist>

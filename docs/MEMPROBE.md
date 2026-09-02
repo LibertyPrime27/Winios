@@ -45,8 +45,9 @@ Or take `MemProbe-unsigned.ipa` from the CI artifacts. Sign and install with
 Sideloadly, then:
 
 1. **Run ladder in app process** — baseline.
-2. **Run ladder in extension** → share sheet → **MemProbe**. Expect it to
-   disappear; that is the measurement, not a crash.
+2. **Run ladder in extension** — launched directly via `NSExtension`. The
+   status line reports the pid, then "KILLED" when the system terminates it;
+   that is the measurement, not a crash.
 3. Reopen MemProbe. The high-water figures are on screen.
 
 Watch `idevicesyslog` for the `winios.memprobe` subsystem to see rungs live.
@@ -67,13 +68,34 @@ Improvements → Analytics Data, `JetsamEvent-*`). The `reason` distinguishes
 `per-process-limit` (a real cap) from `vm-compressor-space-shortage` (device
 pressure, so retest on a quiet device).
 
+## Why the extension is an AR Quick Look extension
+
+The first version was a share extension launched from the share sheet. Two
+things were wrong with that, and the second one is the interesting one.
+
+A regular app is not allowed to *host* a share extension through `NSExtension`
+— only the system share sheet is. So `extensionWithIdentifier:` returned nil
+with no error for an extension that was demonstrably in the bundle. LiveContainer
+avoids this by declaring LiveProcess as **`com.apple.ar.viewer`** with
+`NSExtensionActivationRule: FALSEPREDICATE`: any app may host AR Quick Look
+content, and the predicate keeps it out of every UI. This probe now does the
+same and is launched directly, one button, with a callback when the system
+terminates it — which for the ladder *is* the result.
+
+More importantly, LiveProcess's `Info.plist` carries an `XPCService` block with
+`_ProcessType: App`. That is the most plausible mechanism behind the
+LiveContainer author's claim that LiveProcess gets app-level memory limits in
+spite of Apple's documented extension caps — and it is the very claim this
+tool exists to test. The probe copies that block exactly, so a good number here
+is a number for *this* configuration, which is the one the real product would
+ship with.
+
 ## Before drawing conclusions
 
 **The extension point is a variable.** Apple says each point sets its own limit,
-so one number does not generalise. This probes a **share extension** — a
-general-purpose, user-invocable point in the same broad class as LiveProcess.
-Sweep others before committing: action extension, and whatever LiveContainer
-actually uses.
+so one number does not generalise. This now probes exactly the configuration
+LiveProcess uses (`com.apple.ar.viewer`, App-type XPC). If the number is good
+here, it is good for the configuration we would ship.
 
 **Then repeat inside LiveContainer**, in multitask mode. That is the
 configuration the real product would ship in, and entitlements there apply to
