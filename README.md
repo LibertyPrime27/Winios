@@ -15,7 +15,8 @@ Planning and design. No shippable code yet.
 | CI — unsigned IPA on every push, core tests on Linux | [`.github/workflows/ios-build.yml`](.github/workflows/ios-build.yml) |
 | **MemProbe** — the measurement that gates 64-bit | [`docs/MEMPROBE.md`](docs/MEMPROBE.md), [`tools/memprobe/`](tools/memprobe) |
 | **xcore** — one CPU core for 32- and 64-bit x86, interpreter + differential tests | [`docs/CPU-CORE.md`](docs/CPU-CORE.md), [`core/`](core) — 72 instructions verified against silicon |
-| Engine B — 64-bit process model (wineserver as extension) | **blocked** on MemProbe's result |
+| **JIT on iOS 26 TXM hardware** — bless protocol, `jit_arena` | **working on device** (M3 iPad): [`docs/JIT-DESIGN.md` §1a](docs/JIT-DESIGN.md) |
+| Engine B — 64-bit process model (wineserver as extension) | **blocked** on MemProbe's extension result |
 
 ## The two things to know before reading anything else
 
@@ -27,6 +28,33 @@ Planning and design. No shippable code yet.
 Pushes to `main` build an unsigned `.ipa` on GitHub's `macos-26` runners and attach it as a workflow artifact. Sign it locally with Sideloadly, AltServer or SideStore. The repo is public because macOS runner minutes are free only for public repos.
 
 The emulator core is kept platform-independent so most of it builds and tests on a Linux runner in minutes rather than a macOS runner in tens of minutes.
+
+## Measured on hardware (Sept 2026)
+
+| | M3 iPad | iPhone Air |
+|---|---|---|
+| CPU core vs x86 silicon | 336/336 match | 336/336 match |
+| Usable memory, app process | 8128 MB | 6080 MB |
+| JIT (TXM bless protocol) | **working** | — |
+| Usable memory, app extension | *not yet run* | *not yet run* |
+
+## Inspiration and prior art
+
+- **[StikJIT / StikDebug](https://github.com/StikDebug/StikJIT)** — the iOS 26 TXM JIT
+  protocol (`brk #0xf00d`, debugger-blessed pages) is theirs. Our `jitarena.c`
+  implements the app side of it. This is also what DolphiniOS and MeloNX use.
+- **[LiveExec32](https://github.com/LiveContainer/LiveExec32)** (khanhduytran0,
+  Apache-2.0) — runs 32-bit ARM iOS binaries on 64-bit iOS via Dynarmic. Different
+  guest (ARM, not x86) and needs jailbreak-only entitlements, so no code is shared
+  — but its loader-plus-syscall-bridge shape (guest binary in, trapped system
+  calls marshalled to the host through a page table) is the pattern our Win32
+  personality will follow. Its Dynarmic dependency also points at
+  **[oaknut](https://github.com/merryhime/oaknut)** (MIT), a standalone ARM64
+  emitter that is a strong candidate for our dynarec's code-emission layer.
+- **[Boxedwine](https://github.com/danoon2/Boxedwine)** — showed a soft-MMU can
+  make the low-4 GB problem disappear; we took the idea, not the code.
+- **[Zydis](https://github.com/zyantific/zydis)** (MIT) — our x86 decoder, as a
+  submodule.
 
 ## Licensing
 
