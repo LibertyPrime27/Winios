@@ -27,7 +27,8 @@ final class ProbeViewController: UIViewController {
         let stack = UIStackView(arrangedSubviews: [
             button("1 · Run CPU self-test", #selector(runCPU)),
             button("2 · Memory ladder in app", #selector(runInApp)),
-            button("2b · Memory ladder in extension", #selector(runInExtension)),
+            button("2b · Memory ladder in extension (direct)", #selector(runInExtensionDirect)),
+            button("2c · … via share sheet (fallback)", #selector(runInExtension)),
             button("3a · Check JIT (safe)", #selector(runJITSafe)),
             button("3b · Attach StikDebug (universal script)", #selector(attachJIT)),
             button("3c · Create blessed arena + execute", #selector(runArena)),
@@ -103,6 +104,33 @@ final class ProbeViewController: UIViewController {
     }
 
     @objc private func resetLog() { ResultStore.reset(); refresh() }
+
+    private let extensionID = "winios.memprobe.app.probe"
+    private var extLine = ""
+
+    /// Launch the extension the way LiveContainer launches LiveProcess: through
+    /// NSExtension, no share sheet. The interruption callback is the result --
+    /// the system killing the extension means the ladder found the limit.
+    @objc private func runInExtensionDirect() {
+        var path: NSString? = nil
+        guard ExtensionLauncher.extensionEmbedded(extensionID, path: &path) else {
+            extLine = "EXTENSION NOT IN BUNDLE. The signing tool stripped PlugIns. In Sideloadly, turn off 'Remove app extensions' and reinstall."
+            refresh(); return
+        }
+        extLine = "launching…"; refresh()
+        ExtensionLauncher.launch(extensionID) { [weak self] event, detail in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch event {
+                case "interrupted":
+                    self.extLine = "extension KILLED by the system — the last rung below is the limit"
+                default:
+                    self.extLine = "\(event): \(detail)"
+                }
+                self.refresh()
+            }
+        }
+    }
 
     // MARK: - 3. JIT
 
@@ -191,6 +219,9 @@ final class ProbeViewController: UIViewController {
         let ext = high["extension"].map { "\($0) MB" } ?? "not run"
         let avail = Int(os_proc_available_memory()) >> 20
 
+        var path: NSString? = nil
+        let embedded = ExtensionLauncher.extensionEmbedded(extensionID, path: &path)
+
         var text = """
         1 · CPU CORE (x86 → ARM64)
         \(cpuLine)
@@ -199,6 +230,8 @@ final class ProbeViewController: UIViewController {
             app process        \(app)
             extension process  \(ext)
             available now      \(avail) MB
+            extension in bundle: \(embedded ? "yes" : "NO — stripped at signing; see 2b")
+            \(extLine)
 
             ►► The EXTENSION figure is the measurement that matters. It decides
             whether wineserver can live in an app extension, and so whether

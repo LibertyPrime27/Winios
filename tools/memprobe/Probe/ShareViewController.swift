@@ -11,6 +11,28 @@ import Social
 final class ShareViewController: UIViewController {
 
     private let label = UILabel()
+    private var started = false
+
+    /// When launched directly through NSExtension there may be no view
+    /// hierarchy to trigger viewDidLoad, so the request callback is the
+    /// reliable entry point. Both paths funnel here; it runs once.
+    override func beginRequest(with context: NSExtensionContext) {
+        super.beginRequest(with: context)
+        startLadder()
+    }
+
+    private func startLadder() {
+        guard !started else { return }
+        started = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            Ladder.climb(host: "extension")
+            // Only reached if the ceiling was hit rather than the limit.
+            DispatchQueue.main.async {
+                self.label.text = "Reached the ceiling without being killed.\nRaise ceilingMB and run again."
+                self.extensionContext?.completeRequest(returningItems: nil)
+            }
+        }
+    }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -29,12 +51,6 @@ final class ShareViewController: UIViewController {
             label.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
         ])
 
-        DispatchQueue.global(qos: .userInitiated).async {
-            Ladder.climb(host: "extension")
-            // Only reached if the ceiling was hit rather than the limit.
-            DispatchQueue.main.async {
-                self.label.text = "Reached the ceiling without being killed.\nRaise ceilingMB and run again."
-            }
-        }
+        startLadder()
     }
 }

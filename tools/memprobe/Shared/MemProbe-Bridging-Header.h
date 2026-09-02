@@ -3,3 +3,4 @@
 #import "jitarena.h"
 #import "xcore/golden.h"
 #import "xcore/cpu.h"
+#import "../Host/ExtensionLauncher.h"
