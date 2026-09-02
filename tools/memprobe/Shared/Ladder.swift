@@ -26,7 +26,7 @@ enum Ladder {
     ///     resolution and the number of writes.
     ///   - ceilingMB: stop voluntarily here. Set above any plausible limit when
     ///     you want the kill itself to be the answer.
-    static func climb(host: String, stepMB: Int = 64, ceilingMB: Int = 6144) {
+    static func climb(host: String, stepMB: Int = 64, ceilingMB: Int = 16384) {
         let page = Int(getpagesize())
         let stepBytes = stepMB << 20
         var blocks: [UnsafeMutableRawPointer] = []
