@@ -26,7 +26,12 @@ enum Ladder {
     ///     resolution and the number of writes.
     ///   - ceilingMB: stop voluntarily here. Set above any plausible limit when
     ///     you want the kill itself to be the answer.
-    static func climb(host: String, stepMB: Int = 64, ceilingMB: Int = 16384) {
+    ///   - headroomMB: stop when os_proc_available_memory() drops below this.
+    ///     iOS reports the remaining jetsam budget through that call, so
+    ///     stopping here measures the limit (resident + remaining) without
+    ///     being killed -- which matters inside LiveContainer, where a kill
+    ///     takes the host down too. Pass 0 to climb into the kill as before.
+    static func climb(host: String, stepMB: Int = 64, ceilingMB: Int = 16384, headroomMB: Int = 256) {
         let page = Int(getpagesize())
         let stepBytes = stepMB << 20
         var blocks: [UnsafeMutableRawPointer] = []
@@ -35,6 +40,11 @@ enum Ladder {
         log.notice("ladder start host=\(host, privacy: .public) step=\(stepMB)MB page=\(page)")
 
         while (step + 1) * stepMB <= ceilingMB {
+            let remaining = Int(os_proc_available_memory()) >> 20
+            if headroomMB > 0 && remaining < headroomMB + stepMB {
+                log.notice("ladder stopping short: \(remaining)MB of budget left, limit ~\(step * stepMB + remaining)MB")
+                break
+            }
             guard let block = mp_alloc_touch(stepBytes, page) else {
                 log.error("malloc refused at \(( step + 1) * stepMB)MB -- address space, not jetsam")
                 break

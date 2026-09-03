@@ -213,8 +213,14 @@ final class ProbeViewController: UIViewController {
 
     private func refresh() {
         let high = ResultStore.highWater()
-        let app = high["app"].map { "\($0) MB" } ?? "not run"
         let avail = Int(os_proc_available_memory()) >> 20
+        // The ladder stops with a margin, so the limit is the top rung plus
+        // what the OS said was still available at that point.
+        let top = ResultStore.readAll().filter { $0.host == "app" }.max { $0.residentMB < $1.residentMB }
+        let app: String
+        if let t = top, let h = high["app"] {
+            app = "\(h) MB held, \(t.availableMB) MB budget left  ->  limit ≈ \(h + t.availableMB) MB"
+        } else { app = "not run" }
 
         var text = """
         \(DeviceInfo.summary())
@@ -228,10 +234,9 @@ final class ProbeViewController: UIViewController {
         3 · JIT
         \(jitLine)
 
-        4 · MEMORY, high-water resident in the app process
-            \(app)   (available now \(avail) MB)
-            "stopped voluntarily" in the log means the ceiling was reached
-            rather than a limit — the process was never killed.
+        4 · MEMORY, app process (stops 256 MB short of the kill on purpose)
+            \(app)
+            available now \(avail) MB
 
         RECENT LADDER RUNGS
 
