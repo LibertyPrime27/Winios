@@ -1,9 +1,17 @@
 cmake_minimum_required(VERSION 3.20)
-project(winios C)
+project(winios C CXX)
 
 enable_testing()
 
 add_subdirectory(core)
+
+# --- GPU: Direct3D 12 -> Metal compiler (own repo, vendored as a submodule) ---
+# `git submodule update --init --recursive` fetches it, plus dxil-spirv and
+# SPIRV-Cross underneath it. Without the submodule the build simply skips it.
+option(WINIOS_D12MT "Build the D3D12 -> Metal compiler" ON)
+if(WINIOS_D12MT AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/gpu/d12mt/CMakeLists.txt)
+    add_subdirectory(gpu/d12mt)
+endif()
 
 # --- MemProbe portable core (see docs/MEMPROBE.md) ---------------------------
 add_library(memprobe_core STATIC tools/memprobe/Shared/memprobe.c)

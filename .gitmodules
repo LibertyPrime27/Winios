@@ -1,3 +1,6 @@
 [submodule "third_party/zydis"]
 	path = third_party/zydis
 	url = https://github.com/zyantific/zydis
+[submodule "gpu/d12mt"]
+	path = gpu/d12mt
+	url = https://github.com/LibertyPrime27/d12mt.git

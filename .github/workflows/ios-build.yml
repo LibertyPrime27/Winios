@@ -80,10 +80,12 @@ jobs:
       # which project.yml hardcodes in LIBRARY_SEARCH_PATHS.
       - name: Build xcore + Zydis for iOS arm64
         run: |
+          # d12mt (and dxil-spirv / SPIRV-Cross under it) is built and tested
+          # on the Linux job; its iOS cross-build is a separate step to come.
           cmake -S . -B build-xcore-ios \
             -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release -DWINIOS_D12MT=OFF
           cmake --build build-xcore-ios --target xcore_golden -j3
           echo "--- static libs produced ---"
           find build-xcore-ios -name '*.a' | sed 's/^/  /'

@@ -107,6 +107,7 @@ The GPU is not the constraint. An A19 Pro scores 6,557 in 3DMark Wild Life Extre
 
 The constraint is the translation layer.
 
+- **D3D12 (modern titles, and the model for the rest):** **d12mt** — our own, public, MIT, vendored at `gpu/d12mt` ([repo](https://github.com/LibertyPrime27/d12mt)). Root signatures become Metal argument-buffer layouts; DXIL becomes MSL through dxil-spirv → SPIRV-Cross with remappers that follow that layout. The compiler and planner exist and are tested against real `dxc` output, with CI compiling the generated MSL for iOS with Apple's Metal compiler. The runtime (command lists, fences, PSOs, swap chain) is the next piece; the mapping is written up in `gpu/d12mt/docs/D3D12-ON-METAL.md`.
 - **D3D9 (FO3/NV):** `d9mt` — the Direct3D 9 → Metal fork of DXMT. Early and low-activity, but the right shape.
 - **D3D11 (FO4):** **DXMT** — LGPL-2.1, written for CodeWeavers, shipping as a first-class backend in CrossOver Mac 26 including an ARM64 build. Its `airconv` translates DXBC to Apple IR via LLVM 15; Apple's proprietary converter is not involved. macOS-only today; Metal is Metal, so the GPU side should port and the work is the Wine-unixlib boundary plus carrying LLVM.
 - **DXVK on MoltenVK is not viable.** DXVK 3.0 requires `VK_EXT_transform_feedback`; Metal has no stream-output primitive and MoltenVK has never implemented it. Revisit only if KosmicKrisp ships on iOS with geometry-shader support.
