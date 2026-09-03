@@ -16,7 +16,7 @@ Planning and design. No shippable code yet.
 | **MemProbe** — the measurement that gates 64-bit | [`docs/MEMPROBE.md`](docs/MEMPROBE.md), [`tools/memprobe/`](tools/memprobe) |
 | **xcore** — one CPU core for 32- and 64-bit x86, interpreter + differential tests | [`docs/CPU-CORE.md`](docs/CPU-CORE.md), [`core/`](core) — 72 instructions verified against silicon |
 | **JIT on iOS 26 TXM hardware** — bless protocol, `jit_arena` | **working on device** (M3 iPad): [`docs/JIT-DESIGN.md` §1a](docs/JIT-DESIGN.md) |
-| Engine B — 64-bit process model (wineserver as extension) | **blocked** on MemProbe's extension result |
+| Process model | **decided**: single process, emulated Linux process model (no extension) — `ARCHITECTURE.md` top note |
 
 ## The two things to know before reading anything else
 
@@ -36,7 +36,7 @@ The emulator core is kept platform-independent so most of it builds and tests on
 | CPU core vs x86 silicon | 336/336 match | 336/336 match |
 | Usable memory, app process | 8128 MB | 6080 MB |
 | JIT (TXM bless protocol) | **working** | — |
-| Usable memory, app extension | *not yet run* | *not yet run* |
+| App extension launch | failed (x2) — no longer required | — |
 
 ## Inspiration and prior art
 
