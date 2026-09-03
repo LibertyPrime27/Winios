@@ -1,5 +1,19 @@
 # Architecture — running 32-bit and 64-bit Windows games on iOS
 
+> **Decision (3 Sept 2026): single process, emulated process model.** On device,
+> the app process holds **8128 MB** (M3 iPad) / **6080 MB** (iPhone Air), JIT
+> works via the TXM bless protocol, and launching an app extension failed twice
+> even after mirroring LiveContainer's `com.apple.ar.viewer` configuration. So
+> the wineserver-as-extension path in §2 is **no longer the plan**. Instead the
+> Linux process model is emulated inside our one process -- `fork`/`clone`,
+> pipes, sockets and shared memory between *emulated* processes -- and
+> `wineserver` is simply one of them. This is Boxedwine's model with a core that
+> also handles 64-bit. Cost: Wine itself runs emulated rather than native; the
+> graphics backend stays host-native, which is where the frame time goes.
+> Benefit: no private APIs, no LiveContainer dependency for the process model,
+> and the 8 GB budget covers Wine, the game and the translator together.
+> MemProbe's extension button stays as an instrument, not a gate.
+
 > **Revision (Sept 2026).** The "two engines" split below has been superseded
 > on the CPU side by **one core, `xcore`, with two memory mappings** — see
 > `CPU-CORE.md`. The insight in §0 stands and is now built in: a 64-bit guest
