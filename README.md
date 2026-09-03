@@ -1,8 +1,8 @@
-# winios
+# Winios
 
 Run 32-bit and 64-bit Windows games on iOS. Sideloaded, JIT-enabled, maximum performance.
 
-**Targets:** Fallout 3, Fallout: New Vegas, Fallout 4.
+**Targets:** 3d games, EX: Fallout New Vegas and Fallout 4
 
 ## Status
 
