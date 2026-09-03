@@ -111,6 +111,9 @@ jobs:
       - name: Generate project
         run: xcodegen generate --spec tools/memprobe/project.yml --project tools/memprobe
 
+      - name: Stamp build number with the commit
+        run: plutil -replace CFBundleVersion -string "$(git rev-parse --short HEAD)" tools/memprobe/Host/Info.plist
+
       - name: Build (unsigned)
         run: |
           set -o pipefail

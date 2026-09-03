@@ -3,6 +3,9 @@
 <plist version="1.0">
 <dict>
   <key>UILaunchScreen</key><dict/>
+  <!-- CI stamps CFBundleVersion with the git commit so a report says which build it came from. -->
+  <key>CFBundleShortVersionString</key><string>0.2</string>
+  <key>CFBundleVersion</key><string>dev</string>
   <key>UIApplicationSupportsIndirectInputEvents</key><true/>
   <key>UISupportedInterfaceOrientations</key>
   <array><string>UIInterfaceOrientationPortrait</string></array>

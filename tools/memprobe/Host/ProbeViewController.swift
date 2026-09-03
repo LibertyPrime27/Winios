@@ -18,7 +18,7 @@ final class ProbeViewController: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        title = "winios probes"
+        title = "winios probes · \(DeviceInfo.modelIdentifier)"
         view.backgroundColor = .systemBackground
 
         results.isEditable = false
@@ -228,6 +228,8 @@ final class ProbeViewController: UIViewController {
         let embedded = ExtensionLauncher.extensionEmbedded(extensionID, path: &path)
 
         var text = """
+        \(DeviceInfo.summary())
+
         1 · CPU CORE (x86 → ARM64)
         \(cpuLine)
 
