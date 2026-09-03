@@ -102,28 +102,51 @@ configuration the real product would ship in, and entitlements there apply to
 LiveContainer's bundle rather than the guest's — so a good number here does not
 guarantee a good number there.
 
-## 4 · The GPU binding probe
+## The GPU binding probe (section 2 of the report)
 
-Button 4 is not about memory. It is the on-device test for d12mt
-(`gpu/d12mt`), the Direct3D 12 → Metal compiler. d12mt's whole binding model
-rests on one claim that can only be settled on real silicon: a Metal 3
-argument buffer is a flat array of 8-byte slots, `[[id(k)]]` at byte `8k`, so
-a D3D12 descriptor heap can be an ordinary `MTLBuffer` the CPU writes directly
-and a descriptor table is that buffer bound at an offset.
+This is the on-device test for d12mt (`gpu/d12mt`), the Direct3D → Metal
+compiler. Its whole binding model rests on one claim that can only be settled
+on real silicon: a Metal 3 argument buffer is a flat array of 8-byte slots,
+`[[id(k)]]` at byte `8k`, so a D3D12 descriptor heap — or a D3D9/11 stage's
+register file — can be an ordinary `MTLBuffer` the CPU writes directly, and a
+descriptor table is that buffer bound at an offset.
 
-The probe draws one quad with the shaders d12mt produced from
-`gpu/d12mt/tests/shaders/probe.hlsl` (bundled as `Host/Shaders/probe.*.msl`,
-compiled on the device by the Metal compiler), feeding every binding path from
-descriptors written by hand — four textures and a constant buffer in one heap
-at a non-zero base, two samplers in a sampler heap, a root constant block and a
-root descriptor in the root buffer, a vertex colour through the input layout —
-and reads the nine pixels back. Each column is one binding path with an exact
-expected value.
+The same nine-column probe is written three times and compiled by d12mt from
+the real bytecode each API uses (`gpu/d12mt/tests/shaders/`; the MSL is
+bundled as `Host/Shaders/*.msl` and compiled on the device):
 
-Reading it: `9/9 PASS` means the D3D12 binding design holds on this GPU and
-d12mt's runtime can be built on it without a translation step for descriptors.
-A `FAIL` line names the path that is wrong and shows expected against actual;
-that is a design finding, not a crash. `argument buffers: tier 1` or a family
+- **D3D12** — `probe.hlsl`, DXIL. Root constants, a root CBV (device pointer),
+  an SRV+CBV descriptor table, a sampler table and a static sampler.
+- **D3D11** — `probe11.hlsl`, Shader Model 5 DXBC (what Fallout 4 ships).
+  Fixed register slots through d12mt's legacy plan: `b#` at `[[id(#)]]`,
+  `t#` at `[[id(16+#)]]`, samplers in a second buffer.
+- **D3D9** — `probe9.hlsl`, Shader Model 3 (what Fallout 3 and New Vegas
+  ship). `c#` constant registers become one constant buffer, sampler stages
+  become texture+sampler pairs, and the fixed-function state blocks
+  (alpha test, clip planes, per-sampler state) are supplied as constant
+  buffers the way dxbc-spirv expects.
+
+For each API the probe draws one quad with every binding fed from descriptors
+written by hand — textures and constant buffers in one heap at a non-zero
+base, samplers in a sampler heap, vertex colour through the input layout — and
+reads the nine pixels back. Each column is one binding path with an exact
+expected value, identical across the three APIs.
+
+Reading it: `27/27 PASS` means the binding design holds for all three
+generations on this GPU and d12mt's runtime can be built on it. A `FAIL` line
+names the API and the path that is wrong, with expected against actual; that
+is a design finding, not a crash. `argument buffers: tier 1` or a GPU family
 below `apple6` means the device is too old for this design (A12 and earlier).
 Run it on both the iPad and the iPhone — the result must hold on A-series and
 M-series alike.
+
+## The one-button flow
+
+**▶ Run all probes** runs the CPU self-test, the GPU probe for all three APIs,
+the safe JIT check, and finally the memory ladder — last, because the ladder
+may end with the system killing the process, and by then everything else has
+been saved. **JIT: attach StikDebug** opens StikDebug with the universal
+script; when you return to the app with the debugger attached, the blessed-
+arena execution test runs on its own. **Copy report** puts the whole screen on
+the clipboard for pasting. **Reset results** clears everything, including the
+JIT crash marker.

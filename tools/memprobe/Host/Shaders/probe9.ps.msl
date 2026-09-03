@@ -1,0 +1,494 @@
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+struct _77
+{
+    float4 _m0[224];
+};
+
+struct _80
+{
+    uint _m0;
+    uint _m1;
+    uint _m2;
+};
+
+struct _84
+{
+    uint _m0;
+    uint _m1;
+    uint _m2;
+    uint _m3;
+    uint _m4;
+    uint _m5;
+    float _m6;
+};
+
+struct _86
+{
+    _84 _m0[16];
+};
+
+struct _131
+{
+    uint2 _m0;
+    uint _m1;
+};
+
+struct spvDescriptorSetBuffer0
+{
+    constant _77* m_79 [[id(0)]];
+    constant float* _m1_pad [[id(1)]];
+    constant float* _m2_pad [[id(2)]];
+    constant _80* m_82 [[id(3)]];
+    constant float* _m4_pad [[id(4)]];
+    constant float* _m5_pad [[id(5)]];
+    constant float* _m6_pad [[id(6)]];
+    constant _86* m_88 [[id(7)]];
+    constant float* _m8_pad [[id(8)]];
+    constant float* _m9_pad [[id(9)]];
+    constant float* _m10_pad [[id(10)]];
+    constant float* _m11_pad [[id(11)]];
+    constant float* _m12_pad [[id(12)]];
+    constant float* _m13_pad [[id(13)]];
+    constant float* _m14_pad [[id(14)]];
+    constant float* _m15_pad [[id(15)]];
+    texture2d<float> m_23 [[id(16)]];
+    // Overlapping binding: depth2d<float> m_648 [[id(16)]];
+    texture2d<float> m_25 [[id(17)]];
+    // Overlapping binding: depth2d<float> m_652 [[id(17)]];
+    texture2d<float> m_27 [[id(18)]];
+    // Overlapping binding: depth2d<float> m_656 [[id(18)]];
+    texture2d<float> m_29 [[id(19)]];
+    // Overlapping binding: depth2d<float> m_660 [[id(19)]];
+    texture2d<float> m_31 [[id(20)]];
+    // Overlapping binding: depth2d<float> m_664 [[id(20)]];
+};
+
+struct spvDescriptorSetBuffer1
+{
+    sampler m_20 [[id(0)]];
+    sampler m_24 [[id(1)]];
+    sampler m_26 [[id(2)]];
+    sampler m_28 [[id(3)]];
+    sampler m_30 [[id(4)]];
+};
+
+struct main0_out
+{
+    float4 m_60 [[color(0)]];
+};
+
+struct main0_in
+{
+    float4 m_15 [[user(locn9), centroid_perspective]];
+};
+
+static inline __attribute__((always_inline))
+float4 _323(float4 _324, sampler _20, texture2d<float> _23, constant _86& _88, depth2d<float> _648)
+{
+    if (_88._m0[0u]._m3 != 0u)
+    {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
+    float2 _340 = float2(_324.xy);
+    if (_88._m0[0u]._m1 != 0u)
+    {
+        return float4(_648.sample_compare(_20, _340, (_88._m0[0u]._m5 != 0u) ? precise::clamp(_324.z, 0.0, 1.0) : _324.z));
+    }
+    if (_88._m0[0u]._m4 != 0u)
+    {
+        uint2 _361 = (_131{ uint2(_23.get_width(0u), _23.get_height(0u)), 1u })._m0;
+        return float4(_23.gather(_20, float2(_324.x + (0.5 / float(_361.x)), _324.y + (0.5 / float(_361.y))), int2(0), component::x).zxyw);
+    }
+    return _23.sample(_20, _340);
+}
+
+static inline __attribute__((always_inline))
+float4 _266(float4 _267, sampler _24, texture2d<float> _25, constant _86& _88, depth2d<float> _652)
+{
+    if (_88._m0[1u]._m3 != 0u)
+    {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
+    float2 _283 = float2(_267.xy);
+    if (_88._m0[1u]._m1 != 0u)
+    {
+        return float4(_652.sample_compare(_24, _283, (_88._m0[1u]._m5 != 0u) ? precise::clamp(_267.z, 0.0, 1.0) : _267.z));
+    }
+    if (_88._m0[1u]._m4 != 0u)
+    {
+        uint2 _304 = (_131{ uint2(_25.get_width(0u), _25.get_height(0u)), 1u })._m0;
+        return float4(_25.gather(_24, float2(_267.x + (0.5 / float(_304.x)), _267.y + (0.5 / float(_304.y))), int2(0), component::x).zxyw);
+    }
+    return _25.sample(_24, _283);
+}
+
+static inline __attribute__((always_inline))
+float4 _209(float4 _210, sampler _26, texture2d<float> _27, constant _86& _88, depth2d<float> _656)
+{
+    if (_88._m0[2u]._m3 != 0u)
+    {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
+    float2 _226 = float2(_210.xy);
+    if (_88._m0[2u]._m1 != 0u)
+    {
+        return float4(_656.sample_compare(_26, _226, (_88._m0[2u]._m5 != 0u) ? precise::clamp(_210.z, 0.0, 1.0) : _210.z));
+    }
+    if (_88._m0[2u]._m4 != 0u)
+    {
+        uint2 _247 = (_131{ uint2(_27.get_width(0u), _27.get_height(0u)), 1u })._m0;
+        return float4(_27.gather(_26, float2(_210.x + (0.5 / float(_247.x)), _210.y + (0.5 / float(_247.y))), int2(0), component::x).zxyw);
+    }
+    return _27.sample(_26, _226);
+}
+
+static inline __attribute__((always_inline))
+float4 _152(float4 _153, sampler _28, texture2d<float> _29, constant _86& _88, depth2d<float> _660)
+{
+    if (_88._m0[3u]._m3 != 0u)
+    {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
+    float2 _169 = float2(_153.xy);
+    if (_88._m0[3u]._m1 != 0u)
+    {
+        return float4(_660.sample_compare(_28, _169, (_88._m0[3u]._m5 != 0u) ? precise::clamp(_153.z, 0.0, 1.0) : _153.z));
+    }
+    if (_88._m0[3u]._m4 != 0u)
+    {
+        uint2 _190 = (_131{ uint2(_29.get_width(0u), _29.get_height(0u)), 1u })._m0;
+        return float4(_29.gather(_28, float2(_153.x + (0.5 / float(_190.x)), _153.y + (0.5 / float(_190.y))), int2(0), component::x).zxyw);
+    }
+    return _29.sample(_28, _169);
+}
+
+static inline __attribute__((always_inline))
+float4 _89(float4 _91, sampler _30, texture2d<float> _31, constant _86& _88, depth2d<float> _664)
+{
+    if (_88._m0[4u]._m3 != 0u)
+    {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
+    float2 _109 = float2(_91.xy);
+    if (_88._m0[4u]._m1 != 0u)
+    {
+        return float4(_664.sample_compare(_30, _109, (_88._m0[4u]._m5 != 0u) ? precise::clamp(_91.z, 0.0, 1.0) : _91.z));
+    }
+    if (_88._m0[4u]._m4 != 0u)
+    {
+        uint2 _133 = (_131{ uint2(_31.get_width(0u), _31.get_height(0u)), 1u })._m0;
+        return float4(_31.gather(_30, float2(_91.x + (0.5 / float(_133.x)), _91.y + (0.5 / float(_133.y))), int2(0), component::x).zxyw);
+    }
+    return _31.sample(_30, _109);
+}
+
+static inline __attribute__((always_inline))
+bool _595(float _605, constant _80& _82)
+{
+    if (_82._m0 < 7u)
+    {
+        bool _631 = _82._m1 <= 8u;
+        float _632 = _631 ? rint(_605 * float((256u << _82._m1) - 1u)) : _605;
+        float _633 = _631 ? float((_82._m2 >> (8u - _82._m1)) | (_82._m2 << _82._m1)) : (float(_82._m2) / 255.0);
+        switch (_82._m0)
+        {
+            case 1u:
+            {
+                return _632 < _633;
+            }
+            case 2u:
+            {
+                return _632 == _633;
+            }
+            case 3u:
+            {
+                return _632 <= _633;
+            }
+            case 4u:
+            {
+                return _632 > _633;
+            }
+            case 5u:
+            {
+                return _632 != _633;
+            }
+            case 6u:
+            {
+                return _632 >= _633;
+            }
+            default:
+            {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+fragment main0_out main0(main0_in in [[stage_in]], constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]], constant spvDescriptorSetBuffer1& spvDescriptorSet1 [[buffer(1)]], float4 gl_FragCoord [[position]])
+{
+    main0_out out = {};
+    constant auto &_648 = reinterpret_cast<constant depth2d<float> &>(spvDescriptorSet0.m_23);
+    constant auto &_652 = reinterpret_cast<constant depth2d<float> &>(spvDescriptorSet0.m_25);
+    constant auto &_656 = reinterpret_cast<constant depth2d<float> &>(spvDescriptorSet0.m_27);
+    constant auto &_660 = reinterpret_cast<constant depth2d<float> &>(spvDescriptorSet0.m_29);
+    constant auto &_664 = reinterpret_cast<constant depth2d<float> &>(spvDescriptorSet0.m_31);
+    float _386 = gl_FragCoord.x - 0.5;
+    float _387 = fract(_386);
+    float _388 = floor(_386);
+    float _399;
+    float _400;
+    float _401;
+    float _402;
+    bool _403;
+    if (!((_388 - 0.5) >= 0.0))
+    {
+        float4 _394 = _323(float4(1.25, 0.5, 1.25, 1.25), spvDescriptorSet1.m_20, spvDescriptorSet0.m_23, (*spvDescriptorSet0.m_88), _648);
+        _399 = _394.x;
+        _400 = _394.y;
+        _401 = _394.z;
+        _402 = _394.w;
+        _403 = true;
+    }
+    else
+    {
+        _399 = _387;
+        _400 = _387;
+        _401 = _387;
+        _402 = _387;
+        _403 = false;
+    }
+    float _404 = float(_403);
+    float _590;
+    float _591;
+    float _592;
+    float _593;
+    if ((1.0 - _404) != (_404 - 1.0))
+    {
+        float _420;
+        float _421;
+        float _422;
+        float _423;
+        bool _424;
+        if (!((_388 - 1.5) >= 0.0))
+        {
+            float4 _415 = _266(float4(1.25, 0.5, 1.25, 1.25), spvDescriptorSet1.m_24, spvDescriptorSet0.m_25, (*spvDescriptorSet0.m_88), _652);
+            _420 = _415.x;
+            _421 = _415.y;
+            _422 = _415.z;
+            _423 = _415.w;
+            _424 = true;
+        }
+        else
+        {
+            _420 = _399;
+            _421 = _400;
+            _422 = _401;
+            _423 = _402;
+            _424 = _403;
+        }
+        float _425 = float(_424);
+        float _586;
+        float _587;
+        float _588;
+        float _589;
+        if ((1.0 - _425) != (_425 - 1.0))
+        {
+            float _441;
+            float _442;
+            float _443;
+            float _444;
+            bool _445;
+            if (!((_388 - 2.5) >= 0.0))
+            {
+                float4 _436 = _209(float4(1.75, 0.5, 1.75, 1.75), spvDescriptorSet1.m_26, spvDescriptorSet0.m_27, (*spvDescriptorSet0.m_88), _656);
+                _441 = _436.x;
+                _442 = _436.y;
+                _443 = _436.z;
+                _444 = _436.w;
+                _445 = true;
+            }
+            else
+            {
+                _441 = _420;
+                _442 = _421;
+                _443 = _422;
+                _444 = _423;
+                _445 = _424;
+            }
+            float _446 = float(_445);
+            float _582;
+            float _583;
+            float _584;
+            float _585;
+            if ((1.0 - _446) != (_446 - 1.0))
+            {
+                float _462;
+                float _463;
+                float _464;
+                float _465;
+                bool _466;
+                if (!((_388 - 3.5) >= 0.0))
+                {
+                    float4 _457 = _152(float4(0.5), spvDescriptorSet1.m_28, spvDescriptorSet0.m_29, (*spvDescriptorSet0.m_88), _660);
+                    _462 = _457.x;
+                    _463 = _457.y;
+                    _464 = _457.z;
+                    _465 = _457.w;
+                    _466 = true;
+                }
+                else
+                {
+                    _462 = _441;
+                    _463 = _442;
+                    _464 = _443;
+                    _465 = _444;
+                    _466 = _445;
+                }
+                float _467 = float(_466);
+                float _578;
+                float _579;
+                float _580;
+                float _581;
+                if ((1.0 - _467) != (_467 - 1.0))
+                {
+                    float _483;
+                    float _484;
+                    float _485;
+                    float _486;
+                    bool _487;
+                    if (!((_388 - 4.5) >= 0.0))
+                    {
+                        float4 _478 = _89(float4(0.5), spvDescriptorSet1.m_30, spvDescriptorSet0.m_31, (*spvDescriptorSet0.m_88), _664);
+                        _483 = _478.w;
+                        _484 = _478.z;
+                        _485 = _478.y;
+                        _486 = _478.x;
+                        _487 = true;
+                    }
+                    else
+                    {
+                        _483 = _465;
+                        _484 = _464;
+                        _485 = _463;
+                        _486 = _462;
+                        _487 = _466;
+                    }
+                    float _488 = float(_487);
+                    float _574;
+                    float _575;
+                    float _576;
+                    float _577;
+                    if ((1.0 - _488) != (_488 - 1.0))
+                    {
+                        bool _495 = (_388 - 5.5) >= 0.0;
+                        float _504 = _495 ? _486 : (*spvDescriptorSet0.m_79)._m0[0u].x;
+                        float _505 = _495 ? _485 : (*spvDescriptorSet0.m_79)._m0[0u].y;
+                        float _506 = _495 ? _484 : (*spvDescriptorSet0.m_79)._m0[0u].z;
+                        float _507 = _495 ? _483 : (*spvDescriptorSet0.m_79)._m0[0u].w;
+                        bool _509 = _495 && (!_487);
+                        float _510 = _509 ? 0.0 : 1.0;
+                        float _570;
+                        float _571;
+                        float _572;
+                        float _573;
+                        if ((1.0 - _510) != (_510 - 1.0))
+                        {
+                            bool _517 = (_388 - 6.5) >= 0.0;
+                            float _525 = _517 ? _504 : (*spvDescriptorSet0.m_79)._m0[1u].x;
+                            float _526 = _517 ? _505 : (*spvDescriptorSet0.m_79)._m0[1u].y;
+                            float _527 = _517 ? _506 : (*spvDescriptorSet0.m_79)._m0[1u].z;
+                            float _528 = _517 ? _507 : (*spvDescriptorSet0.m_79)._m0[1u].w;
+                            bool _529 = _517 && _509;
+                            bool _532 = (_388 - 7.5) >= 0.0;
+                            bool _559 = (((((!_529) && _529) || (_529 && (_532 && _529))) ? 0.0 : 1.0) - 1.0) >= 0.0;
+                            bool _565 = ((_529 ? 0.0 : 1.0) - 1.0) >= 0.0;
+                            _570 = _565 ? _525 : (_559 ? (_532 ? _525 : (*spvDescriptorSet0.m_79)._m0[2u].x) : in.m_15.x);
+                            _571 = _565 ? _526 : (_559 ? (_532 ? _526 : (*spvDescriptorSet0.m_79)._m0[2u].y) : in.m_15.y);
+                            _572 = _565 ? _527 : (_559 ? (_532 ? _527 : (*spvDescriptorSet0.m_79)._m0[2u].z) : in.m_15.z);
+                            _573 = _565 ? _528 : (_559 ? (_532 ? _528 : (*spvDescriptorSet0.m_79)._m0[2u].w) : in.m_15.w);
+                        }
+                        else
+                        {
+                            _570 = _504;
+                            _571 = _505;
+                            _572 = _506;
+                            _573 = _507;
+                        }
+                        _574 = _570;
+                        _575 = _571;
+                        _576 = _572;
+                        _577 = _573;
+                    }
+                    else
+                    {
+                        _574 = _486;
+                        _575 = _485;
+                        _576 = _484;
+                        _577 = _483;
+                    }
+                    _578 = _574;
+                    _579 = _575;
+                    _580 = _576;
+                    _581 = _577;
+                }
+                else
+                {
+                    _578 = _462;
+                    _579 = _463;
+                    _580 = _464;
+                    _581 = _465;
+                }
+                _582 = _578;
+                _583 = _579;
+                _584 = _580;
+                _585 = _581;
+            }
+            else
+            {
+                _582 = _441;
+                _583 = _442;
+                _584 = _443;
+                _585 = _444;
+            }
+            _586 = _582;
+            _587 = _583;
+            _588 = _584;
+            _589 = _585;
+        }
+        else
+        {
+            _586 = _420;
+            _587 = _421;
+            _588 = _422;
+            _589 = _423;
+        }
+        _590 = _589;
+        _591 = _588;
+        _592 = _587;
+        _593 = _586;
+    }
+    else
+    {
+        _590 = _402;
+        _591 = _401;
+        _592 = _400;
+        _593 = _399;
+    }
+    if (!_595(_590, (*spvDescriptorSet0.m_82)))
+    {
+        discard_fragment();
+    }
+    out.m_60.x = _593;
+    out.m_60.y = _592;
+    out.m_60.z = _591;
+    out.m_60.w = _590;
+    return out;
+}
+
