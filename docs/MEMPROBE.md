@@ -101,3 +101,29 @@ here, it is good for the configuration we would ship.
 configuration the real product would ship in, and entitlements there apply to
 LiveContainer's bundle rather than the guest's — so a good number here does not
 guarantee a good number there.
+
+## 4 · The GPU binding probe
+
+Button 4 is not about memory. It is the on-device test for d12mt
+(`gpu/d12mt`), the Direct3D 12 → Metal compiler. d12mt's whole binding model
+rests on one claim that can only be settled on real silicon: a Metal 3
+argument buffer is a flat array of 8-byte slots, `[[id(k)]]` at byte `8k`, so
+a D3D12 descriptor heap can be an ordinary `MTLBuffer` the CPU writes directly
+and a descriptor table is that buffer bound at an offset.
+
+The probe draws one quad with the shaders d12mt produced from
+`gpu/d12mt/tests/shaders/probe.hlsl` (bundled as `Host/Shaders/probe.*.msl`,
+compiled on the device by the Metal compiler), feeding every binding path from
+descriptors written by hand — four textures and a constant buffer in one heap
+at a non-zero base, two samplers in a sampler heap, a root constant block and a
+root descriptor in the root buffer, a vertex colour through the input layout —
+and reads the nine pixels back. Each column is one binding path with an exact
+expected value.
+
+Reading it: `9/9 PASS` means the D3D12 binding design holds on this GPU and
+d12mt's runtime can be built on it without a translation step for descriptors.
+A `FAIL` line names the path that is wrong and shows expected against actual;
+that is a design finding, not a crash. `argument buffers: tier 1` or a family
+below `apple6` means the device is too old for this design (A12 and earlier).
+Run it on both the iPad and the iPhone — the result must hold on A-series and
+M-series alike.

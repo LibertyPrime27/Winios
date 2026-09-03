@@ -28,7 +28,13 @@ targets:
     platform: iOS
     sources:
       - path: Host
+        excludes: ["Shaders/**"]
       - path: Shared
+      # d12mt output for the GPU probe. Kept as .msl so Xcode does not try to
+      # link two `main0`s into one default.metallib; compiled on device.
+      - path: Host/Shaders
+        type: folder
+        buildPhase: resources
     info: { path: Host/Info.plist }
     entitlements: { path: Host/Host.entitlements }
     settings:
