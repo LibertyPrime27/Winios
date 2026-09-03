@@ -31,7 +31,12 @@ enum Ladder {
     ///     stopping here measures the limit (resident + remaining) without
     ///     being killed -- which matters inside LiveContainer, where a kill
     ///     takes the host down too. Pass 0 to climb into the kill as before.
-    static func climb(host: String, stepMB: Int = 64, ceilingMB: Int = 16384, headroomMB: Int = 256) {
+    ///   - paused: polled before every rung. iOS kills a non-frontmost app that
+    ///     uses more than 80% CPU over 60 s, and touching pages is CPU work;
+    ///     the host sets this while it is in the background so the ladder
+    ///     waits instead of getting the process killed.
+    static func climb(host: String, stepMB: Int = 64, ceilingMB: Int = 16384, headroomMB: Int = 256,
+                      paused: @escaping () -> Bool = { false }) {
         let page = Int(getpagesize())
         let stepBytes = stepMB << 20
         var blocks: [UnsafeMutableRawPointer] = []
@@ -40,6 +45,8 @@ enum Ladder {
         log.notice("ladder start host=\(host, privacy: .public) step=\(stepMB)MB page=\(page)")
 
         while (step + 1) * stepMB <= ceilingMB {
+            while paused() { Thread.sleep(forTimeInterval: 0.25) }
+            let rungStart = Date()
             let remaining = Int(os_proc_available_memory()) >> 20
             if headroomMB > 0 && remaining < headroomMB + stepMB {
                 log.notice("ladder stopping short: \(remaining)MB of budget left, limit ~\(step * stepMB + remaining)MB")
@@ -67,10 +74,12 @@ enum Ladder {
             ResultStore.append(rung)
             log.notice("rung \(step) resident=\(rung.residentMB)MB available=\(rung.availableMB)MB")
 
-            // Give the OS a moment to account the pages. Without this the
-            // ladder can outrun jetsam and die a rung or two past the real
-            // limit, overstating the result.
-            Thread.sleep(forTimeInterval: 0.15)
+            // Give the OS a moment to account the pages, and keep the duty
+            // cycle under 50%: sleep at least as long as the rung's work took
+            // (page zero-fill is charged to us as CPU time), never less than
+            // 150 ms. Slower, but it can never read as a runaway process.
+            let work = Date().timeIntervalSince(rungStart)
+            Thread.sleep(forTimeInterval: max(0.15, work))
         }
 
         log.notice("ladder stopped voluntarily at \(step * stepMB)MB -- ceiling reached, not a limit")
