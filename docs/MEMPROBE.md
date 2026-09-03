@@ -150,6 +150,17 @@ reports the remaining jetsam budget exactly, so the ladder now stops when fewer
 than 256 MB remain and reports `held + remaining` as the limit. Pass
 `headroomMB: 0` to `Ladder.climb` to get the old behaviour.
 
+## The other way the ladder used to die: the CPU watchdog
+
+A `cpu_resource_fatal` report from the M3 iPad (build 432a8db) showed the real
+cause of the intermittent crashes in the LiveContainer flow: not jetsam but
+`48 seconds cpu time over 51 seconds, exceeding limit of 80% cpu over 60
+seconds` with the app `Non-Frontmost`. iOS kills any background app that
+behaves like that, and touching pages is CPU work (zero-fill is charged to the
+process). Switching to StikDebug while the ladder ran was enough. The ladder
+now pauses whenever the app is not frontmost, and sleeps at least as long as
+each rung's work took, so its duty cycle stays under 50% even in the foreground.
+
 ## The one-button flow
 
 **▶ Run all probes** runs the CPU self-test, the GPU probe for all three APIs,

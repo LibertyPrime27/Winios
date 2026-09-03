@@ -21,6 +21,10 @@ final class ProbeViewController: UIViewController {
     private var jitLine: String { get { store.string(forKey: "jit") ?? "not run" } set { store.set(newValue, forKey: "jit") } }
     private var running = false
     private var jitAttachPending = false
+    /// False while the app is not frontmost. Probe work pauses on it: iOS kills
+    /// a background app that stays above 80% CPU for a minute (see the
+    /// cpu_resource_fatal report in docs/MEMPROBE.md).
+    private var isActive = true
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -55,6 +59,8 @@ final class ProbeViewController: UIViewController {
         // JIT test without another tap.
         NotificationCenter.default.addObserver(self, selector: #selector(becameActive),
                                                name: UIApplication.didBecomeActiveNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(resignedActive),
+                                               name: UIApplication.willResignActiveNotification, object: nil)
         refresh()
     }
 
@@ -103,7 +109,10 @@ final class ProbeViewController: UIViewController {
             }
             DispatchQueue.main.async { self.jitLine = jit; self.refresh() }
 
-            Ladder.climb(host: "app")
+            // The ladder pauses whenever the app is not frontmost. `isActive`
+            // is written on the main thread and read here; a stale read only
+            // delays one rung, so no locking is needed.
+            Ladder.climb(host: "app", paused: { !self.isActive })
             DispatchQueue.main.async { self.running = false; self.refresh() }
         }
     }
@@ -178,7 +187,10 @@ final class ProbeViewController: UIViewController {
         refresh()
     }
 
+    @objc private func resignedActive() { isActive = false }
+
     @objc private func becameActive() {
+        isActive = true
         guard jitAttachPending else { return }
         var probe = jit_result()
         markerPath.withCString { jit_probe_safe(&probe, $0) }
@@ -234,7 +246,8 @@ final class ProbeViewController: UIViewController {
         3 · JIT
         \(jitLine)
 
-        4 · MEMORY, app process (stops 256 MB short of the kill on purpose)
+        4 · MEMORY, app process (stops 256 MB short of the kill on purpose;
+            pauses while the app is in the background)
             \(app)
             available now \(avail) MB
 
