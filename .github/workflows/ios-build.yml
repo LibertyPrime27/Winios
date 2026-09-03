@@ -46,10 +46,11 @@ jobs:
         run: |
           set +e
           rc=0
-          for st in vs ps; do
-            ./build-host/gpu/d12mt/d12mt-shaderc gpu/d12mt/tests/shaders/probe.$st.cso -o /tmp/probe.$st.msl 2>/dev/null
-            if ! diff -u tools/memprobe/Host/Shaders/probe.$st.msl /tmp/probe.$st.msl > /tmp/pdiff.txt; then
-              echo "::error::tools/memprobe/Host/Shaders/probe.$st.msl is stale; regenerate with d12mt-shaderc"
+          for src in probe.vs.cso probe.ps.cso probe11.vs.dxbc probe11.ps.dxbc probe9.vs.d3dbc probe9.ps.d3dbc; do
+            name=${src%.*}
+            ./build-host/gpu/d12mt/d12mt-shaderc gpu/d12mt/tests/shaders/$src -o /tmp/$name.msl 2>/dev/null
+            if ! diff -u tools/memprobe/Host/Shaders/$name.msl /tmp/$name.msl > /tmp/pdiff.txt; then
+              echo "::error::tools/memprobe/Host/Shaders/$name.msl is stale; regenerate with d12mt-shaderc"
               head -20 /tmp/pdiff.txt | while IFS= read -r l; do echo "::error::${l}"; done
               rc=1
             fi

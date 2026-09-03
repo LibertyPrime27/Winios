@@ -1,0 +1,163 @@
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+template<typename T>
+[[clang::optnone]] T spvFMul(T l, T r)
+{
+    return fma(l, r, T(0));
+}
+
+template<typename T, int Cols, int Rows>
+[[clang::optnone]] vec<T, Cols> spvFMulVectorMatrix(vec<T, Rows> v, matrix<T, Cols, Rows> m)
+{
+    vec<T, Cols> res = vec<T, Cols>(0);
+    for (uint i = Rows; i > 0; --i)
+    {
+        vec<T, Cols> tmp(0);
+        for (uint j = 0; j < Cols; ++j)
+        {
+            tmp[j] = m[j][i - 1];
+        }
+        res = fma(tmp, vec<T, Cols>(v[i - 1]), res);
+    }
+    return res;
+}
+
+template<typename T, int Cols, int Rows>
+[[clang::optnone]] vec<T, Rows> spvFMulMatrixVector(matrix<T, Cols, Rows> m, vec<T, Cols> v)
+{
+    vec<T, Rows> res = vec<T, Rows>(0);
+    for (uint i = Cols; i > 0; --i)
+    {
+        res = fma(m[i - 1], vec<T, Rows>(v[i - 1]), res);
+    }
+    return res;
+}
+
+template<typename T, int LCols, int LRows, int RCols, int RRows>
+[[clang::optnone]] matrix<T, RCols, LRows> spvFMulMatrixMatrix(matrix<T, LCols, LRows> l, matrix<T, RCols, RRows> r)
+{
+    matrix<T, RCols, LRows> res;
+    for (uint i = 0; i < RCols; i++)
+    {
+        vec<T, RCols> tmp(0);
+        for (uint j = 0; j < LCols; j++)
+        {
+            tmp = fma(vec<T, RCols>(r[i][j]), l[j], tmp);
+        }
+        res[i] = tmp;
+    }
+    return res;
+}
+
+struct _25
+{
+    uint _m0;
+    packed_float4 _m1;
+    packed_float4 _m2;
+    packed_float4 _m3;
+    packed_float4 _m4;
+    packed_float4 _m5;
+    packed_float4 _m6;
+};
+
+struct _28
+{
+    uint _m0;
+    float _m1;
+    float _m2;
+    float _m3;
+};
+
+struct spvDescriptorSetBuffer0
+{
+    constant float* _m0_pad [[id(0)]];
+    constant float* _m1_pad [[id(1)]];
+    constant float* _m2_pad [[id(2)]];
+    constant float* _m3_pad [[id(3)]];
+    constant float* _m4_pad [[id(4)]];
+    constant _25* m_27 [[id(5)]];
+    constant _28* m_30 [[id(6)]];
+};
+
+struct main0_out
+{
+    float4 m_21 [[user(locn9)]];
+    float4 gl_Position [[position, invariant]];
+    float gl_PointSize [[point_size]];
+    float gl_ClipDistance [[clip_distance]] [6];
+    float gl_ClipDistance_0 [[user(clip0)]];
+    float gl_ClipDistance_1 [[user(clip1)]];
+    float gl_ClipDistance_2 [[user(clip2)]];
+    float gl_ClipDistance_3 [[user(clip3)]];
+    float gl_ClipDistance_4 [[user(clip4)]];
+    float gl_ClipDistance_5 [[user(clip5)]];
+};
+
+struct main0_in
+{
+    float4 m_16 [[attribute(0)]];
+    float4 m_18 [[attribute(1)]];
+};
+
+static inline __attribute__((always_inline))
+float _31(float4 _33, float4 _34)
+{
+    return fma((_34.w == 0.0) ? 0.0 : _33.w, (_33.w == 0.0) ? 0.0 : _34.w, fma((_34.z == 0.0) ? 0.0 : _33.z, (_33.z == 0.0) ? 0.0 : _34.z, fma((_34.y == 0.0) ? 0.0 : _33.y, (_33.y == 0.0) ? 0.0 : _34.y, spvFMul((_34.x == 0.0) ? 0.0 : _33.x, (_33.x == 0.0) ? 0.0 : _34.x))));
+}
+
+static inline __attribute__((always_inline))
+void _84(float4 _106, thread float (&gl_ClipDistance)[6], constant _25& _27)
+{
+    float _116 = _31(_106, float4(_27._m1));
+    bool _117 = _27._m0 > 0u;
+    float _118 = _117 ? _116 : 0.0;
+    gl_ClipDistance[0u] = _118;
+    float _123 = _31(_106, float4(_27._m2));
+    bool _124 = _27._m0 > 1u;
+    float _125 = _124 ? _123 : 0.0;
+    gl_ClipDistance[1u] = _125;
+    float _130 = _31(_106, float4(_27._m3));
+    bool _131 = _27._m0 > 2u;
+    float _132 = _131 ? _130 : 0.0;
+    gl_ClipDistance[2u] = _132;
+    float _137 = _31(_106, float4(_27._m4));
+    bool _138 = _27._m0 > 3u;
+    float _139 = _138 ? _137 : 0.0;
+    gl_ClipDistance[3u] = _139;
+    float _144 = _31(_106, float4(_27._m5));
+    bool _145 = _27._m0 > 4u;
+    float _146 = _145 ? _144 : 0.0;
+    gl_ClipDistance[4u] = _146;
+    float _151 = _31(_106, float4(_27._m6));
+    bool _152 = _27._m0 > 5u;
+    float _153 = _152 ? _151 : 0.0;
+    gl_ClipDistance[5u] = _153;
+}
+
+vertex main0_out main0(main0_in in [[stage_in]], constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]])
+{
+    main0_out out = {};
+    _84(float4(in.m_16.x, in.m_16.y, 0.0, 1.0), out.gl_ClipDistance, (*spvDescriptorSet0.m_27));
+    out.gl_Position.x = in.m_16.x;
+    out.gl_Position.y = in.m_16.y;
+    out.gl_Position.z = 0.0;
+    out.gl_Position.w = 1.0;
+    out.m_21.x = in.m_18.x;
+    out.m_21.y = in.m_18.y;
+    out.m_21.z = in.m_18.z;
+    out.m_21.w = in.m_18.w;
+    out.gl_PointSize = precise::min(precise::max((*spvDescriptorSet0.m_30)._m1, (*spvDescriptorSet0.m_30)._m2), (*spvDescriptorSet0.m_30)._m3);
+    out.gl_ClipDistance_0 = out.gl_ClipDistance[0];
+    out.gl_ClipDistance_1 = out.gl_ClipDistance[1];
+    out.gl_ClipDistance_2 = out.gl_ClipDistance[2];
+    out.gl_ClipDistance_3 = out.gl_ClipDistance[3];
+    out.gl_ClipDistance_4 = out.gl_ClipDistance[4];
+    out.gl_ClipDistance_5 = out.gl_ClipDistance[5];
+    return out;
+}
+

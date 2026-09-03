@@ -1,20 +1,26 @@
 import UIKit
 import os
 
-/// The three questions that gate everything else, on one screen.
+/// The questions that gate everything else, on one screen, one tap.
 ///
 ///  1. Does the CPU core behave on ARM64 the way it does on x86? (golden vectors)
-///  2. Can an app extension hold enough memory to be a wineserver? (the ladder)
-///  3. Is JIT actually available, not just flagged? (the probe)
+///  2. Does the D3D binding design (heap == argument buffer) hold on this GPU,
+///     for D3D9, D3D11 and D3D12 shaders alike?
+///  3. Is JIT actually available, not just flagged?
+///  4. How much memory will the app process hold? (the ladder)
 ///
 /// Answering these on real hardware is the entire purpose of this build. It is
-/// not a game runner and does not pretend to be one.
+/// not a game runner and does not pretend to be one. Every result is persisted
+/// as soon as it exists, so a memory-ladder kill costs nothing.
 final class ProbeViewController: UIViewController {
 
     private let results = UITextView()
-    private var cpuLine = "not run"
-    private var jitLine = "not run"
-    private var gpuLine = "not run"
+    private let store = UserDefaults.standard
+    private var cpuLine: String { get { store.string(forKey: "cpu") ?? "not run" } set { store.set(newValue, forKey: "cpu") } }
+    private var gpuLine: String { get { store.string(forKey: "gpu") ?? "not run" } set { store.set(newValue, forKey: "gpu") } }
+    private var jitLine: String { get { store.string(forKey: "jit") ?? "not run" } set { store.set(newValue, forKey: "jit") } }
+    private var running = false
+    private var jitAttachPending = false
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -22,19 +28,14 @@ final class ProbeViewController: UIViewController {
         view.backgroundColor = .systemBackground
 
         results.isEditable = false
-        results.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        results.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         results.alwaysBounceVertical = true
 
         let stack = UIStackView(arrangedSubviews: [
-            button("1 · Run CPU self-test", #selector(runCPU)),
-            button("2 · Memory ladder in app", #selector(runInApp)),
-            button("2b · Memory ladder in extension", #selector(runInExtensionDirect)),
-            button("3a · Check JIT (safe)", #selector(runJITSafe)),
-            button("3b · Attach StikDebug (universal script)", #selector(attachJIT)),
-            button("3c · Create blessed arena + execute", #selector(runArena)),
-            button("4 · GPU binding probe (d12mt shaders)", #selector(runGPU)),
-            button("Reset JIT marker", #selector(resetJIT)),
-            button("Reset memory log", #selector(resetLog)),
+            button("▶  Run all probes  (CPU · GPU ×3 APIs · JIT check · memory)", #selector(runAll)),
+            button("JIT: attach StikDebug, then execute in a blessed arena", #selector(attachJIT)),
+            button("Copy report", #selector(copyReport)),
+            button("Reset results", #selector(resetAll)),
             results,
         ])
         stack.axis = .vertical
@@ -49,116 +50,92 @@ final class ProbeViewController: UIViewController {
             stack.trailingAnchor.constraint(equalTo: g.trailingAnchor, constant: -12),
             stack.bottomAnchor.constraint(equalTo: g.bottomAnchor, constant: -12),
         ])
-        refresh()
-    }
 
-    override func viewDidAppear(_ animated: Bool) {
-        super.viewDidAppear(animated)
-        refresh()   // the extension may have been killed and recorded since
+        // Coming back from StikDebug with the debugger attached finishes the
+        // JIT test without another tap.
+        NotificationCenter.default.addObserver(self, selector: #selector(becameActive),
+                                               name: UIApplication.didBecomeActiveNotification, object: nil)
+        refresh()
     }
 
     private func button(_ title: String, _ action: Selector) -> UIButton {
         var c = UIButton.Configuration.bordered()
         c.title = title
+        c.titleAlignment = .leading
+        c.titleLineBreakMode = .byWordWrapping
         c.contentInsets = .init(top: 8, leading: 12, bottom: 8, trailing: 12)
         let b = UIButton(configuration: c)
+        b.contentHorizontalAlignment = .leading
         b.addTarget(self, action: action, for: .touchUpInside)
         return b
     }
 
-    // MARK: - 1. CPU core
+    // MARK: - run everything
 
-    /// Replays post-states recorded from a real x86-64 CPU on the CI runner.
-    /// A mismatch means the interpreter is architecture-dependent somewhere —
-    /// the class of bug that otherwise only ever shows up on device.
-    @objc private func runCPU() {
-        cpuLine = "running…"; refresh()
+    /// CPU, GPU and the safe JIT check are quick and harmless, so they go
+    /// first and get saved. The memory ladder goes last because it may end
+    /// with the system killing the process; by then everything else is on disk.
+    @objc private func runAll() {
+        guard !running else { return }
+        running = true
+        cpuLine = "running…"; gpuLine = "queued"; jitLine = "queued"; refresh()
         DispatchQueue.global(qos: .userInitiated).async {
             var buf = [CChar](repeating: 0, count: 8192)
             let bad = xc_selftest(&buf, buf.count, 12)
-            let report = String(cString: buf)
-            DispatchQueue.main.async {
-                self.cpuLine = (bad == 0 ? "PASS — matches x86 silicon\n" : "FAIL — \(bad) mismatched\n") + report
-                self.refresh()
-            }
-        }
-    }
+            let cpu = (bad == 0 ? "PASS — matches x86 silicon\n" : "FAIL — \(bad) mismatched\n") + String(cString: buf)
+            DispatchQueue.main.async { self.cpuLine = cpu; self.gpuLine = "running…"; self.refresh() }
 
-    // MARK: - 2. Memory
+            let gpu = GpuProbe.run()
+            DispatchQueue.main.async { self.gpuLine = gpu; self.jitLine = "checking…"; self.refresh() }
 
-    @objc private func runInApp() {
-        // Off the main thread: a watchdog hang-kill would look exactly like a
-        // memory kill and would corrupt the measurement.
-        DispatchQueue.global(qos: .userInitiated).async {
+            var r = jit_result()
+            self.markerPath.withCString { jit_probe_safe(&r, $0) }
+            let jit = self.describe(r) + "\n    (safe check only — use the JIT button to attach StikDebug and execute)"
+            DispatchQueue.main.async { self.jitLine = jit; self.refresh() }
+
             Ladder.climb(host: "app")
-            DispatchQueue.main.async { self.refresh() }
+            DispatchQueue.main.async { self.running = false; self.refresh() }
         }
     }
 
-    @objc private func resetLog() { ResultStore.reset(); refresh() }
-
-    private let extensionID = "winios.memprobe.app.probe"
-    private var extLine = ""
-
-    /// Launch the extension the way LiveContainer launches LiveProcess: through
-    /// NSExtension, no share sheet. The interruption callback is the result --
-    /// the system killing the extension means the ladder found the limit.
-    @objc private func runInExtensionDirect() {
-        var path: NSString? = nil
-        guard ExtensionLauncher.extensionEmbedded(extensionID, path: &path) else {
-            extLine = "EXTENSION NOT IN BUNDLE. The signing tool stripped PlugIns. In Sideloadly, turn off 'Remove app extensions' and reinstall."
-            refresh(); return
-        }
-        extLine = "launching…"; refresh()
-        ExtensionLauncher.launch(extensionID) { [weak self] event, detail in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                switch event {
-                case "interrupted":
-                    self.extLine = "extension KILLED by the system — the last rung below is the limit"
-                default:
-                    self.extLine = "\(event): \(detail)"
-                }
-                self.refresh()
-            }
-        }
+    @objc private func copyReport() {
+        UIPasteboard.general.string = results.text
+        let old = title
+        title = "copied"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { self.title = old }
     }
 
-    // MARK: - 3. JIT
+    @objc private func resetAll() {
+        ResultStore.reset()
+        markerPath.withCString { jit_probe_reset($0) }
+        ["cpu", "gpu", "jit"].forEach { store.removeObject(forKey: $0) }
+        refresh()
+    }
+
+    // MARK: - JIT
 
     private var markerPath: String {
         (ResultStore.containerDir?.appendingPathComponent("jit.marker").path) ?? ""
     }
 
     private func cstr<T>(_ tuple: T) -> String {
-        withUnsafeBytes(of: tuple) { raw in
-            String(cString: raw.baseAddress!.assumingMemoryBound(to: CChar.self))
-        }
+        withUnsafeBytes(of: tuple) { raw in String(cString: raw.baseAddress!.assumingMemoryBound(to: CChar.self)) }
     }
 
-    private func show(_ r: jit_result) {
+    private func describe(_ r: jit_result) -> String {
         var s = "\(String(cString: jit_state_name(r.state)))"
-        s += "   CS flags 0x\(String(r.cs_flags, radix: 16))"
-        s += "  debugged=\(r.cs_debugged != 0)"
+        s += "   CS flags 0x\(String(r.cs_flags, radix: 16))  debugged=\(r.cs_debugged != 0)"
         s += "  remap_kr=\(r.remap_kr) protect_kr=\(r.protect_kr)"
         let last = cstr(r.last_step)
         if !last.isEmpty { s += "\n    last attempt reached: \(last)" }
         s += "\n    \(cstr(r.detail))"
-        jitLine = s
-        refresh()
-    }
-
-    /// Everything except the jump. Cannot fault, so it is safe to run first and
-    /// tells us most of what we need.
-    @objc private func runJITSafe() {
-        var r = jit_result()
-        markerPath.withCString { jit_probe_safe(&r, $0) }
-        show(r)
+        return s
     }
 
     /// Ask StikDebug to attach with a script that can service the bless
-    /// breakpoint. On TXM hardware (A15+, M2+, so every M-series iPad) a plain
-    /// attach is not enough — the script has to stay to answer `brk #0xf00d`.
+    /// breakpoint. On TXM hardware (A15+, M2+) a plain attach is not enough --
+    /// the script has to stay to answer `brk #0xf00d`. When the app comes back
+    /// to the foreground with CS_DEBUGGED set, the arena test runs by itself.
     @objc private func attachJIT() {
         let bundle = Bundle.main.bundleIdentifier ?? ""
         let pid = getpid()
@@ -169,51 +146,41 @@ final class ProbeViewController: UIViewController {
         ]
         for s in candidates {
             if let u = URL(string: s), UIApplication.shared.canOpenURL(u) {
+                jitAttachPending = true
                 UIApplication.shared.open(u)
-                jitLine = "asked StikDebug to attach:\n    \(s)\n    Come back once it reports success, then run 3c."
+                jitLine = "asked StikDebug to attach:\n    \(s)\n    The arena test runs automatically when you come back."
                 refresh()
                 return
             }
         }
-        jitLine = "No StikDebug URL scheme responded. Install StikDebug, or attach it manually and then run 3c."
+        jitLine = "No StikDebug URL scheme responded. Install StikDebug, or attach it manually and press this button again."
         refresh()
     }
 
+    @objc private func becameActive() {
+        guard jitAttachPending else { return }
+        var probe = jit_result()
+        markerPath.withCString { jit_probe_safe(&probe, $0) }
+        guard probe.cs_debugged != 0 else { return }      // not attached yet; keep waiting
+        jitAttachPending = false
+        runArena()
+    }
+
     /// The real protocol: allocate RX, have the debugger bless every 16 KB page,
-    /// build the RW alias, detach, then write and execute. Everything before the
-    /// bless is what my earlier probe was missing.
-    @objc private func runArena() {
+    /// build the RW alias, detach, then write and execute.
+    private func runArena() {
         var r = jit_result()
         var arena = jit_arena()
         let ok = markerPath.withCString { jit_arena_create(&arena, 1 << 20, &r, $0) }
         if ok == 1 {
-            // AArch64 `ret`.
-            var code: UInt32 = 0xD65F03C0
+            var code: UInt32 = 0xD65F03C0      // AArch64 `ret`
             _ = withUnsafeBytes(of: &code) { raw in
                 markerPath.withCString { jit_arena_run(&arena, raw.baseAddress, 4, &r, $0) }
             }
             jit_arena_free(&arena)
         }
-        show(r)
-    }
-
-    @objc private func resetJIT() {
-        markerPath.withCString { jit_probe_reset($0) }
-        jitLine = "marker cleared — the execute test can be retried"
+        jitLine = describe(r)
         refresh()
-    }
-
-    // MARK: - 4. GPU
-
-    /// Draws through shaders d12mt compiled from HLSL, with descriptor heaps
-    /// written by hand as 8-byte slots, and reads the pixels back. Settles
-    /// whether the D3D12 -> Metal binding design holds on this GPU.
-    @objc private func runGPU() {
-        gpuLine = "running…"; refresh()
-        DispatchQueue.global(qos: .userInitiated).async {
-            let r = GpuProbe.run()
-            DispatchQueue.main.async { self.gpuLine = r; self.refresh() }
-        }
     }
 
     // MARK: - render
@@ -221,11 +188,7 @@ final class ProbeViewController: UIViewController {
     private func refresh() {
         let high = ResultStore.highWater()
         let app = high["app"].map { "\($0) MB" } ?? "not run"
-        let ext = high["extension"].map { "\($0) MB" } ?? "not run"
         let avail = Int(os_proc_available_memory()) >> 20
-
-        var path: NSString? = nil
-        let embedded = ExtensionLauncher.extensionEmbedded(extensionID, path: &path)
 
         var text = """
         \(DeviceInfo.summary())
@@ -233,31 +196,21 @@ final class ProbeViewController: UIViewController {
         1 · CPU CORE (x86 → ARM64)
         \(cpuLine)
 
-        2 · MEMORY, high-water resident
-            app process        \(app)
-            extension process  \(ext)
-            available now      \(avail) MB
-            extension in bundle: \(embedded ? "yes" : "NO — stripped at signing; see 2b")
-            \(extLine)
-
-            ►► The EXTENSION figure is the measurement that matters. It decides
-            whether wineserver can live in an app extension, and so whether
-            64-bit games are reachable at all. Run 2b. The extension being
-            KILLED is the result, not a crash — read the last extension rung.
-
-            "stopped voluntarily" in the log means the ceiling was reached
-            rather than a limit — the process was never killed.
+        2 · GPU — Direct3D 9 / 11 / 12 binding model on Metal (d12mt)
+        \(gpuLine)
 
         3 · JIT
         \(jitLine)
 
-        4 · GPU — D3D12 binding model on Metal (d12mt)
-        \(gpuLine)
+        4 · MEMORY, high-water resident in the app process
+            \(app)   (available now \(avail) MB)
+            "stopped voluntarily" in the log means the ceiling was reached
+            rather than a limit — the process was never killed.
 
         RECENT LADDER RUNGS
 
         """
-        for r in ResultStore.readAll().suffix(20) {
+        for r in ResultStore.readAll().suffix(12) {
             let who = r.host.padding(toLength: 9, withPad: " ", startingAt: 0)
             text += "  \(who) step \(r.step)  resident \(r.residentMB) MB  available \(r.availableMB) MB\n"
         }

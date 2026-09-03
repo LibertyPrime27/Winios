@@ -1,0 +1,165 @@
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+struct _4
+{
+    float4 _m0;
+};
+
+struct _7
+{
+    float4 _m0;
+};
+
+struct _10
+{
+    float4 _m0;
+};
+
+struct spvDescriptorSetBuffer0
+{
+    constant _4* m_6 [[id(0)]];
+    constant _7* m_9 [[id(1)]];
+    constant _10* m_12 [[id(2)]];
+    constant float* _m3_pad [[id(3)]];
+    constant float* _m4_pad [[id(4)]];
+    constant float* _m5_pad [[id(5)]];
+    constant float* _m6_pad [[id(6)]];
+    constant float* _m7_pad [[id(7)]];
+    constant float* _m8_pad [[id(8)]];
+    constant float* _m9_pad [[id(9)]];
+    constant float* _m10_pad [[id(10)]];
+    constant float* _m11_pad [[id(11)]];
+    constant float* _m12_pad [[id(12)]];
+    constant float* _m13_pad [[id(13)]];
+    constant float* _m14_pad [[id(14)]];
+    constant float* _m15_pad [[id(15)]];
+    texture2d<float> m_20 [[id(16)]];
+    texture2d<float> m_21 [[id(17)]];
+    texture2d<float> m_22 [[id(18)]];
+    texture2d<float> m_23 [[id(19)]];
+};
+
+struct spvDescriptorSetBuffer1
+{
+    sampler m_15 [[id(0)]];
+    sampler m_16 [[id(1)]];
+    sampler _m2_pad [[id(2)]];
+    sampler _m3_pad [[id(3)]];
+    sampler m_17 [[id(4)]];
+};
+
+struct main0_out
+{
+    float4 m_24 [[color(0)]];
+};
+
+struct main0_in
+{
+    float4 m_28 [[user(locn1)]];
+};
+
+static inline __attribute__((always_inline))
+uint _49(float _51)
+{
+    return (_51 > 4294967040.0) ? 4294967295u : uint(precise::max(_51, 0.0));
+}
+
+fragment main0_out main0(main0_in in [[stage_in]], constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]], constant spvDescriptorSetBuffer1& spvDescriptorSet1 [[buffer(1)]], float4 gl_FragCoord [[position]])
+{
+    main0_out out = {};
+    float _144;
+    float _145;
+    float _146;
+    float _147;
+    switch (_49(gl_FragCoord.x))
+    {
+        case 0u:
+        {
+            float4 _81 = spvDescriptorSet0.m_20.sample(spvDescriptorSet1.m_15, float2(1.25, 0.5), gradient2d(float2(0.0), float2(0.0)));
+            _144 = _81.w;
+            _145 = _81.z;
+            _146 = _81.y;
+            _147 = _81.x;
+            break;
+        }
+        case 1u:
+        {
+            float4 _87 = spvDescriptorSet0.m_20.sample(spvDescriptorSet1.m_16, float2(1.25, 0.5), gradient2d(float2(0.0), float2(0.0)));
+            _144 = _87.w;
+            _145 = _87.z;
+            _146 = _87.y;
+            _147 = _87.x;
+            break;
+        }
+        case 2u:
+        {
+            float4 _95 = spvDescriptorSet0.m_21.sample(spvDescriptorSet1.m_17, float2(1.75, 0.5), gradient2d(float2(0.0), float2(0.0)));
+            _144 = _95.w;
+            _145 = _95.z;
+            _146 = _95.y;
+            _147 = _95.x;
+            break;
+        }
+        case 3u:
+        {
+            float4 _102 = spvDescriptorSet0.m_22.sample(spvDescriptorSet1.m_15, float2(0.5), gradient2d(float2(0.0), float2(0.0)));
+            _144 = _102.w;
+            _145 = _102.z;
+            _146 = _102.y;
+            _147 = _102.x;
+            break;
+        }
+        case 4u:
+        {
+            float4 _109 = spvDescriptorSet0.m_23.sample(spvDescriptorSet1.m_16, float2(0.5), gradient2d(float2(0.0), float2(0.0)));
+            _144 = _109.w;
+            _145 = _109.z;
+            _146 = _109.y;
+            _147 = _109.x;
+            break;
+        }
+        case 5u:
+        {
+            _144 = (*spvDescriptorSet0.m_6)._m0.w;
+            _145 = (*spvDescriptorSet0.m_6)._m0.z;
+            _146 = (*spvDescriptorSet0.m_6)._m0.y;
+            _147 = (*spvDescriptorSet0.m_6)._m0.x;
+            break;
+        }
+        case 6u:
+        {
+            _144 = (*spvDescriptorSet0.m_9)._m0.w;
+            _145 = (*spvDescriptorSet0.m_9)._m0.z;
+            _146 = (*spvDescriptorSet0.m_9)._m0.y;
+            _147 = (*spvDescriptorSet0.m_9)._m0.x;
+            break;
+        }
+        case 7u:
+        {
+            _144 = (*spvDescriptorSet0.m_12)._m0.w;
+            _145 = (*spvDescriptorSet0.m_12)._m0.z;
+            _146 = (*spvDescriptorSet0.m_12)._m0.y;
+            _147 = (*spvDescriptorSet0.m_12)._m0.x;
+            break;
+        }
+        default:
+        {
+            _144 = in.m_28.w;
+            _145 = in.m_28.z;
+            _146 = in.m_28.y;
+            _147 = in.m_28.x;
+            break;
+        }
+    }
+    out.m_24.x = _147;
+    out.m_24.y = _146;
+    out.m_24.z = _145;
+    out.m_24.w = _144;
+    return out;
+}
+
