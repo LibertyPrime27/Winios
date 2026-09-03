@@ -17,6 +17,7 @@ Planning and design. No shippable code yet.
 | **xcore** — one CPU core for 32- and 64-bit x86, interpreter + differential tests | [`docs/CPU-CORE.md`](docs/CPU-CORE.md), [`core/`](core) — 72 instructions verified against silicon |
 | **JIT on iOS 26 TXM hardware** — bless protocol, `jit_arena` | **working on device** (M3 iPad): [`docs/JIT-DESIGN.md` §1a](docs/JIT-DESIGN.md) |
 | Process model | **decided**: single process, emulated Linux process model (no extension) — `ARCHITECTURE.md` top note |
+| **d12mt** — Direct3D 12 → Metal compiler: root signatures → argument buffers, DXIL → MSL | **working**, own public repo [`LibertyPrime27/d12mt`](https://github.com/LibertyPrime27/d12mt), vendored at [`gpu/d12mt`](gpu/d12mt); CI compiles its MSL for iOS with Apple's Metal compiler |
 
 ## The two things to know before reading anything else
 
@@ -55,6 +56,10 @@ The emulator core is kept platform-independent so most of it builds and tests on
   make the low-4 GB problem disappear; we took the idea, not the code.
 - **[Zydis](https://github.com/zyantific/zydis)** (MIT) — our x86 decoder, as a
   submodule.
+- **[dxil-spirv](https://github.com/HansKristian-Work/dxil-spirv)** (MIT, Valve)
+  and **[SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross)** (Apache-2.0,
+  Khronos) — the two halves of d12mt's shader pipeline. vkd3d-proton and MoltenVK
+  proved them on every D3D12 game on Steam Deck and every Vulkan app on a Mac.
 
 ## Licensing
 
