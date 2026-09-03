@@ -140,6 +140,16 @@ below `apple6` means the device is too old for this design (A12 and earlier).
 Run it on both the iPad and the iPhone — the result must hold on A-series and
 M-series alike.
 
+## The ladder no longer climbs into the kill
+
+The original design let jetsam kill the process and read the answer from the
+last surviving rung. That was right while the limit was unknown; it is measured
+now (8128 MB on the M3 iPad, 6080 MB on the iPhone Air), and inside
+LiveContainer a kill takes LiveContainer down too. `os_proc_available_memory()`
+reports the remaining jetsam budget exactly, so the ladder now stops when fewer
+than 256 MB remain and reports `held + remaining` as the limit. Pass
+`headroomMB: 0` to `Ladder.climb` to get the old behaviour.
+
 ## The one-button flow
 
 **▶ Run all probes** runs the CPU self-test, the GPU probe for all three APIs,
