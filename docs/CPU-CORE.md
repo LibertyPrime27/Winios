@@ -121,6 +121,39 @@ elsewhere); those stay covered by `difftest` on CI and `test_arena32` locally.
 4. If it is 32-bit-only or address-width sensitive, add a check to
    `test_arena32.c` too.
 
+## "Could we just compile it instead of emulating?"
+
+Yes — the dynarec *is* a compiler. It reads x86 machine code and emits ARM64
+machine code, and once a block is translated the game runs as native ARM64
+instructions. The interpreter is the reference semantics and the no-JIT
+fallback, not the engine.
+
+What is **not** possible is compiling a whole game ahead of time into a native
+binary — a true port — without its source code. This is structural to x86
+binaries, not a matter of effort:
+
+- **Indirect control flow.** `jmp rax`, function pointers, C++ virtual calls,
+  switch tables: the target exists only at runtime. Fallout's engine is made of
+  these.
+- **Code is indistinguishable from data** until it executes. Disassembling an
+  arbitrary binary correctly is undecidable in general.
+- **Code that does not exist yet.** DRM unpacks code at runtime; engines load
+  DLLs on demand; mods load arbitrary ones.
+
+Rosetta 2 is not pure ahead-of-time either; it carries a JIT fallback for
+exactly these cases.
+
+What we do instead is **cache translations**: on first run, blocks are compiled
+as they are reached and the ARM64 written to disk; later launches load them and
+start fast. That captures nearly all of AOT's benefit without its impossibility,
+and it is a feature on top of the dynarec rather than a different design — so
+the dynarec is built from the start so its output is relocatable and cacheable.
+
+Wine itself is emulated in the current plan. Making it native ARM64 later
+(built against a libc that calls our kernel emulation) is a real optimisation
+path, but it comes after games run: a game's frame time is dominated by its own
+code and by graphics, and both of those will be native from day one.
+
 ## What comes after this
 
 In order, and each is gated by the previous:
