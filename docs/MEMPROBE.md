@@ -147,6 +147,10 @@ the safe JIT check, and finally the memory ladder — last, because the ladder
 may end with the system killing the process, and by then everything else has
 been saved. **JIT: attach StikDebug** opens StikDebug with the universal
 script; when you return to the app with the debugger attached, the blessed-
-arena execution test runs on its own. **Copy report** puts the whole screen on
+arena execution test runs on its own. If a debugger is already attached when
+the app starts — LiveContainer paired with StikDebug does this before the first
+instruction — both buttons skip the round trip and execute immediately; the
+only thing that stops the automatic execute is a crash marker from an earlier
+attempt, which **Reset results** clears. **Copy report** puts the whole screen on
 the clipboard for pasting. **Reset results** clears everything, including the
 JIT crash marker.
