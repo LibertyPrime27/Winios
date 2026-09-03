@@ -88,9 +88,19 @@ final class ProbeViewController: UIViewController {
             let gpu = GpuProbe.run()
             DispatchQueue.main.async { self.gpuLine = gpu; self.jitLine = "checking…"; self.refresh() }
 
+            // If a debugger is already attached -- LiveContainer + StikDebug do
+            // that before the app's first instruction -- go straight to the real
+            // test. Only skip it if a previous attempt crashed here (marker).
             var r = jit_result()
             self.markerPath.withCString { jit_probe_safe(&r, $0) }
-            let jit = self.describe(r) + "\n    (safe check only — use the JIT button to attach StikDebug and execute)"
+            let jit: String
+            if r.cs_debugged != 0 && r.state != JIT_CRASHED {
+                jit = self.executeArena() + "\n    (debugger was already attached at launch — executed directly)"
+            } else if r.cs_debugged != 0 {
+                jit = self.describe(r) + "\n    (a previous execute crashed; Reset results clears the marker to retry)"
+            } else {
+                jit = self.describe(r) + "\n    (no debugger attached — use the JIT button to attach StikDebug)"
+            }
             DispatchQueue.main.async { self.jitLine = jit; self.refresh() }
 
             Ladder.climb(host: "app")
@@ -137,6 +147,17 @@ final class ProbeViewController: UIViewController {
     /// the script has to stay to answer `brk #0xf00d`. When the app comes back
     /// to the foreground with CS_DEBUGGED set, the arena test runs by itself.
     @objc private func attachJIT() {
+        // Already attached (LiveContainer + StikDebug enable JIT at launch)?
+        // Then there is nothing to ask for; run the execution test now.
+        var probe = jit_result()
+        markerPath.withCString { jit_probe_safe(&probe, $0) }
+        if probe.cs_debugged != 0 {
+            jitLine = probe.state == JIT_CRASHED
+                ? describe(probe) + "\n    (a previous execute crashed; Reset results clears the marker to retry)"
+                : executeArena() + "\n    (debugger was already attached — executed directly)"
+            refresh()
+            return
+        }
         let bundle = Bundle.main.bundleIdentifier ?? ""
         let pid = getpid()
         let candidates = [
@@ -167,8 +188,9 @@ final class ProbeViewController: UIViewController {
     }
 
     /// The real protocol: allocate RX, have the debugger bless every 16 KB page,
-    /// build the RW alias, detach, then write and execute.
-    private func runArena() {
+    /// build the RW alias, detach, then write and execute. Thread-agnostic;
+    /// returns the report line.
+    private func executeArena() -> String {
         var r = jit_result()
         var arena = jit_arena()
         let ok = markerPath.withCString { jit_arena_create(&arena, 1 << 20, &r, $0) }
@@ -179,7 +201,11 @@ final class ProbeViewController: UIViewController {
             }
             jit_arena_free(&arena)
         }
-        jitLine = describe(r)
+        return describe(r)
+    }
+
+    private func runArena() {
+        jitLine = executeArena()
         refresh()
     }
 
