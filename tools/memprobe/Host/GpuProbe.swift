@@ -95,20 +95,25 @@ enum GpuProbe {
     }
 
     private static func source(_ name: String) throws -> String {
-        guard let url = Bundle.main.url(forResource: name, withExtension: "msl"),
-              let s = try? String(contentsOf: url, encoding: .utf8) else {
-            throw ProbeError(message: "\(name).msl missing from the bundle (project.yml resources)")
+        // XcodeGen copies Host/Shaders as a folder reference, so the files land
+        // in MemProbe.app/Shaders/. Check there first, then the bundle root.
+        let url = Bundle.main.url(forResource: name, withExtension: "msl", subdirectory: "Shaders")
+              ?? Bundle.main.url(forResource: name, withExtension: "msl")
+        guard let u = url, let s = try? String(contentsOf: u, encoding: .utf8) else {
+            let listing = (try? FileManager.default.contentsOfDirectory(atPath: Bundle.main.bundlePath))?.joined(separator: " ") ?? "?"
+            throw ProbeError(message: "\(name).msl is not in the app bundle. Bundle root: \(listing)")
         }
         return s
     }
 
     @available(iOS 16.0, *)
     private static func compile(_ device: MTLDevice, _ name: String) throws -> MTLFunction {
+        let src = try source(name)                 // a missing file is its own error, not a compiler one
         let opts = MTLCompileOptions()
         opts.languageVersion = .version3_0
         let lib: MTLLibrary
         do {
-            lib = try device.makeLibrary(source: try source(name), options: opts)
+            lib = try device.makeLibrary(source: src, options: opts)
         } catch {
             throw ProbeError(message: "Metal compiler rejected \(name).msl:\n\(error.localizedDescription)")
         }
