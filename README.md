@@ -36,7 +36,7 @@ The emulator core is kept platform-independent so most of it builds and tests on
 | | M3 iPad | iPhone Air |
 |---|---|---|
 | CPU core vs x86 silicon | 336/336 match | 336/336 match |
-| Usable memory, app process | 8128 MB | 6080 MB |
+| Usable memory, app process | 8128 MB (ladder-to-kill); ≈8167 MB (held + remaining, no kill) | 6080 MB |
 | JIT (TXM bless protocol) | **working** | — |
 | GPU: D3D9 / D3D11 / D3D12 binding model on Metal | **27/27 PASS** (iPadOS 26.3.1) | not yet run |
 | App extension launch | failed (x2) — no longer required | — |
