@@ -17,6 +17,7 @@ Planning and design. No shippable code yet.
 | **xcore** — one CPU core for 32- and 64-bit x86, interpreter + differential tests | [`docs/CPU-CORE.md`](docs/CPU-CORE.md), [`core/`](core) — 72 instructions verified against silicon |
 | **JIT on iOS 26 TXM hardware** — bless protocol, `jit_arena` | **working on device** (M3 iPad): [`docs/JIT-DESIGN.md` §1a](docs/JIT-DESIGN.md) |
 | Process model | **decided**: single process, emulated Linux process model (no extension) — `ARCHITECTURE.md` top note |
+| **GPU binding probe** — d12mt's descriptor-heap-is-an-argument-buffer model, tested on device | in MemProbe, button 4 — [`docs/MEMPROBE.md` §4](docs/MEMPROBE.md) |
 | **d12mt** — Direct3D 12 → Metal compiler: root signatures → argument buffers, DXIL → MSL | **working**, own public repo [`LibertyPrime27/d12mt`](https://github.com/LibertyPrime27/d12mt), vendored at [`gpu/d12mt`](gpu/d12mt); CI compiles its MSL for iOS with Apple's Metal compiler |
 
 ## The two things to know before reading anything else
@@ -37,6 +38,7 @@ The emulator core is kept platform-independent so most of it builds and tests on
 | CPU core vs x86 silicon | 336/336 match | 336/336 match |
 | Usable memory, app process | 8128 MB | 6080 MB |
 | JIT (TXM bless protocol) | **working** | — |
+| GPU: D3D12 heap == Metal argument buffer | not yet run | not yet run |
 | App extension launch | failed (x2) — no longer required | — |
 
 ## Inspiration and prior art

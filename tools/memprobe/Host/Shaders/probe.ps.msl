@@ -1,0 +1,148 @@
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+struct PhysicalPointerFloat4NonWriteCBVArray;
+
+struct RootConstants
+{
+    uint2 _m0;
+    uint _m1;
+    uint _m2;
+    uint _m3;
+    uint _m4;
+};
+
+struct _20
+{
+    float4 _m0[1];
+};
+
+struct PhysicalPointerFloat4NonWriteCBVArray
+{
+    float4 value[4096];
+};
+
+struct spvDescriptorSetBuffer0
+{
+    texture2d<float> m_13 [[id(0)]];
+    texture2d<float> m_14 [[id(1)]];
+    texture2d<float> m_15 [[id(2)]];
+    texture2d<float> m_16 [[id(3)]];
+    constant _20* m_22 [[id(4)]];
+};
+
+struct spvDescriptorSetBuffer1
+{
+    sampler m_25 [[id(0)]];
+    sampler m_26 [[id(1)]];
+};
+
+struct main0_out
+{
+    float4 SV_Target [[color(0)]];
+};
+
+struct main0_in
+{
+    float4 COLOR [[user(locn36736)]];
+};
+
+fragment main0_out main0(main0_in in [[stage_in]], constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]], constant spvDescriptorSetBuffer1& spvDescriptorSet1 [[buffer(1)]], constant RootConstants& registers [[buffer(30)]], float4 gl_FragCoord [[position]])
+{
+    constexpr sampler _27(mip_filter::nearest, address::repeat);
+    main0_out out = {};
+    float _58;
+    float _67;
+    float _76;
+    float _85;
+    switch (uint(gl_FragCoord.x))
+    {
+        case 0u:
+        {
+            float4 _104 = spvDescriptorSet0.m_13.sample(spvDescriptorSet1.m_25, float2(1.25, 0.5));
+            _58 = _104.x;
+            _67 = _104.y;
+            _76 = _104.z;
+            _85 = _104.w;
+            break;
+        }
+        case 1u:
+        {
+            float4 _108 = spvDescriptorSet0.m_13.sample(spvDescriptorSet1.m_26, float2(1.25, 0.5));
+            _58 = _108.x;
+            _67 = _108.y;
+            _76 = _108.z;
+            _85 = _108.w;
+            break;
+        }
+        case 2u:
+        {
+            float4 _112 = spvDescriptorSet0.m_14.sample(_27, float2(1.75, 0.5));
+            _58 = _112.x;
+            _67 = _112.y;
+            _76 = _112.z;
+            _85 = _112.w;
+            break;
+        }
+        case 3u:
+        {
+            float4 _115 = spvDescriptorSet0.m_15.sample(spvDescriptorSet1.m_25, float2(0.5));
+            _58 = _115.x;
+            _67 = _115.y;
+            _76 = _115.z;
+            _85 = _115.w;
+            break;
+        }
+        case 4u:
+        {
+            float4 _118 = spvDescriptorSet0.m_16.sample(spvDescriptorSet1.m_26, float2(0.5));
+            _58 = _118.x;
+            _67 = _118.y;
+            _76 = _118.z;
+            _85 = _118.w;
+            break;
+        }
+        case 5u:
+        {
+            float4 _132 = as_type<float4>(uint4(registers._m1, registers._m2, registers._m3, registers._m4));
+            _58 = _132.x;
+            _67 = _132.y;
+            _76 = _132.z;
+            _85 = _132.w;
+            break;
+        }
+        case 6u:
+        {
+            device PhysicalPointerFloat4NonWriteCBVArray* _137 = reinterpret_cast<device PhysicalPointerFloat4NonWriteCBVArray*>(as_type<ulong>(registers._m0));
+            _58 = _137->value[0u].x;
+            _67 = _137->value[0u].y;
+            _76 = _137->value[0u].z;
+            _85 = _137->value[0u].w;
+            break;
+        }
+        case 7u:
+        {
+            _58 = (*spvDescriptorSet0.m_22)._m0[0u].x;
+            _67 = (*spvDescriptorSet0.m_22)._m0[0u].y;
+            _76 = (*spvDescriptorSet0.m_22)._m0[0u].z;
+            _85 = (*spvDescriptorSet0.m_22)._m0[0u].w;
+            break;
+        }
+        default:
+        {
+            _58 = in.COLOR.x;
+            _67 = in.COLOR.y;
+            _76 = in.COLOR.z;
+            _85 = in.COLOR.w;
+            break;
+        }
+    }
+    out.SV_Target.x = _58;
+    out.SV_Target.y = _67;
+    out.SV_Target.z = _76;
+    out.SV_Target.w = _85;
+    return out;
+}
+

@@ -38,9 +38,24 @@ jobs:
             | head -30 | while IFS= read -r l; do echo "::error::${l}"; done || true
           tail -n 60 /tmp/ctest.log
 
-      # Golden vectors are recorded from the CI runner's real CPU. If the
-      # interpreter changed, they must be regenerated in the same commit --
-      # a stale recording would quietly stop testing the new behaviour.
+      # The GPU probe app ships MSL that d12mt generated from probe.hlsl. If
+      # d12mt's output changed, the checked-in copy must change with it, or the
+      # iPad would be testing yesterday's compiler.
+      - name: GPU probe shaders are current
+        if: always()
+        run: |
+          set +e
+          rc=0
+          for st in vs ps; do
+            ./build-host/gpu/d12mt/d12mt-shaderc gpu/d12mt/tests/shaders/probe.$st.cso -o /tmp/probe.$st.msl 2>/dev/null
+            if ! diff -u tools/memprobe/Host/Shaders/probe.$st.msl /tmp/probe.$st.msl > /tmp/pdiff.txt; then
+              echo "::error::tools/memprobe/Host/Shaders/probe.$st.msl is stale; regenerate with d12mt-shaderc"
+              head -20 /tmp/pdiff.txt | while IFS= read -r l; do echo "::error::${l}"; done
+              rc=1
+            fi
+          done
+          exit $rc
+
       # Vectors are recorded from this runner's real CPU. If the interpreter
       # changed, they must be regenerated in the same commit -- a stale
       # recording quietly stops testing whatever just changed.

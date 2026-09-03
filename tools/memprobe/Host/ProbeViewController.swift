@@ -14,6 +14,7 @@ final class ProbeViewController: UIViewController {
     private let results = UITextView()
     private var cpuLine = "not run"
     private var jitLine = "not run"
+    private var gpuLine = "not run"
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -31,6 +32,7 @@ final class ProbeViewController: UIViewController {
             button("3a · Check JIT (safe)", #selector(runJITSafe)),
             button("3b · Attach StikDebug (universal script)", #selector(attachJIT)),
             button("3c · Create blessed arena + execute", #selector(runArena)),
+            button("4 · GPU binding probe (d12mt shaders)", #selector(runGPU)),
             button("Reset JIT marker", #selector(resetJIT)),
             button("Reset memory log", #selector(resetLog)),
             results,
@@ -201,6 +203,19 @@ final class ProbeViewController: UIViewController {
         refresh()
     }
 
+    // MARK: - 4. GPU
+
+    /// Draws through shaders d12mt compiled from HLSL, with descriptor heaps
+    /// written by hand as 8-byte slots, and reads the pixels back. Settles
+    /// whether the D3D12 -> Metal binding design holds on this GPU.
+    @objc private func runGPU() {
+        gpuLine = "running…"; refresh()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = GpuProbe.run()
+            DispatchQueue.main.async { self.gpuLine = r; self.refresh() }
+        }
+    }
+
     // MARK: - render
 
     private func refresh() {
@@ -233,6 +248,9 @@ final class ProbeViewController: UIViewController {
 
         3 · JIT
         \(jitLine)
+
+        4 · GPU — D3D12 binding model on Metal (d12mt)
+        \(gpuLine)
 
         RECENT LADDER RUNGS
 
