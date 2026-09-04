@@ -118,9 +118,9 @@ int xc_selftest(char *report, size_t report_len, int max_report) {
                     uint64_t em = c.fpr[p].mant, xm = o[3 + 2 * r]; unsigned es = c.fpr[p].se, xsx = (unsigned)o[4 + 2 * r];
                     int same = em == xm && es == xsx;
                     if (!same && v->fuzzy) {
-                        /* transcendental: compare as doubles, loosely */
+                        /* transcendental: recorded to 32 significant bits; compare loosely */
                         double a = (double)ldexp((double)(xm >> 11), (int)(xsx & 0x7FFF) - 16383 - 52), b = (double)ldexp((double)(em >> 11), (int)(es & 0x7FFF) - 16383 - 52);
-                        if ((xsx ^ es) & 0x8000) same = 0; else same = fabs(a - b) <= 1e-15 * fabs(a) + 1e-300;
+                        if ((xsx ^ es) & 0x8000) same = 0; else same = fabs(a - b) <= 1e-9 * fabs(a) + 1e-300;   /* recorded to 32 bits */
                     }
                     if (!same) {
                         if (reported < max_report && off + 128 < report_len)
