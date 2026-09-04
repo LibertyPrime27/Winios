@@ -21,36 +21,15 @@
  * simple, and the working set of a game's hot code is far smaller than the
  * pools below.
  */
-#include "xcore/cpu.h"
+#include "cache.h"
 
-#include "xop.h"
-
-#include <Zydis/Zydis.h>
 #include <stdlib.h>
 #include <string.h>
-
-int xc_decode_at(xc_cpu *c, uint64_t rip, ZydisDecodedInstruction *in, ZydisDecodedOperand *ops);
-xc_stop xc_exec_decoded(xc_cpu *c, const ZydisDecodedInstruction *in_, const xop *ops);
-
-typedef struct {
-    ZydisDecodedInstruction in;
-    uint64_t rip;
-    uint32_t op_first;          /* index into g_ops */
-} dinsn;
-
-typedef struct {
-    uint64_t rip;               /* 0 = empty slot, ~0 = tombstone */
-    uint32_t first, count;      /* into g_insns */
-    uint32_t bytes;             /* into g_bytes: the block's code image */
-    uint16_t len;               /* its length */
-    uint8_t  mode;
-} block;
 
 enum {
     MAX_INSNS  = 1u << 18,      /* 262144 decoded instructions (~110 MB with operands) */
     MAX_OPS    = MAX_INSNS * 3,
     MAX_BYTES  = MAX_INSNS * 5, /* code images; x86 averages under 5 bytes an instruction */
-    MAX_BLOCK  = 64,            /* instructions per block */
     HASH_BITS  = 16,
     HASH_SIZE  = 1u << HASH_BITS,
 };
@@ -75,6 +54,7 @@ void xc_cache_flush(void) {
     memset(g_blocks, 0, sizeof(block) * HASH_SIZE);
     g_ninsns = g_nops = g_nbytes = g_nblocks = 0;
     g_stat_flushes++;
+    xc_jit_code_reset();
 }
 
 /* Blocks whose code lies in [lo, hi) are dropped (a hole in the hash table
@@ -137,7 +117,7 @@ static block *build(xc_cpu *c, uint64_t rip) {
     block *b = &g_blocks[h];
     if (!b->rip) g_nblocks++;
     b->rip = rip; b->first = first; b->count = count; b->mode = (uint8_t)c->mode;
-    b->bytes = bytes; b->len = (uint16_t)(at - rip);
+    b->bytes = bytes; b->len = (uint16_t)(at - rip); b->code = 0;
     g_stat_builds++;
     return b;
 }
@@ -152,19 +132,29 @@ static block *lookup(xc_cpu *c, uint64_t rip) {
     }
 }
 
+/* Lookup plus the self-modifying-code check, once per block execution: the
+ * bytes we decoded must still be there. A block is contiguous, so this is
+ * one memcmp; a mismatch tombstones the block and rebuilds it. */
+block *xc_cache_lookup(xc_cpu *c) {
+    cache_init();
+    for (;;) {
+        block *b = lookup(c, c->rip);
+        if (!b) return 0;
+        const void *now = xc_mem_ptr(c->mem, b->rip, b->len);
+        if (now && !memcmp(now, g_bytes + b->bytes, b->len)) return b;
+        g_stat_smc++;
+        b->rip = ~0ull;
+    }
+}
+const dinsn *xc_cache_insns(const block *b) { return &g_insns[b->first]; }
+const xop *xc_cache_ops(const dinsn *d) { return g_ops + d->op_first; }
+
 xc_stop xc_run(xc_cpu *c, uint64_t max_steps) {
+    if (xc_jit_enabled()) return xc_run_jit(c, max_steps);
     cache_init();
     while (max_steps) {
-        block *b = lookup(c, c->rip);
+        block *b = xc_cache_lookup(c);
         if (!b) return c->stop;
-        /* Self-modifying code check, once per block: the bytes we decoded
-         * must still be there. A block is contiguous, so this is one memcmp. */
-        const void *now = xc_mem_ptr(c->mem, b->rip, b->len);
-        if (!now || memcmp(now, g_bytes + b->bytes, b->len)) {
-            g_stat_smc++;
-            b->rip = ~0ull;                        /* tombstone; rebuilt on the next lookup */
-            continue;
-        }
         const dinsn *d = &g_insns[b->first], *end = d + b->count;
         for (; d < end; d++) {
             xc_stop st = xc_exec_decoded(c, &d->in, g_ops + d->op_first);

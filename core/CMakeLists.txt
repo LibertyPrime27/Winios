@@ -341,7 +341,8 @@ add_library(xcore STATIC
     src/mem.c
     src/interp.c
     src/xop.c
-    src/cache.c)
+    src/cache.c
+    src/jit/jit.c)
 target_include_directories(xcore PUBLIC include)
 target_link_libraries(xcore PUBLIC Zydis softfloat)
 if(NOT APPLE)

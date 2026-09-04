@@ -35,6 +35,26 @@ jobs:
           cmake --build build-host -j"$(nproc)"
           ctest --test-dir build-host --output-on-failure 2>&1 | tee /tmp/ctest.log
 
+      # The dynarec only runs on ARM64. The Linux runner is x86, so it runs an
+      # aarch64 cross-build under qemu-user: the golden vectors through the JIT,
+      # and the guest programs (i386 and x86-64) end to end.
+      - name: Dynarec under qemu-aarch64
+        run: |
+          sudo apt-get install -y --no-install-recommends qemu-user gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          cmake -S . -B build-a64 -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64-linux.cmake -DCMAKE_BUILD_TYPE=Release -DWINIOS_D12MT=OFF
+          cmake --build build-a64 -j"$(nproc)" --target test_selftest xrun
+          Q="qemu-aarch64 -L /usr/aarch64-linux-gnu"
+          $Q build-a64/test_selftest
+          cd tests/guest
+          for g in hello libc_hello hello32; do
+            got=$($Q ../../build-a64/xrun ./$g); exp=$(cat $g.expected)
+            [ "$got" = "$exp" ] && echo "ok   $g (jit)" || { echo "FAIL $g (jit)"; echo "$got"; exit 1; }
+          done
+          if gcc -m32 -static -O2 -o /tmp/lh32 libc_hello.c 2>/dev/null; then
+            exp=$(/tmp/lh32 x y); got=$($Q ../../build-a64/xrun /tmp/lh32 x y)
+            [ "$got" = "$exp" ] && echo "ok   libc_hello i386 glibc (jit)" || { echo "FAIL libc_hello i386 (jit)"; echo "$got"; exit 1; }
+          fi
+
       - name: Surface test failures as annotations
         if: failure()
         run: |
@@ -109,6 +129,15 @@ jobs:
           cmake --build build-xcore-ios --target xcore_golden -j3
           echo "--- static libs produced ---"
           find build-xcore-ios -name '*.a' | sed 's/^/  /'
+
+      # Apple silicon: the dynarec natively, against the silicon recordings.
+      - name: Dynarec on Apple silicon (golden replay)
+        run: |
+          cmake -S . -B build-mac -DCMAKE_BUILD_TYPE=Release -DWINIOS_D12MT=OFF
+          cmake --build build-mac -j3 --target test_selftest test_arena32
+          ./build-mac/test_selftest
+          XCORE_JIT=0 ./build-mac/test_selftest | tail -1
+          ./build-mac/test_arena32
 
       - name: Install XcodeGen
         run: brew install xcodegen

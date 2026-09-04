@@ -33,6 +33,11 @@ add_executable(test_selftest tests/test_selftest.c)
 target_link_libraries(test_selftest PRIVATE xcore_golden)
 add_test(NAME selftest COMMAND test_selftest)
 
+# --- AArch64 encoder sanity: emits one of everything; bytes are checked by
+# hand against the system disassembler (see the file) -----------------------
+add_executable(test_a64 tests/test_a64.c)
+add_test(NAME a64_encoder COMMAND test_a64)
+
 # --- differential test: needs a real x86-64 to act as the oracle -------------
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     enable_language(ASM)

@@ -93,6 +93,48 @@ static void flags_logic(xc_cpu *c, uint64_t res, int bits) {
     flags_zsp(c, res, bits);
 }
 
+/* Lazy flags: the JIT records the last flag-setting operation instead of
+ * computing six flags per instruction; this turns that record into rflags
+ * with exactly the interpreter's rules above, so both paths agree bit for
+ * bit (the difftest checks that they do). */
+void xc_flags_sync(xc_cpu *c) {
+    uint32_t op = c->lz_op & 0xFF; int bits = (int)(c->lz_op >> 8);
+    if (op == XC_LZ_NONE) return;
+    uint64_t a = c->lz_a, b = c->lz_b, r = c->lz_r;
+    switch (op) {
+    case XC_LZ_ADD:   flags_add(c, a, b, 0, r, bits); break;
+    case XC_LZ_SUB:   flags_sub(c, a, b, 0, r, bits); break;
+    case XC_LZ_LOGIC: flags_logic(c, r, bits); break;
+    case XC_LZ_INC:   flags_add(c, a, 1, 0, r, bits); set_flag(c, XC_CF, (int)c->lz_cf); break;
+    case XC_LZ_DEC:   flags_sub(c, a, 1, 0, r, bits); set_flag(c, XC_CF, (int)c->lz_cf); break;
+    case XC_LZ_SHL: case XC_LZ_SHR: case XC_LZ_SAR: {
+        /* a = value, b = count (nonzero, already masked), r = result */
+        uint64_t v = mask_bits(a, bits), cnt = b; int cf, of;
+        if (op == XC_LZ_SHL) { cf = (cnt <= (uint64_t)bits) ? (int)((v >> (bits - cnt)) & 1) : 0; of = msb(r, bits) ^ cf; }
+        else if (op == XC_LZ_SHR) { cf = (int)((v >> (cnt - 1)) & 1); of = msb(v, bits); }
+        else { int64_t sv = (int64_t)sext(v, bits); cf = (int)((sv >> (cnt - 1)) & 1); of = 0; }
+        set_flag(c, XC_CF, cf); set_flag(c, XC_OF, of); set_flag(c, XC_AF, 0);
+        flags_zsp(c, r, bits);
+        break;
+    }
+    case XC_LZ_ROL: {   /* only CF/OF; the rest of rflags is already valid */
+        int cf = (int)(r & 1);
+        set_flag(c, XC_CF, cf); set_flag(c, XC_OF, msb(r, bits) ^ cf);
+        break;
+    }
+    case XC_LZ_ROR: {
+        int m = msb(r, bits);
+        set_flag(c, XC_CF, m); set_flag(c, XC_OF, m ^ (int)((r >> (bits - 2)) & 1));
+        break;
+    }
+    case XC_LZ_IMUL:    /* a = overflow */
+        set_flag(c, XC_CF, (int)a); set_flag(c, XC_OF, (int)a);
+        flags_zsp(c, r, bits); set_flag(c, XC_AF, 0);
+        break;
+    }
+    c->lz_op = XC_LZ_NONE;
+}
+
 /* -------------------------------------------------------------- registers */
 
 /* Map a Zydis GPR to (index, is-high-byte). Zydis GPR8 ids run
