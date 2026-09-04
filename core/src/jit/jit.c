@@ -115,8 +115,10 @@ static int code_alloc(size_t sz) {
     return g_stub_rw != 0;
 #endif
 }
+/* macOS toggles the thread's JIT write permission (MAP_JIT); iOS code memory
+ * is the host's dual-mapped arena, written through its RW alias. */
 static void code_write_begin(void) {
-#if defined(__APPLE__)
+#if defined(__APPLE__) && !TARGET_OS_IPHONE
     if (!g_external) pthread_jit_write_protect_np(0);
 #endif
 }
@@ -124,7 +126,9 @@ static void code_write_begin(void) {
  * execute side. */
 static void code_write_end(void *p, size_t n, void *rx) {
 #if defined(__APPLE__)
+#if !TARGET_OS_IPHONE
     if (!g_external) pthread_jit_write_protect_np(1);
+#endif
     sys_icache_invalidate(rx, n);
 #else
     (void)rx;
