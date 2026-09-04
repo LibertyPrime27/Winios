@@ -40,3 +40,15 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64
     target_link_libraries(difftest PRIVATE xcore)
     add_test(NAME difftest COMMAND difftest)
 endif()
+
+# --- xrun: static x86-64 Linux ELF on xcore (Linux host only for now) --------
+# The guest programs under tests/guest/ are prebuilt (musl, static-pie) so no
+# cross toolchain is needed to run them; tests/guest/build.sh rebuilds them.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(xrun tools/xrun/xrun.c)
+    target_link_libraries(xrun PRIVATE xcore)
+    set_property(TARGET xrun PROPERTY C_STANDARD 11)
+    target_compile_options(xrun PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    add_test(NAME guest_hello COMMAND ${CMAKE_COMMAND} -E env
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/guest/run.sh $<TARGET_FILE:xrun> ${CMAKE_CURRENT_SOURCE_DIR}/tests/guest)
+endif()

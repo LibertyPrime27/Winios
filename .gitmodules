@@ -4,3 +4,6 @@
 [submodule "gpu/d12mt"]
 	path = gpu/d12mt
 	url = https://github.com/LibertyPrime27/d12mt.git
+[submodule "third_party/softfloat"]
+	path = third_party/softfloat
+	url = https://github.com/ucb-bar/berkeley-softfloat-3
