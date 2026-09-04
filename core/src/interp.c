@@ -13,6 +13,7 @@
 
 #include <Zydis/Zydis.h>
 #include "softfloat.h"
+#include "xop.h"
 #include <fenv.h>
 #ifdef __clang__
 #pragma STDC FENV_ACCESS ON
@@ -114,7 +115,7 @@ static int reg_bits(const xc_cpu *c, ZydisRegister r) {
 static uint64_t reg_read(const xc_cpu *c, ZydisRegister r) {
     ZydisRegisterClass cls = ZydisRegisterGetClass(r);
     if (cls == ZYDIS_REGCLASS_IP) return c->rip;                 /* handled by caller for RIP-rel */
-    if (cls == ZYDIS_REGCLASS_SEGMENT) return c->sreg[r - ZYDIS_REGISTER_ES];   /* selector value only */
+    if (cls == ZYDIS_REGCLASS_SEGMENT) return c->sreg[(unsigned)(r - ZYDIS_REGISTER_ES) % 6];   /* selector value only */
     int hi; int i = gpr_index(r, &hi);
     uint64_t v = c->gpr[i];
     if (hi) v >>= 8;
@@ -126,7 +127,7 @@ static void reg_write(xc_cpu *c, ZydisRegister r, uint64_t v) {
         /* Flat model: a selector load changes the visible selector and
          * nothing else. FS/GS bases are set by the host (arch_prctl /
          * set_thread_area / the Win32 TEB) rather than through a GDT. */
-        c->sreg[r - ZYDIS_REGISTER_ES] = (uint16_t)v; return;
+        c->sreg[(unsigned)(r - ZYDIS_REGISTER_ES) % 6] = (uint16_t)v; return;
     }
     int hi; int i = gpr_index(r, &hi);
     switch (reg_bits(c, r)) {
@@ -140,12 +141,32 @@ static void reg_write(xc_cpu *c, ZydisRegister r, uint64_t v) {
     }
 }
 
+/* Operand-form register access: no table lookups, the xop carries the slot. */
+static inline uint64_t xreg_read(const xc_cpu *c, const xop *o) {
+    switch (o->rcls) {
+    case XR_GPR: { uint64_t v = c->gpr[o->ridx]; if (o->rhi8) v >>= 8; return mask_bits(v, o->rbits); }
+    case XR_SEG: return c->sreg[o->ridx];
+    case XR_IP:  return c->rip;
+    default:     return 0;
+    }
+}
+static inline void xreg_write(xc_cpu *c, const xop *o, uint64_t v) {
+    if (o->rcls != XR_GPR) { if (o->rcls == XR_SEG) c->sreg[o->ridx] = (uint16_t)v; return; }
+    uint64_t *r = &c->gpr[o->ridx];
+    switch (o->rbits) {
+    case 8:  if (o->rhi8) *r = (*r & ~0xFF00ull) | ((v & 0xFF) << 8); else *r = (*r & ~0xFFull) | (v & 0xFF); break;
+    case 16: *r = (*r & ~0xFFFFull) | (v & 0xFFFF); break;
+    case 32: *r = v & 0xFFFFFFFFull; break;
+    default: *r = v; break;
+    }
+}
+
 /* ----------------------------------------------------------------- memory */
 
 typedef struct {
     xc_cpu *c;
     const ZydisDecodedInstruction *in;
-    const ZydisDecodedOperand *ops;
+    const xop *ops;
     uint64_t next_rip;
     xc_stop stop;
 } ctx;
@@ -165,46 +186,41 @@ static int mem_write(ctx *x, uint64_t ga, int bits, uint64_t v) {
     return 1;
 }
 
-static uint64_t ea(ctx *x, const ZydisDecodedOperand *op) {
+static uint64_t ea(ctx *x, const xop *op) {
     const xc_cpu *c = x->c;
-    uint64_t a = 0;
-    if (op->mem.base != ZYDIS_REGISTER_NONE) {
-        a += (op->mem.base == ZYDIS_REGISTER_RIP || op->mem.base == ZYDIS_REGISTER_EIP)
-             ? x->next_rip : reg_read(c, op->mem.base);
-    }
-    if (op->mem.index != ZYDIS_REGISTER_NONE)
-        a += reg_read(c, op->mem.index) * op->mem.scale;
-    a += (uint64_t)op->mem.disp.value;
+    uint64_t a = (uint64_t)op->disp;                      /* RIP-relative already folded in */
+    if (op->mbase >= 0) a += c->gpr[op->mbase];
+    if (op->mindex >= 0) a += c->gpr[op->mindex] * op->mscale;
     a = mask_bits(a, x->in->address_width);
     /* Flat segments except FS/GS, whose bases the host sets (TLS, the Win32
      * TEB). In 32-bit mode the sum is still a 32-bit address. */
-    if (op->mem.segment == ZYDIS_REGISTER_FS) a += c->fs_base;
-    else if (op->mem.segment == ZYDIS_REGISTER_GS) a += c->gs_base;
+    if (op->mseg == 1) a += c->fs_base;
+    else if (op->mseg == 2) a += c->gs_base;
     return mask_bits(a, c->mode);
 }
 
 /* --------------------------------------------------------------- operands */
 
 static int op_read(ctx *x, int i, uint64_t *out) {
-    const ZydisDecodedOperand *op = &x->ops[i];
+    const xop *op = &x->ops[i];
     switch (op->type) {
-    case ZYDIS_OPERAND_TYPE_REGISTER:
-        *out = reg_read(x->c, op->reg.value); return 1;
-    case ZYDIS_OPERAND_TYPE_MEMORY:
+    case XOP_REG:
+        *out = xreg_read(x->c, op); return 1;
+    case XOP_MEM:
         return mem_read(x, ea(x, op), op->size, out);
-    case ZYDIS_OPERAND_TYPE_IMMEDIATE:
-        *out = op->imm.is_signed ? (uint64_t)op->imm.value.s : op->imm.value.u; return 1;
+    case XOP_IMM:
+        *out = op->imm; return 1;
     default:
         x->stop = XC_STOP_UNDEFINED; return 0;
     }
 }
 
 static int op_write(ctx *x, int i, uint64_t v) {
-    const ZydisDecodedOperand *op = &x->ops[i];
+    const xop *op = &x->ops[i];
     switch (op->type) {
-    case ZYDIS_OPERAND_TYPE_REGISTER:
-        reg_write(x->c, op->reg.value, v); return 1;
-    case ZYDIS_OPERAND_TYPE_MEMORY:
+    case XOP_REG:
+        xreg_write(x->c, op, v); return 1;
+    case XOP_MEM:
         return mem_write(x, ea(x, op), op->size, v);
     default:
         x->stop = XC_STOP_UNDEFINED; return 0;
@@ -213,40 +229,38 @@ static int op_write(ctx *x, int i, uint64_t v) {
 
 /* --------------------------------------------------------- 128-bit operands */
 
-static int xmm_index(ZydisRegister r) { return ZydisRegisterGetId(r); }
-
 /* Read an operand as up to 128 bits. Registers narrower than 128 bits and
  * memory operands are zero-extended; the caller decides what the top means. */
 static int op_read128(ctx *x, int i, xc_u128 *out) {
-    const ZydisDecodedOperand *op = &x->ops[i];
+    const xop *op = &x->ops[i];
     out->lo = out->hi = 0;
-    if (op->type == ZYDIS_OPERAND_TYPE_REGISTER) {
-        if (ZydisRegisterGetClass(op->reg.value) == ZYDIS_REGCLASS_XMM) { *out = x->c->xmm[xmm_index(op->reg.value)]; return 1; }
-        out->lo = reg_read(x->c, op->reg.value); return 1;
+    if (op->type == XOP_REG) {
+        if (op->rcls == XR_XMM) { *out = x->c->xmm[op->ridx]; return 1; }
+        out->lo = xreg_read(x->c, op); return 1;
     }
-    if (op->type == ZYDIS_OPERAND_TYPE_MEMORY) {
+    if (op->type == XOP_MEM) {
         uint64_t a = ea(x, op);
         if (op->size == 128) return mem_read(x, a, 64, &out->lo) && mem_read(x, a + 8, 64, &out->hi);
         return mem_read(x, a, op->size, &out->lo);
     }
-    if (op->type == ZYDIS_OPERAND_TYPE_IMMEDIATE) { out->lo = op->imm.value.u; return 1; }
+    if (op->type == XOP_IMM) { out->lo = op->imm; return 1; }
     x->stop = XC_STOP_UNDEFINED; return 0;
 }
 
 /* Write `bits` (32/64/128) of v to operand i. Writing an XMM register with
  * fewer than 128 bits zeroes the rest (MOVD/MOVQ semantics). */
 static int op_write128(ctx *x, int i, xc_u128 v, int bits) {
-    const ZydisDecodedOperand *op = &x->ops[i];
-    if (op->type == ZYDIS_OPERAND_TYPE_REGISTER) {
-        if (ZydisRegisterGetClass(op->reg.value) == ZYDIS_REGCLASS_XMM) {
-            xc_u128 *d = &x->c->xmm[xmm_index(op->reg.value)];
+    const xop *op = &x->ops[i];
+    if (op->type == XOP_REG) {
+        if (op->rcls == XR_XMM) {
+            xc_u128 *d = &x->c->xmm[op->ridx];
             if (bits == 128) *d = v;
             else { d->lo = bits == 64 ? v.lo : (v.lo & 0xFFFFFFFFull); d->hi = 0; }
             return 1;
         }
-        reg_write(x->c, op->reg.value, v.lo); return 1;
+        xreg_write(x->c, op, v.lo); return 1;
     }
-    if (op->type == ZYDIS_OPERAND_TYPE_MEMORY) {
+    if (op->type == XOP_MEM) {
         uint64_t a = ea(x, op);
         if (bits == 128) return mem_write(x, a, 64, v.lo) && mem_write(x, a + 8, 64, v.hi);
         return mem_write(x, a, bits, v.lo);
@@ -538,10 +552,10 @@ static int do_bt(ctx *x, ZydisMnemonic m) {
     int bits = x->ops[0].size;
     uint64_t off;
     if (!op_read(x, 1, &off)) return 0;
-    uint64_t v; uint64_t addr = 0; int is_mem = x->ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY;
+    uint64_t v; uint64_t addr = 0; int is_mem = x->ops[0].type == XOP_MEM;
     if (is_mem) {
         addr = ea(x, &x->ops[0]);
-        if (x->ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        if (x->ops[1].type == XOP_REG) {
             int64_t so = (int64_t)sext(off, x->ops[1].size);
             addr += (uint64_t)((so >> (bits == 64 ? 6 : bits == 32 ? 5 : 4)) * (bits / 8));
         }
@@ -691,15 +705,13 @@ static int do_loop(ctx *x, ZydisMnemonic m, uint64_t *next) {
     int go = mask_bits(c->gpr[XC_RCX], aw) != 0;
     if (m == ZYDIS_MNEMONIC_LOOPE) go = go && get_flag(c, XC_ZF);
     if (m == ZYDIS_MNEMONIC_LOOPNE) go = go && !get_flag(c, XC_ZF);
-    if (go) { ZyanU64 t; ZydisCalcAbsoluteAddress(x->in, &x->ops[0], c->rip, &t); *next = t; }
+    if (go) *next = x->ops[0].imm;
     return 1;
 }
 
 /* ------------------------------------------------------------- SSE / SSE2 */
 
-static int is_xmm_op(const ZydisDecodedOperand *op) {
-    return op->type == ZYDIS_OPERAND_TYPE_REGISTER && ZydisRegisterGetClass(op->reg.value) == ZYDIS_REGCLASS_XMM;
-}
+static int is_xmm_op(const xop *op) { return op->type == XOP_REG && op->rcls == XR_XMM; }
 
 static inline uint64_t f64_bits(double v) { uint64_t u; memcpy(&u, &v, 8); return u; }
 static inline double   bits_f64(uint64_t u) { double v; memcpy(&v, &u, 8); return v; }
@@ -860,14 +872,18 @@ static inline int16_t  sat_s16(int32_t v) { return v < -32768 ? -32768 : v > 327
 /* One SSE instruction with an XMM destination. Returns 1 if handled (ok or
  * fault -- check x->stop), 0 if the mnemonic is not an SSE op we know. */
 static int do_sse(ctx *x, ZydisMnemonic m, int *ok) {
-    const ZydisDecodedOperand *ops = x->ops;
+    const xop *ops = x->ops;
     xc_cpu *c = x->c;
     lanes a, b, r;
     memset(&r, 0, sizeof r);
-    fenv_begin(c);
+    /* Only floating-point cases touch the host FP environment (FENV/WRF); the
+     * integer and move cases skip it -- feclearexcept/fetestexcept are libm
+     * calls and would otherwise dominate PXOR. */
+#define FENV() fenv_begin(c)
 #define RD(i, dst) do { if (!op_read128(x, i, &(dst).q)) { *ok = 0; return 1; } } while (0)
-#define WR(v, bits) do { fenv_end(c); *ok = op_write128(x, 0, (v).q, bits); return 1; } while (0)
-#define IMM(i) ((int)ops[i].imm.value.u)
+#define WR(v, bits) do { *ok = op_write128(x, 0, (v).q, bits); return 1; } while (0)
+#define WRF(v, bits) do { fenv_end(c); *ok = op_write128(x, 0, (v).q, bits); return 1; } while (0)
+#define IMM(i) ((int)ops[i].imm)
     switch (m) {
     /* ---- moves ---- */
     case ZYDIS_MNEMONIC_MOVAPS: case ZYDIS_MNEMONIC_MOVUPS: case ZYDIS_MNEMONIC_MOVAPD:
@@ -881,7 +897,7 @@ static int do_sse(ctx *x, ZydisMnemonic m, int *ok) {
         int bits = m == ZYDIS_MNEMONIC_MOVSD ? 64 : 32;
         RD(1, a);
         if (is_xmm_op(&ops[0]) && is_xmm_op(&ops[1])) {          /* merge into the low lane */
-            r.q = c->xmm[xmm_index(ops[0].reg.value)];
+            r.q = c->xmm[ops[0].ridx];
             if (bits == 64) r.q.lo = a.q.lo; else r.d[0] = a.d[0];
             WR(r, 128);
         }
@@ -889,11 +905,11 @@ static int do_sse(ctx *x, ZydisMnemonic m, int *ok) {
     }
     case ZYDIS_MNEMONIC_MOVLPS: case ZYDIS_MNEMONIC_MOVLPD:
         RD(1, a);
-        if (is_xmm_op(&ops[0])) { r.q = c->xmm[xmm_index(ops[0].reg.value)]; r.q.lo = a.q.lo; WR(r, 128); }
+        if (is_xmm_op(&ops[0])) { r.q = c->xmm[ops[0].ridx]; r.q.lo = a.q.lo; WR(r, 128); }
         WR(a, 64);
     case ZYDIS_MNEMONIC_MOVHPS: case ZYDIS_MNEMONIC_MOVHPD:
         RD(1, a);
-        if (is_xmm_op(&ops[0])) { r.q = c->xmm[xmm_index(ops[0].reg.value)]; r.q.hi = a.q.lo; WR(r, 128); }
+        if (is_xmm_op(&ops[0])) { r.q = c->xmm[ops[0].ridx]; r.q.hi = a.q.lo; WR(r, 128); }
         r.q.lo = a.q.hi; WR(r, 64);
     case ZYDIS_MNEMONIC_MOVHLPS: RD(0, r); RD(1, a); r.q.lo = a.q.hi; WR(r, 128);
     case ZYDIS_MNEMONIC_MOVLHPS: RD(0, r); RD(1, a); r.q.hi = a.q.lo; WR(r, 128);
@@ -969,7 +985,7 @@ static int do_sse(ctx *x, ZydisMnemonic m, int *ok) {
     case ZYDIS_MNEMONIC_PSRAW: case ZYDIS_MNEMONIC_PSRAD: {
         RD(0, a);
         uint64_t n;
-        if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) n = ops[1].imm.value.u; else { RD(1, b); n = b.q.lo; }
+        if (ops[1].type == XOP_IMM) n = ops[1].imm; else { RD(1, b); n = b.q.lo; }
         int left = m == ZYDIS_MNEMONIC_PSLLW || m == ZYDIS_MNEMONIC_PSLLD || m == ZYDIS_MNEMONIC_PSLLQ;
         int arith = m == ZYDIS_MNEMONIC_PSRAW || m == ZYDIS_MNEMONIC_PSRAD;
         if (m == ZYDIS_MNEMONIC_PSLLW || m == ZYDIS_MNEMONIC_PSRLW || m == ZYDIS_MNEMONIC_PSRAW) {
@@ -1023,65 +1039,65 @@ static int do_sse(ctx *x, ZydisMnemonic m, int *ok) {
     case ZYDIS_MNEMONIC_PACKSSDW: RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) { r.w[i] = (uint16_t)sat_s16((int32_t)a.d[i]); r.w[4 + i] = (uint16_t)sat_s16((int32_t)b.d[i]); } WR(r, 128);
 
     /* ---- scalar double ---- */
-    case ZYDIS_MNEMONIC_ADDSD: RD(0, r); RD(1, b); r.e[0] = sse_fix64(r.e[0] + b.e[0], r.e[0], b.e[0]); WR(r, 128);
-    case ZYDIS_MNEMONIC_SUBSD: RD(0, r); RD(1, b); r.e[0] = sse_fix64(r.e[0] - b.e[0], r.e[0], b.e[0]); WR(r, 128);
-    case ZYDIS_MNEMONIC_MULSD: RD(0, r); RD(1, b); r.e[0] = sse_fix64(r.e[0] * b.e[0], r.e[0], b.e[0]); WR(r, 128);
-    case ZYDIS_MNEMONIC_DIVSD: RD(0, r); RD(1, b); r.e[0] = sse_fix64(r.e[0] / b.e[0], r.e[0], b.e[0]); WR(r, 128);
-    case ZYDIS_MNEMONIC_MINSD: RD(0, r); RD(1, b); r.e[0] = sse_min64(r.e[0], b.e[0]); WR(r, 128);
-    case ZYDIS_MNEMONIC_MAXSD: RD(0, r); RD(1, b); r.e[0] = sse_max64(r.e[0], b.e[0]); WR(r, 128);
-    case ZYDIS_MNEMONIC_SQRTSD: RD(0, r); RD(1, b); r.e[0] = sse_sqrt64(b.e[0]); WR(r, 128);
+    case ZYDIS_MNEMONIC_ADDSD: FENV(); RD(0, r); RD(1, b); r.e[0] = sse_fix64(r.e[0] + b.e[0], r.e[0], b.e[0]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_SUBSD: FENV(); RD(0, r); RD(1, b); r.e[0] = sse_fix64(r.e[0] - b.e[0], r.e[0], b.e[0]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_MULSD: FENV(); RD(0, r); RD(1, b); r.e[0] = sse_fix64(r.e[0] * b.e[0], r.e[0], b.e[0]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_DIVSD: FENV(); RD(0, r); RD(1, b); r.e[0] = sse_fix64(r.e[0] / b.e[0], r.e[0], b.e[0]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_MINSD: FENV(); RD(0, r); RD(1, b); r.e[0] = sse_min64(r.e[0], b.e[0]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_MAXSD: FENV(); RD(0, r); RD(1, b); r.e[0] = sse_max64(r.e[0], b.e[0]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_SQRTSD: FENV(); RD(0, r); RD(1, b); r.e[0] = sse_sqrt64(b.e[0]); WRF(r, 128);
     /* ---- scalar single ---- */
-    case ZYDIS_MNEMONIC_ADDSS: RD(0, r); RD(1, b); r.f[0] = sse_fix32(r.f[0] + b.f[0], r.f[0], b.f[0]); WR(r, 128);
-    case ZYDIS_MNEMONIC_SUBSS: RD(0, r); RD(1, b); r.f[0] = sse_fix32(r.f[0] - b.f[0], r.f[0], b.f[0]); WR(r, 128);
-    case ZYDIS_MNEMONIC_MULSS: RD(0, r); RD(1, b); r.f[0] = sse_fix32(r.f[0] * b.f[0], r.f[0], b.f[0]); WR(r, 128);
-    case ZYDIS_MNEMONIC_DIVSS: RD(0, r); RD(1, b); r.f[0] = sse_fix32(r.f[0] / b.f[0], r.f[0], b.f[0]); WR(r, 128);
-    case ZYDIS_MNEMONIC_MINSS: RD(0, r); RD(1, b); r.f[0] = sse_min32(r.f[0], b.f[0]); WR(r, 128);
-    case ZYDIS_MNEMONIC_MAXSS: RD(0, r); RD(1, b); r.f[0] = sse_max32(r.f[0], b.f[0]); WR(r, 128);
-    case ZYDIS_MNEMONIC_SQRTSS: RD(0, r); RD(1, b); r.f[0] = sse_sqrt32(b.f[0]); WR(r, 128);
+    case ZYDIS_MNEMONIC_ADDSS: FENV(); RD(0, r); RD(1, b); r.f[0] = sse_fix32(r.f[0] + b.f[0], r.f[0], b.f[0]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_SUBSS: FENV(); RD(0, r); RD(1, b); r.f[0] = sse_fix32(r.f[0] - b.f[0], r.f[0], b.f[0]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_MULSS: FENV(); RD(0, r); RD(1, b); r.f[0] = sse_fix32(r.f[0] * b.f[0], r.f[0], b.f[0]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_DIVSS: FENV(); RD(0, r); RD(1, b); r.f[0] = sse_fix32(r.f[0] / b.f[0], r.f[0], b.f[0]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_MINSS: FENV(); RD(0, r); RD(1, b); r.f[0] = sse_min32(r.f[0], b.f[0]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_MAXSS: FENV(); RD(0, r); RD(1, b); r.f[0] = sse_max32(r.f[0], b.f[0]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_SQRTSS: FENV(); RD(0, r); RD(1, b); r.f[0] = sse_sqrt32(b.f[0]); WRF(r, 128);
     /* ---- packed double ---- */
-    case ZYDIS_MNEMONIC_ADDPD: RD(0, a); RD(1, b); for (int i = 0; i < 2; i++) r.e[i] = sse_fix64(a.e[i] + b.e[i], a.e[i], b.e[i]); WR(r, 128);
-    case ZYDIS_MNEMONIC_SUBPD: RD(0, a); RD(1, b); for (int i = 0; i < 2; i++) r.e[i] = sse_fix64(a.e[i] - b.e[i], a.e[i], b.e[i]); WR(r, 128);
-    case ZYDIS_MNEMONIC_MULPD: RD(0, a); RD(1, b); for (int i = 0; i < 2; i++) r.e[i] = sse_fix64(a.e[i] * b.e[i], a.e[i], b.e[i]); WR(r, 128);
-    case ZYDIS_MNEMONIC_DIVPD: RD(0, a); RD(1, b); for (int i = 0; i < 2; i++) r.e[i] = sse_fix64(a.e[i] / b.e[i], a.e[i], b.e[i]); WR(r, 128);
-    case ZYDIS_MNEMONIC_MINPD: RD(0, a); RD(1, b); for (int i = 0; i < 2; i++) r.e[i] = sse_min64(a.e[i], b.e[i]); WR(r, 128);
-    case ZYDIS_MNEMONIC_MAXPD: RD(0, a); RD(1, b); for (int i = 0; i < 2; i++) r.e[i] = sse_max64(a.e[i], b.e[i]); WR(r, 128);
-    case ZYDIS_MNEMONIC_SQRTPD: RD(1, b); for (int i = 0; i < 2; i++) r.e[i] = sse_sqrt64(b.e[i]); WR(r, 128);
+    case ZYDIS_MNEMONIC_ADDPD: FENV(); RD(0, a); RD(1, b); for (int i = 0; i < 2; i++) r.e[i] = sse_fix64(a.e[i] + b.e[i], a.e[i], b.e[i]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_SUBPD: FENV(); RD(0, a); RD(1, b); for (int i = 0; i < 2; i++) r.e[i] = sse_fix64(a.e[i] - b.e[i], a.e[i], b.e[i]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_MULPD: FENV(); RD(0, a); RD(1, b); for (int i = 0; i < 2; i++) r.e[i] = sse_fix64(a.e[i] * b.e[i], a.e[i], b.e[i]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_DIVPD: FENV(); RD(0, a); RD(1, b); for (int i = 0; i < 2; i++) r.e[i] = sse_fix64(a.e[i] / b.e[i], a.e[i], b.e[i]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_MINPD: FENV(); RD(0, a); RD(1, b); for (int i = 0; i < 2; i++) r.e[i] = sse_min64(a.e[i], b.e[i]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_MAXPD: FENV(); RD(0, a); RD(1, b); for (int i = 0; i < 2; i++) r.e[i] = sse_max64(a.e[i], b.e[i]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_SQRTPD: FENV(); RD(1, b); for (int i = 0; i < 2; i++) r.e[i] = sse_sqrt64(b.e[i]); WRF(r, 128);
     /* ---- packed single ---- */
-    case ZYDIS_MNEMONIC_ADDPS: RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) r.f[i] = sse_fix32(a.f[i] + b.f[i], a.f[i], b.f[i]); WR(r, 128);
-    case ZYDIS_MNEMONIC_SUBPS: RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) r.f[i] = sse_fix32(a.f[i] - b.f[i], a.f[i], b.f[i]); WR(r, 128);
-    case ZYDIS_MNEMONIC_MULPS: RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) r.f[i] = sse_fix32(a.f[i] * b.f[i], a.f[i], b.f[i]); WR(r, 128);
-    case ZYDIS_MNEMONIC_DIVPS: RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) r.f[i] = sse_fix32(a.f[i] / b.f[i], a.f[i], b.f[i]); WR(r, 128);
-    case ZYDIS_MNEMONIC_MINPS: RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) r.f[i] = sse_min32(a.f[i], b.f[i]); WR(r, 128);
-    case ZYDIS_MNEMONIC_MAXPS: RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) r.f[i] = sse_max32(a.f[i], b.f[i]); WR(r, 128);
-    case ZYDIS_MNEMONIC_SQRTPS: RD(1, b); for (int i = 0; i < 4; i++) r.f[i] = sse_sqrt32(b.f[i]); WR(r, 128);
+    case ZYDIS_MNEMONIC_ADDPS: FENV(); RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) r.f[i] = sse_fix32(a.f[i] + b.f[i], a.f[i], b.f[i]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_SUBPS: FENV(); RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) r.f[i] = sse_fix32(a.f[i] - b.f[i], a.f[i], b.f[i]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_MULPS: FENV(); RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) r.f[i] = sse_fix32(a.f[i] * b.f[i], a.f[i], b.f[i]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_DIVPS: FENV(); RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) r.f[i] = sse_fix32(a.f[i] / b.f[i], a.f[i], b.f[i]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_MINPS: FENV(); RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) r.f[i] = sse_min32(a.f[i], b.f[i]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_MAXPS: FENV(); RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) r.f[i] = sse_max32(a.f[i], b.f[i]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_SQRTPS: FENV(); RD(1, b); for (int i = 0; i < 4; i++) r.f[i] = sse_sqrt32(b.f[i]); WRF(r, 128);
 
     /* ---- FP compares ---- */
     case ZYDIS_MNEMONIC_COMISD: case ZYDIS_MNEMONIC_UCOMISD:
-        RD(0, a); RD(1, b); fcmp64(c, a.e[0], b.e[0], m == ZYDIS_MNEMONIC_COMISD); *ok = 1; fenv_end(c); return 1;
+        FENV(); RD(0, a); RD(1, b); fcmp64(c, a.e[0], b.e[0], m == ZYDIS_MNEMONIC_COMISD); *ok = 1; fenv_end(c); return 1;
     case ZYDIS_MNEMONIC_COMISS: case ZYDIS_MNEMONIC_UCOMISS:
-        RD(0, a); RD(1, b); fcmp32(c, a.f[0], b.f[0], m == ZYDIS_MNEMONIC_COMISS); *ok = 1; fenv_end(c); return 1;
-    case ZYDIS_MNEMONIC_CMPSD: RD(0, r); RD(1, b); r.q.lo = fpred(IMM(2), r.e[0], b.e[0]) ? ~0ull : 0; WR(r, 128);
-    case ZYDIS_MNEMONIC_CMPSS: RD(0, r); RD(1, b); r.d[0] = fpred32(IMM(2), r.f[0], b.f[0]) ? ~0u : 0; WR(r, 128);
-    case ZYDIS_MNEMONIC_CMPPD: RD(0, a); RD(1, b); r.q.lo = fpred(IMM(2), a.e[0], b.e[0]) ? ~0ull : 0; r.q.hi = fpred(IMM(2), a.e[1], b.e[1]) ? ~0ull : 0; WR(r, 128);
-    case ZYDIS_MNEMONIC_CMPPS: RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) r.d[i] = fpred32(IMM(2), a.f[i], b.f[i]) ? ~0u : 0; WR(r, 128);
+        FENV(); RD(0, a); RD(1, b); fcmp32(c, a.f[0], b.f[0], m == ZYDIS_MNEMONIC_COMISS); *ok = 1; fenv_end(c); return 1;
+    case ZYDIS_MNEMONIC_CMPSD: FENV(); RD(0, r); RD(1, b); r.q.lo = fpred(IMM(2), r.e[0], b.e[0]) ? ~0ull : 0; WRF(r, 128);
+    case ZYDIS_MNEMONIC_CMPSS: FENV(); RD(0, r); RD(1, b); r.d[0] = fpred32(IMM(2), r.f[0], b.f[0]) ? ~0u : 0; WRF(r, 128);
+    case ZYDIS_MNEMONIC_CMPPD: FENV(); RD(0, a); RD(1, b); r.q.lo = fpred(IMM(2), a.e[0], b.e[0]) ? ~0ull : 0; r.q.hi = fpred(IMM(2), a.e[1], b.e[1]) ? ~0ull : 0; WRF(r, 128);
+    case ZYDIS_MNEMONIC_CMPPS: FENV(); RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) r.d[i] = fpred32(IMM(2), a.f[i], b.f[i]) ? ~0u : 0; WRF(r, 128);
 
     /* ---- conversions ---- */
-    case ZYDIS_MNEMONIC_CVTSI2SD: RD(0, r); RD(1, b); r.e[0] = ops[1].size == 64 ? (double)(int64_t)b.q.lo : (double)(int32_t)b.d[0]; WR(r, 128);
-    case ZYDIS_MNEMONIC_CVTSI2SS: RD(0, r); RD(1, b); r.f[0] = ops[1].size == 64 ? (float)(int64_t)b.q.lo : (float)(int32_t)b.d[0]; WR(r, 128);
+    case ZYDIS_MNEMONIC_CVTSI2SD: FENV(); RD(0, r); RD(1, b); r.e[0] = ops[1].size == 64 ? (double)(int64_t)b.q.lo : (double)(int32_t)b.d[0]; WRF(r, 128);
+    case ZYDIS_MNEMONIC_CVTSI2SS: FENV(); RD(0, r); RD(1, b); r.f[0] = ops[1].size == 64 ? (float)(int64_t)b.q.lo : (float)(int32_t)b.d[0]; WRF(r, 128);
     case ZYDIS_MNEMONIC_CVTTSD2SI: case ZYDIS_MNEMONIC_CVTSD2SI:
-        RD(1, b); r.q.lo = (uint64_t)sse_to_int(b.e[0], ops[0].size, m == ZYDIS_MNEMONIC_CVTTSD2SI); WR(r, ops[0].size);
+        FENV(); RD(1, b); r.q.lo = (uint64_t)sse_to_int(b.e[0], ops[0].size, m == ZYDIS_MNEMONIC_CVTTSD2SI); WRF(r, ops[0].size);
     case ZYDIS_MNEMONIC_CVTTSS2SI: case ZYDIS_MNEMONIC_CVTSS2SI:
-        RD(1, b); r.q.lo = (uint64_t)sse_to_int((double)b.f[0], ops[0].size, m == ZYDIS_MNEMONIC_CVTTSS2SI); WR(r, ops[0].size);
-    case ZYDIS_MNEMONIC_CVTSD2SS: RD(0, r); RD(1, b); r.f[0] = sse_f64_to_f32(b.e[0]); WR(r, 128);
-    case ZYDIS_MNEMONIC_CVTSS2SD: RD(0, r); RD(1, b); r.e[0] = sse_f32_to_f64(b.f[0]); WR(r, 128);
-    case ZYDIS_MNEMONIC_CVTDQ2PS: RD(1, b); for (int i = 0; i < 4; i++) r.f[i] = (float)(int32_t)b.d[i]; WR(r, 128);
-    case ZYDIS_MNEMONIC_CVTDQ2PD: RD(1, b); for (int i = 0; i < 2; i++) r.e[i] = (double)(int32_t)b.d[i]; WR(r, 128);
+        FENV(); RD(1, b); r.q.lo = (uint64_t)sse_to_int((double)b.f[0], ops[0].size, m == ZYDIS_MNEMONIC_CVTTSS2SI); WRF(r, ops[0].size);
+    case ZYDIS_MNEMONIC_CVTSD2SS: FENV(); RD(0, r); RD(1, b); r.f[0] = sse_f64_to_f32(b.e[0]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_CVTSS2SD: FENV(); RD(0, r); RD(1, b); r.e[0] = sse_f32_to_f64(b.f[0]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_CVTDQ2PS: FENV(); RD(1, b); for (int i = 0; i < 4; i++) r.f[i] = (float)(int32_t)b.d[i]; WRF(r, 128);
+    case ZYDIS_MNEMONIC_CVTDQ2PD: FENV(); RD(1, b); for (int i = 0; i < 2; i++) r.e[i] = (double)(int32_t)b.d[i]; WRF(r, 128);
     case ZYDIS_MNEMONIC_CVTPS2DQ: case ZYDIS_MNEMONIC_CVTTPS2DQ:
-        RD(1, b); for (int i = 0; i < 4; i++) r.d[i] = (uint32_t)sse_to_int((double)b.f[i], 32, m == ZYDIS_MNEMONIC_CVTTPS2DQ); WR(r, 128);
+        FENV(); RD(1, b); for (int i = 0; i < 4; i++) r.d[i] = (uint32_t)sse_to_int((double)b.f[i], 32, m == ZYDIS_MNEMONIC_CVTTPS2DQ); WRF(r, 128);
     case ZYDIS_MNEMONIC_CVTPD2DQ: case ZYDIS_MNEMONIC_CVTTPD2DQ:
-        RD(1, b); for (int i = 0; i < 2; i++) r.d[i] = (uint32_t)sse_to_int(b.e[i], 32, m == ZYDIS_MNEMONIC_CVTTPD2DQ); WR(r, 128);
-    case ZYDIS_MNEMONIC_CVTPS2PD: RD(1, b); for (int i = 0; i < 2; i++) r.e[i] = sse_f32_to_f64(b.f[i]); WR(r, 128);
-    case ZYDIS_MNEMONIC_CVTPD2PS: RD(1, b); for (int i = 0; i < 2; i++) r.f[i] = sse_f64_to_f32(b.e[i]); WR(r, 128);
+        FENV(); RD(1, b); for (int i = 0; i < 2; i++) r.d[i] = (uint32_t)sse_to_int(b.e[i], 32, m == ZYDIS_MNEMONIC_CVTTPD2DQ); WRF(r, 128);
+    case ZYDIS_MNEMONIC_CVTPS2PD: FENV(); RD(1, b); for (int i = 0; i < 2; i++) r.e[i] = sse_f32_to_f64(b.f[i]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_CVTPD2PS: FENV(); RD(1, b); for (int i = 0; i < 2; i++) r.f[i] = sse_f64_to_f32(b.e[i]); WRF(r, 128);
 
     /* ---- control ---- */
     case ZYDIS_MNEMONIC_LDMXCSR: { uint64_t v; *ok = op_read(x, 0, &v); if (*ok) c->mxcsr = (uint32_t)v; return 1; }
@@ -1091,6 +1107,8 @@ static int do_sse(ctx *x, ZydisMnemonic m, int *ok) {
     }
 #undef RD
 #undef WR
+#undef WRF
+#undef FENV
 #undef IMM
 }
 
@@ -1220,7 +1238,14 @@ static int do_cmpxchg8b(ctx *x, int bits) {
 
 /* ------------------------------------------------------------------- step */
 
-xc_stop xc_step(xc_cpu *c) {
+int xc_decode_at(xc_cpu *c, uint64_t rip, ZydisDecodedInstruction *in, ZydisDecodedOperand *ops);
+xc_stop xc_exec_decoded(xc_cpu *c, const ZydisDecodedInstruction *in_, const xop *ops);
+
+/* ------------------------------------------------------------------- step */
+
+/* Fetch and decode the instruction at `rip`. Shared by xc_step and the block
+ * cache. Returns 0 and sets c->stop on a fetch fault or undecodable bytes. */
+int xc_decode_at(xc_cpu *c, uint64_t rip, ZydisDecodedInstruction *in, ZydisDecodedOperand *ops) {
     static ZydisDecoder dec64, dec32;
     static int inited;
     if (!inited) {
@@ -1228,25 +1253,34 @@ xc_stop xc_step(xc_cpu *c) {
         ZydisDecoderInit(&dec32, ZYDIS_MACHINE_MODE_LONG_COMPAT_32, ZYDIS_STACK_WIDTH_32);
         inited = 1;
     }
-
-    /* Fetch. Up to 15 bytes, but do not read past the arena. */
+    /* Up to 15 bytes, but do not read past the arena. */
     uint8_t buf[16]; size_t avail = 15;
     const uint8_t *src = 0;
     for (; avail > 0; --avail) {
-        src = (const uint8_t *)xc_mem_ptr(c->mem, c->rip, avail);
+        src = (const uint8_t *)xc_mem_ptr(c->mem, rip, avail);
         if (src) break;
     }
-    if (!src) { c->stop = XC_STOP_FAULT; c->fault_addr = c->rip; return c->stop; }
+    if (!src) { c->stop = XC_STOP_FAULT; c->fault_addr = rip; return 0; }
     memcpy(buf, src, avail);
-
-    ZydisDecodedInstruction in;
-    ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
-    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(c->mode == XC_MODE_64 ? &dec64 : &dec32,
-                                             buf, avail, &in, ops))) {
-        c->stop = XC_STOP_DECODE; return c->stop;
+    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(c->mode == XC_MODE_64 ? &dec64 : &dec32, buf, avail, in, ops))) {
+        c->stop = XC_STOP_DECODE; return 0;
     }
+    return 1;
+}
 
-    ctx x = { c, &in, ops, c->rip + in.length, XC_STOP_NONE };
+xc_stop xc_step(xc_cpu *c) {
+    ZydisDecodedInstruction in;
+    ZydisDecodedOperand zops[ZYDIS_MAX_OPERAND_COUNT];
+    xop ops[ZYDIS_MAX_OPERAND_COUNT];
+    if (!xc_decode_at(c, c->rip, &in, zops)) return c->stop;
+    xop_convert(&in, zops, c->rip, c->mode, ops);
+    return xc_exec_decoded(c, &in, ops);
+}
+
+/* Execute one already-decoded instruction at c->rip. */
+xc_stop xc_exec_decoded(xc_cpu *c, const ZydisDecodedInstruction *in_, const xop *ops) {
+#define in (*in_)
+    ctx x = { c, in_, ops, c->rip + in.length, XC_STOP_NONE };
     uint64_t next = x.next_rip;
     int ok = 1;
     ZydisMnemonic m = in.mnemonic;
@@ -1339,8 +1373,8 @@ xc_stop xc_step(xc_cpu *c) {
     /* control flow */
     case ZYDIS_MNEMONIC_JMP: case ZYDIS_MNEMONIC_CALL: {
         uint64_t target;
-        if (ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-            ZyanU64 t; ZydisCalcAbsoluteAddress(&in, &ops[0], c->rip, &t); target = t;
+        if (ops[0].type == XOP_IMM) {
+            target = ops[0].imm;
         } else if (!(ok = op_read(&x, 0, &target))) break;
         if (m == ZYDIS_MNEMONIC_CALL && !(ok = push(&x, next))) break;
         next = mask_bits(target, c->mode);
@@ -1358,7 +1392,7 @@ xc_stop xc_step(xc_cpu *c) {
     }
     case ZYDIS_MNEMONIC_JRCXZ: case ZYDIS_MNEMONIC_JECXZ: case ZYDIS_MNEMONIC_JCXZ: {
         int w = m == ZYDIS_MNEMONIC_JRCXZ ? 64 : m == ZYDIS_MNEMONIC_JECXZ ? 32 : 16;
-        if (mask_bits(c->gpr[XC_RCX], w) == 0) { ZyanU64 t; ZydisCalcAbsoluteAddress(&in, &ops[0], c->rip, &t); next = t; }
+        if (mask_bits(c->gpr[XC_RCX], w) == 0) { next = ops[0].imm; }
         break;
     }
 
@@ -1434,9 +1468,9 @@ xc_stop xc_step(xc_cpu *c) {
     case ZYDIS_MNEMONIC_POPCNT:
         ok = do_bitscan(&x, m); break;
     case ZYDIS_MNEMONIC_BSWAP: {
-        uint64_t v = reg_read(c, ops[0].reg.value);
+        uint64_t v = xreg_read(c, &ops[0]);
         if (ops[0].size == 64) v = __builtin_bswap64(v); else v = __builtin_bswap32((uint32_t)v);
-        reg_write(c, ops[0].reg.value, v); break;
+        xreg_write(c, &ops[0], v); break;
     }
     case ZYDIS_MNEMONIC_SHLD: ok = do_shd(&x, 1); break;
     case ZYDIS_MNEMONIC_SHRD: ok = do_shd(&x, 0); break;
@@ -1466,7 +1500,7 @@ xc_stop xc_step(xc_cpu *c) {
     default: {
         cc_t cc;
         if ((cc = cc_jcc(m)) != CC_NONE) {
-            if (cc_eval(c, cc)) { ZyanU64 t; ZydisCalcAbsoluteAddress(&in, &ops[0], c->rip, &t); next = t; }
+            if (cc_eval(c, cc)) { next = ops[0].imm; }
         } else if ((cc = cc_setcc(m)) != CC_NONE) {
             ok = op_write(&x, 0, cc_eval(c, cc));
         } else if ((cc = cc_cmov(m)) != CC_NONE) {
@@ -1490,15 +1524,7 @@ xc_stop xc_step(xc_cpu *c) {
     c->rip = next;
     c->stop = XC_STOP_NONE;
     return XC_STOP_NONE;
-}
-
-xc_stop xc_run(xc_cpu *c, uint64_t max_steps) {
-    while (max_steps--) {
-        xc_stop s = xc_step(c);
-        if (s != XC_STOP_NONE) return s;
-    }
-    c->stop = XC_STOP_STEPS;
-    return XC_STOP_STEPS;
+#undef in
 }
 
 void xc_cpu_init(xc_cpu *c, xc_mode mode, xc_mem *mem) {

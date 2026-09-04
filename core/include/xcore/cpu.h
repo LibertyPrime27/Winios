@@ -100,9 +100,17 @@ void *xc_mem_ptr(const xc_mem *m, uint64_t gaddr, size_t len);
 
 void xc_cpu_init(xc_cpu *c, xc_mode mode, xc_mem *mem);
 
-/* Execute up to `max_steps` instructions. Returns the stop reason; 
- * XC_STOP_STEPS means nothing went wrong. */
+/* Execute up to `max_steps` instructions through the decoded-block cache
+ * (core/src/cache.c). Returns the stop reason; XC_STOP_STEPS means nothing
+ * went wrong. */
 xc_stop xc_run(xc_cpu *c, uint64_t max_steps);
+
+/* The block cache verifies each instruction's bytes before running it, so
+ * self-modifying code is safe without these; they exist for hosts that unmap
+ * or repurpose guest code pages and want the memory back. */
+void xc_cache_flush(void);
+void xc_cache_invalidate(uint64_t lo, uint64_t hi);
+void xc_cache_stats(uint64_t *hits, uint64_t *builds, uint64_t *flushes, uint64_t *smc);
 
 /* Execute exactly one instruction. */
 xc_stop xc_step(xc_cpu *c);
