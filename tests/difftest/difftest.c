@@ -355,7 +355,18 @@ static int run_case(const tcase *t, uint64_t seed) {
              * a tolerance, and the replay checks ARM64 against x86 hosts. */
             const x87state *rec = t->fuzzy ? &x87emu : &x87nat;
             fprintf(g_golden, "},\n    (const uint64_t[]){%u,%u,%u,", rec->fcw, rec->fsw, rec->ftw);
-            for (int i = 0; i < 8; i++) fprintf(g_golden, "0x%llxull,%u,", (unsigned long long)rec->st[i].mant, rec->st[i].se);
+            for (int i = 0; i < 8; i++) {
+                uint64_t mant = rec->st[i].mant; unsigned se = rec->st[i].se;
+                if (t->fuzzy && st_valid(rec, i) && (se & 0x7FFF) != 0x7FFF) {
+                    /* Even our own transcendental results differ in the last
+                     * bit between libm versions; keep 32 significant bits so
+                     * the file is stable and the replay compares loosely. */
+                    uint64_t r = mant + 0x80000000ull;
+                    if (r < mant) { r = 1ull << 63; se++; }
+                    mant = r & ~0xFFFFFFFFull;
+                }
+                fprintf(g_golden, "0x%llxull,%u,", (unsigned long long)mant, se);
+            }
             fprintf(g_golden, "}, %#x, %d },\n", t->fsw_mask, t->fuzzy);
         } else fprintf(g_golden, "0, 0, 0, 0 },\n");
     }
