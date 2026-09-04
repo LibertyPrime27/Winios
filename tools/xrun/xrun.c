@@ -19,6 +19,7 @@
  */
 #define _GNU_SOURCE
 #include "xcore/cpu.h"
+#include "xrun.h"
 
 #include <elf.h>
 #include <errno.h>
@@ -288,15 +289,31 @@ int main(int argc, char **argv, char **envp) {
     }
     if (ai >= argc) { fprintf(stderr, "usage: xrun [-v] [-s max_steps] program [args...]\n"); return 2; }
 
-    if (load_elf(argv[ai], &g_im)) return 2;
-    uint64_t rsp = build_stack(&g_im, argc - ai, argv + ai, envp);
+    /* Which ELF class? 32-bit guests get the arena, 64-bit ones identity. */
+    int is32 = 0;
+    { FILE *f = fopen(argv[ai], "rb"); unsigned char id[5] = {0}; if (f) { if (fread(id, 1, 5, f) != 5) id[0] = 0; fclose(f); }
+      if (memcmp(id, ELFMAG, 4)) { fprintf(stderr, "%s: not an ELF file\n", argv[ai]); return 2; }
+      is32 = id[EI_CLASS] == ELFCLASS32; }
 
-    xc_mem mem; xc_mem_init_identity(&mem);
-    xc_cpu c; xc_cpu_init(&c, XC_MODE_64, &mem);
-    c.rip = g_im.entry;
-    c.gpr[XC_RSP] = rsp;
-    if (verbose) fprintf(stderr, "xrun: entry %#llx rsp %#llx brk %#llx\n",
-                         (unsigned long long)c.rip, (unsigned long long)rsp, (unsigned long long)g_im.brk_start);
+    xc_mem mem; xc_cpu c;
+    if (is32) {
+        if (load_elf32(argv[ai])) return 2;
+        uint32_t esp = build_stack32(argc - ai, argv + ai, envp);
+        xc_mem_init_arena(&mem, arena_base32(), 1ull << 32);
+        xc_cpu_init(&c, XC_MODE_32, &mem);
+        c.rip = entry32();
+        c.gpr[XC_RSP] = esp;
+        c.sreg[1] = 0x23; c.sreg[0] = c.sreg[2] = c.sreg[3] = 0x2b;     /* what a 32-bit Linux process sees */
+    } else {
+        if (load_elf(argv[ai], &g_im)) return 2;
+        uint64_t rsp = build_stack(&g_im, argc - ai, argv + ai, envp);
+        xc_mem_init_identity(&mem);
+        xc_cpu_init(&c, XC_MODE_64, &mem);
+        c.rip = g_im.entry;
+        c.gpr[XC_RSP] = rsp;
+    }
+    if (verbose) fprintf(stderr, "xrun: %d-bit guest, entry %#llx rsp %#llx\n", is32 ? 32 : 64,
+                         (unsigned long long)c.rip, (unsigned long long)c.gpr[XC_RSP]);
 
     uint64_t steps = 0;
     int code = 0;
@@ -306,7 +323,13 @@ int main(int argc, char **argv, char **envp) {
         xc_stop st = xc_run(&c, chunk);
         steps += chunk;                      /* approximate: the last chunk may be short */
         if (st == XC_STOP_STEPS) continue;
-        if (st == XC_STOP_SYSCALL) { if (!do_syscall(&c, &code)) break; continue; }
+        if (st == XC_STOP_SYSCALL) {
+            int keep = c.syscall_vector == 0x80 ? do_syscall32(&c, &code, verbose)
+                     : c.syscall_vector == -1 && !is32 ? do_syscall(&c, &code)
+                     : (fprintf(stderr, "xrun: unexpected syscall vector %d at rip=%#llx\n", c.syscall_vector, (unsigned long long)c.rip), code = 125, 0);
+            if (!keep) break;
+            continue;
+        }
         char dis[128]; xc_disasm(&c, c.rip, dis, sizeof dis);
         fprintf(stderr, "xrun: stopped: %s at rip=%#llx  [%s]", xc_stop_name(st), (unsigned long long)c.rip, dis);
         if (st == XC_STOP_FAULT) fprintf(stderr, "  fault_addr=%#llx", (unsigned long long)c.fault_addr);

@@ -48,8 +48,12 @@ int xc_selftest(char *report, size_t report_len, int max_report) {
         memset(arena + CODE_AT, 0xCC, 64);
         memcpy(arena + CODE_AT, v->code, v->len);
 
+        /* Both modes replay over the arena: 64-bit vectors exercise the
+         * arena as a bounds-checked window, 32-bit ones exercise it as the
+         * real thing -- a nonzero base under 32-bit guest addresses, which is
+         * how every 32-bit game will run on iOS. */
         xc_mem mem; xc_mem_init_arena(&mem, arena, ARENA_SZ);
-        xc_cpu c;   xc_cpu_init(&c, XC_MODE_64, &mem);
+        xc_cpu c;   xc_cpu_init(&c, v->mode == 32 ? XC_MODE_32 : XC_MODE_64, &mem);
         /* Inputs verbatim: these cases never dereference, and several of them
          * (sub sil,dil) compute on the very registers a rewrite would clobber.
          * The arena mapping means a stray access faults instead of reading
@@ -82,13 +86,14 @@ int xc_selftest(char *report, size_t report_len, int max_report) {
                     "  %s: stopped %s\n", v->name, xc_stop_name(st));
             bad = 1;
         } else {
-            for (int r = 0; r < 16; r++) {
+            for (int r = 0; r < (v->mode == 32 ? 8 : 16); r++) {
                 if (r == XC_RSP) continue;          /* not recorded; see above */
-                if (c.gpr[r] != v->out_gpr[r]) {
+                uint64_t got = v->mode == 32 ? (c.gpr[r] & 0xFFFFFFFFull) : c.gpr[r];
+                if (got != v->out_gpr[r]) {
                     if (reported < max_report && off + 96 < report_len)
                         off += (size_t)snprintf(report + off, report_len - off,
                             "  %s: %s x86=%llx arm=%llx\n", v->name, rn[r],
-                            (unsigned long long)v->out_gpr[r], (unsigned long long)c.gpr[r]);
+                            (unsigned long long)v->out_gpr[r], (unsigned long long)got);
                     bad = 1;
                 }
             }

@@ -114,7 +114,7 @@ static int reg_bits(const xc_cpu *c, ZydisRegister r) {
 static uint64_t reg_read(const xc_cpu *c, ZydisRegister r) {
     ZydisRegisterClass cls = ZydisRegisterGetClass(r);
     if (cls == ZYDIS_REGCLASS_IP) return c->rip;                 /* handled by caller for RIP-rel */
-    if (cls == ZYDIS_REGCLASS_SEGMENT) return 0;                 /* flat */
+    if (cls == ZYDIS_REGCLASS_SEGMENT) return c->sreg[r - ZYDIS_REGISTER_ES];   /* selector value only */
     int hi; int i = gpr_index(r, &hi);
     uint64_t v = c->gpr[i];
     if (hi) v >>= 8;
@@ -122,6 +122,12 @@ static uint64_t reg_read(const xc_cpu *c, ZydisRegister r) {
 }
 
 static void reg_write(xc_cpu *c, ZydisRegister r, uint64_t v) {
+    if (ZydisRegisterGetClass(r) == ZYDIS_REGCLASS_SEGMENT) {
+        /* Flat model: a selector load changes the visible selector and
+         * nothing else. FS/GS bases are set by the host (arch_prctl /
+         * set_thread_area / the Win32 TEB) rather than through a GDT. */
+        c->sreg[r - ZYDIS_REGISTER_ES] = (uint16_t)v; return;
+    }
     int hi; int i = gpr_index(r, &hi);
     switch (reg_bits(c, r)) {
     case 8:
@@ -170,11 +176,11 @@ static uint64_t ea(ctx *x, const ZydisDecodedOperand *op) {
         a += reg_read(c, op->mem.index) * op->mem.scale;
     a += (uint64_t)op->mem.disp.value;
     a = mask_bits(a, x->in->address_width);
-    if (c->mode == XC_MODE_64) {
-        if (op->mem.segment == ZYDIS_REGISTER_FS) a += c->fs_base;
-        else if (op->mem.segment == ZYDIS_REGISTER_GS) a += c->gs_base;
-    }
-    return a;
+    /* Flat segments except FS/GS, whose bases the host sets (TLS, the Win32
+     * TEB). In 32-bit mode the sum is still a 32-bit address. */
+    if (op->mem.segment == ZYDIS_REGISTER_FS) a += c->fs_base;
+    else if (op->mem.segment == ZYDIS_REGISTER_GS) a += c->gs_base;
+    return mask_bits(a, c->mode);
 }
 
 /* --------------------------------------------------------------- operands */
@@ -1088,6 +1094,128 @@ static int do_sse(ctx *x, ZydisMnemonic m, int *ok) {
 #undef IMM
 }
 
+
+/* ------------------------------------------------- 32-bit-era leftovers */
+
+/* The BCD adjust family. Nobody emits these on purpose any more, but 32-bit
+ * Windows binaries carry them (compilers of the era, hand-written asm,
+ * obfuscators), and each is a couple of lines against the SDM. */
+static void do_daa_das(xc_cpu *c, int sub) {
+    uint64_t al = c->gpr[XC_RAX] & 0xFF, old_al = al;
+    int cf = get_flag(c, XC_CF), af = get_flag(c, XC_AF), ncf = 0;
+    if ((al & 0xF) > 9 || af) {
+        al = sub ? al - 6 : al + 6;
+        ncf = cf || (sub ? old_al < 6 : (old_al + 6) > 0xFF);
+        set_flag(c, XC_AF, 1);
+    } else set_flag(c, XC_AF, 0);
+    if (old_al > 0x99 || cf) { al = sub ? al - 0x60 : al + 0x60; ncf = 1; }
+    al &= 0xFF;
+    reg_write(c, ZYDIS_REGISTER_AL, al);
+    set_flag(c, XC_CF, ncf);
+    flags_zsp(c, al, 8);
+}
+static void do_aaa_aas(xc_cpu *c, int sub) {
+    uint64_t ax = c->gpr[XC_RAX] & 0xFFFF;
+    if ((ax & 0xF) > 9 || get_flag(c, XC_AF)) {
+        ax = sub ? ax - 6 : ax + 6;
+        ax = sub ? ax - 0x100 : ax + 0x100;
+        set_flag(c, XC_AF, 1); set_flag(c, XC_CF, 1);
+    } else { set_flag(c, XC_AF, 0); set_flag(c, XC_CF, 0); }
+    ax &= 0xFF0F;
+    reg_write(c, ZYDIS_REGISTER_AX, ax);
+}
+static int do_aam(ctx *x) {
+    uint64_t base; op_read(x, 0, &base); base &= 0xFF;
+    if (base == 0) { x->stop = XC_STOP_FAULT; return 0; }                 /* #DE */
+    uint64_t al = x->c->gpr[XC_RAX] & 0xFF;
+    uint64_t ax = ((al / base) << 8) | (al % base);
+    reg_write(x->c, ZYDIS_REGISTER_AX, ax);
+    flags_zsp(x->c, ax & 0xFF, 8);
+    return 1;
+}
+static void do_aad(ctx *x) {
+    uint64_t base; op_read(x, 0, &base); base &= 0xFF;
+    uint64_t ax = x->c->gpr[XC_RAX] & 0xFFFF;
+    uint64_t al = ((ax & 0xFF) + ((ax >> 8) & 0xFF) * base) & 0xFF;
+    reg_write(x->c, ZYDIS_REGISTER_AX, al);
+    flags_zsp(x->c, al, 8);
+}
+
+/* PUSHF/POPF at the instruction's operand size. POPF in user mode cannot
+ * change IOPL/IF/VM etc.; we keep the arithmetic flags, DF, TF-free. */
+static int do_pushf(ctx *x) {
+    int w = x->in->operand_width;
+    return push(x, mask_bits(x->c->rflags & 0x00FCFFFFu, w));           /* RF, VM read as 0 */
+}
+static int do_popf(ctx *x) {
+    uint64_t v; if (!pop(x, &v)) return 0;
+    const uint64_t m = XC_CF | XC_PF | XC_AF | XC_ZF | XC_SF | XC_DF | XC_OF;   /* what user mode may change */
+    x->c->rflags = (x->c->rflags & ~m) | (mask_bits(v, x->in->operand_width) & m) | 0x2;
+    return 1;
+}
+
+/* PUSHA/POPA (32-bit mode only): the eight registers in encoding order,
+ * with the pushed ESP being its value before the instruction, and the
+ * popped ESP slot discarded. */
+static int do_pusha(ctx *x) {
+    xc_cpu *c = x->c;
+    uint64_t sp0 = mask_bits(c->gpr[XC_RSP], x->in->stack_width);
+    static const int order[8] = { XC_RAX, XC_RCX, XC_RDX, XC_RBX, XC_RSP, XC_RBP, XC_RSI, XC_RDI };
+    for (int i = 0; i < 8; i++) {
+        uint64_t v = order[i] == XC_RSP ? sp0 : c->gpr[order[i]];
+        if (!push(x, mask_bits(v, x->in->operand_width))) return 0;
+    }
+    return 1;
+}
+static int do_popa(ctx *x) {
+    xc_cpu *c = x->c;
+    static const int order[8] = { XC_RDI, XC_RSI, XC_RBP, XC_RSP, XC_RBX, XC_RDX, XC_RCX, XC_RAX };
+    int w = x->in->operand_width;
+    for (int i = 0; i < 8; i++) {
+        uint64_t v; if (!pop(x, &v)) return 0;
+        if (order[i] == XC_RSP) continue;
+        if (w == 16) c->gpr[order[i]] = (c->gpr[order[i]] & ~0xFFFFull) | (v & 0xFFFF);
+        else c->gpr[order[i]] = v & 0xFFFFFFFFull;
+    }
+    return 1;
+}
+
+/* ENTER imm16, imm8 -- the frame builder MSVC emitted for nested scopes. */
+static int do_enter(ctx *x) {
+    xc_cpu *c = x->c;
+    uint64_t size, level; op_read(x, 0, &size); op_read(x, 1, &level);
+    level &= 31;
+    int sw = x->in->stack_width;
+    if (!push(x, mask_bits(c->gpr[XC_RBP], sw))) return 0;
+    uint64_t frame = mask_bits(c->gpr[XC_RSP], sw);
+    for (uint64_t i = 1; i < level; i++) {
+        uint64_t bp = mask_bits(c->gpr[XC_RBP] - i * (sw / 8), sw), v;
+        if (!mem_read(x, bp, sw, &v) || !push(x, v)) return 0;
+    }
+    if (level > 0 && !push(x, frame)) return 0;
+    c->gpr[XC_RBP] = sw == 64 ? frame : (frame & 0xFFFFFFFFull);
+    c->gpr[XC_RSP] = mask_bits(c->gpr[XC_RSP] - size, sw);
+    if (sw == 32) c->gpr[XC_RSP] &= 0xFFFFFFFFull;
+    return 1;
+}
+
+/* CMPXCHG8B / CMPXCHG16B: compare EDX:EAX (RDX:RAX) with m64 (m128). */
+static int do_cmpxchg8b(ctx *x, int bits) {
+    xc_cpu *c = x->c;
+    uint64_t a = ea(x, &x->ops[0]);
+    int half = bits / 2;
+    uint64_t lo, hi;
+    if (!mem_read(x, a, half, &lo) || !mem_read(x, a + half / 8, half, &hi)) return 0;
+    if (lo == mask_bits(c->gpr[XC_RAX], half) && hi == mask_bits(c->gpr[XC_RDX], half)) {
+        set_flag(c, XC_ZF, 1);
+        return mem_write(x, a, half, mask_bits(c->gpr[XC_RBX], half)) && mem_write(x, a + half / 8, half, mask_bits(c->gpr[XC_RCX], half));
+    }
+    set_flag(c, XC_ZF, 0);
+    if (half == 32) { c->gpr[XC_RAX] = lo; c->gpr[XC_RDX] = hi; }          /* zero-extended, as on hardware */
+    else { c->gpr[XC_RAX] = lo; c->gpr[XC_RDX] = hi; }
+    return 1;
+}
+
 #include "interp_x87.h"
 
 /* ------------------------------------------------------------------- step */
@@ -1266,6 +1394,29 @@ xc_stop xc_step(xc_cpu *c) {
     case ZYDIS_MNEMONIC_CMPSD:                         /* string form; the SSE form is below */
         if (in.meta.category != ZYDIS_CATEGORY_STRINGOP) goto sse;
         ok = do_string_cmp(&x, m, 32); break;
+
+    /* 32-bit-era instructions (also legal in 64-bit mode where noted) */
+    case ZYDIS_MNEMONIC_PUSHF: case ZYDIS_MNEMONIC_PUSHFD: case ZYDIS_MNEMONIC_PUSHFQ: ok = do_pushf(&x); break;
+    case ZYDIS_MNEMONIC_POPF: case ZYDIS_MNEMONIC_POPFD: case ZYDIS_MNEMONIC_POPFQ: ok = do_popf(&x); break;
+    case ZYDIS_MNEMONIC_PUSHA: case ZYDIS_MNEMONIC_PUSHAD: ok = do_pusha(&x); break;
+    case ZYDIS_MNEMONIC_POPA: case ZYDIS_MNEMONIC_POPAD: ok = do_popa(&x); break;
+    case ZYDIS_MNEMONIC_DAA: do_daa_das(c, 0); break;
+    case ZYDIS_MNEMONIC_DAS: do_daa_das(c, 1); break;
+    case ZYDIS_MNEMONIC_AAA: do_aaa_aas(c, 0); break;
+    case ZYDIS_MNEMONIC_AAS: do_aaa_aas(c, 1); break;
+    case ZYDIS_MNEMONIC_AAM: ok = do_aam(&x); break;
+    case ZYDIS_MNEMONIC_AAD: do_aad(&x); break;
+    case ZYDIS_MNEMONIC_XLAT: {
+        uint64_t a = mask_bits(c->gpr[XC_RBX] + (c->gpr[XC_RAX] & 0xFF), in.address_width), v;
+        if ((ok = mem_read(&x, a, 8, &v))) reg_write(c, ZYDIS_REGISTER_AL, v);
+        break;
+    }
+    case ZYDIS_MNEMONIC_SALC: reg_write(c, ZYDIS_REGISTER_AL, get_flag(c, XC_CF) ? 0xFF : 0); break;
+    case ZYDIS_MNEMONIC_ENTER: ok = do_enter(&x); break;
+    case ZYDIS_MNEMONIC_CMPXCHG8B: ok = do_cmpxchg8b(&x, 64); break;
+    case ZYDIS_MNEMONIC_CMPXCHG16B: ok = do_cmpxchg8b(&x, 128); break;
+    case ZYDIS_MNEMONIC_SYSENTER:
+        c->syscall_vector = -2; c->stop = XC_STOP_SYSCALL; c->rip = next; return c->stop;
 
     /* flags */
     case ZYDIS_MNEMONIC_CLC: set_flag(c, XC_CF, 0); break;

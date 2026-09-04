@@ -25,9 +25,10 @@
  * recorded RDI is a host address that means nothing on another machine. An
  * earlier write-based check missed exactly those and the replay faulted.
  * Hidden operands are included, which is what catches PUSH/POP/CALL/RET. */
-static int snippet_touches_memory(const uint8_t *code, size_t len) {
+static int snippet_touches_memory(const uint8_t *code, size_t len, int mode) {
     ZydisDecoder d;
-    ZydisDecoderInit(&d, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+    if (mode == 64) ZydisDecoderInit(&d, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+    else ZydisDecoderInit(&d, ZYDIS_MACHINE_MODE_LONG_COMPAT_32, ZYDIS_STACK_WIDTH_32);
     size_t off = 0;
     while (off < len) {
         ZydisDecodedInstruction in;
@@ -95,16 +96,59 @@ static int f80_close(xc_f80 a, xc_f80 b) {
 
 extern void native_run(nstate *s);
 
+/* --- 32-bit: compatibility mode from inside this process (see native_x64.S) --- */
+typedef struct {
+    uint32_t gpr[8];         /* eax ecx edx ebx esp ebp esi edi */
+    uint32_t eflags;
+    uint32_t code;
+    uint32_t pad[6];
+    uint8_t  fx[512];        /* offset 64 */
+} nstate32;
+extern void native_run32(nstate32 *s, uint32_t stub32);
+extern void native_back64(void);
+extern const uint8_t stub32_tmpl[], stub32_tmpl_end[], s32_p_state1[], s32_p_code[], s32_p_state2[], s32_p_land[];
+extern const uint8_t land64_tmpl[], land64_tmpl_end[], l64_p_target[];
+
+static nstate32 *g_st32;         /* below 4 GB, page aligned */
+static uint32_t  g_stub32;       /* copied stub, below 4 GB */
+
+static void *low_alloc(size_t sz, int prot) {
+    void *p = mmap(0, sz, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+    if (p == MAP_FAILED || (uint64_t)p >= 0x100000000ull) { perror("mmap MAP_32BIT"); exit(2); }
+    return p;
+}
+
+/* Copy the two templates below 4 GB and patch their absolute addresses. */
+static void setup32(void) {
+    g_st32 = low_alloc(4096, PROT_READ | PROT_WRITE);
+    uint8_t *page = low_alloc(4096, PROT_READ | PROT_WRITE | PROT_EXEC);
+    size_t slen = (size_t)(stub32_tmpl_end - stub32_tmpl), llen = (size_t)(land64_tmpl_end - land64_tmpl);
+    memcpy(page, stub32_tmpl, slen);
+    uint8_t *land = page + 256;
+    memcpy(land, land64_tmpl, llen);
+    uint32_t st = (uint32_t)(uintptr_t)g_st32, code_slot = st + 36, landp = (uint32_t)(uintptr_t)land;
+    memcpy(page + (s32_p_state1 - stub32_tmpl) - 4, &st, 4);
+    memcpy(page + (s32_p_state2 - stub32_tmpl) - 4, &st, 4);
+    memcpy(page + (s32_p_code - stub32_tmpl) - 4, &code_slot, 4);
+    memcpy(page + (s32_p_land - stub32_tmpl) - 4, &landp, 4);
+    uint64_t back = (uint64_t)(uintptr_t)native_back64;
+    memcpy(land + (l64_p_target - land64_tmpl) - 8, &back, 8);
+    g_stub32 = (uint32_t)(uintptr_t)page;
+}
+
 enum { STACK_SZ = 64 * 1024, DATA_SZ = 4096, CODE_SZ = 4096 };
 static uint8_t *g_code, *g_stack, *g_data;
+static uint8_t *g_code32, *g_stack32, *g_data32;      /* the same three, below 4 GB */
+static const uint32_t SENTINEL32 = 0x5E17E000u;
 static const uint64_t SENTINEL = 0x5E17E0000ull;      /* unmapped; emulator stops here */
 
 typedef void (*setup_fn)(uint64_t gpr[16], uint64_t *flags);
 
 /* Does the snippet name an XMM register? Such cases record the XMM file. */
-static int snippet_uses_xmm(const uint8_t *code, size_t len) {
+static int snippet_uses_xmm(const uint8_t *code, size_t len, int mode) {
     ZydisDecoder d;
-    ZydisDecoderInit(&d, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+    if (mode == 64) ZydisDecoderInit(&d, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+    else ZydisDecoderInit(&d, ZYDIS_MACHINE_MODE_LONG_COMPAT_32, ZYDIS_STACK_WIDTH_32);
     size_t off = 0;
     while (off < len) {
         ZydisDecodedInstruction in;
@@ -127,6 +171,7 @@ typedef struct {
     setup_fn       setup;
     unsigned       fsw_mask;    /* x87 status bits compared; 0 = case is not x87 */
     int            fuzzy;       /* transcendental: compare ST values with tolerance */
+    int            mode;        /* 64 or 32 */
 } tcase;
 
 /* deterministic register soup so preserved-flag and upper-bit bugs surface */
@@ -193,8 +238,8 @@ static int run_case(const tcase *t, uint64_t seed) {
     memcpy(g_code, t->code, t->len);
     g_code[t->len] = 0xC3;
 
-    const int needs_mem = snippet_touches_memory(t->code, t->len);
-    const int uses_xmm = snippet_uses_xmm(t->code, t->len);
+    const int needs_mem = snippet_touches_memory(t->code, t->len, 64);
+    const int uses_xmm = snippet_uses_xmm(t->code, t->len, 64);
     uint64_t gpr[16], flags;
     xc_u128 xmm[16];
     x87state x87in;
@@ -367,8 +412,174 @@ static int run_case(const tcase *t, uint64_t seed) {
                 }
                 fprintf(g_golden, "0x%llxull,%u,", (unsigned long long)mant, se);
             }
-            fprintf(g_golden, "}, %#x, %d },\n", t->fsw_mask, t->fuzzy);
-        } else fprintf(g_golden, "0, 0, 0, 0 },\n");
+            fprintf(g_golden, "}, %#x, %d, 64 },\n", t->fsw_mask, t->fuzzy);
+        } else fprintf(g_golden, "0, 0, 0, 0, 64 },\n");
+    }
+
+    free(snap_data); free(snap_stack); free(nat_data); free(nat_stack);
+    return bad;
+}
+
+
+/* The 32-bit twin of run_case. Same idea, three differences: the snippet runs
+ * in compatibility mode through native_run32, everything it can touch is
+ * below 4 GB, and the emulator runs in 32-bit mode over an arena whose base
+ * is 0 -- so guest and host addresses coincide and the buffers compare
+ * directly. (The nonzero-base arena is what the device replay uses.) */
+static int run_case32(const tcase *t, uint64_t seed) {
+    memset(g_code32, 0xCC, CODE_SZ);
+    memcpy(g_code32, t->code, t->len);
+    g_code32[t->len] = 0xC3;
+
+    const int needs_mem = snippet_touches_memory(t->code, t->len, 32);
+    const int uses_xmm = snippet_uses_xmm(t->code, t->len, 32);
+    uint64_t gpr64[16], flags;
+    xc_u128 xmm[16];
+    x87state x87in;
+    seed_regs(gpr64, &flags, seed, 0);
+    seed_xmm(xmm, seed);
+    seed_x87(&x87in, seed);
+    if (t->setup) t->setup(gpr64, &flags);
+    uint32_t gpr[8];
+    for (int i = 0; i < 8; i++) gpr[i] = (uint32_t)gpr64[i];
+    gpr[XC_RSP] = (uint32_t)(uintptr_t)(g_stack32 + STACK_SZ - 256);
+    if (needs_mem) { gpr[XC_RDI] = (uint32_t)(uintptr_t)g_data32; gpr[XC_RSI] = (uint32_t)(uintptr_t)g_data32 + 64; }
+
+    uint64_t s = seed * 7 + 3;
+    for (size_t i = 0; i < DATA_SZ; i += 8) { uint64_t v = xs(&s); memcpy(g_data32 + i, &v, 8); }
+    for (size_t i = 0; i < STACK_SZ; i += 8) { uint64_t v = xs(&s); memcpy(g_stack32 + i, &v, 8); }
+    uint8_t *snap_data = malloc(DATA_SZ), *snap_stack = malloc(STACK_SZ);
+    memcpy(snap_data, g_data32, DATA_SZ); memcpy(snap_stack, g_stack32, STACK_SZ);
+
+    /* --- native, in compatibility mode --- */
+    nstate32 *n = g_st32;
+    memset(n, 0, sizeof *n);
+    memcpy(n->gpr, gpr, sizeof gpr); n->eflags = (uint32_t)flags; n->code = (uint32_t)(uintptr_t)g_code32;
+    x87_to_fx(&x87in, n->fx);
+    { uint32_t m = 0x1F80, mm = 0xFFFF; memcpy(n->fx + FX_MXCSR, &m, 4); memcpy(n->fx + FX_MXCSR_MASK, &mm, 4); }
+    memcpy(n->fx + FX_XMM, xmm, sizeof xmm);
+    native_run32(n, g_stub32);
+    x87state x87nat; x87_from_fx(n->fx, &x87nat);
+    xc_u128 xmmnat[16]; memcpy(xmmnat, n->fx + FX_XMM, sizeof xmmnat);
+    uint32_t mxcsrnat; memcpy(&mxcsrnat, n->fx + FX_MXCSR, 4);
+    uint32_t ngpr[8]; memcpy(ngpr, n->gpr, sizeof ngpr);
+    uint32_t nflags = n->eflags;
+    uint8_t *nat_data = malloc(DATA_SZ), *nat_stack = malloc(STACK_SZ);
+    memcpy(nat_data, g_data32, DATA_SZ); memcpy(nat_stack, g_stack32, STACK_SZ);
+
+    /* --- emulated --- */
+    memcpy(g_data32, snap_data, DATA_SZ); memcpy(g_stack32, snap_stack, STACK_SZ);
+    xc_mem mem; xc_mem_init_arena(&mem, 0, 1ull << 32);
+    xc_cpu c; xc_cpu_init(&c, XC_MODE_32, &mem);
+    for (int i = 0; i < 8; i++) c.gpr[i] = gpr[i];
+    memcpy(c.xmm, xmm, sizeof xmm);
+    x87_to_cpu(&x87in, &c);
+    c.rflags = flags;
+    c.rip = (uint32_t)(uintptr_t)g_code32;
+    c.gpr[XC_RSP] -= 4;
+    memcpy((void *)(uintptr_t)c.gpr[XC_RSP], &SENTINEL32, 4);
+    size_t ret_slot = (size_t)(c.gpr[XC_RSP] - (uint32_t)(uintptr_t)g_stack32);
+
+    int steps = 0; xc_stop st = XC_STOP_NONE;
+    while (c.rip != SENTINEL32 && steps++ < 100000) {
+        st = xc_step(&c);
+        if (st != XC_STOP_NONE) break;
+    }
+
+    int bad = 0;
+    if (c.rip != SENTINEL32) {
+        printf("  [%s] emulator stopped: %s at eip=%#llx (fault_addr=%#llx)\n",
+               t->name, xc_stop_name(st), (unsigned long long)c.rip, (unsigned long long)c.fault_addr);
+        bad = 1;
+    }
+    static const char *rn[8] = {"eax","ecx","edx","ebx","esp","ebp","esi","edi"};
+    for (int i = 0; i < 8; i++) if (ngpr[i] != (uint32_t)c.gpr[i]) {
+        printf("  [%s] %s: native %#010x  emu %#010x\n", t->name, rn[i], ngpr[i], (uint32_t)c.gpr[i]);
+        bad = 1;
+    }
+    for (int i = 0; i < 16; i++) if (xmmnat[i].lo != c.xmm[i].lo || xmmnat[i].hi != c.xmm[i].hi) {
+        printf("  [%s] xmm%d: native %016llx_%016llx  emu %016llx_%016llx\n", t->name, i,
+               (unsigned long long)xmmnat[i].hi, (unsigned long long)xmmnat[i].lo,
+               (unsigned long long)c.xmm[i].hi, (unsigned long long)c.xmm[i].lo);
+        bad = 1;
+    }
+    if (mxcsrnat != c.mxcsr) { printf("  [%s] mxcsr: native %#x  emu %#x\n", t->name, mxcsrnat, c.mxcsr); bad = 1; }
+    x87state x87emu; x87_from_cpu(&c, &x87emu);
+    if (t->fsw_mask) {
+        if (x87nat.fcw != x87emu.fcw) { printf("  [%s] fcw: native %#x  emu %#x\n", t->name, x87nat.fcw, x87emu.fcw); bad = 1; }
+        if ((x87nat.fsw & t->fsw_mask) != (x87emu.fsw & t->fsw_mask)) {
+            printf("  [%s] fsw: native %#06x  emu %#06x  (mask %#x)\n", t->name, x87nat.fsw, x87emu.fsw, t->fsw_mask); bad = 1;
+        }
+        if (x87nat.ftw != x87emu.ftw) { printf("  [%s] ftw: native %#04x  emu %#04x\n", t->name, x87nat.ftw, x87emu.ftw); bad = 1; }
+        else for (int i = 0; i < 8; i++) if (st_valid(&x87nat, i)) {
+            int same = t->fuzzy ? f80_close(x87nat.st[i], x87emu.st[i])
+                                : (x87nat.st[i].mant == x87emu.st[i].mant && x87nat.st[i].se == x87emu.st[i].se);
+            if (!same) {
+                printf("  [%s] st(%d): native %04x_%016llx  emu %04x_%016llx\n", t->name, i,
+                       x87nat.st[i].se, (unsigned long long)x87nat.st[i].mant, x87emu.st[i].se, (unsigned long long)x87emu.st[i].mant);
+                bad = 1;
+            }
+        }
+    }
+    uint64_t fm = t->flag_mask;
+    if ((nflags & fm) != (c.rflags & fm)) {
+        printf("  [%s] flags: native %#06x  emu %#06llx  (mask %#06llx)\n", t->name,
+               nflags & XC_ARITH_FLAGS, (unsigned long long)(c.rflags & XC_ARITH_FLAGS), (unsigned long long)fm);
+        bad = 1;
+    }
+    if (memcmp(nat_data, g_data32, DATA_SZ)) {
+        printf("  [%s] data buffer differs\n", t->name); bad = 1;
+        if (getenv("XDBG")) for (size_t i = 0; i < DATA_SZ; i += 8) if (memcmp(nat_data + i, g_data32 + i, 8)) {
+            uint64_t a, b; memcpy(&a, nat_data + i, 8); memcpy(&b, g_data32 + i, 8);
+            printf("    +%zu: native %016llx emu %016llx\n", i, (unsigned long long)a, (unsigned long long)b);
+        }
+    }
+    /* The trampoline owns the return slot and the one below it (it saves
+     * EFLAGS and ESI there after the snippet returns). */
+    memcpy(nat_stack + ret_slot - 4, g_stack32 + ret_slot - 4, 8);
+    if (memcmp(nat_stack, g_stack32, STACK_SZ)) {
+        printf("  [%s] stack differs\n", t->name); bad = 1;
+        if (getenv("XDBG")) for (size_t i = 0; i < STACK_SZ; i += 4) if (memcmp(nat_stack + i, g_stack32 + i, 4)) {
+            uint32_t a, b; memcpy(&a, nat_stack + i, 4); memcpy(&b, g_stack32 + i, 4);
+            printf("    stack+%zu (ret_slot %zu): native %08x emu %08x\n", i, ret_slot, a, b);
+        }
+    }
+
+    if (g_golden) {
+        const int touched = needs_mem;
+        fprintf(g_golden, "  { \"%s\", 0x%llxull, { ", t->name, (unsigned long long)seed);
+        for (int i = 0; i < 16; i++)
+            fprintf(g_golden, "0x%llxull,", (unsigned long long)(touched || i >= 8 || i == XC_RSP ? 0 : gpr[i]));
+        fprintf(g_golden, " }, 0x%llxull, { ", (unsigned long long)(touched ? 0 : (flags & XC_ARITH_FLAGS)));
+        for (int i = 0; i < 16; i++)
+            fprintf(g_golden, "0x%llxull,", (unsigned long long)(touched || i >= 8 || i == XC_RSP ? 0 : ngpr[i]));
+        fprintf(g_golden, " }, 0x%llxull, 0x%llxull, %d,\n    (const uint8_t[]){",
+                (unsigned long long)(touched ? 0 : (nflags & t->flag_mask)), (unsigned long long)t->flag_mask, touched);
+        for (size_t i = 0; i < t->len; i++) fprintf(g_golden, "0x%02x,", t->code[i]);
+        fprintf(g_golden, "}, %zu,\n    ", t->len);
+        if (uses_xmm && !touched) {
+            fprintf(g_golden, "(const uint64_t[]){");
+            for (int i = 0; i < 16; i++) fprintf(g_golden, "0x%llxull,0x%llxull,", (unsigned long long)xmm[i].lo, (unsigned long long)xmm[i].hi);
+            fprintf(g_golden, "},\n    (const uint64_t[]){");
+            for (int i = 0; i < 16; i++) fprintf(g_golden, "0x%llxull,0x%llxull,", (unsigned long long)xmmnat[i].lo, (unsigned long long)xmmnat[i].hi);
+            fprintf(g_golden, "},\n    ");
+        } else fprintf(g_golden, "0, 0,\n    ");
+        if (t->fsw_mask && !touched) {
+            fprintf(g_golden, "(const uint64_t[]){%u,%u,%u,", x87in.fcw, x87in.fsw, x87in.ftw);
+            for (int i = 0; i < 8; i++) fprintf(g_golden, "0x%llxull,%u,", (unsigned long long)x87in.st[i].mant, x87in.st[i].se);
+            const x87state *rec = t->fuzzy ? &x87emu : &x87nat;
+            fprintf(g_golden, "},\n    (const uint64_t[]){%u,%u,%u,", rec->fcw, rec->fsw, rec->ftw);
+            for (int i = 0; i < 8; i++) {
+                uint64_t mant = rec->st[i].mant; unsigned se = rec->st[i].se;
+                if (t->fuzzy && st_valid(rec, i) && (se & 0x7FFF) != 0x7FFF) {
+                    uint64_t r = mant + 0x80000000ull;
+                    if (r < mant) { r = 1ull << 63; se++; }
+                    mant = r & ~0xFFFFFFFFull;
+                }
+                fprintf(g_golden, "0x%llxull,%u,", (unsigned long long)mant, se);
+            }
+            fprintf(g_golden, "}, %#x, %d, 32 },\n", t->fsw_mask, t->fuzzy);
+        } else fprintf(g_golden, "0, 0, 0, 0, 32 },\n");
     }
 
     free(snap_data); free(snap_stack); free(nat_data); free(nat_stack);
@@ -389,6 +600,8 @@ static int run_case(const tcase *t, uint64_t seed) {
 #define ZF   XC_ZF                                 /* BSF/BSR: only ZF defined */
 #define CZ   (XC_CF | XC_ZF)                       /* TZCNT/LZCNT */
 #define CF   XC_CF                                 /* BT family */
+#define AC   (XC_AF | XC_CF)                       /* AAA/AAS */
+#define SZP  (XC_SF | XC_ZF | XC_PF)               /* AAM/AAD */
 
 static void s_div(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RDX] = 0; g[XC_RCX] |= 1; g[XC_RAX] &= 0xFFFFFFFF; }
 static void s_idiv32(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RCX] = 0x1234567 | 1; g[XC_RAX] &= 0x7FFFFFFF; }
@@ -405,6 +618,11 @@ static void s_eqc(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RCX] = g[XC_RAX];
 static void s_eqc32(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RCX] = (g[XC_RCX] & ~0xFFFFFFFFull) | (g[XC_RAX] & 0xFFFFFFFF); }
 static void s_rbx0(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RBX] = 0; }
 static void s_rcx100(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RCX] = 100; }
+/* 32-bit helpers: the low halves are what matter */
+static void s_div32(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RDX] = 0; g[XC_RCX] |= 1; g[XC_RAX] &= 0x7FFFFFFF; }
+static void s_div8(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RCX] |= 0x80; g[XC_RAX] &= 0x7FFF; }
+static void s_ecx0(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RCX] = 0; }
+static void s_xlat(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RBX] = (uint32_t)(uintptr_t)g_data32 + 100; }
 
 /* x87 status word: C1 is masked everywhere (it reports round-up, which the
  * software FPU does not track); C0/C2/C3 are undefined after arithmetic. */
@@ -413,8 +631,10 @@ static void s_rcx100(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RCX] = 100; }
 #define FSW_TOP  0x3800u                 /* transcendentals: stack shape only */
 
 #define B(...) ((const uint8_t[]){__VA_ARGS__})
-#define T(nm, mask, setup, ...) { nm, B(__VA_ARGS__), sizeof(B(__VA_ARGS__)), mask, setup, 0, 0 }
-#define TX(nm, mask, fsw, fuzzy, setup, ...) { nm, B(__VA_ARGS__), sizeof(B(__VA_ARGS__)), mask, setup, fsw, fuzzy }
+#define T(nm, mask, setup, ...) { nm, B(__VA_ARGS__), sizeof(B(__VA_ARGS__)), mask, setup, 0, 0, 64 }
+#define TX(nm, mask, fsw, fuzzy, setup, ...) { nm, B(__VA_ARGS__), sizeof(B(__VA_ARGS__)), mask, setup, fsw, fuzzy, 64 }
+#define T32(nm, mask, setup, ...) { nm, B(__VA_ARGS__), sizeof(B(__VA_ARGS__)), mask, setup, 0, 0, 32 }
+#define TX32(nm, mask, fsw, fuzzy, setup, ...) { nm, B(__VA_ARGS__), sizeof(B(__VA_ARGS__)), mask, setup, fsw, fuzzy, 32 }
 
 static const tcase cases[] = {
     /* moves */
@@ -507,6 +727,8 @@ static const tcase cases[] = {
 
     /* everything below is assembled by cases_gen.py */
 #include "cases_gen.inc"
+    /* 32-bit mode, run in compatibility mode on the native side */
+#include "cases32_gen.inc"
 };
 
 int main(int argc, char **argv) {
@@ -520,6 +742,10 @@ int main(int argc, char **argv) {
     if (g_code == MAP_FAILED || g_stack == MAP_FAILED || g_data == MAP_FAILED) {
         perror("mmap"); return 2;
     }
+    g_code32  = low_alloc(CODE_SZ, PROT_READ | PROT_WRITE | PROT_EXEC);
+    g_stack32 = low_alloc(STACK_SZ, PROT_READ | PROT_WRITE);
+    g_data32  = low_alloc(DATA_SZ, PROT_READ | PROT_WRITE);
+    setup32();
 
     if (emit) {
         g_golden = fopen(emit, "w");
@@ -538,11 +764,16 @@ int main(int argc, char **argv) {
 
     int failed = 0, total = 0;
     const int n = (int)(sizeof cases / sizeof cases[0]);
+    const int dbg = getenv("XDBG") != 0;
+    if (dbg) setvbuf(stdout, 0, _IONBF, 0);
     for (int i = 0; i < n; i++) {
         /* several seeds per case: flags-in and register soup vary */
         for (uint64_t seed = 1; seed <= 6; seed++) {
             total++;
-            if (run_case(&cases[i], seed * 0x9E3779B97F4A7C15ull)) { failed++; if (!g_golden) break; }
+            if (dbg) printf("run [%s] mode %d seed %d\n", cases[i].name, cases[i].mode, (int)seed);
+            int bad = cases[i].mode == 32 ? run_case32(&cases[i], seed * 0x9E3779B97F4A7C15ull)
+                                          : run_case(&cases[i], seed * 0x9E3779B97F4A7C15ull);
+            if (bad) { failed++; if (!g_golden) break; }
         }
     }
     if (g_golden) {
