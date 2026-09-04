@@ -59,8 +59,11 @@ Narrow operands (8/16-bit) are shifted to the top of a 32-bit register before
 Every guest access is `ldr/str Rt, [x25, Rn{, uxtw}]`. For a 32-bit guest x25
 is the arena base and the `uxtw` is the `base + zext32(addr)` of the memory
 model, at zero cost; for a 64-bit guest x25 is 0 and the same form is the
-identity mapping. An access to unmapped guest memory is a host fault today; a
-signal handler that turns it into a guest fault is the runtime's job later.
+identity mapping. When a 32-bit arena is smaller than 4 GB (a memory-constrained
+configuration, or a test), every access carries a bounds check that faults the
+way the interpreter does; a full-size arena needs none. An access to an
+unmapped page *inside* the arena is a host fault today; a signal handler that
+turns it into a guest fault is the runtime's job later.
 
 ## Self-modifying code
 

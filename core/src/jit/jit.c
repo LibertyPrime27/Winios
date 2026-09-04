@@ -206,6 +206,8 @@ static int jit_cc(xc_cpu *c, int cc) {
     return (cc & 1) ? !r : r;
 }
 static int jit_cf(xc_cpu *c) { xc_flags_sync(c); return (int)(c->rflags & 1); }
+/* A guest address outside a bounded arena: report it as the interpreter would. */
+static void jit_fault(xc_cpu *c, uint64_t addr, uint64_t rip) { c->stop = XC_STOP_FAULT; c->fault_addr = addr; c->rip = rip; }
 static void jit_sync(xc_cpu *c) { xc_flags_sync(c); }
 
 /* --------------------------------------------------------- the compiler */
@@ -234,6 +236,7 @@ typedef struct {
     const xop *ops;
     int flags_live;             /* after the current instruction */
     int failed;
+    uint64_t bound;             /* arena size when smaller than 4 GB (32-bit mode), else 0: no checks */
 } jc;
 
 static int greg(jc *j, int g) {
@@ -284,6 +287,27 @@ static int emit_ea(jc *j, const xop *op, int rd) {
 }
 static int ldst_size(int bits) { return bits == 64 ? 3 : bits == 32 ? 2 : bits == 16 ? 1 : 0; }
 
+static void emit_set_rip_imm(jc *j, uint64_t rip);
+/* Bounded arena (smaller than 4 GB): fault the way the interpreter does when
+ * the address in T4 is past the end. Full-size arenas need no check -- every
+ * 32-bit address lands inside the reservation and unmapped pages fault in
+ * the host, which is the runtime's problem to translate. */
+static void emit_bounds(jc *j, int bytes) {
+    if (!j->bound) return;
+    a64_mov_imm(&j->a, T3, j->bound - (uint64_t)bytes);
+    a64_cmp(&j->a, 0, T4, T3);
+    uint32_t ok = a64_here(&j->a); a64_bcond(&j->a, CC_LS, 0);
+    /* out of range: spill, report, leave */
+    uint16_t dirty = j->dirty; flush(j); j->dirty = dirty;      /* this path does not change compile state */
+    a64_mov_reg(&j->a, 1, 0, R_CPU);
+    a64_mov_reg(&j->a, 1, 1, T4);
+    a64_mov_imm(&j->a, 2, j->d->rip);
+    a64_mov_imm(&j->a, R_TMP, (uint64_t)(uintptr_t)jit_fault);
+    a64_blr(&j->a, R_TMP);
+    a64_br(&j->a, R_DISP);
+    a64_patch_bcond(&j->a, ok, a64_here(&j->a));
+}
+
 /* Load operand into a register, zero- (or sign-) extended to 64 bits.
  * Returns the register that holds it -- possibly the guest's own host
  * register when no adjustment was needed (do not write to it). */
@@ -302,6 +326,7 @@ static int ld_op(jc *j, const xop *op, int rd, int sext) {
     case XOP_MEM: {
         int w = emit_ea(j, op, T4);
         int opt = w ? 2 : 3;
+        emit_bounds(j, bits / 8);
         if (sext && bits < 64) a64_ldrs_reg(&j->a, ldst_size(bits), 1, rd, R_BASE, T4, opt);
         else a64_ldr_reg(&j->a, ldst_size(bits), rd, R_BASE, T4, opt);
         return rd;
@@ -330,6 +355,7 @@ static void st_op(jc *j, const xop *op, int rs) {
     }
     if (op->type == XOP_MEM) {
         int w = emit_ea(j, op, T4);
+        emit_bounds(j, bits / 8);
         a64_str_reg(&j->a, ldst_size(bits), rs, R_BASE, T4, w ? 2 : 3);
         return;
     }
@@ -649,11 +675,13 @@ static void emit_push_reg(jc *j, int rval) {         /* rval holds a stack-width
     if (rval == rsp) { a64_mov_reg(&j->a, 1, T0, rsp); rval = T0; }   /* push rsp stores the old value */
     a64_sub_imm(&j->a, sf, rsp, rsp, sw / 8);
     gdirty(j, XC_RSP);
+    if (j->bound) { a64_mov_reg(&j->a, 1, T4, rsp); emit_bounds(j, sw / 8); }
     a64_str_reg(&j->a, sf ? 3 : 2, rval, R_BASE, rsp, sf ? 3 : 2);
 }
 static void emit_pop_to(jc *j, int rd) {
     int sw = j->d->in.stack_width, sf = sw == 64;
     int rsp = greg(j, XC_RSP);
+    if (j->bound) { a64_mov_reg(&j->a, 1, T4, rsp); emit_bounds(j, sw / 8); }
     a64_ldr_reg(&j->a, sf ? 3 : 2, rd, R_BASE, rsp, sf ? 3 : 2);
     a64_add_imm(&j->a, sf, rsp, rsp, sw / 8);
     gdirty(j, XC_RSP);
@@ -852,6 +880,7 @@ static void *compile(xc_cpu *c, block *b) {
     jc j; memset(&j, 0, sizeof j);
     j.a.buf = (uint32_t *)(g_code_rw + g_code_used); j.a.cap = (uint32_t)(room / 4);
     j.mode = c->mode; j.b = b;
+    j.bound = (c->mode == XC_MODE_32 && c->mem->size < (1ull << 32)) ? c->mem->size : 0;
     const dinsn *insns = xc_cache_insns(b);
 
     /* liveness of flags after each instruction, backwards from "live at exit" */
