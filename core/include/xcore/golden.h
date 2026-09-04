@@ -39,6 +39,7 @@ typedef struct {
     const uint64_t *out_x87;
     unsigned        fsw_mask;
     int             fuzzy;
+    int             mode;          /* 64: identity-mapped long mode; 32: arena, compatibility mode */
 } golden_vec;
 
 extern const golden_vec xc_golden[];

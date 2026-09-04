@@ -20,5 +20,7 @@ void *xc_mem_ptr(const xc_mem *m, uint64_t gaddr, size_t len) {
      * defensive -- an unmasked address here would silently escape the arena. */
     uint64_t a = gaddr & 0xFFFFFFFFu;
     if (a + len > m->size || a + len < a) return 0;
-    return m->base + a;
+    /* uintptr arithmetic: a NULL base (identity in the low 4 GB, used by the
+     * 32-bit difftest) is legal here. */
+    return (void *)((uintptr_t)m->base + (uintptr_t)a);
 }

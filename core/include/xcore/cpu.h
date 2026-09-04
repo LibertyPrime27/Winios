@@ -66,6 +66,7 @@ typedef struct xc_cpu {
     uint64_t rip;
     uint64_t rflags;
     uint64_t fs_base, gs_base;
+    uint16_t sreg[6];          /* ES CS SS DS FS GS selectors (values only; flat model) */
     xc_u128  xmm[16];
     uint32_t mxcsr;
     /* x87: eight physical 80-bit registers (ST(i) = fpr[(TOP+i)&7], TOP in

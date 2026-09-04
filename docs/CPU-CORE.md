@@ -97,6 +97,21 @@ Not yet: SSE3 and later (CPUID does not advertise them, so well-behaved code
 does not use them), AVX, `CMPXCHG16B`, `FBLD`/`FBSTP`, segment-register loads,
 anything privileged. Each is a case in the switch and a line in the difftest.
 
+## 32-bit: tested against silicon too
+
+Every 64-bit case has a 32-bit sibling table (`CASES32` in `cases_gen.py`,
+155 cases): the same instructions with 32-bit registers and addressing, plus
+the things only 32-bit code still uses -- `PUSHAD`/`POPAD`, `PUSHFD`/`POPFD`,
+`ENTER`, `CMPXCHG8B`, `XLAT`, the BCD group, and x87 with `FLDCW` in D3D9's
+24-bit mode. The native side runs them in **compatibility mode inside the
+64-bit test process**: Linux keeps a 32-bit code segment (selector `0x23`) in
+every process, a far return into it switches modes, and a far return back
+lands in a 64-bit stub below 4 GB -- the same mechanism a 32-bit Windows
+program runs under on a 64-bit kernel. The emulated side runs in 32-bit mode
+over an arena with base 0, so guest and host addresses coincide and the
+buffers compare directly. On the device the golden vectors replay over an
+arena with a *nonzero* base, which is exactly how a 32-bit game runs on iOS.
+
 ## Running programs: `xrun`
 
 `tools/xrun/xrun.c` loads a static x86-64 Linux ELF (`ET_EXEC` or static PIE),
@@ -112,6 +127,16 @@ TLS setup, `malloc` over `brk`, `printf`), and a stock glibc-static
 `busybox`: `sh`, `awk` with floating point, `md5sum`, `sha256sum`, `sort`,
 `gzip`, `printf %f` all produce output identical to native. That is the
 milestone the roadmap below called "enough instructions to run real code".
+
+The 32-bit half (`tools/xrun/linux32.c`) loads a static i386 ELF into a 4 GB
+arena and services `int 0x80` with an explicit i386 syscall table -- pointers
+rebased, `stat64`/`iovec`/`timespec`/`rlimit` converted to the 32-bit
+layouts, `set_thread_area` setting the `%gs` base. A static i386 glibc
+program (TLS through `%gs`, `brk`, x87 `long double` arithmetic, `printf`,
+libm's `sin`/`exp`/`atan2`) produces output identical to native; the guest
+test builds and runs one when a 32-bit toolchain is present. The Win32
+loader will replace the ELF and syscall parts of this file and keep the
+memory model.
 
 ## The test that makes this tractable
 

@@ -343,12 +343,178 @@ CASES = [
     ("f2xm1 (small)",               "ALL", "0", "fld1\n fdiv st(0), st(1)\n f2xm1", "FSW_TOP", 1),      # 1/x in (-1,1) mostly
 ]
 
-def assemble(asm):
+# 32-bit mode: run natively in compatibility mode. edi/esi point at the data
+# buffer when the snippet dereferences them; the stack is a real 32-bit stack.
+CASES32 = [
+    # moves and addressing
+    ("mov eax,ebx",                 "ALL", "0", "mov eax, ebx"),
+    ("mov ax,imm16",                "ALL", "0", "mov ax, 0x1234"),
+    ("mov ah,bl",                   "ALL", "0", "mov ah, bl"),
+    ("mov [edi],eax",               "ALL", "0", "mov [edi], eax"),
+    ("mov eax,[edi+8]",             "ALL", "0", "mov eax, [edi+8]"),
+    ("mov [edi+ecx*4],edx",         "ALL", "s_idx", "mov [edi+ecx*4], edx"),
+    ("mov word [edi+2],bx",         "ALL", "0", "mov word ptr [edi+2], bx"),
+    ("mov byte [edi],0x5a",         "ALL", "0", "mov byte ptr [edi], 0x5a"),
+    ("mov eax,[esp+4]",             "ALL", "0", "mov eax, [esp+4]"),
+    ("mov [esp-12],ebx (below sp)",  "ALL", "0", "mov [esp-12], ebx"),
+    ("movzx eax,byte [edi]",        "ALL", "0", "movzx eax, byte ptr [edi]"),
+    ("movzx ecx,bx",                "ALL", "0", "movzx ecx, bx"),
+    ("movsx eax,word [edi+2]",      "ALL", "0", "movsx eax, word ptr [edi+2]"),
+    ("movsx edx,cl",                "ALL", "0", "movsx edx, cl"),
+    ("lea eax,[edi+ecx*8+16]",      "ALL", "0", "lea eax, [edi+ecx*8+16]"),
+    ("lea eax,[ebx+ebx*2]",         "ALL", "0", "lea eax, [ebx+ebx*2]"),
+    ("xchg eax,ebx",                "ALL", "0", "xchg eax, ebx"),
+    ("xchg [edi],ecx",              "ALL", "0", "xchg [edi], ecx"),
+    ("bswap eax",                   "ALL", "0", "bswap eax"),
+    ("xlat",                        "ALL", "s_xlat", "xlat"),
+    # alu
+    ("add eax,ebx",                 "ALL", "0", "add eax, ebx"),
+    ("add ax,bx",                   "ALL", "0", "add ax, bx"),
+    ("add al,5",                    "ALL", "0", "add al, 5"),
+    ("add ah,bh",                   "ALL", "0", "add ah, bh"),
+    ("sub ecx,edx",                 "ALL", "0", "sub ecx, edx"),
+    ("sub cx,0x8000",               "ALL", "0", "sub cx, 0x8000"),
+    ("adc eax,ecx",                 "ALL", "0", "adc eax, ecx"),
+    ("sbb ebx,edx",                 "ALL", "0", "sbb ebx, edx"),
+    ("and eax,0x0f0f",              "ALL", "0", "and eax, 0x0f0f"),
+    ("or edx,0x80000000",           "ALL", "0", "or edx, 0x80000000"),
+    ("xor esi,edi (regs)",          "ALL", "0", "xor esi, edi"),
+    ("cmp eax,ebx",                 "ALL", "0", "cmp eax, ebx"),
+    ("cmp eax,ebx (equal)",         "ALL", "s_eq", "cmp eax, ebx"),
+    ("test ecx,edx",                "ALL", "0", "test ecx, edx"),
+    ("inc eax (short form)",        "ALL", "0", "inc eax"),
+    ("dec ecx (short form)",        "ALL", "0", "dec ecx"),
+    ("inc word [edi]",              "ALL", "0", "inc word ptr [edi]"),
+    ("neg edx",                     "ALL", "0", "neg edx"),
+    ("not ebx",                     "ALL", "0", "not ebx"),
+    ("add [edi],eax",               "ALL", "0", "add [edi], eax"),
+    ("add dword [edi+4],7",         "ALL", "0", "add dword ptr [edi+4], 7"),
+    ("adc byte [edi],cl",           "ALL", "0", "adc byte ptr [edi], cl"),
+    # shifts
+    ("shl eax,1",                   "SH1", "0", "shl eax, 1"),
+    ("shl eax,3",                   "SHN", "0", "shl eax, 3"),
+    ("shr ecx,5",                   "SHN", "0", "shr ecx, 5"),
+    ("sar edx,7",                   "SHN", "0", "sar edx, 7"),
+    ("shl ax,cl (cl=7)",            "SHN", "s_cl7", "shl ax, cl"),
+    ("shl eax,cl (cl=0)",           "ALL", "s_cl0", "shl eax, cl"),
+    ("rol eax,9",                   "NO_OF", "0", "rol eax, 9"),
+    ("ror cx,13",                   "NO_OF", "0", "ror cx, 13"),
+    ("rcl eax,1",                   "ALL", "0", "rcl eax, 1"),
+    ("rcr edx,3",                   "NO_OF", "0", "rcr edx, 3"),
+    ("shld eax,ebx,5",              "SHN", "0", "shld eax, ebx, 5"),
+    ("shrd eax,ebx,cl (cl=7)",      "SHN", "s_cl7", "shrd eax, ebx, cl"),
+    # mul / div
+    ("imul eax,ebx",                "CO", "0", "imul eax, ebx"),
+    ("imul ecx,edx,100",            "CO", "0", "imul ecx, edx, 100"),
+    ("imul ebx (1-op)",             "CO", "0", "imul ebx"),
+    ("imul bx (16-bit 1-op)",       "CO", "0", "imul bx"),
+    ("mul ecx",                     "CO", "0", "mul ecx"),
+    ("mul cl",                      "CO", "0", "mul cl"),
+    ("div ecx",                     "NONE", "s_div32", "div ecx"),
+    ("cdq; idiv ecx",               "NONE", "s_idiv32", "cdq\n idiv ecx"),
+    ("div cl",                      "NONE", "s_div8", "div cl"),
+    # widen
+    ("cbw", "ALL", "0", "cbw"), ("cwde", "ALL", "0", "cwde"), ("cwd", "ALL", "0", "cwd"), ("cdq", "ALL", "0", "cdq"),
+    # stack
+    ("push ebx; pop ecx",           "ALL", "0", "push ebx\n pop ecx"),
+    ("push imm8; pop eax",          "ALL", "0", "push 0x12\n pop eax"),
+    ("push imm32(neg); pop edx",    "ALL", "0", "push 0x80000000\n pop edx"),
+    ("push [edi]; pop [edi+8]",     "ALL", "0", "push dword ptr [edi]\n pop dword ptr [edi+8]"),
+    ("push ebp;mov ebp,esp;sub esp,32;leave", "ALL", "0", "push ebp\n mov ebp, esp\n sub esp, 32\n leave"),
+    ("enter 16,0; leave",           "ALL", "0", "enter 16, 0\n leave"),
+    ("enter 8,2; leave",            "ALL", "0", "mov ebp, esp\n enter 8, 2\n leave"),
+    ("pushad; popad",               "ALL", "0", "pushad\n popad"),
+    ("pushad; add esp,32",          "ALL", "0", "pushad\n add esp, 32"),
+    ("pushfd; pop eax",             "ALL", "0", "pushfd\n pop eax"),
+    # popf with a random word would set TF and single-step the real CPU; keep it to user flags
+    ("and eax,0x8d5; push eax; popfd", "ALL", "0", "and eax, 0x8d5\n push eax\n popfd"),
+    ("pushf (16); pop ax",          "ALL", "0", "pushfw\n pop ax"),
+    # control flow
+    ("cmp;jz;mov;jmp;mov",          "ALL", "0", "cmp eax, ebx\n jz 1f\n mov ecx, 1\n jmp 2f\n 1: mov ecx, 2\n 2:"),
+    ("cmp;jz (taken)",              "ALL", "s_eq", "cmp eax, ebx\n jz 1f\n mov ecx, 1\n jmp 2f\n 1: mov ecx, 2\n 2:"),
+    ("call/ret",                    "ALL", "0", "call 1f\n add eax, 1\n jmp 2f\n 1: add ecx, 7\n ret\n 2:"),
+    ("call edx (indirect)",         "ALL", "0", "call 1f\n 1: pop edx\n add edx, 2f-1b\n call edx\n jmp 3f\n 2: add ecx, 7\n ret\n 3:"),
+    ("jecxz (ecx=0)",               "ALL", "s_ecx0", "jecxz 1f\n mov eax, 1\n 1:"),
+    ("loop (ecx=4)",                "ALL", "s_rcx4", "1: add eax, ebx\n loop 1b"),
+    ("cmovz eax,ecx (ZF)",          "ALL", "s_zf", "cmovz eax, ecx"),
+    ("cmovnz eax,ecx (!ZF)",        "ALL", "s_nzf", "cmovnz eax, ecx"),
+    ("setb al; setnle dl",          "ALL", "0", "setb al\n setnle dl"),
+    # flags & misc
+    ("lahf", "ALL", "0", "lahf"), ("sahf", "ALL", "0", "sahf"),
+    ("clc; cmc", "ALL", "0", "clc\n cmc"), ("stc", "ALL", "0", "stc"),
+    ("cld", "ALL", "0", "cld"),
+    ("bt eax,ebx",                  "CF", "0", "bt eax, ebx"),
+    ("bts [edi],ecx (ecx=100)",     "CF", "s_rcx100", "bts [edi], ecx"),
+    ("btr ax,5",                    "CF", "0", "btr ax, 5"),
+    ("bsf eax,ebx",                 "ZF", "0", "bsf eax, ebx"),
+    ("bsr eax,ebx (zero)",          "ZF", "s_rbx0", "bsr eax, ebx"),
+    ("cmpxchg ecx,ebx (hit)",       "ALL", "s_eqc32", "cmpxchg ecx, ebx"),
+    ("cmpxchg [edi],ebx",           "ALL", "0", "cmpxchg [edi], ebx"),
+    ("cmpxchg8b [edi]",             "ALL", "0", "cmpxchg8b [edi]"),
+    ("cmpxchg8b [edi] (hit)",       "ALL", "0", "mov eax, [edi]\n mov edx, [edi+4]\n cmpxchg8b [edi]"),
+    ("xadd [edi],ecx",              "ALL", "0", "xadd [edi], ecx"),
+    # BCD: the SDM leaves OF undefined after DAA/DAS, everything but AF/CF after
+    # AAA/AAS, and everything but SF/ZF/PF after AAM/AAD
+    ("daa", "NO_OF", "0", "daa"), ("das", "NO_OF", "0", "das"),
+    ("aaa", "AC", "0", "aaa"), ("aas", "AC", "0", "aas"),
+    ("aam", "SZP", "0", "aam"), ("aad", "SZP", "0", "aad"),
+    ("aam 7", "SZP", "0", "aam 7"),
+    # strings
+    ("rep stosd (ecx=4)",           "ALL", "s_rcx4", "rep stosd"),
+    ("rep movsb (ecx=16)",          "ALL", "s_rcx16", "rep movsb"),
+    ("repe cmpsb (ecx=16)",         "ALL", "s_rcx16", "repe cmpsb"),
+    ("repne scasb (ecx=16)",        "ALL", "s_rcx16", "repne scasb"),
+    ("lodsd; stosw",                "ALL", "0", "lodsd\n stosw"),
+    ("std; movsd; cld",             "ALL", "0", "std\n movsd\n cld"),
+    # SSE in 32-bit mode
+    ("movaps xmm0,xmm1",            "ALL", "0", "movaps xmm0, xmm1"),
+    ("movdqu xmm3,[edi+16]",        "ALL", "0", "movdqu xmm3, [edi+16]"),
+    ("movq [edi],xmm4",             "ALL", "0", "movq [edi], xmm4"),
+    ("movd eax,xmm2",               "ALL", "0", "movd eax, xmm2"),
+    ("movd xmm6,ecx",               "ALL", "0", "movd xmm6, ecx"),
+    ("movsd xmm1,xmm3 (merge)",     "ALL", "0", "movsd xmm1, xmm3"),
+    ("pxor xmm0,xmm1",              "ALL", "0", "pxor xmm0, xmm1"),
+    ("paddd xmm4,[edi]",            "ALL", "0", "paddd xmm4, [edi]"),
+    ("pshufd xmm0,xmm1,0x1B",       "ALL", "0", "pshufd xmm0, xmm1, 0x1B"),
+    ("pmovmskb eax,xmm2",           "ALL", "0", "pmovmskb eax, xmm2"),
+    ("cvtsi2sd xmm1,ecx",           "ALL", "0", "cvtsi2sd xmm1, ecx"),
+    ("cvttsd2si eax,xmm1 (soup)",   "ALL", "0", "cvttsd2si eax, xmm1"),
+    ("cvtsi2ss xmm2,[edi]",         "ALL", "0", "cvtsi2ss xmm2, dword ptr [edi]"),
+    ("addsd xmm1,[edi] (soup)",     "ALL", "0", "addsd xmm1, [edi]"),
+    ("ucomisd xmm1,xmm2 (soup)",    "ALL", "0", "ucomisd xmm1, xmm2"),
+    # x87 in 32-bit mode -- how Fallout 3 does its float math
+    ("fld qword [edi]",             "ALL", "0", "fld qword ptr [edi]",       "FSW_ALL", 0),
+    ("fld dword [edi]",             "ALL", "0", "fld dword ptr [edi]",       "FSW_ALL", 0),
+    ("fild dword [edi]",            "ALL", "0", "fild dword ptr [edi]",      "FSW_ALL", 0),
+    ("fstp qword [edi]",            "ALL", "0", "fstp qword ptr [edi]",      "FSW_NOCC", 0),
+    ("fstp dword [edi]",            "ALL", "0", "fstp dword ptr [edi]",      "FSW_NOCC", 0),
+    ("fistp dword [edi]",           "ALL", "0", "fistp dword ptr [edi]",     "FSW_NOCC", 0),
+    ("fadd st0,st1",                "ALL", "0", "fadd st(0), st(1)",         "FSW_NOCC", 0),
+    ("fmulp st1,st0",               "ALL", "0", "fmulp st(1), st(0)",        "FSW_NOCC", 0),
+    ("fsubr dword [edi]",           "ALL", "0", "fsubr dword ptr [edi]",     "FSW_NOCC", 0),
+    ("fdiv qword [edi]",            "ALL", "0", "fdiv qword ptr [edi]",      "FSW_NOCC", 0),
+    ("fxch st2",                    "ALL", "0", "fxch st(2)",                "FSW_ALL", 0),
+    ("fchs; fabs",                  "ALL", "0", "fchs\n fabs",               "FSW_NOCC", 0),
+    ("fsqrt",                       "ALL", "0", "fabs\n fsqrt",              "FSW_NOCC", 0),
+    ("fcom st1; fnstsw ax; sahf",   "ALL", "0", "fcom st(1)\n fnstsw ax\n sahf", "FSW_ALL", 0),
+    ("fucomip st0,st1",             "ALL", "0", "fucomip st(0), st(1)",      "FSW_ALL", 0),
+    ("fnstcw [edi]; fldcw [edi]",   "ALL", "0", "fnstcw [edi]\n fldcw [edi]", "FSW_ALL", 0),
+    ("fldcw pc=24; fmul (D3D9 mode)","ALL", "0", "mov word ptr [edi], 0x007F\n fldcw [edi]\n fmul st(0), st(1)", "FSW_NOCC", 0),
+    ("fldcw rc=zero; fistp",        "ALL", "0", "mov word ptr [edi], 0x0F7F\n fldcw [edi]\n fistp dword ptr [edi+8]", "FSW_NOCC", 0),
+    ("frndint",                     "ALL", "0", "frndint",                   "FSW_NOCC", 0),
+    ("fprem",                       "ALL", "0", "fprem",                     "FSW_ALL", 0),
+    ("fsin",                        "ALL", "0", "fsin",                      "FSW_TOP", 1),
+    ("fpatan",                      "ALL", "0", "fpatan",                    "FSW_TOP", 1),
+    ("fnstenv [edi]",               "ALL", "0", "fnstenv [edi]",             "FSW_ALL", 0),
+    ("fnsave/frstor [edi]",         "ALL", "0", "fnsave [edi]\n frstor [edi]", "FSW_ALL", 0),
+]
+
+def assemble(asm, bits=64):
     with tempfile.TemporaryDirectory() as d:
         src = os.path.join(d, "t.s"); obj = os.path.join(d, "t.o"); bin_ = os.path.join(d, "t.bin")
         with open(src, "w") as f:
             f.write(".intel_syntax noprefix\n.text\n" + asm + "\n")
-        subprocess.check_call(["as", "--64", "-o", obj, src])
+        subprocess.check_call(["as", f"--{bits}", "-o", obj, src])
         subprocess.check_call(["objcopy", "-O", "binary", "-j", ".text", obj, bin_])
         return open(bin_, "rb").read()
 
@@ -367,6 +533,21 @@ def main():
     with open(path, "w") as f:
         f.write("\n".join(out) + "\n")
     print(f"{len(CASES)} cases -> {path}")
+
+    out = ["/* GENERATED by cases_gen.py (32-bit mode) -- edit CASES32 there, not this file. */"]
+    for case in CASES32:
+        name, mask, setup, asm = case[:4]
+        code = assemble(asm, 32)
+        bytes_ = ",".join("0x%02X" % b for b in code)
+        cmt = asm.replace(chr(10), "; ")
+        if len(case) == 6:
+            out.append(f'    TX32("{name}", {mask}, {case[4]}, {case[5]}, {setup}, {bytes_}),   /* {cmt} */')
+        else:
+            out.append(f'    T32("{name}", {mask}, {setup}, {bytes_}),   /* {cmt} */')
+    path = os.path.join(HERE, "cases32_gen.inc")
+    with open(path, "w") as f:
+        f.write("\n".join(out) + "\n")
+    print(f"{len(CASES32)} cases -> {path}")
 
 if __name__ == "__main__":
     main()
