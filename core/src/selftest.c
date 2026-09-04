@@ -72,10 +72,19 @@ int xc_selftest(char *report, size_t report_len, int max_report) {
         c.rflags = v->in_flags | 0x2;   /* recorded masked; bit 1 is always set */
         c.rip = CODE_AT;
 
+        /* Alternate between the two execution paths so both are checked on
+         * this CPU: single-step (decode every time) and xc_run through the
+         * decoded-block cache. The code is followed by INT3 filler, so a run
+         * stops with XC_STOP_BREAKPOINT one byte past the snippet. */
         int steps = 0; xc_stop st = XC_STOP_NONE;
-        while (c.rip != CODE_AT + v->len && steps++ < 10000) {
-            st = xc_step(&c);
-            if (st != XC_STOP_NONE) break;
+        if (i & 1) {
+            st = xc_run(&c, 10000);
+            if (st == XC_STOP_BREAKPOINT && c.rip == CODE_AT + v->len + 1) c.rip = CODE_AT + v->len;
+        } else {
+            while (c.rip != CODE_AT + v->len && steps++ < 10000) {
+                st = xc_step(&c);
+                if (st != XC_STOP_NONE) break;
+            }
         }
         ran++;
 

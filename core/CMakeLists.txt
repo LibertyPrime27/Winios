@@ -339,7 +339,9 @@ set_property(TARGET softfloat PROPERTY C_STANDARD 11)
 # to fix them.
 add_library(xcore STATIC
     src/mem.c
-    src/interp.c)
+    src/interp.c
+    src/xop.c
+    src/cache.c)
 target_include_directories(xcore PUBLIC include)
 target_link_libraries(xcore PUBLIC Zydis softfloat)
 if(NOT APPLE)

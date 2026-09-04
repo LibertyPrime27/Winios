@@ -100,7 +100,7 @@ static unsigned x87_denorm_flag(xc_f80 a) { return f80_is_denorm(a) ? FSW_DE : 0
 
 /* --- memory operands ------------------------------------------------- */
 
-static int x87_load_mem(ctx *x, const ZydisDecodedOperand *op, int integer, xc_f80 *out, unsigned *flags) {
+static int x87_load_mem(ctx *x, const xop *op, int integer, xc_f80 *out, unsigned *flags) {
     uint64_t a = ea(x, op), lo, hi = 0;
     *flags = 0;
     if (op->size == 80) {
@@ -126,7 +126,7 @@ static int x87_load_mem(ctx *x, const ZydisDecodedOperand *op, int integer, xc_f
     return 1;
 }
 
-static int x87_store_mem(ctx *x, const ZydisDecodedOperand *op, int integer, int trunc, xc_f80 v) {
+static int x87_store_mem(ctx *x, const xop *op, int integer, int trunc, xc_f80 v) {
     uint64_t a = ea(x, op);
     if (op->size == 80) return mem_write(x, a, 64, v.mant) && mem_write(x, a + 8, 16, v.se);
     extFloat80_t e = f80_of(v);
@@ -397,14 +397,14 @@ static int x87_fxrstor(ctx *x, uint64_t a) {
 
 /* --- dispatch ------------------------------------------------------------- */
 
-static inline int st_index(const ZydisDecodedOperand *op) { return op->reg.value - ZYDIS_REGISTER_ST0; }
-static inline int is_st(const ZydisDecodedOperand *op) { return op->type == ZYDIS_OPERAND_TYPE_REGISTER && ZydisRegisterGetClass(op->reg.value) == ZYDIS_REGCLASS_X87; }
-static inline int is_mem(const ZydisDecodedOperand *op) { return op->type == ZYDIS_OPERAND_TYPE_MEMORY; }
+static inline int st_index(const xop *op) { return op->ridx; }
+static inline int is_st(const xop *op) { return op->type == XOP_REG && op->rcls == XR_X87; }
+static inline int is_mem(const xop *op) { return op->type == XOP_MEM; }
 
 /* Returns 1 if handled (ok in *ok), 0 if not an x87 instruction. */
 static int do_x87(ctx *x, ZydisMnemonic m, int *ok) {
     xc_cpu *c = x->c;
-    const ZydisDecodedOperand *ops = x->ops;
+    const xop *ops = x->ops;
     int nvis = x->in->operand_count_visible;
     unsigned fl = 0;
     xc_f80 a, b, r;
@@ -571,7 +571,7 @@ static int do_x87(ctx *x, ZydisMnemonic m, int *ok) {
         int ordered = m == ZYDIS_MNEMONIC_FCOM || m == ZYDIS_MNEMONIC_FCOMP || m == ZYDIS_MNEMONIC_FICOM || m == ZYDIS_MNEMONIC_FICOMP;
         int integer = m == ZYDIS_MNEMONIC_FICOM || m == ZYDIS_MNEMONIC_FICOMP;
         a = x87_read(c, 0);
-        const ZydisDecodedOperand *src = nvis >= 1 ? &ops[nvis - 1] : 0;
+        const xop *src = nvis >= 1 ? &ops[nvis - 1] : 0;
         if (src && is_mem(src)) { if (!x87_load_mem(x, src, integer, &b, &fl)) FAIL(); }
         else b = x87_read(c, src && is_st(src) ? st_index(src) : 1);
         x87_set_cc(c, x87_compare(c, a, b, ordered));

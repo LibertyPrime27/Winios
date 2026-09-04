@@ -97,6 +97,26 @@ Not yet: SSE3 and later (CPUID does not advertise them, so well-behaved code
 does not use them), AVX, `CMPXCHG16B`, `FBLD`/`FBSTP`, segment-register loads,
 anything privileged. Each is a case in the switch and a line in the difftest.
 
+## Speed: the decoded-block cache
+
+`xc_step` decodes and executes one instruction; `xc_run` (`core/src/cache.c`)
+does not decode at all on the hot path. Code is split into basic blocks --
+straight runs ending at the first branch, call, return or trap -- each decoded
+once into a compact pre-resolved operand form (`xop`: register slot, width,
+high-byte flag; base/index/scale/displacement with RIP-relative folded in;
+immediates sign-extended and branch targets absolute) and kept in a hash
+table by address. Executing a block is a memcmp of its code bytes against
+memory (self-modifying code drops the block and decodes again -- no write
+tracking needed) followed by the instructions' executors, until one leaves
+the straight line.
+
+Measured on `busybox sha256sum` of 1 MB (71 M instructions, x86-64 host):
+4 MIPS decoding every instruction, 51 MIPS with the cache -- 12×. What
+remains is the executor itself (the switch, ALU, flags), which is what the
+dynarec removes. The block structure here is what it compiles from, and the
+self-test replays half its vectors through this path so the cache is checked
+on device as well.
+
 ## 32-bit: tested against silicon too
 
 Every 64-bit case has a 32-bit sibling table (`CASES32` in `cases_gen.py`,
