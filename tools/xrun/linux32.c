@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -239,9 +240,9 @@ int do_syscall32(xc_cpu *c, int *code, int verbose) {
     case 301: r = host(SYS_unlinkat, (int32_t)a0, (long)P(a1), a2, 0, 0, 0); break;
     case 39:  r = host(SYS_mkdirat, AT_FDCWD, (long)P(a0), a1, 0, 0, 0); break;
     case 40:  r = host(SYS_unlinkat, AT_FDCWD, (long)P(a0), AT_REMOVEDIR, 0, 0, 0); break;
-    case 38:  r = host(SYS_renameat, AT_FDCWD, (long)P(a0), AT_FDCWD, (long)P(a1), 0, 0); break;
+    case 38:  r = renameat(AT_FDCWD, P(a0), AT_FDCWD, P(a1)) < 0 ? -errno : 0; break;
     case 41:  r = host(SYS_dup, a0, 0, 0, 0, 0, 0); break;
-    case 63:  r = host(SYS_dup2, a0, a1, 0, 0, 0, 0); break;
+    case 63:  r = dup2((int)a0, (int)a1) < 0 ? -errno : (int)a1; break;
     case 330: r = host(SYS_dup3, a0, a1, a2, 0, 0, 0); break;
     case 42:  r = host(SYS_pipe2, (long)P(a0), 0, 0, 0, 0, 0); break;
     case 331: r = host(SYS_pipe2, (long)P(a0), a1, 0, 0, 0, 0); break;
@@ -251,7 +252,7 @@ int do_syscall32(xc_cpu *c, int *code, int verbose) {
     case 94:  r = host(SYS_fchmod, a0, a1, 0, 0, 0, 0); break;
     case 118: r = host(SYS_fsync, a0, 0, 0, 0, 0, 0); break;
     case 133: r = host(SYS_fchdir, a0, 0, 0, 0, 0, 0); break;
-    case 168: r = host(SYS_poll, (long)P(a0), a1, a2, 0, 0, 0); break;      /* struct pollfd is the same */
+    case 168: r = poll(P(a0), a1, (int)a2) < 0 ? -errno : 0; break;         /* struct pollfd is the same */
     case 194: r = host(SYS_ftruncate, a0, (long)(((uint64_t)a2 << 32) | a1), 0, 0, 0, 0); break;
     case 91:  r = guest_unmap(a0, a1); break;
     case 122: r = host(SYS_uname, (long)P(a0), 0, 0, 0, 0, 0); break;        /* same layout */

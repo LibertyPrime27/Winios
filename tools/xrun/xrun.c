@@ -182,12 +182,64 @@ static uint64_t g_tid_addr;
 
 #define ARG(n) (c->gpr[(int[]){XC_RDI, XC_RSI, XC_RDX, XC_R10, XC_R8, XC_R9}[n]])
 
+#if defined(__x86_64__)
 static long host(long nr, long a, long b, long c_, long d, long e, long f) {
     long r = syscall(nr, a, b, c_, d, e, f);
     return r < 0 ? -errno : r;
 }
+#endif
 
 /* Returns 1 to keep running, 0 on exit (status in *code). */
+#if !defined(__x86_64__)
+/* On a non-x86 host the guest's syscall numbers mean nothing to the kernel,
+ * so this is a small translated table -- the calls a musl static binary
+ * needs to start, print and exit -- through libc wrappers. Enough to run
+ * the guest tests on an ARM64 host; the 32-bit path (linux32.c) is complete. */
+#include <sys/uio.h>
+#include <sys/ioctl.h>
+static int do_syscall(xc_cpu *c, int *code) {
+    uint64_t nr = c->gpr[XC_RAX];
+    long a0 = (long)ARG(0), a1 = (long)ARG(1), a2 = (long)ARG(2);
+    long r;
+    switch (nr) {
+    case 0:   r = read((int)a0, (void *)a1, (size_t)a2); if (r < 0) r = -errno; break;
+    case 1:   r = write((int)a0, (const void *)a1, (size_t)a2); if (r < 0) r = -errno; break;
+    case 3:   r = close((int)a0) < 0 ? -errno : 0; break;
+    case 16:  r = ioctl((int)a0, (unsigned long)a1, (void *)a2) < 0 ? -errno : 0; break;
+    case 20:  r = writev((int)a0, (const struct iovec *)a1, (int)a2); if (r < 0) r = -errno; break;
+    case 39:  r = getpid(); break;
+    case 60: case 231: *code = (int)a0 & 0xff; return 0;
+    case 9: {                                            /* mmap: the identity mapping makes this a host mmap */
+        void *p = mmap((void *)a0, (size_t)a1, (int)a2, (int)ARG(3), (int)ARG(4), (off_t)ARG(5));
+        r = p == MAP_FAILED ? -errno : (long)p; break;
+    }
+    case 10:  r = mprotect((void *)a0, (size_t)a1, (int)a2) < 0 ? -errno : 0; break;
+    case 11:  r = munmap((void *)a0, (size_t)a1) < 0 ? -errno : 0; break;
+    case 12: {
+        uint64_t want = (uint64_t)a0;
+        if (want == 0 || want < g_im.brk_start || want > g_im.brk_max) { r = (long)g_im.brk_cur; break; }
+        uint64_t cur_pg = PAGE_UP(g_im.brk_cur), want_pg = PAGE_UP(want);
+        if (want_pg > cur_pg) mprotect((void *)cur_pg, want_pg - cur_pg, PROT_READ | PROT_WRITE);
+        g_im.brk_cur = want; r = (long)want; break;
+    }
+    case 13: case 14: case 131: case 273: r = 0; break;  /* rt_sigaction, rt_sigprocmask, sigaltstack, set_robust_list */
+    case 158:
+        if (a0 == 0x1002) { c->fs_base = (uint64_t)a1; r = 0; } else if (a0 == 0x1001) { c->gs_base = (uint64_t)a1; r = 0; } else r = -EINVAL;
+        break;
+    case 218: g_tid_addr = (uint64_t)a0; r = getpid(); break;
+    case 228: { struct timespec ts; r = clock_gettime((clockid_t)a0, &ts) < 0 ? -errno : 0; if (!r) memcpy((void *)a1, &ts, sizeof ts); break; }
+    case 334: r = -ENOSYS; break;                        /* rseq */
+    default:
+        fprintf(stderr, "xrun: unimplemented (translated) syscall %llu at rip=%#llx\n", (unsigned long long)nr, (unsigned long long)c->rip);
+        r = -ENOSYS;
+    }
+    if (verbose) fprintf(stderr, "  syscall %llu(%#lx, %#lx, %#lx) = %ld\n", (unsigned long long)nr, a0, a1, a2, r);
+    c->gpr[XC_RAX] = (uint64_t)r;
+    c->gpr[XC_RCX] = c->rip;
+    c->gpr[XC_R11] = c->rflags;
+    return 1;
+}
+#else
 static int do_syscall(xc_cpu *c, int *code) {
     uint64_t nr = c->gpr[XC_RAX];
     long r;
@@ -275,6 +327,7 @@ static int do_syscall(xc_cpu *c, int *code) {
     c->gpr[XC_R11] = c->rflags;
     return 1;
 }
+#endif
 
 /* ---------------------------------------------------------------- main */
 
@@ -336,6 +389,13 @@ int main(int argc, char **argv, char **envp) {
         fprintf(stderr, "\n");
         code = 125; break;
     }
-    if (verbose) fprintf(stderr, "xrun: exit %d after ~%llu steps\n", code, (unsigned long long)steps);
+    if (verbose) {
+        uint64_t hits, builds, flushes, smc, jb, jco, jbytes;
+        xc_cache_stats(&hits, &builds, &flushes, &smc);
+        xc_jit_stats(&jb, &jco, &jbytes);
+        fprintf(stderr, "xrun: exit %d after ~%llu steps; blocks built %llu, hits %llu, smc %llu; jit: %s, %llu blocks (%llu KB), %llu callouts\n",
+                code, (unsigned long long)steps, (unsigned long long)builds, (unsigned long long)hits, (unsigned long long)smc,
+                xc_jit_enabled() ? "on" : "off", (unsigned long long)jb, (unsigned long long)(jbytes >> 10), (unsigned long long)jco);
+    }
     return code;
 }

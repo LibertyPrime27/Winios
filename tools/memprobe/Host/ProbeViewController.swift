@@ -86,9 +86,36 @@ final class ProbeViewController: UIViewController {
         running = true
         cpuLine = "running…"; gpuLine = "queued"; jitLine = "queued"; refresh()
         DispatchQueue.global(qos: .userInitiated).async {
+            // 1a. interpreter: decode-and-execute, the reference semantics
             var buf = [CChar](repeating: 0, count: 8192)
+            xc_jit_enable(0)
             let bad = xc_selftest(&buf, buf.count, 12)
-            let cpu = (bad == 0 ? "PASS — matches x86 silicon\n" : "FAIL — \(bad) mismatched\n") + String(cString: buf)
+            var cpu = "interpreter: " + (bad == 0 ? "PASS — matches x86 silicon\n" : "FAIL — \(bad) mismatched\n") + String(cString: buf)
+            DispatchQueue.main.async { self.cpuLine = cpu; self.refresh() }
+
+            // 1b. dynarec: the same vectors through ARM64 code the JIT emits
+            // into a debugger-blessed arena. Needs StikDebug attached.
+            var jr = jit_result()
+            self.markerPath.withCString { jit_probe_safe(&jr, $0) }
+            if jr.cs_debugged != 0 && jr.state != JIT_CRASHED {
+                var arena = jit_arena()
+                let ok = self.markerPath.withCString { jit_arena_create(&arena, 16 << 20, &jr, $0) }
+                if ok == 1 && xc_jit_set_code(arena.rw, arena.rx, arena.size) == 1 {
+                    xc_jit_enable(1)
+                    var buf2 = [CChar](repeating: 0, count: 8192)
+                    let bad2 = xc_selftest(&buf2, buf2.count, 12)
+                    var blocks: UInt64 = 0, callouts: UInt64 = 0, bytes: UInt64 = 0
+                    xc_jit_stats(&blocks, &callouts, &bytes)
+                    cpu += "dynarec:     " + (bad2 == 0 ? "PASS — ARM64 code matches x86 silicon\n" : "FAIL — \(bad2) mismatched\n")
+                        + String(cString: buf2)
+                        + "    \(blocks) blocks compiled, \(bytes >> 10) KB of ARM64, \(callouts) interpreter callouts\n"
+                    xc_jit_enable(0)
+                } else {
+                    cpu += "dynarec:     not run — could not obtain a blessed code arena\n"
+                }
+            } else {
+                cpu += "dynarec:     not run — no debugger attached (JIT needs StikDebug)\n"
+            }
             DispatchQueue.main.async { self.cpuLine = cpu; self.gpuLine = "running…"; self.refresh() }
 
             let gpu = GpuProbe.run()

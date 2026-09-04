@@ -259,5 +259,6 @@ In order, and each is gated by the previous:
 2. **A Linux-syscall or Win32 personality on top of the `XC_STOP_SYSCALL`
    boundary.** `xrun` is the Linux one, host-only for now; the Win32 side is
    what Wine provides once Wine itself runs here.
-3. **The ARM64 dynarec**, behind the same `xc_cpu`, checked against this
-   interpreter the way this interpreter is checked against silicon.
+3. ~~The ARM64 dynarec~~ — first version in `core/src/jit/`, see
+   [`DYNAREC.md`](DYNAREC.md): the integer core natively, everything else via
+   the interpreter, verified against the same silicon recordings.

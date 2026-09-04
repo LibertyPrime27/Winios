@@ -5,8 +5,8 @@
 #include <stdio.h>
 
 int main(void) {
-    char report[8192];
-    int bad = xc_selftest(report, sizeof report, 20);
+    static char report[65536];
+    int bad = xc_selftest(report, sizeof report, 400);
     fputs(report, stdout);
     if (bad) { fprintf(stderr, "selftest: %d mismatches\n", bad); return 1; }
     return 0;

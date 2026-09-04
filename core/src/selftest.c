@@ -77,7 +77,9 @@ int xc_selftest(char *report, size_t report_len, int max_report) {
          * decoded-block cache. The code is followed by INT3 filler, so a run
          * stops with XC_STOP_BREAKPOINT one byte past the snippet. */
         int steps = 0; xc_stop st = XC_STOP_NONE;
-        if (i & 1) {
+        /* On a host with the dynarec, every vector goes through xc_run (the
+         * JIT); elsewhere alternate so the block cache is covered too. */
+        if (xc_jit_enabled() || (i & 1)) {
             st = xc_run(&c, 10000);
             if (st == XC_STOP_BREAKPOINT && c.rip == CODE_AT + v->len + 1) c.rip = CODE_AT + v->len;
         } else {

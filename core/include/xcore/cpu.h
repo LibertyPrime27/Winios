@@ -78,12 +78,28 @@ typedef struct xc_cpu {
     xc_mode  mode;
     xc_mem  *mem;
 
+    /* Lazy flags (dynarec). When lz_op != XC_LZ_NONE the arithmetic bits of
+     * rflags are stale and must be recomputed from the last flag-setting
+     * operation recorded here (xc_flags_sync). Only the JIT writes these;
+     * the interpreter always keeps rflags exact. */
+    uint32_t lz_op;            /* XC_LZ_* | (operand bits << 8) */
+    uint32_t lz_cf;            /* carry-in / preserved CF where the op needs one */
+    uint64_t lz_a, lz_b, lz_r;
+    int64_t  steps;            /* JIT step budget, decremented per block */
+    uint64_t jit_base;         /* host address of guest 0 (arena base; 0 for identity) */
+
     /* Diagnostics for the last stop. */
     xc_stop  stop;
     uint64_t fault_addr;
     int      syscall_vector;   /* 0x80 for INT 80, -1 for SYSCALL */
     char     last_insn[64];    /* disassembly, when the formatter is built in */
 } xc_cpu;
+
+enum { XC_LZ_NONE = 0, XC_LZ_ADD, XC_LZ_SUB, XC_LZ_LOGIC, XC_LZ_INC, XC_LZ_DEC,
+       XC_LZ_SHL, XC_LZ_SHR, XC_LZ_SAR, XC_LZ_ROL, XC_LZ_ROR, XC_LZ_IMUL };
+
+/* Materialise lazily-tracked flags into rflags. Idempotent. */
+void xc_flags_sync(xc_cpu *c);
 
 /* Memory model -------------------------------------------------------- */
 
@@ -111,6 +127,16 @@ xc_stop xc_run(xc_cpu *c, uint64_t max_steps);
 void xc_cache_flush(void);
 void xc_cache_invalidate(uint64_t lo, uint64_t hi);
 void xc_cache_stats(uint64_t *hits, uint64_t *builds, uint64_t *flushes, uint64_t *smc);
+
+/* Dynarec (ARM64 hosts). xc_run uses it when available and enabled; set
+ * XCORE_JIT=0 in the environment to force the interpreter. */
+int  xc_jit_available(void);
+void xc_jit_enable(int on);
+/* iOS: supply dual-mapped code memory (written at rw, executed at rx) that
+ * the debugger has blessed; without it the JIT reports unavailable there. */
+int  xc_jit_set_code(void *rw, void *rx, size_t size);
+int  xc_jit_enabled(void);
+void xc_jit_stats(uint64_t *blocks_compiled, uint64_t *callouts, uint64_t *code_bytes);
 
 /* Execute exactly one instruction. */
 xc_stop xc_step(xc_cpu *c);
