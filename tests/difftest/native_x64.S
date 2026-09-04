@@ -10,6 +10,7 @@
  *   128 rflags
  *   136 code
  *   144 saved_rsp
+ *   160 fxsave area (512 bytes, 16-aligned): x87, MXCSR, XMM0-15
  */
     .text
     .globl  native_run
@@ -45,6 +46,8 @@ native_run:
     movq    104(%rdi), %r13
     movq    112(%rdi), %r14
     movq    120(%rdi), %r15
+    fxsave64  g_hostfx(%rip)          /* keep this process's own FPU state */
+    fxrstor64 160(%rdi)
     movq    32(%rdi),  %rsp          /* switch to the guest stack */
     movq    56(%rdi),  %rdi          /* rdi last -- it was our state pointer */
 
@@ -68,6 +71,8 @@ native_run:
     movq    %r13, 104(%rax)
     movq    %r14, 112(%rax)
     movq    %r15, 120(%rax)
+    fxsave64  160(%rax)
+    fxrstor64 g_hostfx(%rip)
     pushfq                            /* still on the guest stack; harmless */
     popq    128(%rax)
     movq    g_scratch(%rip), %rcx
@@ -88,5 +93,7 @@ native_run:
 g_state:   .quad 0
 g_code:    .quad 0
 g_scratch: .quad 0
+    .align  16
+g_hostfx:  .space 512
 
     .section .note.GNU-stack,"",@progbits

@@ -10,6 +10,7 @@
 #include "xcore/golden.h"
 #include "xcore/cpu.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -58,6 +59,12 @@ int xc_selftest(char *report, size_t report_len, int max_report) {
          * trampoline's own stack pointer, which is meaningless here. These
          * snippets provably never touch memory, so any valid value does. */
         c.gpr[XC_RSP] = STACK_AT;
+        if (v->in_xmm) memcpy(c.xmm, v->in_xmm, sizeof c.xmm);
+        if (v->in_x87) {
+            c.fcw = (uint16_t)v->in_x87[0]; c.fsw = (uint16_t)v->in_x87[1]; c.ftag_empty = (uint8_t)~v->in_x87[2];
+            int top = (c.fsw >> 11) & 7;
+            for (int r = 0; r < 8; r++) { c.fpr[(top + r) & 7].mant = v->in_x87[3 + 2 * r]; c.fpr[(top + r) & 7].se = (uint16_t)v->in_x87[4 + 2 * r]; }
+        }
         c.rflags = v->in_flags | 0x2;   /* recorded masked; bit 1 is always set */
         c.rip = CODE_AT;
 
@@ -83,6 +90,44 @@ int xc_selftest(char *report, size_t report_len, int max_report) {
                             "  %s: %s x86=%llx arm=%llx\n", v->name, rn[r],
                             (unsigned long long)v->out_gpr[r], (unsigned long long)c.gpr[r]);
                     bad = 1;
+                }
+            }
+            if (v->out_xmm) for (int r = 0; r < 16; r++) {
+                if (c.xmm[r].lo != v->out_xmm[2 * r] || c.xmm[r].hi != v->out_xmm[2 * r + 1]) {
+                    if (reported < max_report && off + 128 < report_len)
+                        off += (size_t)snprintf(report + off, report_len - off,
+                            "  %s: xmm%d x86=%llx_%llx arm=%llx_%llx\n", v->name, r,
+                            (unsigned long long)v->out_xmm[2 * r + 1], (unsigned long long)v->out_xmm[2 * r],
+                            (unsigned long long)c.xmm[r].hi, (unsigned long long)c.xmm[r].lo);
+                    bad = 1;
+                }
+            }
+            if (v->out_x87) {
+                const uint64_t *o = v->out_x87;
+                int top = (c.fsw >> 11) & 7;
+                if (c.fcw != o[0] || (c.fsw & v->fsw_mask) != (o[1] & v->fsw_mask) || (uint8_t)~c.ftag_empty != o[2]) {
+                    if (reported < max_report && off + 128 < report_len)
+                        off += (size_t)snprintf(report + off, report_len - off,
+                            "  %s: x87 fcw/fsw/ftw x86=%llx/%llx/%llx arm=%x/%x/%x\n", v->name,
+                            (unsigned long long)o[0], (unsigned long long)(o[1] & v->fsw_mask), (unsigned long long)o[2],
+                            c.fcw, c.fsw & v->fsw_mask, (uint8_t)~c.ftag_empty);
+                    bad = 1;
+                } else for (int r = 0; r < 8; r++) {
+                    int p = (top + r) & 7;
+                    if (c.ftag_empty & (1u << p)) continue;
+                    uint64_t em = c.fpr[p].mant, xm = o[3 + 2 * r]; unsigned es = c.fpr[p].se, xsx = (unsigned)o[4 + 2 * r];
+                    int same = em == xm && es == xsx;
+                    if (!same && v->fuzzy) {
+                        /* transcendental: compare as doubles, loosely */
+                        double a = (double)ldexp((double)(xm >> 11), (int)(xsx & 0x7FFF) - 16383 - 52), b = (double)ldexp((double)(em >> 11), (int)(es & 0x7FFF) - 16383 - 52);
+                        if ((xsx ^ es) & 0x8000) same = 0; else same = fabs(a - b) <= 1e-15 * fabs(a) + 1e-300;
+                    }
+                    if (!same) {
+                        if (reported < max_report && off + 128 < report_len)
+                            off += (size_t)snprintf(report + off, report_len - off,
+                                "  %s: st(%d) x86=%04x_%016llx arm=%04x_%016llx\n", v->name, r, xsx, (unsigned long long)xm, es, (unsigned long long)em);
+                        bad = 1;
+                    }
                 }
             }
             if ((c.rflags & v->flag_mask) != (v->out_flags & v->flag_mask)) {

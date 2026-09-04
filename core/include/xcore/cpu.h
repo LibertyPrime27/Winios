@@ -56,11 +56,24 @@ typedef struct xc_mem {
     uint64_t size;        /* arena size (32-bit) */
 } xc_mem;
 
+/* One 128-bit SSE register, as two little-endian halves. */
+typedef struct { uint64_t lo, hi; } xc_u128;
+/* One x87 register: 64-bit significand, then sign + 15-bit exponent. */
+typedef struct { uint64_t mant; uint16_t se; } xc_f80;
+
 typedef struct xc_cpu {
     uint64_t gpr[16];
     uint64_t rip;
     uint64_t rflags;
     uint64_t fs_base, gs_base;
+    xc_u128  xmm[16];
+    uint32_t mxcsr;
+    /* x87: eight physical 80-bit registers (ST(i) = fpr[(TOP+i)&7], TOP in
+     * fsw bits 11-13), control and status words, and an empty-tag bitmask. */
+    xc_f80   fpr[8];
+    uint16_t fcw, fsw;
+    uint8_t  ftag_empty;
+    uint64_t tsc;              /* RDTSC counter: deterministic, advances per read */
     xc_mode  mode;
     xc_mem  *mem;
 
@@ -94,6 +107,9 @@ xc_stop xc_run(xc_cpu *c, uint64_t max_steps);
 xc_stop xc_step(xc_cpu *c);
 
 const char *xc_stop_name(xc_stop s);
+
+/* Disassemble the instruction at `rip` into `buf` (for diagnostics). */
+int xc_disasm(const xc_cpu *c, uint64_t rip, char *buf, size_t buflen);
 
 #ifdef __cplusplus
 }

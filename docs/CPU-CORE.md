@@ -52,21 +52,66 @@ touching host memory. `tests/test_arena32.c` checks both.
 a dynarec exists: it is what the dynarec is checked against, and what runs when
 JIT is unavailable (see `JIT-DESIGN.md` §5 — the interpreter is never dead code).
 
-Currently implemented: `MOV`/`MOVZX`/`MOVSX`/`MOVSXD`, `LEA`, `XCHG`; the ALU
-family (`ADD ADC SUB SBB AND OR XOR CMP TEST INC DEC NEG NOT`); shifts and
-rotates; `MUL`/`IMUL` (all forms), `DIV`/`IDIV` with `#DE`; the sign-extension
-family (`CBW`…`CQO`); `PUSH`/`POP`/`LEAVE`; `JMP`/`Jcc`/`CALL`/`RET`/`JRCXZ`;
-`CMOVcc`/`SETcc`; `MOVS*`/`STOS*` with `REP`; `NOP`/`PAUSE`/`ENDBR`; and
-`HLT`/`INT3`/`UD2`/`SYSCALL`/`INT n` as stop conditions the host handles.
+Implemented, all checked against silicon (see below):
+
+- **Integer.** `MOV`/`MOVZX`/`MOVSX`/`MOVSXD`, `LEA`, `XCHG`, `BSWAP`; the ALU
+  family (`ADD ADC SUB SBB AND OR XOR CMP TEST INC DEC NEG NOT`); shifts,
+  rotates, `RCL`/`RCR`, `SHLD`/`SHRD`; `MUL`/`IMUL` (all forms), `DIV`/`IDIV`
+  with `#DE`; `CBW`…`CQO`; `PUSH`/`POP`/`LEAVE`; `JMP`/`Jcc`/`CALL`/`RET`/
+  `JRCXZ`/`LOOP*`; `CMOVcc`/`SETcc`; the whole string family with `REP`/
+  `REPE`/`REPNE`; `BT`/`BTS`/`BTR`/`BTC`, `BSF`/`BSR`/`TZCNT`/`LZCNT`/`POPCNT`;
+  `CMPXCHG`/`XADD` (one core, so plain read-modify-write is atomic); `LAHF`/
+  `SAHF`/`CLC`/`STC`/`CMC`/`CLD`/`STD`; `CPUID` (a fixed SSE2-class CPU with
+  no AVX/BMI, so libraries pick the code paths that exist here), `RDTSC`
+  (deterministic), fences and prefetches as no-ops, CET shadow-stack ops as
+  the no-ops they are on hardware without CET.
+- **SSE / SSE2.** All the moves (`MOVAPS`…`MOVQ`/`MOVD`, the merge semantics
+  of `MOVSD`/`MOVSS`, `MOVLPS`/`MOVHPS`), packed integer arithmetic including
+  the saturating and multiply forms, compares, shifts, shuffles, unpacks and
+  packs, `PMOVMSKB`, scalar and packed single/double arithmetic, `MIN`/`MAX`
+  with x86's "second operand wins" NaN rule, `COMIS*`/`UCOMIS*`, the `CMP`
+  predicates, every conversion, `LDMXCSR`/`STMXCSR`. NaN propagation follows
+  the SDM (first NaN operand, quieted; invalid operations yield x86's
+  *negative* default NaN), and the MXCSR exception flags are maintained:
+  IE/ZE/OE/UE/PE come back from the host FPU via `fenv`, DE from the inputs.
+- **x87.** The full stack machine in `core/src/interp_x87.h`: loads and stores
+  in every width, the arithmetic group in all operand forms, `FCOM*`/`FUCOM*`/
+  `FCOMI*`/`FTST`/`FXAM`, `FCMOVcc`, `FPREM`/`FPREM1` with the quotient bits,
+  `FSCALE`, `FXTRACT`, `FRNDINT`, `FSQRT`, control-word handling (precision
+  control and rounding mode are honoured on every operation — D3D9 puts the
+  FPU into 24-bit mode and Fallout 3 lives there), stack faults, and the
+  environment/save-area formats (`FNSTENV`, `FNSAVE`, `FXSAVE`). Arithmetic is
+  [Berkeley SoftFloat](https://github.com/ucb-bar/berkeley-softfloat-3)
+  (BSD-3) with the 8086 specialisation, so the results are the x87's bits on
+  any host. `FSIN`/`FCOS`/`FPTAN`/`FPATAN`/`F2XM1`/`FYL2X*` use the host's
+  `long double`: real x87s disagree with each other in the last bits of
+  these, and the test compares them with a tolerance.
 
 Flags are computed eagerly and exactly, including the parts people get wrong:
 `INC`/`DEC` preserve `CF`; a 32-bit `CMOVcc` zero-extends the destination even
 when the move does not happen; shift-by-zero leaves flags untouched; `NEG`
-sets `CF` from the operand rather than the result.
+sets `CF` from the operand rather than the result; `BT` with a register bit
+offset and a memory operand adjusts the address.
 
-Not yet: SSE/x87, `BT*`, `SHLD`/`SHRD`, `CMPXCHG`, `XADD`, `BSF`/`BSR`,
-`LODS`/`SCAS`/`CMPS`, segment-register loads, anything privileged. Each is a
-case in the switch and a line in the difftest.
+Not yet: SSE3 and later (CPUID does not advertise them, so well-behaved code
+does not use them), AVX, `CMPXCHG16B`, `FBLD`/`FBSTP`, segment-register loads,
+anything privileged. Each is a case in the switch and a line in the difftest.
+
+## Running programs: `xrun`
+
+`tools/xrun/xrun.c` loads a static x86-64 Linux ELF (`ET_EXEC` or static PIE),
+builds the initial stack the way the kernel does (argv, envp, auxv with
+`AT_PHDR`/`AT_RANDOM`/…), and services system calls at the `XC_STOP_SYSCALL`
+boundary. Because guest addresses are host addresses, a pointer the guest
+hands to `write()` goes straight to the host; the layer is an explicit
+allow-list rather than a pass-through, and `brk`, `arch_prctl` (TLS) and the
+signal/thread calls are handled in xrun rather than reaching the host kernel.
+
+It runs `tests/guest/hello` (no libc), `tests/guest/libc_hello` (musl static:
+TLS setup, `malloc` over `brk`, `printf`), and a stock glibc-static
+`busybox`: `sh`, `awk` with floating point, `md5sum`, `sha256sum`, `sort`,
+`gzip`, `printf %f` all produce output identical to native. That is the
+milestone the roadmap below called "enough instructions to run real code".
 
 ## The test that makes this tractable
 
@@ -80,8 +125,13 @@ the specification**. For every case:
    whole register file, calls the bytes on a private stack, and stores
    everything back.
 3. Restore memory, run the same bytes through `xc_step` until it returns.
-4. Compare all sixteen GPRs, the flags under a per-case mask, and every byte
-   of the data and stack regions.
+4. Compare all sixteen GPRs, the flags under a per-case mask, XMM0-15 and
+   MXCSR, the x87 stack (control word, status word under a mask, tags, and
+   every valid register), and every byte of the data and stack regions.
+
+The trampoline moves the whole FPU state with `FXRSTOR`/`FXSAVE` and keeps the
+host's own state aside, so a case that leaves the x87 stack full or the
+precision control at 24 bits does not poison the process running the test.
 
 Six seeds per case. A wrong `AF` or a missed zero-extension shows up as a
 one-line diff against silicon rather than as a game crashing three layers up.
@@ -113,9 +163,10 @@ elsewhere); those stay covered by `difftest` on CI and `test_arena32` locally.
 
 ## Adding an instruction
 
-1. Add the case in `xc_step`.
-2. Add a `T(...)` line in `difftest.c` with the hand-assembled bytes. If the
-   instruction leaves flags undefined, mask them and say why in a comment.
+1. Add the case in `xc_step` (or `do_sse` / `do_x87`).
+2. Add a line to `CASES` in `tests/difftest/cases_gen.py` — assembly text,
+   not bytes — and run it to regenerate `cases_gen.inc`. If the instruction
+   leaves flags undefined, mask them and say why in a comment.
 3. If it touches memory, make it touch `[rdi+…]` — `rdi` points at the shared
    data buffer, which is compared byte-for-byte.
 4. If it is 32-bit-only or address-width sensitive, add a check to
@@ -158,10 +209,10 @@ code and by graphics, and both of those will be native from day one.
 
 In order, and each is gated by the previous:
 
-1. **Enough instructions to run real code.** SSE2 (every modern compiler emits
-   it), `CMPXCHG`, `BT*`, the remaining string ops. Measured by running a
-   statically linked x86-64 `hello world` to its exit syscall.
+1. ~~Enough instructions to run real code.~~ Done: `xrun` runs musl and glibc
+   static binaries, busybox included.
 2. **A Linux-syscall or Win32 personality on top of the `XC_STOP_SYSCALL`
-   boundary.** Which one is a product decision; the core does not care.
+   boundary.** `xrun` is the Linux one, host-only for now; the Win32 side is
+   what Wine provides once Wine itself runs here.
 3. **The ARM64 dynarec**, behind the same `xc_cpu`, checked against this
    interpreter the way this interpreter is checked against silicon.

@@ -28,6 +28,17 @@ typedef struct {
     int            touches_mem;   /* recorded, not inferred */
     const uint8_t *code;
     size_t         len;
+    /* xmm0..15 as lo,hi pairs (32 qwords); NULL when the case names no XMM
+     * register. The MXCSR is always its default in these vectors. */
+    const uint64_t *in_xmm;
+    const uint64_t *out_xmm;
+    /* x87: {fcw, fsw, ftw-abridged, then ST(0)..ST(7) as mant,se pairs} =
+     * 19 entries; NULL for non-x87 cases. fsw_mask selects the status bits
+     * compared; fuzzy marks transcendental results compared with tolerance. */
+    const uint64_t *in_x87;
+    const uint64_t *out_x87;
+    unsigned        fsw_mask;
+    int             fuzzy;
 } golden_vec;
 
 extern const golden_vec xc_golden[];
