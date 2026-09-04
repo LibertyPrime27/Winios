@@ -51,7 +51,7 @@ jobs:
             [ "$got" = "$exp" ] && echo "ok   $g (jit)" || { echo "FAIL $g (jit)"; echo "$got"; exit 1; }
           done
           if gcc -m32 -static -O2 -o /tmp/lh32 libc_hello.c 2>/dev/null; then
-            exp=$(/tmp/lh32 x y); got=$($Q ../../build-a64/xrun /tmp/lh32 x y)
+            exp=$(/tmp/lh32 x y || true); got=$($Q ../../build-a64/xrun /tmp/lh32 x y || true)   # exits 3 by design
             [ "$got" = "$exp" ] && echo "ok   libc_hello i386 glibc (jit)" || { echo "FAIL libc_hello i386 (jit)"; echo "$got"; exit 1; }
           fi
 
