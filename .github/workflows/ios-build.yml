@@ -133,11 +133,17 @@ jobs:
       # Apple silicon: the dynarec natively, against the silicon recordings.
       - name: Dynarec on Apple silicon (golden replay)
         run: |
-          cmake -S . -B build-mac -DCMAKE_BUILD_TYPE=Release -DWINIOS_D12MT=OFF
-          cmake --build build-mac -j3 --target test_selftest test_arena32
-          ./build-mac/test_selftest
-          XCORE_JIT=0 ./build-mac/test_selftest | tail -1
-          ./build-mac/test_arena32
+          set +e
+          cmake -S . -B build-mac -DCMAKE_BUILD_TYPE=Release -DWINIOS_D12MT=OFF 2>&1 | tail -3
+          cmake --build build-mac -j3 --target test_selftest test_arena32 2>&1 | grep -E "error|warning: |Built target" | head -20
+          uname -m; sysctl -n machdep.cpu.brand_string || true
+          out=$(./build-mac/test_selftest 2>&1); rc=$?
+          echo "$out" | tail -30 | while IFS= read -r l; do echo "::notice::jit: ${l}"; done
+          out2=$(XCORE_JIT=0 ./build-mac/test_selftest 2>&1); rc2=$?
+          echo "$out2" | tail -3 | while IFS= read -r l; do echo "::notice::interp: ${l}"; done
+          ./build-mac/test_arena32; rc3=$?
+          echo "rc jit=$rc interp=$rc2 arena=$rc3"
+          [ $rc -eq 0 ] && [ $rc2 -eq 0 ] && [ $rc3 -eq 0 ]
 
       - name: Install XcodeGen
         run: brew install xcodegen
