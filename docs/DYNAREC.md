@@ -86,6 +86,18 @@ Three layers, from cheapest to most authoritative:
    runs it on the iPad and iPhone inside a debugger-blessed arena
    (`xc_jit_set_code`), which is the real target environment.
 
+   One rule on iOS 26 / TXM hardware: **one bless per launch.** Blessing ends
+   with the debugger detaching, and any `brk #0xf00d` after that is an
+   unserviced breakpoint -- the kernel delivers SIGTRAP and the process dies
+   (`"esr": "(Breakpoint) brk 61453"` in the crash log). The first MemProbe
+   build with the dynarec pass created a second arena for it and crashed
+   exactly there. `jit_arena_shared()` now owns the single arena, the execute
+   probe and the dynarec pass both draw from it, and `jit_arena_create()`
+   refuses a second attempt in the same process rather than trapping. Real
+   dynarec code memory therefore has to be sized up front (or the app has to
+   re-attach StikDebug to grow it), which is why the code cache is one arena
+   sub-allocated by xcore rather than a pool of mappings.
+
 Debugging aids: `XCORE_JIT_TRACE=1` prints each block entry; `XCORE_JIT_DUMP=dir`
 writes every compiled block's bytes for `objdump -D -b binary -m aarch64`.
 

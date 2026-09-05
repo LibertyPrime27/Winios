@@ -47,6 +47,16 @@ int jit_arena_run(jit_arena *a, const void *code, size_t len, jit_result *r,
 
 void jit_arena_free(jit_arena *a);
 
+/* The process-wide arena. The debugger session is single-use (create ends
+ * with a detach, after which any brk is fatal), so every consumer -- the
+ * execute probe, the dynarec self-test, later the real JIT -- must share one
+ * arena created on first request. Returns NULL and fills `r` if no arena can
+ * be had; `*fresh` is 1 only on the call that created it (safe to scribble a
+ * test instruction at offset 0 before anyone else has used the memory). Never
+ * freed; jit_arena_free on it is a no-op. After the first attempt, whatever
+ * its outcome, this never executes another brk. */
+jit_arena *jit_arena_shared(size_t size, jit_result *r, const char *marker_path, int *fresh);
+
 #ifdef __cplusplus
 }
 #endif

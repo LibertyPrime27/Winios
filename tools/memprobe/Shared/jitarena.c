@@ -40,9 +40,28 @@ static int is_debugged(uint32_t *flags_out) {
     return rc == 0 && (flags & CS_DEBUGGED) != 0;
 }
 
+/* The debugger session is single-use: the create below ends with a detach,
+ * and any brk after that is unserviced and fatal (SIGTRAP, "brk 61453" in the
+ * crash log). So the process gets exactly one bless attempt, enforced here
+ * where the brk lives rather than trusted to every caller. */
+static int g_session_used;
+static jit_arena g_shared;
+static int g_shared_ok;
+
 int jit_arena_create(jit_arena *a, size_t size, jit_result *r, const char *marker_path) {
     memset(a, 0, sizeof *a);
     memset(r, 0, sizeof *r);
+
+    if (g_session_used) {
+        is_debugged(&r->cs_flags);
+        r->cs_debugged = 1;
+        r->state = g_shared_ok ? JIT_MAPPED : JIT_ABSENT;
+        snprintf(r->detail, sizeof r->detail,
+                 "The debugger session was already used (and detached) by an earlier "
+                 "arena in this launch; a second bless would trap. Reuse the shared "
+                 "arena (jit_arena_shared) or relaunch.");
+        return 0;
+    }
 
     if (!is_debugged(&r->cs_flags)) {
         r->state = JIT_ABSENT;
@@ -70,6 +89,7 @@ int jit_arena_create(jit_arena *a, size_t size, jit_result *r, const char *marke
      * debugger has touched -- remap and vm_protect both succeed regardless,
      * which is why their success says nothing about whether code will run. */
     crumb(marker_path, "bless (brk #0xf00d, x16=1)");
+    g_session_used = 1;                  /* from here on, no second attempt */
     void *got = jit26_prepare_region(rx, size);
     if (got && got != rx) rx = got;      /* the script may relocate it */
 
@@ -143,6 +163,32 @@ int jit_arena_run(jit_arena *a, const void *code, size_t len, jit_result *r,
 }
 
 void jit_arena_free(jit_arena *a) {
+    if (a == &g_shared) return;          /* the shared arena lives until exit */
     if (a->rx) munmap(a->rx, a->size);
     memset(a, 0, sizeof *a);
+}
+
+jit_arena *jit_arena_shared(size_t size, jit_result *r, const char *marker_path, int *fresh) {
+    if (fresh) *fresh = 0;
+    if (g_session_used) {
+        memset(r, 0, sizeof *r);
+        is_debugged(&r->cs_flags);
+        r->cs_debugged = 1;
+        if (g_shared_ok) {
+            r->state = JIT_MAPPED;
+            snprintf(r->detail, sizeof r->detail,
+                     "Reusing the arena blessed earlier this launch: %zu KB, RX %p / RW %p.",
+                     g_shared.size / 1024, g_shared.rx, g_shared.rw);
+            return &g_shared;
+        }
+        r->state = JIT_ABSENT;
+        snprintf(r->detail, sizeof r->detail,
+                 "The one bless attempt this launch did not produce an arena; relaunch to retry.");
+        return NULL;
+    }
+    int ok = jit_arena_create(&g_shared, size, r, marker_path);
+    if (!ok) return NULL;
+    g_shared_ok = 1;
+    if (fresh) *fresh = 1;
+    return &g_shared;
 }
