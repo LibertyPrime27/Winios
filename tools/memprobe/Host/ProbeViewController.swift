@@ -93,14 +93,19 @@ final class ProbeViewController: UIViewController {
             var cpu = "interpreter: " + (bad == 0 ? "PASS — matches x86 silicon\n" : "FAIL — \(bad) mismatched\n") + String(cString: buf)
             DispatchQueue.main.async { self.cpuLine = cpu; self.refresh() }
 
+            // 2. JIT: the one bless of this launch. Blesses the shared arena and
+            // executes a `ret` from it. Everything that needs executable memory
+            // afterwards -- the dynarec pass below, the JIT button -- reuses
+            // this arena; the debugger detaches at the end of the bless, and a
+            // second bless would be an unserviced brk (the 5c2e468 crash).
+            DispatchQueue.main.async { self.jitLine = "blessing arena…"; self.refresh() }
+            let jit = self.executeArena()
+            DispatchQueue.main.async { self.jitLine = jit; self.refresh() }
+
             // 1b. dynarec: the same vectors through ARM64 code the JIT emits
-            // into a debugger-blessed arena. Needs StikDebug attached.
-            var jr = jit_result()
-            self.markerPath.withCString { jit_probe_safe(&jr, $0) }
-            if jr.cs_debugged != 0 && jr.state != JIT_CRASHED {
-                var arena = jit_arena()
-                let ok = self.markerPath.withCString { jit_arena_create(&arena, 16 << 20, &jr, $0) }
-                if ok == 1 && xc_jit_set_code(arena.rw, arena.rx, arena.size) == 1 {
+            // into that arena.
+            if let arena = self.sharedArena, arena.pointee.blessed != 0 {
+                if self.handArenaToXcore(arena) {
                     xc_jit_enable(1)
                     var buf2 = [CChar](repeating: 0, count: 8192)
                     let bad2 = xc_selftest(&buf2, buf2.count, 12)
@@ -111,30 +116,15 @@ final class ProbeViewController: UIViewController {
                         + "    \(blocks) blocks compiled, \(bytes >> 10) KB of ARM64, \(callouts) interpreter callouts\n"
                     xc_jit_enable(0)
                 } else {
-                    cpu += "dynarec:     not run — could not obtain a blessed code arena\n"
+                    cpu += "dynarec:     not run — arena too small for xcore (\(arena.pointee.size >> 10) KB)\n"
                 }
             } else {
-                cpu += "dynarec:     not run — no debugger attached (JIT needs StikDebug)\n"
+                cpu += "dynarec:     not run — no blessed arena (see JIT below)\n"
             }
             DispatchQueue.main.async { self.cpuLine = cpu; self.gpuLine = "running…"; self.refresh() }
 
             let gpu = GpuProbe.run()
-            DispatchQueue.main.async { self.gpuLine = gpu; self.jitLine = "checking…"; self.refresh() }
-
-            // If a debugger is already attached -- LiveContainer + StikDebug do
-            // that before the app's first instruction -- go straight to the real
-            // test. Only skip it if a previous attempt crashed here (marker).
-            var r = jit_result()
-            self.markerPath.withCString { jit_probe_safe(&r, $0) }
-            let jit: String
-            if r.cs_debugged != 0 && r.state != JIT_CRASHED {
-                jit = self.executeArena() + "\n    (debugger was already attached at launch — executed directly)"
-            } else if r.cs_debugged != 0 {
-                jit = self.describe(r) + "\n    (a previous execute crashed; Reset results clears the marker to retry)"
-            } else {
-                jit = self.describe(r) + "\n    (no debugger attached — use the JIT button to attach StikDebug)"
-            }
-            DispatchQueue.main.async { self.jitLine = jit; self.refresh() }
+            DispatchQueue.main.async { self.gpuLine = gpu; self.refresh() }
 
             // The ladder pauses whenever the app is not frontmost. `isActive`
             // is written on the main thread and read here; a stale read only
@@ -188,9 +178,7 @@ final class ProbeViewController: UIViewController {
         var probe = jit_result()
         markerPath.withCString { jit_probe_safe(&probe, $0) }
         if probe.cs_debugged != 0 {
-            jitLine = probe.state == JIT_CRASHED
-                ? describe(probe) + "\n    (a previous execute crashed; Reset results clears the marker to retry)"
-                : executeArena() + "\n    (debugger was already attached — executed directly)"
+            jitLine = executeArena()        // reuses the arena if this launch already has one
             refresh()
             return
         }
@@ -226,21 +214,57 @@ final class ProbeViewController: UIViewController {
         runArena()
     }
 
-    /// The real protocol: allocate RX, have the debugger bless every 16 KB page,
-    /// build the RW alias, detach, then write and execute. Thread-agnostic;
-    /// returns the report line.
+    /// The process-wide blessed arena (nil until executeArena has run, or if
+    /// the bless failed). 1 MB: the size that is known to work on the iPad, and
+    /// twenty times what the dynarec self-test compiles (≈50 KB). Whether the
+    /// debugger script copes with much larger regions is a separate experiment
+    /// -- one that has to be run knowing it may cost the launch.
+    private var sharedArena: UnsafeMutablePointer<jit_arena>?
+    private var arenaInXcore = false
+    private var arenaReport = ""
+    private let arenaSize = 1 << 20
+
+    /// Point xcore's code emitter at the arena. Idempotent: xcore keeps the
+    /// dispatcher it built on first use, and the `ret` probe only ever ran
+    /// before this (on the fresh arena), so nothing tramples anything.
+    private func handArenaToXcore(_ a: UnsafeMutablePointer<jit_arena>) -> Bool {
+        if arenaInXcore { return true }
+        arenaInXcore = xc_jit_set_code(a.pointee.rw, a.pointee.rx, a.pointee.size) == 1
+        return arenaInXcore
+    }
+
+    /// The real protocol, once per launch: allocate RX, have the debugger bless
+    /// every 16 KB page, build the RW alias, detach, then write a `ret` and
+    /// execute it. Later calls return the same arena and the saved report
+    /// without touching the breakpoint again. Thread-agnostic.
     private func executeArena() -> String {
         var r = jit_result()
-        var arena = jit_arena()
-        let ok = markerPath.withCString { jit_arena_create(&arena, 1 << 20, &r, $0) }
-        if ok == 1 {
+
+        // Refuse to walk into a breakpoint that killed a previous launch.
+        var probe = jit_result()
+        markerPath.withCString { jit_probe_safe(&probe, $0) }
+        if probe.cs_debugged == 0 {
+            return describe(probe) + "\n    (no debugger attached — use the JIT button to attach StikDebug)"
+        }
+        if probe.state == JIT_CRASHED && sharedArena == nil {
+            return describe(probe) + "\n    (a previous bless/execute crashed; Reset results clears the marker to retry)"
+        }
+
+        var fresh: Int32 = 0
+        let arena = markerPath.withCString { jit_arena_shared(arenaSize, &r, $0, &fresh) }
+        guard let arena else {
+            arenaReport = describe(r)
+            return arenaReport
+        }
+        sharedArena = arena
+        if fresh == 1 {
             var code: UInt32 = 0xD65F03C0      // AArch64 `ret`
             _ = withUnsafeBytes(of: &code) { raw in
-                markerPath.withCString { jit_arena_run(&arena, raw.baseAddress, 4, &r, $0) }
+                markerPath.withCString { jit_arena_run(arena, raw.baseAddress, 4, &r, $0) }
             }
-            jit_arena_free(&arena)
+            arenaReport = describe(r) + "\n    (debugger was attached — blessed \(arenaSize >> 10) KB and executed directly)"
         }
-        return describe(r)
+        return arenaReport
     }
 
     private func runArena() {

@@ -11,8 +11,16 @@ enum ResultStore {
     static let appGroup = "group.winios.memprobe"
 
     /// The shared container. Also where the JIT probe keeps its crash marker.
+    /// Under LiveContainer the app-group entitlement may not resolve (the guest
+    /// runs inside LiveContainer's own container), which used to leave the
+    /// marker path empty -- so a crash at the bless breakpoint was never
+    /// recorded and the next launch walked straight into it again. Fall back
+    /// to the app's own Library directory rather than to no marker at all.
     static var containerDir: URL? {
-        FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup)
+        if let group = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup) {
+            return group
+        }
+        return FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first
     }
 
     static var url: URL? { containerDir?.appendingPathComponent("ladder.jsonl") }
