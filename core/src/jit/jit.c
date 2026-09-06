@@ -72,6 +72,11 @@
 
 static size_t g_code_used;
 static uint64_t g_stat_blocks, g_stat_callouts;
+/* Bytes ever emitted. Not the same as g_code_used, which is how much of the
+ * arena is in use *now*: a cache flush resets that to zero while the block
+ * count keeps climbing, and reporting the two together then reads as 4695
+ * blocks in 64 KB. Blocks are cumulative, so the bytes beside them must be. */
+static uint64_t g_stat_bytes;
 /* x87 instructions the compiler lowered natively vs sent to the interpreter,
  * counted at compile time. The ratio is what says whether the 53-bit fast
  * path is actually engaging on a given program (see xc_jit_x87_stats). */
@@ -225,7 +230,7 @@ void xc_jit_unlink(block *b) { (void)b; }
 void xc_jit_stats(uint64_t *blocks, uint64_t *callouts, uint64_t *bytes) {
     if (blocks) *blocks = g_stat_blocks;
     if (callouts) *callouts = g_stat_callouts;
-    if (bytes) *bytes = g_code_used;
+    if (bytes) *bytes = g_stat_bytes;
 }
 uint64_t xc_jit_links(void) { return g_stat_links; }
 void xc_jit_link_stats(uint64_t *links, uint64_t *warm, uint64_t *stub) {
@@ -1250,6 +1255,7 @@ static void *compile(xc_cpu *c, block *b) {
         FILE *f = fopen(name, "wb"); if (f) { fwrite(j.a.buf, 1, bytes, f); fclose(f); }
     }
     g_code_used += (bytes + 15) & ~(size_t)15;
+    g_stat_bytes += bytes;
     g_stat_blocks++;
     b->warm = (uint8_t *)rx + warm * 4;
     b->live_in = livein;
@@ -1283,6 +1289,7 @@ static void *link_stub(uint32_t need, void *warm) {
     a64_b(&a, (int32_t)off);
     code_write_end(rw, (size_t)a.n * 4, rx);
     g_code_used += ((size_t)a.n * 4 + 15) & ~(size_t)15;
+    g_stat_bytes += (uint64_t)a.n * 4;
     return rx;
 }
 

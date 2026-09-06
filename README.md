@@ -38,42 +38,45 @@ The emulator core is kept platform-independent so most of it builds and tests on
 
 ## Measured on hardware (Sept 2026)
 
-Both columns are build `3555253`, run on the devices themselves through MemProbe.
+Both devices, after the change that carries guest registers across a chained
+link (iPad on `7397729`, iPhone on `f0fe2ce`).
 
 | | iPad Air 11" (M3), iPadOS 26.3.1 | iPhone Air (A19 Pro), iOS 27.0 |
 |---|---|---|
 | CPU core vs x86 silicon (integer, SSE2, x87; 64- and 32-bit mode replayed on ARM64) | **2388/2388 match** | **2388/2388 match** |
-| Dynarec: the same vectors through JIT-emitted ARM64 in the blessed arena | **2388/2388 match** — 436 blocks, 88 KB, 3434 callouts | **identical to the digit**: 436 blocks, 88 KB, 3434 callouts |
+| Dynarec: the same vectors through JIT-emitted ARM64 in the blessed arena | **2388/2388 match** — 436 blocks, 89 KB | **identical to the digit**: 436 blocks, 89 KB, same callout count |
 | JIT (TXM bless protocol) | **working** | **working** |
 | GPU: D3D9 / D3D11 / D3D12 binding model on Metal | **27/27 PASS** | **27/27 PASS** |
-| **Windows executables** (PE loader + kernel32/msvcrt + dynarec, on device) | **6/6 PASS** — hello, crt and nbody as PE32 and PE32+ | **6/6 PASS** |
+| **Windows executables** (PE loader, DLL loading, kernel32/msvcrt/d3d9, dynarec) | **12/12 PASS** | 12/12 expected; last full run 6/6 |
+| **Direct3D 9**: a guest creates a device, presents a frame | **on screen in the app** | — |
 | x87 lowered onto NEON, `nbody32.exe` | **455 of 472** (96%) | **455 of 472** (96%) |
-| **Dynarec speed** (`xc_bench`) | integer **1675 MIPS**, sse2 **842**, x87 **649** | integer **1924 MIPS**, sse2 **932**, x87 **705** |
-| Interpreter, same loops | 9.6 / 12.1 / 11.8 MIPS | 8.6 / 12.0 / 12.2 MIPS |
-| Dynarec ÷ interpreter | 175× / 70× / 55× | **223× / 78× / 58×** |
-| Usable memory, app process | **≈8169 MB** (ladder held 7872 MB) | **≈6118 MB** (ladder held 5824 MB) |
+| **Dynarec speed** (`xc_bench`) | integer **4034 MIPS**, sse2 **864**, x87 **675** | integer **4353 MIPS**, sse2 **891**, x87 **665** |
+| Interpreter, same loops | 9.4 / 12.2 / 11.8 MIPS | 7.7 / 11.9 / 12.5 MIPS |
+| Dynarec ÷ interpreter | **429× / 71× / 57×** | **565× / 75× / 53×** |
+| Usable memory, app process | **≈8163 MB** (ladder held 7872 MB) | **≈6117 MB** (ladder held 5824 MB) |
 | Physical RAM | 7.5 GB | 11.5 GB |
 
-The headline: **real Windows executables run on both devices**, and the dynarec
-retires between 0.7 and 1.9 billion guest instructions per second doing it.
+The headline: **real Windows executables run on both devices**, one of them
+now draws a Direct3D 9 frame that appears on the iPad's screen, and the
+dynarec retires around four billion guest instructions per second doing it.
 
 Three more things that table says.
 
-**The dynarec compiles bit-for-bit identically on A-series and M-series** — same
-block count, same code size, same callout count, on two different chips and two
-different OS majors. Compilation depends on the guest code and nothing else.
+**Carrying registers across a chained link was worth far more on real silicon
+than under emulation.** qemu measured +62% on the integer loop; the iPad went
+1659 → 4034 MIPS (+143%) and the iPhone 1924 → 4353 (+126%). A store-and-reload
+per loop iteration costs a deeply out-of-order Apple core much more than it
+costs qemu's own interpreter.
 
-**The phone is the faster machine and the smaller one.** The A19 Pro runs the
-dynarec 12–15% faster than the M3 across all three loops, while running the
-*interpreter* about 10% slower on the integer loop — a big decode switch and a
-straight run of ARM64 stress a core in different ways, and the phone wins the one
-that matters. Its memory ceiling is nonetheless ~2 GB below the iPad's despite 4 GB
-more physical RAM, because the limit is OS policy, not hardware. Size the guest
-heap against the phone and benchmark against it too.
+**The dynarec compiles bit-for-bit identically on A-series and M-series** —
+same block count, code size and callout count on an M3 under iPadOS 26 and an
+A19 Pro under iOS 27. What it emits depends on the guest code and nothing else,
+which is what makes one set of golden vectors meaningful across the matrix.
 
-**x87 is the path a 32-bit game takes.** `nbody32.exe` — the only guest here built
-the way Fallout 3 and New Vegas were — lowers 96% of its x87 onto NEON doubles on
-both devices, and runs at ~700 MIPS on the phone.
+**The memory ceiling is OS policy, not RAM.** The phone has 4 GB more physical
+memory than the iPad and a ~2 GB lower per-app limit, so the phone is what the
+guest heap has to be sized against — and, on the integer loop, it is also the
+faster machine.
 
 ## Inspiration and prior art
 

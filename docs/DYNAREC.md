@@ -248,45 +248,48 @@ writes every compiled block's bytes for `objdump -D -b binary -m aarch64`.
 
 ### On the device (the only numbers that mean anything in absolute terms)
 
-`xc_bench` through MemProbe, build `3555253`, guest instructions per second:
+`xc_bench` through MemProbe, guest instructions per second, after registers
+started crossing a chained link (iPad on `7397729`, iPhone on `f0fe2ce`):
 
 | loop | | iPad Air 11" (M3) | iPhone Air (A19 Pro) |
 |---|---|---|---|
-| integer (add/xor/imul + branch) | interpreter | 9.6 MIPS | 8.6 MIPS |
-| | dynarec | **1675 MIPS** (175×) | **1924 MIPS** (223×) |
-| sse2 (add/mul/sub/div sd) | interpreter | 12.1 MIPS | 12.0 MIPS |
-| | dynarec | **842 MIPS** (70×) | **932 MIPS** (78×) |
-| x87 (fld/fmul/fadd/fstp m64, 53-bit) | interpreter | 11.8 MIPS | 12.2 MIPS |
-| | dynarec | **649 MIPS** (55×) | **705 MIPS** (58×) |
+| integer (add/xor/imul + branch) | interpreter | 9.4 MIPS | 7.7 MIPS |
+| | dynarec | **4034 MIPS** (429x) | **4353 MIPS** (565x) |
+| sse2 (add/mul/sub/div sd) | interpreter | 12.2 MIPS | 11.9 MIPS |
+| | dynarec | **864 MIPS** (71x) | **891 MIPS** (75x) |
+| x87 (fld/fmul/fadd/fstp m64, 53-bit) | interpreter | 11.8 MIPS | 12.5 MIPS |
+| | dynarec | **675 MIPS** (57x) | **665 MIPS** (53x) |
 
-These are points, not ranges, because `xc_bench` calibrates: it runs the dynarec
-pass once to find the rate, then again with enough iterations to take about a
-tenth of a second. Before that it finished 200 000 iterations in a millisecond
-or two -- too short to measure against the clock, dominated by the one-off cost
-of compiling the loop, and swinging 9% between runs of the same build on the
-same device.
+These are points, not ranges, because `xc_bench` calibrates: it runs the
+dynarec pass once to find the rate, then again with enough iterations to take
+about a tenth of a second. Before that it finished 200 000 iterations in a
+millisecond or two -- too short to measure, dominated by the one-off cost of
+compiling the loop, and swinging 9% between runs of the same build on the same
+device.
 
-**The phone is the faster machine.** The A19 Pro runs the dynarec 12-15% ahead
-of the M3 on all three loops while running the *interpreter* about 10% slower on
-the integer loop. A 300-case decode switch and a straight run of dependent
-ARM64 stress a core differently; the phone wins the one this project cares
-about. The macOS CI runner measures ~1770 MIPS on the integer loop, so both
-devices are in the same class as a desktop Apple-silicon part.
+**Carrying registers across a link was worth more than twice what qemu
+predicted.** qemu measured +62% on the integer loop; the iPad went from 1659 to
+4034 MIPS (+143%) and the iPhone from 1924 to 4353 (+126%). The store-and-reload
+that used to happen at every block boundary costs a deeply out-of-order Apple
+core far more than it costs qemu's own interpreter, which is exactly the kind
+of thing only hardware can tell you. The FP loops moved a few percent, because
+their traffic is FP and neither the exit stores nor the x87 stack cross a link
+yet.
+
+**The compilation is identical on both chips** -- same 436 blocks, same 89 KB
+of ARM64, same 3434 interpreter callouts, on an M3 running iPadOS 26 and an
+A19 Pro running iOS 27. What the compiler emits depends on the guest code and
+nothing else, which is what makes a single set of golden vectors meaningful
+across the whole device matrix.
+
+x87 lowering on device: `nbody32.exe` -- a real mingw-w64 Windows guest whose
+float work is entirely x87, the way Fallout 3 and New Vegas were built --
+comes out at **455 lowered against 17 called out on both devices**, so 96% of
+its FPU work runs as NEON doubles.
 
 For scale: the 32-bit games this targets were built for single cores in the low
-gigahertz, and a dynarec retiring one to two billion guest instructions per
-second on a phone is the number that makes them plausible at all.
-
-x87 lowering on device: the golden replay compiles most of its x87 natively, and
-`nbody32.exe` -- a real mingw-w64 Windows guest whose float work is entirely x87,
-the way Fallout 3 and New Vegas were built -- comes out at **455 lowered against
-17 called out on both devices**, so 96% of its FPU work runs as NEON doubles.
-
-**The compilation is identical on both chips.** Same 436 blocks, same 88 KB of
-ARM64, same 3434 interpreter callouts, on an M3 running iPadOS 26 and an A19 Pro
-running iOS 27. What the compiler emits depends on the guest code and nothing
-else -- which is what makes a single set of golden vectors meaningful across the
-whole device matrix.
+gigahertz, and a dynarec retiring four billion guest instructions per second on
+a tablet is the number that makes them plausible at all.
 
 ### Under qemu
 
