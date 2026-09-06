@@ -22,5 +22,7 @@ check crt64.exe 3
 check crt32.exe 3
 check nbody64.exe 0
 check nbody32.exe 0
+check dlltest64.exe 0
+check dlltest32.exe 0
 rm -f /tmp/winrun_err.$$
 exit $fail

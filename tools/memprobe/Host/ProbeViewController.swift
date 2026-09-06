@@ -208,6 +208,11 @@ final class ProbeViewController: UIViewController {
     /// loader, the host-implemented kernel32/msvcrt, and the dynarec, end to
     /// end on the device. `single` runs just one of them (the x87 button uses
     /// nbody32.exe, whose float work is all x87).
+    ///
+    /// dlltest is the loader test: a static import chain the device has to
+    /// walk (dlltest -> mid.dll -> sub.dll), DllMain ordering across it, and
+    /// LoadLibrary/GetProcAddress at run time -- the machinery a game's own
+    /// DLLs, and eventually our d3d9.dll, arrive through.
     private func windowsProbe(single: String?) {
         DispatchQueue.main.async { self.winLine = "running…"; self.refresh() }
         guard let dir = Bundle.main.resourceURL?.appendingPathComponent("win32") else {
@@ -221,6 +226,7 @@ final class ProbeViewController: UIViewController {
             ("hello64.exe", ["a", "b"], 7), ("hello32.exe", ["a", "b"], 7),
             ("crt64.exe", [], 3),           ("crt32.exe", [], 3),
             ("nbody64.exe", [], 0),         ("nbody32.exe", [], 0),
+            ("dlltest64.exe", [], 0),       ("dlltest32.exe", [], 0),
         ]
         let cases = single.map { s in all.filter { $0.0 == s } } ?? all
 

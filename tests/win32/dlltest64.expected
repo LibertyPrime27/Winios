@@ -1,0 +1,14 @@
+order: sub mid exe 
+static import: mid_calc(7) = 21
+LoadLibrary(sub64.dll): ok
+GetProcAddress by name: sub_add(20, 3) = 23
+GetProcAddress by ordinal 3: same address
+one image, not two: yes
+GetProcAddress for a name that is not exported: NULL, as it should be
+GetModuleHandle(sub64.dll) == LoadLibrary: yes
+GetModuleHandle(nosuch.dll): NULL, as it should be
+LoadLibrary(late64.dll) for a DLL never linked in: ok
+its import resolved to the loaded sub: late_triple(5) = 15
+its DllMain ran, in order: sub mid exe late 
+forwarded export: resolves to sub_add itself
+still alive after FreeLibrary: sub_add(1, 1) = 2

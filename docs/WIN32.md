@@ -4,7 +4,7 @@
 `tools/winrun/winrun.c` (runtime and command-line driver),
 `tests/win32/` (mingw-built .exe guests with recorded output).
 
-    winrun [-v] program.exe [args...]
+    winrun [-v] [-L dlldir] program.exe [args...]
 
 This is the step from "a CPU that runs x86 code" to "a machine that runs
 Windows programs": load a PE image, give it a process to live in, and answer
@@ -33,6 +33,44 @@ Guest callbacks go the other way through `w32_call_guest()`: push a
 return-to-host stub, set up the frame, re-enter the run loop until that stub
 is hit. TLS callbacks, `_initterm`, `atexit` handlers and `qsort` comparators
 all run this way, nested to any depth.
+
+## DLLs the guest brings with it
+
+An import names a DLL, and two different things can satisfy it.
+
+**A DLL we implement on the host** — kernel32, msvcrt, ntdll, user32 — resolves
+to stubs, as above. The host list always wins: a program shipping its own
+`kernel32.dll` gets ours, which is the whole point of the exercise.
+
+**A real PE DLL sitting next to the executable** is loaded the same way the
+executable is — mapped, relocated, its own imports resolved, its TLS block
+allocated — and the import resolves through its **export directory**. Exports
+resolve by name (the name table is sorted, so it is a binary search) or by
+ordinal, and an export whose address lands inside the export directory is a
+**forwarder**: the bytes there are `"otherdll.SomeFunc"`, which is resolved
+again from the start. `LoadLibrary`, `GetProcAddress` (by name and by
+ordinal), `GetModuleHandle`, `GetModuleFileName` and `FreeLibrary` all work
+against the same module table. `-L dir` adds a directory to search; otherwise
+it is the executable's own directory and the working directory.
+
+Two ordering rules matter, and both are observable in the test:
+
+- **Loading is recursive and cycle-safe.** A module is registered in the table
+  *before* its imports are resolved, so a dependency loop finds the half-built
+  module instead of looping forever.
+- **DllMain runs in dependency order** — which is *not* table order. Because a
+  module is registered before its dependencies are, the table has dependents
+  first; each module also records the order in which it *finished* loading,
+  and that is what the attach walk sorts by. So `sub.dll` is attached before
+  `mid.dll`, and `mid.dll`'s DllMain can call into `sub.dll`. Getting this
+  backwards is the first bug this code had, and the test now names the order
+  explicitly rather than checking a return value.
+
+A DLL loaded later by `LoadLibrary` is attached before that call returns, so a
+plugin host, a mod loader, or a late-bound `d3d9` sees an initialised module.
+Nothing is ever unmapped: `FreeLibrary` decrements a count and returns
+success, because an emulator that keeps a dead image mapped is strictly safer
+than one that unmaps it under a live return address.
 
 ## Both bitnesses, one implementation
 
@@ -81,11 +119,21 @@ compiled code for pages that become writable.
 
 ## Verified
 
-`tests/win32/run.sh` runs six executables and compares stdout and exit code
+`tests/win32/run.sh` runs eight executables and compares stdout and exit code
 with recordings: the three-import `hello`, the full mingw-w64 CRT program
 (`crt.c`: TLS callbacks, `__getmainargs`, `_initterm`, malloc/free, `sqrt`,
-`printf`, `snprintf`, exit code) and the n-body benchmark, each as PE32 and
-PE32+. The 64-bit n-body output is byte-identical to the Linux build of the
+`printf`, `snprintf`, exit code), the n-body benchmark, and the loader test
+`dlltest`, each as PE32 and PE32+.
+
+`dlltest` is built as a chain — `dlltest.exe` statically imports `mid.dll`,
+which statically imports `sub.dll`, and `late.dll` is in nobody's import table
+and reachable only through `LoadLibrary`. Each DllMain writes its name into a
+log inside `sub.dll`, so the program prints the order the loader actually used
+(`sub mid exe`, then `late` when it is loaded) rather than trusting a return
+code. It also checks `GetProcAddress` by name and by ordinal against each
+other, that a DLL imported twice is one image and not two, that a forwarded
+export lands on the real function in the other DLL, that a name that is not
+exported gives NULL, and that the module stays callable after `FreeLibrary`. The 64-bit n-body output is byte-identical to the Linux build of the
 same source (`tests/guest/nbody`), which is byte-identical to native x86. The
 suite runs on the x86 runner (interpreter, 4 KB and simulated 16 KB pages),
 under `qemu-aarch64` (JIT) and natively on the Apple-silicon CI job (JIT,
@@ -111,11 +159,18 @@ guest's real FCW/MXCSR so the CRT actually reaches that mode.
 ## What is deliberately not here yet
 
 Threads (`CreateThread`/`_beginthreadex` report failure), structured
-exception handling (a guest fault ends the run), real DLL loading (only the
-built-in DLL surface exists; a game's own DLLs need the loader to map them
-and resolve their exports — the PE code is there, the export-table walk is
-not), registry, and everything user32/gdi32 beyond `MessageBoxA`. Each of
-those is a defined next step, not a design gap: the stub mechanism, the two
-memory models and the calling-convention helpers are the parts that had to be
-right first, and they are the same parts the D3D-to-Metal layer will plug
-into as `d3d9.dll` / `d3d11.dll` / `d3d12.dll`.
+exception handling (a guest fault ends the run), the registry, and everything
+user32/gdi32 beyond `MessageBoxA`.
+
+Within the loader specifically: `DLL_PROCESS_DETACH` is never sent (nothing is
+ever unloaded and the process exits without unwinding), `DLL_THREAD_ATTACH`
+cannot exist until threads do, delay-loaded imports are left to the guest's own
+helper, and `GetProcAddress` by ordinal works on guest DLLs but not on the
+host-implemented ones, which have no ordinals to speak of.
+
+Each of those is a defined next step, not a design gap: the stub mechanism, the
+two memory models, the calling-convention helpers and now the module table are
+the parts that had to be right first, and they are the same parts the
+D3D-to-Metal layer will plug into as `d3d9.dll` / `d3d11.dll` / `d3d12.dll` —
+which, now that a guest DLL can be loaded and its exports resolved, is the
+next thing to build.

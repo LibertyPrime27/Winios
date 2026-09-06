@@ -565,10 +565,15 @@ int winrun_main(int argc, char **argv) {
     while (ai < argc && argv[ai][0] == '-') {
         if (!strcmp(argv[ai], "-v")) w->verbose++;
         else if (!strcmp(argv[ai], "-vv")) w->verbose += 2;
-        else { fprintf(stderr, "usage: winrun [-v] program.exe [args...]\n"); return 2; }
+        else if (!strcmp(argv[ai], "-L") && ai + 1 < argc) {       /* extra directory to find guest DLLs in */
+            static char dir[512];
+            snprintf(dir, sizeof dir, "%s%s", argv[ai + 1], argv[ai + 1][strlen(argv[ai + 1]) - 1] == '/' ? "" : "/");
+            w->dll_dir = dir; ai++;
+        }
+        else { fprintf(stderr, "usage: winrun [-v] [-L dlldir] program.exe [args...]\n"); return 2; }
         ai++;
     }
-    if (ai >= argc) { fprintf(stderr, "usage: winrun [-v] program.exe [args...]\n"); return 2; }
+    if (ai >= argc) { fprintf(stderr, "usage: winrun [-v] [-L dlldir] program.exe [args...]\n"); return 2; }
     w->exe_path = argv[ai];
 
     /* bitness decides the memory model, so peek at the header first */
@@ -618,6 +623,12 @@ int winrun_main(int argc, char **argv) {
     /* a Windows process starts with the FPU in 53-bit precision (FCW 0x027F),
      * not the 8087 default the core's FNINIT sets; MSVC-built code relies on it */
     c->fcw = 0x027F;
+    /* Statically imported DLLs are initialised before the executable's own
+     * TLS callbacks and entry point, in the order they were loaded (which is
+     * dependency order) -- this is what the loader in ntdll does, and code in
+     * a DllMain relies on its own dependencies already being attached. */
+    w32_attach_modules(w);
+    c->rip = w->entry;
     /* TLS callbacks (DLL_PROCESS_ATTACH) before the entry point, as the loader does */
     if (w->tls_callbacks) {
         int psz = w->is32 ? 4 : 8;
@@ -629,6 +640,12 @@ int winrun_main(int argc, char **argv) {
             w32_call_guest(w, cb, 3, args);
         }
         c->rip = w->entry;
+    }
+    if (w->verbose) {
+        for (int i = 0; i < w->nmods; i++)
+            fprintf(stderr, "winrun: module %-20s base %#llx size %#llx%s%s\n", w->mods[i].name,
+                    (unsigned long long)w->mods[i].base, (unsigned long long)w->mods[i].size,
+                    w->mods[i].is_exe ? "  (exe)" : "", w->mods[i].exp_size ? "  exports" : "");
     }
     if (w->verbose) fprintf(stderr, "winrun: %d-bit, entry %#llx, rsp %#llx, teb %#llx, peb %#llx\n", w->is32 ? 32 : 64,
                             (unsigned long long)c->rip, (unsigned long long)c->gpr[XC_RSP], (unsigned long long)w->teb, (unsigned long long)w->peb);

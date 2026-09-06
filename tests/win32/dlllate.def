@@ -1,0 +1,3 @@
+EXPORTS
+  late_triple @1
+  late_fwd_add = sub32.sub_add @2

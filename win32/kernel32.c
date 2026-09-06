@@ -81,10 +81,24 @@ static void k_GetEnvironmentVariableA(w32 *w) {
     }
     w32_set_last_error(w, 203 /* ERROR_ENVVAR_NOT_FOUND */); RET(0);
 }
+/* A module handle is a loaded guest image's base, or one of the fake pages
+ * that stand for a host-implemented DLL. GetModuleHandle never loads: an
+ * image that is not there yet is simply absent. */
+static uint64_t module_handle(w32 *w, const char *name) {
+    for (int i = 0; i < w->nmods; i++) {
+        const char *b = name, *p;
+        for (p = name; *p; p++) if (*p == '\\' || *p == '/') b = p + 1;
+        if (!strcasecmp(w->mods[i].name, b)) return w->mods[i].base;
+        size_t ln = strlen(w->mods[i].name);
+        if (ln > 4 && !strcasecmp(w->mods[i].name + ln - 4, ".dll")
+            && !strncasecmp(w->mods[i].name, b, ln - 4) && !b[ln - 4]) return w->mods[i].base;
+    }
+    return w32_module_handle(w, name);
+}
 static void k_GetModuleHandleA(w32 *w) {
     uint64_t name = ARG(0);
     if (!name) { RET(w->image_base); return; }
-    uint64_t h = w32_module_handle(w, GSTR(name));
+    uint64_t h = module_handle(w, GSTR(name));
     if (!h) w32_set_last_error(w, ERROR_MOD_NOT_FOUND);
     RET(h);
 }
@@ -92,44 +106,77 @@ static void k_GetModuleHandleW(w32 *w) {
     uint64_t name = ARG(0); char buf[260];
     if (!name) { RET(w->image_base); return; }
     w32_wtoa(w, name, buf, sizeof buf);
-    uint64_t h = w32_module_handle(w, buf);
+    uint64_t h = module_handle(w, buf);
     if (!h) w32_set_last_error(w, ERROR_MOD_NOT_FOUND);
     RET(h);
 }
 static void k_GetModuleHandleExW(w32 *w) {
     uint64_t name = ARG(1), out = ARG(2); char buf[260]; uint64_t h;
-    if (!name) h = w->image_base; else { w32_wtoa(w, name, buf, sizeof buf); h = w32_module_handle(w, buf); }
+    if (!name) h = w->image_base; else { w32_wtoa(w, name, buf, sizeof buf); h = module_handle(w, buf); }
     w32_write(w, out, (int)w32_ptrsize(w), h);
     RET(bool_(h != 0));
 }
-static void k_LoadLibraryA(w32 *w) { uint64_t h = w32_module_handle(w, GSTR(ARG(0))); if (!h) w32_set_last_error(w, ERROR_MOD_NOT_FOUND); RET(h); }
-static void k_LoadLibraryW(w32 *w) { char buf[260]; w32_wtoa(w, ARG(0), buf, sizeof buf); uint64_t h = w32_module_handle(w, buf); if (!h) w32_set_last_error(w, ERROR_MOD_NOT_FOUND); RET(h); }
-static void k_LoadLibraryExA(w32 *w) { k_LoadLibraryA(w); }
-static void k_LoadLibraryExW(w32 *w) { k_LoadLibraryW(w); }
-static void k_FreeLibrary(w32 *w) { RET(1); }
+/* LoadLibrary does load: a guest DLL found beside the executable is mapped,
+ * its own imports resolved, and its DllMain run before this returns -- which
+ * is what a plugin host, a mod loader or a late-bound d3d9 expects. */
+static void load_library(w32 *w, const char *name) {
+    uint64_t h = w32_load_library(w, name);
+    if (!h) { w32_set_last_error(w, ERROR_MOD_NOT_FOUND); RET(0); return; }
+    w32_attach_modules(w);
+    if (w->verbose) fprintf(stderr, "winrun: LoadLibrary(%s) = %#llx\n", name, (unsigned long long)h);
+    RET(h);
+}
+static void k_LoadLibraryA(w32 *w) { load_library(w, GSTR(ARG(0))); }
+static void k_LoadLibraryW(w32 *w) { char buf[260]; w32_wtoa(w, ARG(0), buf, sizeof buf); load_library(w, buf); }
+static void k_LoadLibraryExA(w32 *w) { load_library(w, GSTR(ARG(0))); }
+static void k_LoadLibraryExW(w32 *w) { char buf[260]; w32_wtoa(w, ARG(0), buf, sizeof buf); load_library(w, buf); }
+/* Nothing is ever unmapped: a module's code may still be on the stack, and
+ * an emulator that keeps a dead image mapped is strictly safer than one that
+ * unmaps it under a live return address. */
+static void k_FreeLibrary(w32 *w) {
+    w32_module *m = w32_module_at(w, ARG(0));
+    if (m && m->refs > 0) m->refs--;
+    RET(1);
+}
 static void k_GetProcAddress(w32 *w) {
     uint64_t h = ARG(0), name = ARG(1);
-    const char *dll = 0;
-    static const char *names[] = { "kernel32.dll", "msvcrt.dll", "ntdll.dll", "user32.dll" };
-    for (int d = 0; d < 4; d++) if (h == w->stub_base + 0x10000u * (d + 1)) dll = names[d];
-    if (!dll || (name >> 16) == 0) { w32_set_last_error(w, ERROR_PROC_NOT_FOUND); RET(0); return; }
-    uint64_t a = w32_stub_for(w, dll, GSTR(name));
-    /* a "missing" stub means we do not have it: report absence like Windows would */
-    if (w->verbose) fprintf(stderr, "winrun: GetProcAddress(%s, %s) = %#llx\n", dll, GSTR(name), (unsigned long long)a);
+    /* the low word is an ordinal when the high word is zero (MAKEINTRESOURCE) */
+    int ordinal = (name >> 16) == 0 ? (int)(name & 0xFFFF) : -1;
+    const char *nm = ordinal < 0 ? GSTR(name) : 0;
+    uint64_t a = 0;
+    if (w32_module_at(w, h)) {
+        a = w32_module_export(w, h, nm, ordinal);
+    } else {
+        static const char *names[] = { "kernel32.dll", "msvcrt.dll", "ntdll.dll", "user32.dll" };
+        for (int d = 0; d < 4; d++) if (h == w->stub_base + 0x10000u * (d + 1) && nm) a = w32_stub_for(w, names[d], nm);
+    }
+    if (w->verbose) {
+        char ob[16]; if (!nm) snprintf(ob, sizeof ob, "#%d", ordinal);
+        fprintf(stderr, "winrun: GetProcAddress(%#llx, %s) = %#llx\n", (unsigned long long)h, nm ? nm : ob, (unsigned long long)a);
+    }
+    if (!a) w32_set_last_error(w, ERROR_PROC_NOT_FOUND);
     RET(a);
+}
+/* The DOS path of a loaded module -- the executable when hModule is NULL. */
+static void module_file_name(w32 *w, uint64_t h, char *out, size_t n) {
+    const char *path = w->exe_path;
+    w32_module *m = h ? w32_module_at(w, h) : 0;
+    if (m) path = m->path;
+    const char *slash = strrchr(path, '/');
+    const char *file = slash ? slash + 1 : path;
+    size_t room = n > 10 ? n - 10 : 0;                     /* "C:\xcore\" plus the terminator */
+    snprintf(out, n, "C:\\xcore\\%.*s", (int)room, file);
 }
 static void k_GetModuleFileNameA(w32 *w) {
     uint64_t buf = ARG(1); uint32_t n = (uint32_t)ARG(2);
-    const char *slash = strrchr(w->exe_path, '/');
-    char s[300]; snprintf(s, sizeof s, "C:\\xcore\\%s", slash ? slash + 1 : w->exe_path);
+    char s[300]; module_file_name(w, ARG(0), s, sizeof s);
     size_t l = strlen(s); if (l + 1 > n) l = n ? n - 1 : 0;
     if (n) { memcpy(W32P(w, buf), s, l); w32_write(w, buf + l, 1, 0); }
     RET(l);
 }
 static void k_GetModuleFileNameW(w32 *w) {
     uint64_t buf = ARG(1); uint32_t n = (uint32_t)ARG(2);
-    const char *slash = strrchr(w->exe_path, '/');
-    char s[300]; snprintf(s, sizeof s, "C:\\xcore\\%s", slash ? slash + 1 : w->exe_path);
+    char s[300]; module_file_name(w, ARG(0), s, sizeof s);
     size_t l = strlen(s); if (l + 1 > n) l = n ? n - 1 : 0;
     uint16_t *d = W32P(w, buf);
     if (d) { for (size_t i = 0; i < l; i++) d[i] = (uint8_t)s[i]; d[l] = 0; }

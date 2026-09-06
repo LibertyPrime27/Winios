@@ -24,7 +24,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-enum { W32_MAX_STUBS = 2048, W32_MAX_HANDLES = 256, W32_MAX_TLS = 64 };
+enum { W32_MAX_STUBS = 2048, W32_MAX_HANDLES = 256, W32_MAX_TLS = 64, W32_MAX_MODULES = 64 };
 
 typedef struct w32 w32;
 typedef void (*w32_fn)(w32 *w);
@@ -45,6 +45,22 @@ typedef struct {
     const w32_api *apis;         /* terminated by name == NULL */
     uint64_t       hmodule;      /* fake module base */
 } w32_dll;
+
+/* One loaded PE image -- the executable, or a guest DLL beside it. Host DLLs
+ * (kernel32 and friends) are not modules: they have no image, and their
+ * handles are the fake pages stubs_init makes. */
+typedef struct {
+    char     name[64];           /* lowercased basename with extension, "engine.dll" */
+    char     path[512];
+    uint64_t base, size;
+    uint64_t entry;              /* DllMain, or the executable's entry point; 0 if none */
+    uint32_t exp_rva, exp_size;  /* export directory, 0 if the image exports nothing */
+    uint64_t tls_callbacks;
+    int      is_exe;
+    int      refs;               /* LoadLibrary count; nothing is ever unmapped */
+    int      attached;           /* DllMain(DLL_PROCESS_ATTACH) has run */
+    int      seq;                /* order this image *finished* loading: dependency order */
+} w32_module;
 
 typedef enum { H_NONE = 0, H_FILE, H_PROCESS, H_THREAD, H_HEAP, H_EVENT, H_MUTEX } w32_htype;
 typedef struct { w32_htype type; int fd; int flags; } w32_handle;
@@ -73,6 +89,13 @@ struct w32 {
     /* heap: bump allocator plus a size header per block */
     uint64_t  heap_cur, heap_end;
     uint64_t  tls_slots[W32_MAX_TLS]; uint64_t tls_used;
+    uint64_t  tls_array;         /* TEB.ThreadLocalStoragePointer: one entry per module with TLS */
+    int       ntls;
+
+    /* loaded images */
+    w32_module mods[W32_MAX_MODULES];
+    int        nmods, nloaded;
+    const char *dll_dir;         /* extra directory to search for guest DLLs (-L) */
     w32_handle handles[W32_MAX_HANDLES];
     uint32_t  last_error;
 
@@ -119,7 +142,15 @@ void     w32_handle_close(w32 *w, uint64_t h);
 
 /* stubs / modules */
 uint64_t w32_stub_for(w32 *w, const char *dll, const char *name);   /* resolves or makes a "missing" stub */
-uint64_t w32_module_handle(w32 *w, const char *dll);
+uint64_t w32_module_handle(w32 *w, const char *dll);                /* host-implemented DLLs only */
+
+/* loader (pe.c) */
+int      w32_load_pe(w32 *w, const char *path);                     /* the executable */
+uint64_t w32_load_library(w32 *w, const char *name);                /* a guest DLL, or a host module handle; 0 if unknown */
+w32_module *w32_module_at(w32 *w, uint64_t base);                   /* the loaded image with that base, or NULL */
+uint64_t w32_module_export(w32 *w, uint64_t hmodule, const char *name, int ordinal);
+uint64_t w32_import_addr(w32 *w, const char *dll, const char *name, int ordinal, int depth);
+void     w32_attach_modules(w32 *w);                                /* DllMain(DLL_PROCESS_ATTACH) for every new DLL */
 
 /* the DLLs */
 extern const w32_api w32_kernel32[];
@@ -130,9 +161,6 @@ extern const w32_api w32_user32[];
 /* msvcrt.c: drop every cached guest address, so a second process can start
  * in the same host process (see winrun_main). */
 void w32_reset_statics(void);
-
-/* loader (pe.c) */
-int w32_load_pe(w32 *w, const char *path);
 
 /* runtime (winrun.c) */
 int w32_run(w32 *w);
