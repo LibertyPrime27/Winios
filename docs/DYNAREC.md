@@ -208,7 +208,7 @@ the block, and the next lookup decodes and compiles afresh.
 Three layers, from cheapest to most authoritative:
 
 1. **Golden vectors.** The on-device self-test replays every recorded silicon
-   post-state through the JIT (`xc_run`) as well as the interpreter. 2364
+   post-state through the JIT (`xc_run`) as well as the interpreter. 2388
    vectors; a divergence is a one-line diff naming the instruction.
 2. **qemu-user on the Linux runner.** CI cross-builds for aarch64 and runs the
    self-test and the guest programs (i386 and x86-64, musl and glibc) through
@@ -248,31 +248,45 @@ writes every compiled block's bytes for `objdump -D -b binary -m aarch64`.
 
 ### On the device (the only numbers that mean anything in absolute terms)
 
-`xc_bench` through MemProbe, iPad Air 11" (M3) — guest instructions per second:
+`xc_bench` through MemProbe, build `3555253`, guest instructions per second:
 
-| loop | interpreter | dynarec | speedup |
+| loop | | iPad Air 11" (M3) | iPhone Air (A19 Pro) |
 |---|---|---|---|
-| integer (add/xor/imul + branch) | ~10 MIPS | **~1500–1700 MIPS** | ~165× |
-| sse2 (add/mul/sub/div sd) | ~12 MIPS | **~790–850 MIPS** | ~65× |
-| x87 (fld/fmul/fadd/fstp m64, 53-bit) | ~12 MIPS | **~630–670 MIPS** | ~53× |
+| integer (add/xor/imul + branch) | interpreter | 9.6 MIPS | 8.6 MIPS |
+| | dynarec | **1675 MIPS** (175×) | **1924 MIPS** (223×) |
+| sse2 (add/mul/sub/div sd) | interpreter | 12.1 MIPS | 12.0 MIPS |
+| | dynarec | **842 MIPS** (70×) | **932 MIPS** (78×) |
+| x87 (fld/fmul/fadd/fstp m64, 53-bit) | interpreter | 11.8 MIPS | 12.2 MIPS |
+| | dynarec | **649 MIPS** (55×) | **705 MIPS** (58×) |
 
-Ranges, not points: two runs of build bc628c0 and bc14a86 differed by up to 9%
-on the same device. The dynarec finished 200 000 iterations in one or two
-milliseconds, which is too short to measure against the clock and is dominated
-by the one-off cost of compiling the loop. `xc_bench` now calibrates — it runs
-the dynarec pass once to find the rate, then again with enough iterations to
-take about a tenth of a second — so later figures are steadier than these.
+These are points, not ranges, because `xc_bench` calibrates: it runs the dynarec
+pass once to find the rate, then again with enough iterations to take about a
+tenth of a second. Before that it finished 200 000 iterations in a millisecond
+or two -- too short to measure against the clock, dominated by the one-off cost
+of compiling the loop, and swinging 9% between runs of the same build on the
+same device.
 
-The macOS CI runner measures ~1770 MIPS on the integer loop, so the iPad is
-within a few percent of a desktop Apple-silicon part. For scale: the 32-bit
-games this targets were built for single cores in the low gigahertz, and a
-dynarec retiring most of a billion guest instructions per second on a tablet
-is the number that makes them plausible at all.
+**The phone is the faster machine.** The A19 Pro runs the dynarec 12-15% ahead
+of the M3 on all three loops while running the *interpreter* about 10% slower on
+the integer loop. A 300-case decode switch and a straight run of dependent
+ARM64 stress a core differently; the phone wins the one this project cares
+about. The macOS CI runner measures ~1770 MIPS on the integer loop, so both
+devices are in the same class as a desktop Apple-silicon part.
 
-x87 lowering on that device: the golden replay compiled 544 x87 instructions
-natively against 138 left to the interpreter, and `nbody32.exe` — a real
-mingw-w64 Windows guest whose float work is entirely x87 — came out at **455
-lowered against 17 called out**, so 96% of its FPU work runs as NEON doubles.
+For scale: the 32-bit games this targets were built for single cores in the low
+gigahertz, and a dynarec retiring one to two billion guest instructions per
+second on a phone is the number that makes them plausible at all.
+
+x87 lowering on device: the golden replay compiles most of its x87 natively, and
+`nbody32.exe` -- a real mingw-w64 Windows guest whose float work is entirely x87,
+the way Fallout 3 and New Vegas were built -- comes out at **455 lowered against
+17 called out on both devices**, so 96% of its FPU work runs as NEON doubles.
+
+**The compilation is identical on both chips.** Same 436 blocks, same 88 KB of
+ARM64, same 3434 interpreter callouts, on an M3 running iPadOS 26 and an A19 Pro
+running iOS 27. What the compiler emits depends on the guest code and nothing
+else -- which is what makes a single set of golden vectors meaningful across the
+whole device matrix.
 
 ### Under qemu
 
