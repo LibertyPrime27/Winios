@@ -17,7 +17,7 @@ is now working on hardware.
 | JIT acquisition and probing design | [`docs/JIT-DESIGN.md`](docs/JIT-DESIGN.md) |
 | CI — unsigned IPA on every push, core tests on Linux | [`.github/workflows/ios-build.yml`](.github/workflows/ios-build.yml) |
 | **Win32 layer** — PE32/PE32+ loader, TEB/PEB, kernel32 + msvcrt on the host, imports as `int3` stubs | [`docs/WIN32.md`](docs/WIN32.md), [`win32/`](win32), [`tools/winrun/`](tools/winrun) — **runs real Windows executables**: a three-import hello, a full mingw-w64 CRT program (TLS callbacks, malloc, printf, exit code) and the n-body benchmark, each as 32- and 64-bit, output byte-identical to the Linux build; interpreter, qemu JIT, Apple-silicon CI — and **on the iPad itself, 6/6 through MemProbe** |
-| **dynarec** — x86 basic blocks → ARM64 code, block chaining, SSE/SSE2 on NEON, x87 (53-bit precision) on NEON doubles, lazy flags, callouts to the interpreter for the rest | [`docs/DYNAREC.md`](docs/DYNAREC.md), [`core/src/jit/`](core/src/jit) — **passes all 2388 silicon vectors on the M3 iPad and the A19 Pro iPhone** (and under qemu-aarch64 / Apple-silicon CI); JIT-vs-interpreter differential over every difftest case, 67 000 runs identical; **on the iPad: 1678 MIPS integer, 853 SSE2, 670 x87 — 172× / 66× / 53× the interpreter** |
+| **dynarec** — x86 basic blocks → ARM64 code, block chaining, SSE/SSE2 on NEON, x87 (53-bit precision) on NEON doubles, lazy flags, callouts to the interpreter for the rest | [`docs/DYNAREC.md`](docs/DYNAREC.md), [`core/src/jit/`](core/src/jit) — **passes all 2388 silicon vectors on the M3 iPad and the A19 Pro iPhone** (and under qemu-aarch64 / Apple-silicon CI); JIT-vs-interpreter differential over every difftest case, 67 000 runs identical; **on the iPad: ~1600 MIPS integer, ~820 SSE2, ~650 x87 — roughly 165× / 65× / 53× the interpreter** |
 | **MemProbe** — the device app: CPU vectors, on-device benchmark, GPU probe, JIT bless, **real Windows .exe**, memory ladder | [`docs/MEMPROBE.md`](docs/MEMPROBE.md), [`tools/memprobe/`](tools/memprobe) — one button per probe; runs the six mingw-w64 guests through the PE loader on the device itself, and is where the only non-qemu performance numbers come from |
 | **xcore** — one CPU core for 32- and 64-bit x86, interpreter + differential tests | [`docs/CPU-CORE.md`](docs/CPU-CORE.md), [`core/`](core) — full baseline x86 + SSE2 + x87 in both 64- and 32-bit mode, 542 cases verified against silicon; `xrun` runs static Linux binaries (musl, glibc, busybox; i386 glibc through the 4 GB arena) |
 | **JIT on iOS 26 TXM hardware** — bless protocol, `jit_arena` | **working on device** (M3 iPad): [`docs/JIT-DESIGN.md` §1a](docs/JIT-DESIGN.md) |
@@ -48,7 +48,7 @@ Both columns are build `bb13301`.
 | GPU: D3D9 / D3D11 / D3D12 binding model on Metal | **27/27 PASS** | **27/27 PASS** |
 | Usable memory, app process | ≈8169 MB (ladder climbed to 7872 MB held) | ≈6126 MB (early read; full ladder pending) |
 | Physical RAM | 7.5 GB | 11.5 GB |
-| **Speed, dynarec vs interpreter** (`xc_bench`, build bc628c0) | integer **1678 MIPS** (172×), sse2 **853 MIPS** (66×), x87 **670 MIPS** (53×) | pending |
+| **Speed, dynarec vs interpreter** (`xc_bench`) | integer **~1600 MIPS** (~165×), sse2 **~820 MIPS** (~65×), x87 **~650 MIPS** (~53×) | pending |
 | **Windows executables** (PE loader + kernel32/msvcrt + dynarec, on device) | **6/6 PASS** — hello, crt and nbody as PE32 and PE32+ | pending |
 | x87 lowered onto NEON, `nbody32.exe` | **455 of 472** (96%) | pending |
 

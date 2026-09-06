@@ -134,7 +134,26 @@ int xc_bench(char *report, size_t report_len, uint64_t iters) {
 
         xc_stop why_i = XC_STOP_NONE, why_j = XC_STOP_NONE;
         uint64_t ns_i = run_one(b, arena, iters, 0, &why_i);
-        uint64_t ns_j = have_jit ? run_one(b, arena, iters, 1, &why_j) : 0;
+
+        /* The dynarec is fast enough that `iters` finishes in a millisecond or
+         * two on an M3 -- too short to measure honestly, and dominated by the
+         * one-off cost of compiling the loop. So its pass is calibrated: run
+         * once to find the rate, then run again with enough iterations to take
+         * about a tenth of a second. Without this the reported figure swings
+         * ~10% between runs on the same device for no reason but noise. */
+        uint64_t iters_j = iters, ns_j = 0;
+        if (have_jit) {
+            ns_j = run_one(b, arena, iters, 1, &why_j);
+            if (ns_j > 0 && ns_j < 50000000ull) {
+                uint64_t scale = 100000000ull / ns_j;
+                if (scale > 4096) scale = 4096;
+                if (scale > 1) {
+                    iters_j = iters * scale;
+                    ns_j = run_one(b, arena, iters_j, 1, &why_j);
+                }
+            }
+        }
+        uint64_t guest_j = iters_j * (uint64_t)b->insns;
 
         if (!ns_i) {
             off += (size_t)snprintf(report + off, report_len - off,
@@ -157,11 +176,16 @@ int xc_bench(char *report, size_t report_len, uint64_t iters) {
                 b->name, (double)ns_i / 1e6, mips_i);
             continue;
         }
-        double mips_j = (double)guest * 1000.0 / (double)ns_j;
+        double mips_j = (double)guest_j * 1000.0 / (double)ns_j;
         off += (size_t)snprintf(report + off, report_len - off,
-            "  %s\n      interp %6.0f ms (%5.1f MIPS)   dynarec %6.0f ms (%6.1f MIPS)   %.1fx\n",
+            "  %s\n      interp %6.0f ms (%5.1f MIPS)   dynarec %6.0f ms (%6.1f MIPS)   %.1fx",
             b->name, (double)ns_i / 1e6, mips_i, (double)ns_j / 1e6, mips_j,
-            (double)ns_i / (double)ns_j);
+            mips_j / mips_i);
+        if (iters_j != iters && off < report_len)
+            off += (size_t)snprintf(report + off, report_len - off,
+                "   (dynarec ran %llux the iterations, to be measurable)",
+                (unsigned long long)(iters_j / iters));
+        if (off < report_len) off += (size_t)snprintf(report + off, report_len - off, "\n");
     }
 
     if (off < report_len) {

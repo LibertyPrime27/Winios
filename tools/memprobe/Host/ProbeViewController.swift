@@ -159,17 +159,25 @@ final class ProbeViewController: UIViewController {
             DispatchQueue.main.async { self.cpuLine = cpu; self.refresh() }
             return
         }
+        // The core's counters are cumulative for the whole process, so what
+        // this probe cost is the difference across it. Reporting the running
+        // total instead makes the same probe read 436 blocks on one launch and
+        // 2580 on the next, purely by what was tapped first.
+        var b0: UInt64 = 0, c0: UInt64 = 0, y0: UInt64 = 0, xn0: UInt64 = 0, xc0: UInt64 = 0
+        xc_jit_stats(&b0, &c0, &y0)
+        xc_jit_x87_stats(&xn0, &xc0)
         xc_jit_enable(1)
         var buf2 = [CChar](repeating: 0, count: 8192)
         let bad2 = xc_selftest(&buf2, buf2.count, 12)
-        var blocks: UInt64 = 0, callouts: UInt64 = 0, bytes: UInt64 = 0
-        xc_jit_stats(&blocks, &callouts, &bytes)
-        var x87n: UInt64 = 0, x87c: UInt64 = 0
-        xc_jit_x87_stats(&x87n, &x87c)
+        var b1: UInt64 = 0, c1: UInt64 = 0, y1: UInt64 = 0, xn1: UInt64 = 0, xc1: UInt64 = 0
+        xc_jit_stats(&b1, &c1, &y1)
+        xc_jit_x87_stats(&xn1, &xc1)
         xc_jit_enable(0)
+        let blocks = b1 - b0, callouts = c1 - c0, bytes = y1 - y0
+        let x87n = xn1 - xn0, x87c = xc1 - xc0
         cpu += "dynarec:     " + (bad2 == 0 ? "PASS — ARM64 code matches x86 silicon\n" : "FAIL — \(bad2) mismatched\n")
             + String(cString: buf2)
-            + "    \(blocks) blocks compiled, \(bytes >> 10) KB of ARM64, \(callouts) interpreter callouts\n"
+            + "    this replay: \(blocks) blocks compiled, \(bytes >> 10) KB of ARM64, \(callouts) interpreter callouts\n"
             + "    x87: \(x87n) instructions lowered onto NEON, \(x87c) left to the interpreter\n"
         DispatchQueue.main.async { self.cpuLine = cpu; self.refresh() }
     }
