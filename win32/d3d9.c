@@ -29,7 +29,8 @@
 #include <stdio.h>
 #include <string.h>
 
-enum { S_OK_ = 0, E_FAIL_ = (int)0x80004005, D3DERR_INVALIDCALL = (int)0x8876086C };
+enum { S_OK_ = 0, E_FAIL_ = (int)0x80004005, D3DERR_INVALIDCALL = (int)0x8876086C,
+       D3DERR_DEVICELOST = (int)0x88760868 };
 enum { D3DCLEAR_TARGET = 1, D3DCLEAR_ZBUFFER = 2, D3DCLEAR_STENCIL = 4 };
 enum { FMT_X8R8G8B8 = 22, FMT_A8R8G8B8 = 21 };
 
@@ -38,6 +39,14 @@ static w32_present_fn g_present;
 static void *g_present_ctx;
 void w32_set_present(w32_present_fn fn, void *ctx) { g_present = fn; g_present_ctx = ctx; }
 
+/* How the host asks a guest that is drawing frames to stop: Present starts
+ * returning D3DERR_DEVICELOST. A game already has to handle that -- it is
+ * what a real driver returns when the display mode changes or the machine
+ * sleeps -- so a loop that checks its Present result exits on its own,
+ * without the host reaching into a running guest. */
+static volatile int g_lost;
+void w32_d3d9_device_lost(int on) { g_lost = on ? 1 : 0; }
+
 /* object fields (64-bit slots after the header) */
 enum { D3D_NDEV = 0 };                                        /* IDirect3D9 */
 enum { DEV_PARENT = 0, DEV_FB, DEV_W, DEV_H, DEV_PITCH, DEV_BBSURF, DEV_FRAMES, DEV_HWND };
@@ -45,7 +54,7 @@ enum { SURF_DEV = 0, SURF_BITS, SURF_W, SURF_H, SURF_PITCH };
 enum { TAG_D3D9 = 1, TAG_DEVICE, TAG_SURFACE };
 
 static w32_com_class cls_d3d9, cls_device, cls_surface;
-void w32_d3d9_reset(void) { cls_d3d9.vtable = cls_device.vtable = cls_surface.vtable = 0; }
+void w32_d3d9_reset(void) { cls_d3d9.vtable = cls_device.vtable = cls_surface.vtable = 0; g_lost = 0; }
 
 /* The display we claim to be. A game picks a back-buffer size from this when
  * it asks for a windowed device without saying how big. */
@@ -111,7 +120,7 @@ static void d_GetDirect3D(w32 *w) {
     if (out) w32_write(w, out, w32_ptrsize(w), w32_com_get(w, ARG(0), DEV_PARENT));
     RET(S_OK_);
 }
-static void d_TestCooperativeLevel(w32 *w) { RET(S_OK_); }
+static void d_TestCooperativeLevel(w32 *w) { RET(g_lost ? D3DERR_DEVICELOST : S_OK_); }
 static void d_GetAvailableTextureMem(w32 *w) { RET(256u << 20); }
 static void d_GetNumberOfSwapChains(w32 *w) { RET(1); }
 static void d_BeginScene(w32 *w) { RET(S_OK_); }
@@ -144,6 +153,7 @@ static void d_Clear(w32 *w) {
 
 static void d_Present(w32 *w) {
     uint64_t self = ARG(0);
+    if (g_lost) { RET(D3DERR_DEVICELOST); return; }
     uint64_t fb = w32_com_get(w, self, DEV_FB);
     int width = (int)w32_com_get(w, self, DEV_W), h = (int)w32_com_get(w, self, DEV_H);
     int pitch = (int)w32_com_get(w, self, DEV_PITCH);

@@ -8,8 +8,35 @@
  * different order the second time, is the cheapest way to catch that.
  */
 #include "winrun.h"
+#include "w32.h"
 #include <stdio.h>
 #include <string.h>
+
+/* The app stops a guest that is drawing frames by making Present return
+ * D3DERR_DEVICELOST; the guest sees its own Present fail and leaves its loop.
+ * Nothing reaches into the running guest, which is the point -- so this
+ * checks the whole path: run d3dloop with no frame limit, ask it to stop
+ * after a few frames, and require that it stops there and exits cleanly. */
+static int g_seen;
+static void count_and_stop(void *ctx, const void *px, int w, int h, int pitch) {
+    (void)ctx; (void)px; (void)w; (void)h; (void)pitch;
+    if (++g_seen == 5) w32_d3d9_device_lost(1);
+}
+static int test_device_lost(const char *dir) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/d3dloop32.exe", dir);
+    char *av[2] = { (char *)"winrun", path };
+    g_seen = 0;
+    w32_set_present(count_and_stop, 0);
+    int rc = winrun_main(2, av);            /* no frame limit: only the stop ends it */
+    w32_set_present(0, 0);
+    if (rc != 0 || g_seen != 5) {
+        printf("FAIL device-lost stop: exit %d after %d frames, want 0 after 5\n", rc, g_seen);
+        return 1;
+    }
+    printf("ok   d3dloop32.exe stopped on device-lost after %d frames\n", g_seen);
+    return 0;
+}
 
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : "tests/win32";
@@ -21,6 +48,7 @@ int main(int argc, char **argv) {
         { "dlltest64.exe", 0 }, { "dlltest32.exe", 0 },
         { "d3dtest64.exe", 0 },  { "d3dtest32.exe", 0 },
         { "d3dframe64.exe", 0 }, { "d3dframe32.exe", 0 },
+        { "d3dloop64.exe", 0 },  { "d3dloop32.exe", 0 },
     };
     const int n = (int)(sizeof G / sizeof G[0]);
     int bad = 0;
@@ -33,7 +61,10 @@ int main(int argc, char **argv) {
             char path[512];
             snprintf(path, sizeof path, "%s/%s", dir, G[i].exe);
             char *av[4] = { (char *)"winrun", path, (char *)"a", (char *)"b" };
-            int argn = strncmp(G[i].exe, "hello", 5) == 0 ? 4 : 2;
+            int argn = 2;
+            if (!strncmp(G[i].exe, "hello", 5)) argn = 4;
+            /* d3dloop draws until the device is lost; here it gets a frame count */
+            else if (!strncmp(G[i].exe, "d3dloop", 7)) { av[2] = (char *)"12"; argn = 3; }
             fflush(stdout);
             int rc = winrun_main(argn, av);
             fflush(stdout);
@@ -43,6 +74,7 @@ int main(int argc, char **argv) {
             }
         }
     }
+    bad += test_device_lost(dir);
     printf("test_winrun_lib: %d runs, %d failed\n", 2 * n, bad);
     return bad != 0;
 }

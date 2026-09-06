@@ -26,4 +26,5 @@ for a in 32 64; do
     # Direct3D 9 through d3d9.dll: COM vtables in guest memory
     $CC -O2 -s -o d3dtest$a.exe  d3dtest.c  -ld3d9
     $CC -O2 -s -o d3dframe$a.exe d3dframe.c -ld3d9
+    $CC -O2 -s -o d3dloop$a.exe  d3dloop.c  -ld3d9
 done

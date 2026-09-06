@@ -188,6 +188,10 @@ extern const w32_api w32_d3d9[];
  * the headless test and CI want; the iOS app sets it to a Metal blit. */
 typedef void (*w32_present_fn)(void *ctx, const void *pixels, int width, int height, int pitch);
 void w32_set_present(w32_present_fn fn, void *ctx);
+/* Ask a guest that is presenting frames to stop: Present and
+ * TestCooperativeLevel start returning D3DERR_DEVICELOST, which a game
+ * already knows how to exit on. */
+void w32_d3d9_device_lost(int on);
 void w32_d3d9_reset(void);
 
 /* msvcrt.c: drop every cached guest address, so a second process can start

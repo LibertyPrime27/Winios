@@ -15,6 +15,7 @@
 #include "xcore/cpu.h"
 
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,16 +26,44 @@
  * they live in is unmapped when the next run resets the process, and the UI
  * keeps showing the last frame until then. */
 static uint8_t *g_frame;
+static size_t g_frame_cap;
 static int g_fw, g_fh, g_fpitch;
+static uint64_t g_seq;
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void grab_frame(void *ctx, const void *pixels, int width, int height, int pitch) {
     (void)ctx;
     size_t n = (size_t)height * (size_t)pitch;
-    uint8_t *p = realloc(g_frame, n);
-    if (!p) return;
-    memcpy(p, pixels, n);
-    g_frame = p; g_fw = width; g_fh = height; g_fpitch = pitch;
+    pthread_mutex_lock(&g_lock);
+    if (n > g_frame_cap) {
+        uint8_t *p = realloc(g_frame, n);
+        if (!p) { pthread_mutex_unlock(&g_lock); return; }
+        g_frame = p; g_frame_cap = n;
+    }
+    memcpy(g_frame, pixels, n);
+    g_fw = width; g_fh = height; g_fpitch = pitch;
+    g_seq++;
+    pthread_mutex_unlock(&g_lock);
 }
+
+int win_probe_copy_frame(uint64_t *seq, void *dst, size_t dst_len,
+                         int *width, int *height, int *pitch) {
+    int got = 0;
+    pthread_mutex_lock(&g_lock);
+    size_t n = (size_t)g_fh * (size_t)g_fpitch;
+    if (g_frame && n && (!seq || g_seq > *seq) && n <= dst_len) {
+        memcpy(dst, g_frame, n);
+        if (seq) *seq = g_seq;
+        if (width) *width = g_fw;
+        if (height) *height = g_fh;
+        if (pitch) *pitch = g_fpitch;
+        got = 1;
+    }
+    pthread_mutex_unlock(&g_lock);
+    return got;
+}
+
+void win_probe_request_stop(void) { w32_d3d9_device_lost(1); }
 
 const void *win_probe_frame(int *width, int *height, int *pitch) {
     if (width) *width = g_fw;
@@ -58,7 +87,10 @@ int win_probe_run(const char *exe_path, const char *arg1, const char *arg2,
     char tmp[1024];
     snprintf(tmp, sizeof tmp, "%swinprobe.%d.out", tmpdir && *tmpdir ? tmpdir : "/tmp/", (int)getpid());
 
+    pthread_mutex_lock(&g_lock);
     g_fw = g_fh = 0;
+    pthread_mutex_unlock(&g_lock);
+    w32_d3d9_device_lost(0);
     w32_set_present(grab_frame, 0);
 
     uint64_t n0 = 0, c0 = 0;

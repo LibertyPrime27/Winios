@@ -94,7 +94,15 @@ without a copy through a second address space. `Clear`, `BeginScene`,
 the state setters accept and ignore, because there is nothing to draw with
 yet. Where a presented frame goes is a host callback (`w32_set_present`):
 nothing by default, a `.ppm` per frame under `WINRUN_PRESENT_PPM=<prefix>`,
-and on the device the image MemProbe displays.
+and on the device a Metal texture MemProbe draws full screen.
+
+Stopping a guest that is drawing frames goes the other way, and deliberately
+does not reach into it: `w32_d3d9_device_lost(1)` makes `Present` and
+`TestCooperativeLevel` return `D3DERR_DEVICELOST`, which is what a real driver
+returns when the display mode changes or the machine sleeps. A program that
+checks its `Present` result — every game does — leaves its own loop and exits
+normally. `test_winrun_lib` runs `d3dloop32.exe` with no frame limit, trips
+the flag after five frames, and requires that it stopped there and exited 0.
 
 **Vtable order is load-bearing.** A slot in the wrong place is an indirect
 call to the wrong function, so the tables carry explicit slot numbers taken
@@ -156,12 +164,12 @@ compiled code for pages that become writable.
 
 ## Verified
 
-`tests/win32/run.sh` runs twelve executables and compares stdout and exit code
+`tests/win32/run.sh` runs fourteen executables and compares stdout and exit code
 with recordings: the three-import `hello`, the full mingw-w64 CRT program
 (`crt.c`: TLS callbacks, `__getmainargs`, `_initterm`, malloc/free, `sqrt`,
 `printf`, `snprintf`, exit code), the n-body benchmark, the loader test
-`dlltest`, and the two Direct3D 9 programs `d3dtest` and `d3dframe`, each as
-PE32 and PE32+.
+`dlltest`, and the three Direct3D 9 programs `d3dtest`, `d3dframe` and
+`d3dloop`, each as PE32 and PE32+.
 
 `d3dtest` calls Direct3D 9 the way a game starts up — `Direct3DCreate9`,
 `GetAdapterIdentifier`, `CreateDevice`, `Clear`, `Present`, then
@@ -170,8 +178,11 @@ those goes through a COM vtable, so it is also what keeps the slot numbers
 honest. `d3dframe` produces an actual picture: it locks the back buffer and
 draws a gradient, a disc and a checkerboard with integer arithmetic (so PE32
 and PE32+ produce byte-identical output), presents it, and prints an FNV-1a
-checksum of the frame. Both are recorded like the others, and the same
-checksum comes out of the interpreter, the qemu JIT and the device.
+checksum of the frame. `d3dloop` is the same thing as a loop — the shape a
+game's frame loop has — animating a disc across the screen and either stopping
+at a frame count (which is how it is tested) or running until the device is
+lost (which is how the app runs it). All are recorded like the others, and the
+same checksums come out of the interpreter, the qemu JIT and the device.
 
 `dlltest` is built as a chain — `dlltest.exe` statically imports `mid.dll`,
 which statically imports `sub.dll`, and `late.dll` is in nobody's import table

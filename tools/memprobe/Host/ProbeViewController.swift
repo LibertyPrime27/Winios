@@ -62,6 +62,7 @@ final class ProbeViewController: UIViewController {
             row([("3 · GPU (D3D9/11/12)", #selector(runGPU)), ("5 · Windows .exe", #selector(runWindows))]),
             row([("x87 fast path", #selector(runX87)), ("7 · D3D9 frame", #selector(runFrame))]),
             row([("6 · Memory ladder", #selector(runLadder)), ("Clear frame", #selector(clearFrame))]),
+            button("8 · Run a Windows program full screen (live frames)", #selector(runGuest)),
             button("4 · JIT: attach StikDebug, then execute in a blessed arena", #selector(attachJIT)),
             row([("Copy report", #selector(copyReport)), ("Reset results", #selector(resetAll))]),
             frameView,
@@ -148,6 +149,14 @@ final class ProbeViewController: UIViewController {
     @objc private func runWindows() { work("Windows guests") { self.windowsProbe(single: nil) } }
     @objc private func runX87()  { work("x87")         { self.windowsProbe(single: "nbody32.exe") } }
     @objc private func runFrame() { work("frame")      { self.frameProbe() } }
+    /// The app rather than the probe: a guest drawing frames in a loop, full
+    /// screen, presented through Metal as fast as the emulator manages.
+    @objc private func runGuest() {
+        guard !running else { return }
+        let vc = GuestViewController(exe: "d3dloop32.exe")
+        vc.modalPresentationStyle = .fullScreen
+        present(vc, animated: true)
+    }
     @objc private func clearFrame() {
         frameImage = nil
         DispatchQueue.main.async { self.frameView.image = nil; self.frameView.isHidden = true }

@@ -201,6 +201,20 @@ the ladder just to see the GPU result again.
   `Present` are real; the pixels come from the guest's own x86 code on the
   dynarec, because `DrawPrimitive` is not implemented yet. It is the first
   thing this project has put on a screen. **Clear frame** hides it again.
+- **8 · Run a Windows program full screen** — the app rather than the probe.
+  `d3dloop32.exe` runs its own frame loop (clear, draw, present, repeat) on a
+  background queue while a `CAMetalLayer` shows each frame as it arrives, with
+  the guest's frame rate on screen. **Close** asks it to stop by making
+  `Present` return `D3DERR_DEVICELOST` — what a real driver returns when the
+  display mode changes — so the guest leaves its own loop and exits; nothing
+  reaches into running guest code.
+
+  The guest never waits for the display and the display never waits for the
+  guest: every presented frame is copied under a lock with a sequence number,
+  and the display link takes whatever is newest once per vsync. Frames it
+  misses are dropped rather than queued, which is what makes the number on
+  screen the rate the *emulator* managed rather than the rate the screen
+  refreshed at.
 - **6 · Memory ladder** — the ladder on its own.
 - **Copy report** puts the whole screen on the clipboard. **Reset results**
   clears everything, including the JIT crash marker.
