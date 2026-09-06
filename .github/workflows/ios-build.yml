@@ -42,10 +42,12 @@ jobs:
         run: |
           sudo apt-get install -y --no-install-recommends qemu-user gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
           cmake -S . -B build-a64 -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64-linux.cmake -DCMAKE_BUILD_TYPE=Release -DWINIOS_D12MT=OFF
-          cmake --build build-a64 -j"$(nproc)" --target test_selftest test_jitdiff xrun
+          cmake --build build-a64 -j"$(nproc)" --target test_selftest test_jitdiff xrun winrun
           Q="qemu-aarch64 -L /usr/aarch64-linux-gnu"
           $Q build-a64/test_selftest
           $Q build-a64/test_jitdiff 24
+          printf '#!/bin/sh\nexec %s %s/build-a64/winrun "$@"\n' "$Q" "$PWD" > /tmp/winrun-q && chmod +x /tmp/winrun-q
+          sh tests/win32/run.sh /tmp/winrun-q tests/win32
           cd tests/guest
           for g in hello libc_hello hello32 nbody; do
             got=$($Q ../../build-a64/xrun ./$g); exp=$(cat $g.expected)
@@ -136,7 +138,7 @@ jobs:
         run: |
           set +e
           cmake -S . -B build-mac -DCMAKE_BUILD_TYPE=Release -DWINIOS_D12MT=OFF 2>&1 | tail -3
-          cmake --build build-mac -j3 --target test_selftest test_arena32 test_jitdiff 2>&1 | grep -E "error|warning: |Built target" | head -20
+          cmake --build build-mac -j3 --target test_selftest test_arena32 test_jitdiff winrun 2>&1 | grep -E "error|warning: |Built target" | head -20
           uname -m; sysctl -n machdep.cpu.brand_string || true
           out=$(./build-mac/test_selftest 2>&1); rc=$?
           echo "$out" | tail -30 | while IFS= read -r l; do echo "::notice::jit: ${l}"; done
@@ -145,8 +147,10 @@ jobs:
           ./build-mac/test_arena32; rc3=$?
           out4=$(./build-mac/test_jitdiff 100 2>&1); rc4=$?
           echo "$out4" | tail -12 | while IFS= read -r l; do echo "::notice::jitdiff: ${l}"; done
-          echo "rc jit=$rc interp=$rc2 arena=$rc3 jitdiff=$rc4"
-          [ $rc -eq 0 ] && [ $rc2 -eq 0 ] && [ $rc3 -eq 0 ] && [ $rc4 -eq 0 ]
+          out5=$(sh tests/win32/run.sh build-mac/winrun tests/win32 2>&1); rc5=$?
+          echo "$out5" | tail -12 | while IFS= read -r l; do echo "::notice::win32: ${l}"; done
+          echo "rc jit=$rc interp=$rc2 arena=$rc3 jitdiff=$rc4 win32=$rc5"
+          [ $rc -eq 0 ] && [ $rc2 -eq 0 ] && [ $rc3 -eq 0 ] && [ $rc4 -eq 0 ] && [ $rc5 -eq 0 ]
 
       - name: Install XcodeGen
         run: brew install xcodegen

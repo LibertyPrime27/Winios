@@ -63,3 +63,16 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_test(NAME guest_hello COMMAND ${CMAKE_COMMAND} -E env
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/guest/run.sh $<TARGET_FILE:xrun> ${CMAKE_CURRENT_SOURCE_DIR}/tests/guest)
 endif()
+
+# winrun: Windows executables (PE32 / PE32+) on xcore with a host-implemented
+# kernel32 / msvcrt (win32/). The .exe guests under tests/win32/ are prebuilt
+# with mingw-w64 so nothing beyond a C compiler is needed to run them.
+if(NOT WIN32)
+    add_executable(winrun tools/winrun/winrun.c win32/pe.c win32/kernel32.c win32/msvcrt.c)
+    target_link_libraries(winrun PRIVATE xcore m)
+    target_include_directories(winrun PRIVATE win32)
+    set_property(TARGET winrun PROPERTY C_STANDARD 11)
+    target_compile_options(winrun PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    add_test(NAME win32_guests COMMAND ${CMAKE_COMMAND} -E env
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/win32/run.sh $<TARGET_FILE:winrun> ${CMAKE_CURRENT_SOURCE_DIR}/tests/win32)
+endif()
