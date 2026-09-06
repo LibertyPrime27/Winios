@@ -205,8 +205,31 @@ writes every compiled block's bytes for `objdump -D -b binary -m aarch64`.
 
 ## Measured
 
-Under `qemu-aarch64` (so absolute numbers are meaningless, only the ratios
-matter):
+### On the device (the only numbers that mean anything in absolute terms)
+
+`xc_bench` through MemProbe, iPad Air 11" (M3), build bc628c0 — 200 000
+iterations per loop, guest instructions per second:
+
+| loop | interpreter | dynarec | speedup |
+|---|---|---|---|
+| integer (add/xor/imul + branch) | 9.8 MIPS | **1678 MIPS** | 172× |
+| sse2 (add/mul/sub/div sd) | 12.8 MIPS | **853 MIPS** | 66× |
+| x87 (fld/fmul/fadd/fstp m64, 53-bit) | 12.6 MIPS | **670 MIPS** | 53× |
+
+The macOS CI runner measures 1770 MIPS on the integer loop, so the iPad is
+within 6% of a desktop Apple-silicon part. For scale: the 32-bit games this
+targets were built for single cores in the low gigahertz, and a dynarec
+retiring 0.7–1.7 billion guest instructions per second on the *phone-class*
+part is the number that makes them plausible at all.
+
+x87 lowering on that device: the golden replay compiled 544 x87 instructions
+natively against 138 left to the interpreter, and `nbody32.exe` — a real
+mingw-w64 Windows guest whose float work is entirely x87 — came out at **455
+lowered against 17 called out**, so 96% of its FPU work runs as NEON doubles.
+
+### Under qemu
+
+Absolute numbers are meaningless here, only the ratios matter:
 
 | workload | interpreter | JIT + chaining + SSE/x87 |
 |---|---|---|

@@ -392,6 +392,11 @@ final class ProbeViewController: UIViewController {
                 markerPath.withCString { jit_arena_run(arena, raw.baseAddress, 4, &r, $0) }
             }
             arenaReport = describe(r) + "\n    (debugger was attached — blessed \(arenaSize >> 10) KB and executed directly)"
+        } else if arenaReport.isEmpty {
+            // Reusing an arena blessed earlier this launch: jit_arena_shared
+            // filled `r` in with exactly that story, so use it rather than
+            // returning the empty string this started as.
+            arenaReport = describe(r)
         }
         return arenaReport
     }
@@ -402,6 +407,25 @@ final class ProbeViewController: UIViewController {
     }
 
     // MARK: - render
+
+    /// What is true of the JIT *right now*, read from the arena and the core
+    /// rather than from whatever a probe last stored. Section 4 used to be a
+    /// saved string alone, which let it read "not run" on a device that had
+    /// just compiled 2580 blocks -- a report that contradicts itself is worse
+    /// than no report.
+    private var jitLive: String {
+        var s = ""
+        if let a = sharedArena, a.pointee.blessed != 0 {
+            s += "    arena: \(a.pointee.size >> 10) KB blessed and held; handed to xcore: \(arenaInXcore ? "yes" : "no")\n"
+        }
+        var blocks: UInt64 = 0, callouts: UInt64 = 0, bytes: UInt64 = 0
+        xc_jit_stats(&blocks, &callouts, &bytes)
+        if blocks > 0 {
+            s += "    dynarec has compiled \(blocks) blocks / \(bytes >> 10) KB of ARM64 in this launch"
+            s += " — JIT is working on this device\n"
+        }
+        return s
+    }
 
     private func refresh() {
         let high = ResultStore.highWater()
@@ -428,6 +452,7 @@ final class ProbeViewController: UIViewController {
 
         4 · JIT
         \(jitLine)
+        \(jitLive)
 
         5 · WINDOWS EXECUTABLES (PE loader + kernel32/msvcrt + dynarec)
         \(winLine)
