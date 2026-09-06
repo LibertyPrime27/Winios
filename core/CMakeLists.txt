@@ -355,6 +355,7 @@ target_compile_options(xcore PRIVATE -Wall -Wextra -Wno-unused-parameter)
 # app and by test_selftest; never by difftest.
 add_library(xcore_golden STATIC
     src/selftest.c
+    src/bench.c
     src/golden_vectors.c)
 target_link_libraries(xcore_golden PUBLIC xcore)
 set_property(TARGET xcore_golden PROPERTY C_STANDARD 11)

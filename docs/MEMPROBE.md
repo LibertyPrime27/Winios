@@ -161,17 +161,61 @@ process). Switching to StikDebug while the ladder ran was enough. The ladder
 now pauses whenever the app is not frontmost, and sleeps at least as long as
 each rung's work took, so its duty cycle stays under 50% even in the foreground.
 
-## The one-button flow
+## The buttons
 
-**▶ Run all probes** runs the CPU self-test, the GPU probe for all three APIs,
-the safe JIT check, and finally the memory ladder — last, because the ladder
-may end with the system killing the process, and by then everything else has
-been saved. **JIT: attach StikDebug** opens StikDebug with the universal
-script; when you return to the app with the debugger attached, the blessed-
-arena execution test runs on its own. If a debugger is already attached when
-the app starts — LiveContainer paired with StikDebug does this before the first
-instruction — both buttons skip the round trip and execute immediately; the
-only thing that stops the automatic execute is a crash marker from an earlier
-attempt, which **Reset results** clears. **Copy report** puts the whole screen on
-the clipboard for pasting. **Reset results** clears everything, including the
-JIT crash marker.
+**▶ Run all probes** runs everything in report order — CPU vectors, benchmark,
+GPU, Windows guests — and finally the memory ladder, last because the ladder
+may end with the system killing the process and by then everything else has
+been saved. Each probe also has its own button, because once something has
+failed you want to re-run that one thing, and because you rarely want to risk
+the ladder just to see the GPU result again.
+
+- **1 · CPU vectors** — the recorded silicon post-states, replayed through the
+  interpreter and then through the dynarec. Since half the x87 vectors are now
+  recorded in 53-bit precision, the dynarec pass reports how many x87
+  instructions it lowered onto NEON versus left to the interpreter.
+- **2 · Benchmark** — `xc_bench`: integer, SSE2 and x87 loops through both
+  engines, in milliseconds and millions of guest instructions per second. Every
+  performance figure in the other docs comes from qemu-user, where the absolute
+  numbers mean nothing; this is the only place real ones come from.
+- **3 · GPU** — the D3D9/11/12 binding probe (section above).
+- **4 · JIT: attach StikDebug** opens StikDebug with the universal script; when
+  you return to the app with the debugger attached, the blessed-arena execution
+  test runs on its own. If a debugger is already attached when the app starts —
+  LiveContainer paired with StikDebug does this before the first instruction —
+  the round trip is skipped and it executes immediately. The only thing that
+  stops the automatic execute is a crash marker from an earlier attempt, which
+  **Reset results** clears.
+- **5 · Windows .exe** — runs the six mingw-w64 guests bundled with the app
+  (`hello`, `crt` and `nbody`, each as PE32 and PE32+) through `winrun_lib` and
+  compares stdout and exit code against the recorded expectations. This is the
+  PE loader, the host-implemented kernel32/msvcrt, and the dynarec, end to end
+  on the device.
+- **x87 fast path** — the same machinery on `nbody32.exe` alone, the guest whose
+  float work is entirely x87, with its timing and its lowered-versus-called-out
+  counts. The quickest way to see the 53-bit lowering working on hardware.
+- **6 · Memory ladder** — the ladder on its own.
+- **Copy report** puts the whole screen on the clipboard. **Reset results**
+  clears everything, including the JIT crash marker.
+
+Only one probe runs at a time, off the main thread, and each result is written
+to `UserDefaults` the moment it exists.
+
+### One bless, many buttons
+
+Every button that needs executable memory goes through `ensureArena()`, which
+blesses the shared arena at most once per launch. That is not tidiness: on iOS
+26 / TXM hardware the debugger detaches at the end of the bless, and a second
+`brk #0xf00d` is an unserviced breakpoint that kills the process (the 5c2e468
+crash). The benchmark, the dynarec pass and the Windows guests all reuse the
+one arena the JIT probe created.
+
+### Running a guest twice
+
+`winrun_main()` resets every global the runtime owns before it starts —
+including unmapping the previous guest's memory and flushing the block cache.
+Both matter: a second PE32+ image wants the same preferred base as the first,
+and two PE32 images both map their code at `0x400000`, where a stale compiled
+block would run the previous program's instructions. `tests/test_winrun_lib.c`
+runs all six guests twice, in opposite orders, to keep that honest — it caught
+the unmapping bug the first time it ran.

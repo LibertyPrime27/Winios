@@ -72,6 +72,10 @@
 
 static size_t g_code_used;
 static uint64_t g_stat_blocks, g_stat_callouts;
+/* x87 instructions the compiler lowered natively vs sent to the interpreter,
+ * counted at compile time. The ratio is what says whether the 53-bit fast
+ * path is actually engaging on a given program (see xc_jit_x87_stats). */
+static uint64_t g_stat_x87_native, g_stat_x87_callout;
 static int g_enabled = -1;
 #if XC_JIT_HOST
 static int g_callout_stats, g_stat_callouts_reg;   /* XCORE_JIT_CALLOUTS=1: histogram of interpreter callouts at exit */
@@ -209,6 +213,10 @@ void xc_jit_stats(uint64_t *blocks, uint64_t *callouts, uint64_t *bytes) {
     if (bytes) *bytes = g_code_used;
 }
 uint64_t xc_jit_links(void) { return g_stat_links; }
+void xc_jit_x87_stats(uint64_t *native, uint64_t *callout) {
+    if (native) *native = g_stat_x87_native;
+    if (callout) *callout = g_stat_x87_callout;
+}
 /* Where the generated code lives (execute side), for crash reports. */
 int xc_jit_code_range(uint64_t *lo, uint64_t *hi) {
 #if XC_JIT_HOST

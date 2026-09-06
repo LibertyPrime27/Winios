@@ -357,6 +357,7 @@ static void x87_nan_guard(jc *j, int v) {
 
 /* The instruction goes to the interpreter and the block ends there. */
 static void x87_callout_end(jc *j) {
+    g_stat_x87_callout++;
     emit_callout(j);
     emit_exit_imm(j, j->d->rip + j->d->in.length);
     j->ended = 1;
@@ -399,13 +400,22 @@ static void x87_cc_to_rflags(jc *j) {
 
 /* ------------------------------------------------------------ lowering */
 
+static void emit_x87_inner(jc *j);
+/* Every x87 instruction either lowers natively or goes to the interpreter;
+ * counting the callouts and attributing the rest keeps the two in step
+ * without a `native++` on each of the many return paths below. */
 static void emit_x87(jc *j) {
+    uint64_t before = g_stat_x87_callout;
+    emit_x87_inner(j);
+    if (g_stat_x87_callout == before) g_stat_x87_native++;
+}
+static void emit_x87_inner(jc *j) {
     const ZydisDecodedInstruction *in = &j->d->in;
     const xop *ops = j->ops;
     ZydisMnemonic m = in->mnemonic;
     int nvis = in->operand_count_visible;
 
-    if (!j->x87_on) { emit_callout(j); return; }               /* PC=64 (or an odd mode): the interpreter, as before */
+    if (!j->x87_on) { g_stat_x87_callout++; emit_callout(j); return; }   /* PC=64 (or an odd mode): the interpreter, as before */
 
     /* control-word traffic needs no stack state */
     if (m == ZYDIS_MNEMONIC_FNSTCW && ops[0].type == XOP_MEM) { a64_ldr_off(&j->a, 1, T0, R_CPU, OFF(fcw)); st_op(j, &ops[0], T0); return; }

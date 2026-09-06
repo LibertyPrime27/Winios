@@ -127,6 +127,10 @@ extern const w32_api w32_msvcrt[];
 extern const w32_api w32_ntdll[];
 extern const w32_api w32_user32[];
 
+/* msvcrt.c: drop every cached guest address, so a second process can start
+ * in the same host process (see winrun_main). */
+void w32_reset_statics(void);
+
 /* loader (pe.c) */
 int w32_load_pe(w32 *w, const char *path);
 

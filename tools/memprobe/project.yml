@@ -14,9 +14,11 @@ settings:
     TARGETED_DEVICE_FAMILY: "1,2"
     SWIFT_OBJC_BRIDGING_HEADER: Shared/MemProbe-Bridging-Header.h
     # xcore and Zydis are built by CMake (see CI) into build-xcore-ios/.
-    HEADER_SEARCH_PATHS: $(SRCROOT)/Shared $(SRCROOT)/../../core/include
-    LIBRARY_SEARCH_PATHS: $(SRCROOT)/../../build-xcore-ios/core $(SRCROOT)/../../build-xcore-ios/core/zydis $(SRCROOT)/../../build-xcore-ios/core/zydis/zycore
-    OTHER_LDFLAGS: -lxcore_golden -lxcore -lsoftfloat -lZydis -lZycore
+    HEADER_SEARCH_PATHS: $(SRCROOT)/Shared $(SRCROOT)/../../core/include $(SRCROOT)/../../win32 $(SRCROOT)/../../tools/winrun
+    LIBRARY_SEARCH_PATHS: $(SRCROOT)/../../build-xcore-ios $(SRCROOT)/../../build-xcore-ios/core $(SRCROOT)/../../build-xcore-ios/core/zydis $(SRCROOT)/../../build-xcore-ios/core/zydis/zycore
+    # winrun_lib is the PE loader + kernel32/msvcrt: it lets the app run a real
+    # Windows .exe. It must precede xcore, which it calls into.
+    OTHER_LDFLAGS: -lwinrun_lib -lxcore_golden -lxcore -lsoftfloat -lZydis -lZycore
     # Unsigned by design -- signing happens locally with Sideloadly.
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"
@@ -35,6 +37,12 @@ targets:
       - path: Host/Shaders
         type: folder
         buildPhase: resources
+      # The mingw-w64-built Windows guests, so the device can run a real .exe.
+      # A folder reference: they land in the bundle as win32/hello32.exe etc.
+      - path: ../../tests/win32
+        name: win32
+        type: folder
+        buildPhase: resources
     info: { path: Host/Info.plist }
     entitlements: { path: Host/Host.entitlements }
     settings:
@@ -49,7 +57,11 @@ targets:
     platform: iOS
     sources:
       - path: Probe
+      # winprobe.c calls winrun_lib, which the extension does not link: the
+      # extension exists to measure memory in a second process, not to run
+      # guests.
       - path: Shared
+        excludes: ["winprobe.c"]
     info: { path: Probe/Info.plist }
     entitlements: { path: Probe/Probe.entitlements }
     settings:

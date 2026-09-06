@@ -31,6 +31,16 @@ static uint64_t g_errno;        /* int in guest memory */
 static uint64_t g_lconv;        /* struct lconv */
 static uint64_t g_argv, g_envp; /* what __getmainargs handed out */
 static uint64_t g_onexit[128]; static int g_nonexit;
+static uint64_t g_locale_c;     /* the "C" string setlocale hands back */
+
+/* Every guest address cached above belongs to one process image. winrun_main
+ * can start a second one (the device build re-runs on a tap), and those
+ * addresses would then point into the previous guest's heap. */
+void w32_reset_statics(void) {
+    g_iob = g_errno = g_lconv = g_argv = g_envp = g_locale_c = 0;
+    memset(g_onexit, 0, sizeof g_onexit);
+    g_nonexit = 0;
+}
 
 static int file_size(w32 *w) { return w->is32 ? 32 : 48; }
 static int file_off(w32 *w) { return w->is32 ? 16 : 28; }      /* offsetof(FILE, _file) */
@@ -255,7 +265,7 @@ static void m__unlock(w32 *w) { (void)w; }
 static void m___lc_codepage_func(w32 *w) { RET(1252); }
 static void m___mb_cur_max_func(w32 *w) { RET(1); }
 static void m_localeconv(w32 *w) { ensure_state(w); RET(g_lconv); }
-static void m_setlocale(w32 *w) { static uint64_t c; if (!c) c = w32_strdup(w, "C"); RET(c); }
+static void m_setlocale(w32 *w) { if (!g_locale_c) g_locale_c = w32_strdup(w, "C"); RET(g_locale_c); }
 /* _controlfp/_control87: the CRT's view of the FPU control word. Abstract
  * bits: _MCW_EM 0x0008001F (inexact 1, underflow 2, overflow 4, zerodivide 8,
  * invalid 0x10, denormal 0x80000), _MCW_RC 0x300 (near/down/up/chop),
@@ -267,14 +277,27 @@ static void m_setlocale(w32 *w) { static uint64_t c; if (!c) c = w32_strdup(w, "
  * -- the dynarec's native x87 mode -- so it has to be real. */
 static uint32_t cw_abstract(const w32 *w) {
     uint16_t f = w->c->fcw; uint32_t a = 0;
-    if (f & 0x20) a |= 0x01; if (f & 0x10) a |= 0x02; if (f & 0x08) a |= 0x04; if (f & 0x04) a |= 0x08; if (f & 0x01) a |= 0x10; if (f & 0x02) a |= 0x80000;
+    /* FCW mask bit -> _EM_* abstract bit, in FCW bit order: IM DM ZM OM UM PM */
+    static const struct { uint16_t fcw; uint32_t em; } M[] = {
+        { 0x01, 0x10 },      /* IM -> _EM_INVALID   */
+        { 0x02, 0x80000 },   /* DM -> _EM_DENORMAL  */
+        { 0x04, 0x08 },      /* ZM -> _EM_ZERODIVIDE */
+        { 0x08, 0x04 },      /* OM -> _EM_OVERFLOW  */
+        { 0x10, 0x02 },      /* UM -> _EM_UNDERFLOW */
+        { 0x20, 0x01 },      /* PM -> _EM_INEXACT   */
+    };
+    for (unsigned i = 0; i < sizeof M / sizeof M[0]; i++) if (f & M[i].fcw) a |= M[i].em;
     a |= ((f >> 10) & 3) << 8;
     switch ((f >> 8) & 3) { case 0: a |= 0x20000; break; case 2: a |= 0x10000; break; default: break; }
     return a;
 }
 static void cw_apply(w32 *w, uint32_t a) {
     uint16_t f = (uint16_t)(w->c->fcw & ~0x0F3Fu);
-    if (a & 0x01) f |= 0x20; if (a & 0x02) f |= 0x10; if (a & 0x04) f |= 0x08; if (a & 0x08) f |= 0x04; if (a & 0x10) f |= 0x01; if (a & 0x80000) f |= 0x02;
+    static const struct { uint32_t em; uint16_t fcw; } M[] = {
+        { 0x01, 0x20 }, { 0x02, 0x10 }, { 0x04, 0x08 },
+        { 0x08, 0x04 }, { 0x10, 0x01 }, { 0x80000, 0x02 },
+    };
+    for (unsigned i = 0; i < sizeof M / sizeof M[0]; i++) if (a & M[i].em) f |= M[i].fcw;
     f |= (uint16_t)(((a >> 8) & 3) << 10);
     switch (a & 0x30000) { case 0x20000: break; case 0x10000: f |= 0x200; break; default: f |= 0x300; break; }
     w->c->fcw = f;

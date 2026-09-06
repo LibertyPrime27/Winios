@@ -145,6 +145,9 @@ int  xc_jit_set_code(void *rw, void *rx, size_t size);
 int  xc_jit_enabled(void);
 void xc_jit_stats(uint64_t *blocks_compiled, uint64_t *callouts, uint64_t *code_bytes);
 uint64_t xc_jit_links(void);          /* block-to-block links patched so far */
+/* x87 instructions lowered onto NEON doubles vs handed to the interpreter,
+ * counted as blocks are compiled. Both zero means no x87 was compiled at all. */
+void xc_jit_x87_stats(uint64_t *native, uint64_t *callout);
 int xc_jit_code_range(uint64_t *lo, uint64_t *hi);   /* execute-side range of generated code; 0 if none */
 
 /* Execute exactly one instruction. */

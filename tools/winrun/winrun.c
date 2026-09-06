@@ -54,6 +54,19 @@ uint64_t w32_host_page(void) {
 #define HP_DOWN(x) ((x) & ~(hpage() - 1))
 #define HP_UP(x)   (((x) + hpage() - 1) & ~(hpage() - 1))
 
+/* Every host mapping made for a 64-bit (identity-mapped) guest, so a second
+ * guest in the same process starts with its address space clear. A PE32+ image
+ * wants its preferred base (0x140000000) and the stub page wants 0x7FF7...;
+ * leaving the first process's mappings there makes the second one relocate --
+ * or fail outright when it has no relocations. The 32-bit arena needs no list:
+ * it is one reservation, and unmapping it releases everything inside. */
+enum { W32_MAX_MAPS = 512 };
+static struct { void *p; size_t n; } g_maps[W32_MAX_MAPS];
+static int g_nmaps;
+static void track_map(void *p, size_t n) {
+    if (g_nmaps < W32_MAX_MAPS) { g_maps[g_nmaps].p = p; g_maps[g_nmaps].n = n; g_nmaps++; }
+}
+
 /* Guest memory is never executed by the host -- the interpreter reads it and
  * the dynarec translates it -- so it is always mapped RW, whatever the guest
  * asked for. That matters: Apple silicon refuses RWX mappings that are not
@@ -84,6 +97,7 @@ uint64_t w32_alloc_at(w32 *w, uint64_t addr, uint64_t size, int exec) {
 #endif
     if (p == MAP_FAILED) return 0;
     if ((uint64_t)(uintptr_t)p != addr) { munmap(p, size); return 0; }
+    track_map(p, size);
     return addr;
 }
 uint64_t w32_alloc(w32 *w, uint64_t size, int exec) {
@@ -95,7 +109,9 @@ uint64_t w32_alloc(w32 *w, uint64_t size, int exec) {
         return w32_alloc_at(w, a, size, exec) ? a : 0;
     }
     void *p = mmap(0, size, GUEST_PROT, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    return p == MAP_FAILED ? 0 : (uint64_t)(uintptr_t)p;
+    if (p == MAP_FAILED) return 0;
+    track_map(p, size);
+    return (uint64_t)(uintptr_t)p;
 }
 
 /* Heap: a bump allocator over w32_alloc'd chunks with a 16-byte header
@@ -522,7 +538,26 @@ static void on_crash(int sig, siginfo_t *si, void *uctx) {
     raise(sig);
 }
 
-int main(int argc, char **argv) {
+/* Reset every global this file owns, so winrun_main can be called more than
+ * once in a process -- which is exactly what the device build does when the
+ * button is tapped again. The block cache must go too: a second executable
+ * maps its own code at the same guest addresses (0x400000 for a PE32), and a
+ * stale compiled block there would run the previous program's instructions. */
+static void winrun_reset(void) {
+    if (g_w.is32 && g_w.base) munmap(g_w.base, 1ull << 32);
+    for (int i = 0; i < g_nmaps; i++) munmap(g_maps[i].p, g_maps[i].n);
+    g_nmaps = 0;
+    memset(&g_w, 0, sizeof g_w);
+    memset(&g_mem, 0, sizeof g_mem);
+    memset(&g_cpu, 0, sizeof g_cpu);
+    memset(g_free, 0, sizeof g_free);
+    g_bump32 = 0x10000000u;
+    w32_reset_statics();
+    xc_cache_flush();
+}
+
+int winrun_main(int argc, char **argv) {
+    winrun_reset();
     w32 *w = &g_w;
     { struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_sigaction = on_crash; sa.sa_flags = SA_SIGINFO;
       sigaction(SIGSEGV, &sa, 0); sigaction(SIGBUS, &sa, 0); }
@@ -607,3 +642,7 @@ int main(int argc, char **argv) {
     }
     return code;
 }
+
+#ifndef WINRUN_NO_MAIN
+int main(int argc, char **argv) { return winrun_main(argc, argv); }
+#endif

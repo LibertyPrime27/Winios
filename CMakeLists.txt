@@ -22,6 +22,11 @@ add_executable(test_memprobe tests/test_memprobe.c)
 target_link_libraries(test_memprobe PRIVATE memprobe_core)
 add_test(NAME memprobe COMMAND test_memprobe)
 
+# --- xc_bench: interpreter vs dynarec timing on the host CPU -----------------
+add_executable(test_bench tests/test_bench.c)
+target_link_libraries(test_bench PRIVATE xcore_golden)
+add_test(NAME bench COMMAND test_bench 20000)
+
 # --- 32-bit arena mode: portable, runs everywhere ----------------------------
 add_executable(test_arena32 tests/test_arena32.c)
 target_link_libraries(test_arena32 PRIVATE xcore)
@@ -68,11 +73,30 @@ endif()
 # kernel32 / msvcrt (win32/). The .exe guests under tests/win32/ are prebuilt
 # with mingw-w64 so nothing beyond a C compiler is needed to run them.
 if(NOT WIN32)
+    # The same sources twice: once as the command-line tool, once as a library
+    # the device build links (tools/memprobe) so an iPad can run a .exe.
+    add_library(winrun_lib STATIC tools/winrun/winrun.c win32/pe.c win32/kernel32.c win32/msvcrt.c)
+    target_link_libraries(winrun_lib PUBLIC xcore)
+    if(NOT APPLE)
+        target_link_libraries(winrun_lib PUBLIC m)
+    endif()
+    target_include_directories(winrun_lib PUBLIC win32 tools/winrun)
+    target_compile_definitions(winrun_lib PRIVATE WINRUN_NO_MAIN=1)
+    set_property(TARGET winrun_lib PROPERTY C_STANDARD 11)
+    target_compile_options(winrun_lib PRIVATE -Wall -Wextra -Wno-unused-parameter)
+
     add_executable(winrun tools/winrun/winrun.c win32/pe.c win32/kernel32.c win32/msvcrt.c)
     target_link_libraries(winrun PRIVATE xcore m)
     target_include_directories(winrun PRIVATE win32)
     set_property(TARGET winrun PROPERTY C_STANDARD 11)
     target_compile_options(winrun PRIVATE -Wall -Wextra -Wno-unused-parameter)
+
+    # Several guests back to back in one process -- what the device build does
+    # when the button is tapped again, and what would break first if
+    # winrun_reset() ever missed a global.
+    add_executable(test_winrun_lib tests/test_winrun_lib.c)
+    target_link_libraries(test_winrun_lib PRIVATE winrun_lib)
+    add_test(NAME winrun_lib COMMAND test_winrun_lib ${CMAKE_CURRENT_SOURCE_DIR}/tests/win32)
     add_test(NAME win32_guests COMMAND ${CMAKE_COMMAND} -E env
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/win32/run.sh $<TARGET_FILE:winrun> ${CMAKE_CURRENT_SOURCE_DIR}/tests/win32)
 endif()

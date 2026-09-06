@@ -4,3 +4,5 @@
 #import "xcore/golden.h"
 #import "xcore/cpu.h"
 #import "../Host/ExtensionLauncher.h"
+#import "winprobe.h"
+#import "xcore/bench.h"

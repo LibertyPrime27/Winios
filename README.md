@@ -13,9 +13,9 @@ Planning and design. No shippable code yet.
 | Architecture (why two engines, what blocks 64-bit) | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
 | JIT acquisition and probing design | [`docs/JIT-DESIGN.md`](docs/JIT-DESIGN.md) |
 | CI — unsigned IPA on every push, core tests on Linux | [`.github/workflows/ios-build.yml`](.github/workflows/ios-build.yml) |
-| **MemProbe** — the measurement that gates 64-bit | [`docs/MEMPROBE.md`](docs/MEMPROBE.md), [`tools/memprobe/`](tools/memprobe) |
 | **Win32 layer** — PE32/PE32+ loader, TEB/PEB, kernel32 + msvcrt on the host, imports as `int3` stubs | [`docs/WIN32.md`](docs/WIN32.md), [`win32/`](win32), [`tools/winrun/`](tools/winrun) — **runs real Windows executables**: a three-import hello, a full mingw-w64 CRT program (TLS callbacks, malloc, printf, exit code) and the n-body benchmark, each as 32- and 64-bit, output byte-identical to the Linux build; interpreter, qemu JIT and Apple-silicon CI |
 | **dynarec** — x86 basic blocks → ARM64 code, block chaining, SSE/SSE2 on NEON, x87 (53-bit precision) on NEON doubles, lazy flags, callouts to the interpreter for the rest | [`docs/DYNAREC.md`](docs/DYNAREC.md), [`core/src/jit/`](core/src/jit) — **passes all 2364 silicon vectors on the M3 iPad** (and under qemu-aarch64 / Apple-silicon CI); JIT-vs-interpreter differential over every difftest case, 67 000 runs identical; SSE2 n-body 54× the interpreter, the x87 (i686) build 43×, busybox sha256 with zero SSE callouts |
+| **MemProbe** — the device app: CPU vectors, on-device benchmark, GPU probe, JIT bless, **real Windows .exe**, memory ladder | [`docs/MEMPROBE.md`](docs/MEMPROBE.md), [`tools/memprobe/`](tools/memprobe) — one button per probe; runs the six mingw-w64 guests through the PE loader on the device itself, and is where the only non-qemu performance numbers come from |
 | **xcore** — one CPU core for 32- and 64-bit x86, interpreter + differential tests | [`docs/CPU-CORE.md`](docs/CPU-CORE.md), [`core/`](core) — full baseline x86 + SSE2 + x87 in both 64- and 32-bit mode, 542 cases verified against silicon; `xrun` runs static Linux binaries (musl, glibc, busybox; i386 glibc through the 4 GB arena) |
 | **JIT on iOS 26 TXM hardware** — bless protocol, `jit_arena` | **working on device** (M3 iPad): [`docs/JIT-DESIGN.md` §1a](docs/JIT-DESIGN.md) |
 | Process model | **decided**: single process, emulated Linux process model (no extension) — `ARCHITECTURE.md` top note |
@@ -35,14 +35,23 @@ The emulator core is kept platform-independent so most of it builds and tests on
 
 ## Measured on hardware (Sept 2026)
 
-| | M3 iPad | iPhone Air |
+Both columns are build `bb13301`.
+
+| | iPad Air 11" (M3), iPadOS 26.3.1 | iPhone Air (A19 Pro), iOS 27.0 |
 |---|---|---|
-| CPU core vs x86 silicon (integer, SSE2, x87; 64- and 32-bit mode replayed on ARM64) | **2364/2364 match** (build cd9cb3e) | 336/336 match (older build; rerun pending) |
-| Dynarec: the same vectors through JIT-emitted ARM64 in the blessed arena | **2364/2364 match** — 395 blocks, 49 KB of ARM64 (build cd9cb3e) | rerun pending |
-| Usable memory, app process | 8128 MB (ladder-to-kill); ≈8167 MB (held + remaining, no kill) | 6080 MB (ladder-to-kill); ≈6118 MB (no kill) |
-| JIT (TXM bless protocol) | **working** | **working** (earlier run) |
-| GPU: D3D9 / D3D11 / D3D12 binding model on Metal | **27/27 PASS** (iPadOS 26.3.1) | **27/27 PASS** (iOS 27.0, A19 Pro) |
-| App extension launch | failed (x2) — no longer required | — |
+| CPU core vs x86 silicon (integer, SSE2, x87; 64- and 32-bit mode replayed on ARM64) | **2388/2388 match** | **2388/2388 match** |
+| Dynarec: the same vectors through JIT-emitted ARM64 in the blessed arena | **2388/2388 match** — 401 blocks, 61 KB | **identical**: 401 blocks, 61 KB, same callout count |
+| JIT (TXM bless protocol) | **working** | **working** |
+| GPU: D3D9 / D3D11 / D3D12 binding model on Metal | **27/27 PASS** | **27/27 PASS** |
+| Usable memory, app process | ≈8169 MB (ladder climbed to 7872 MB held) | ≈6126 MB (early read; full ladder pending) |
+| Physical RAM | 7.5 GB | 11.5 GB |
+
+Two things that table says. The dynarec compiles **bit-for-bit identically on
+A-series and M-series** — same block count, code size and callout count — so
+compilation depends on the guest code and not the host chip. And the memory
+ceiling is set by OS policy rather than RAM: the iPhone has 4 GB more physical
+memory than the iPad and a ~2 GB lower per-app limit, which makes the phone,
+not the tablet, the target to size the guest heap against.
 
 ## Inspiration and prior art
 
