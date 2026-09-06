@@ -34,6 +34,9 @@ jobs:
           cmake -S . -B build-host -DCMAKE_BUILD_TYPE=RelWithDebInfo
           cmake --build build-host -j"$(nproc)"
           ctest --test-dir build-host --output-on-failure 2>&1 | tee /tmp/ctest.log
+          # the Win32 suite again as a 16 KB-page host would run it (Apple silicon
+          # maps in 16 KB pages; the runtime widens guest ranges to host pages)
+          WINRUN_HOST_PAGE=16384 sh tests/win32/run.sh build-host/winrun tests/win32
 
       # The dynarec only runs on ARM64. The Linux runner is x86, so it runs an
       # aarch64 cross-build under qemu-user: the golden vectors through the JIT,
@@ -139,17 +142,30 @@ jobs:
           set +e
           cmake -S . -B build-mac -DCMAKE_BUILD_TYPE=Release -DWINIOS_D12MT=OFF 2>&1 | tail -3
           cmake --build build-mac -j3 --target test_selftest test_arena32 test_jitdiff winrun 2>&1 | grep -E "error|warning: |Built target" | head -20
-          uname -m; sysctl -n machdep.cpu.brand_string || true
+          uname -m; sysctl -n machdep.cpu.brand_string || true; echo "page size $(getconf PAGESIZE)"
+          # GitHub keeps at most 10 notice annotations per step, so the run page
+          # gets one line per suite; the full outputs go to the job summary
+          # (also on the run page, no cap).
           out=$(./build-mac/test_selftest 2>&1); rc=$?
-          echo "$out" | tail -30 | while IFS= read -r l; do echo "::notice::jit: ${l}"; done
+          echo "$out" | tail -2 | while IFS= read -r l; do echo "::notice::jit: ${l}"; done
           out2=$(XCORE_JIT=0 ./build-mac/test_selftest 2>&1); rc2=$?
-          echo "$out2" | tail -3 | while IFS= read -r l; do echo "::notice::interp: ${l}"; done
-          ./build-mac/test_arena32; rc3=$?
+          echo "$out2" | tail -1 | while IFS= read -r l; do echo "::notice::interp: ${l}"; done
+          out3=$(./build-mac/test_arena32 2>&1); rc3=$?
           out4=$(./build-mac/test_jitdiff 100 2>&1); rc4=$?
-          echo "$out4" | tail -12 | while IFS= read -r l; do echo "::notice::jitdiff: ${l}"; done
+          echo "$out4" | tail -1 | while IFS= read -r l; do echo "::notice::jitdiff: ${l}"; done
           out5=$(sh tests/win32/run.sh build-mac/winrun tests/win32 2>&1); rc5=$?
-          echo "$out5" | tail -12 | while IFS= read -r l; do echo "::notice::win32: ${l}"; done
+          echo "::notice::win32: $(echo "$out5" | grep -c '^ok') ok, $(echo "$out5" | grep -c '^FAIL') failed (rc $rc5)"
+          echo "$out5" | grep -E '^FAIL|winrun: host SIG' | head -8 | while IFS= read -r l; do echo "::error::win32: ${l}"; done
           echo "rc jit=$rc interp=$rc2 arena=$rc3 jitdiff=$rc4 win32=$rc5"
+          {
+            echo "## Apple silicon ($(uname -m), $(getconf PAGESIZE)-byte pages)"
+            echo "rc: jit=$rc interp=$rc2 arena=$rc3 jitdiff=$rc4 win32=$rc5"
+            echo; echo "### test_selftest (jit)"; echo '```'; echo "$out" | tail -30; echo '```'
+            echo "### test_selftest (interpreter)"; echo '```'; echo "$out2" | tail -3; echo '```'
+            echo "### test_arena32"; echo '```'; echo "$out3" | tail -5; echo '```'
+            echo "### test_jitdiff 100"; echo '```'; echo "$out4" | tail -12; echo '```'
+            echo "### Win32 guests"; echo '```'; echo "$out5" | tail -80; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
           [ $rc -eq 0 ] && [ $rc2 -eq 0 ] && [ $rc3 -eq 0 ] && [ $rc4 -eq 0 ] && [ $rc5 -eq 0 ]
 
       - name: Install XcodeGen

@@ -88,6 +88,7 @@ struct w32 {
 void    *W32P(w32 *w, uint64_t addr);                      /* guest -> host, NULL for guest NULL */
 uint64_t w32_alloc(w32 *w, uint64_t size, int exec);        /* fresh zeroed pages */
 uint64_t w32_alloc_at(w32 *w, uint64_t addr, uint64_t size, int exec);   /* 0 on failure */
+uint64_t w32_host_page(void);                               /* host page size (16 KB on Apple silicon) */
 uint64_t w32_heap_alloc(w32 *w, uint64_t size);
 uint64_t w32_heap_realloc(w32 *w, uint64_t addr, uint64_t size);
 void     w32_heap_free(w32 *w, uint64_t addr);

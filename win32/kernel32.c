@@ -249,13 +249,20 @@ static void k_CompareStringW(w32 *w) {
 }
 
 /* ---- memory ---- */
+/* Host page size: the guest's 4 KB pages are a fiction on Apple silicon (16 KB),
+ * and the kernel wants host-page-aligned ranges. */
+#define hpage() w32_host_page()
 static uint64_t valloc_(w32 *w, uint64_t addr, uint64_t size, uint32_t type) {
     if (w->is32) { addr = (uint32_t)addr; size = (uint32_t)size; }
     uint64_t r = 0;
     if (addr) {
         uint64_t a = addr & ~0xFFFull, end = (addr + size + 0xFFF) & ~0xFFFull;
-        /* commit on an already-reserved range is the common case: pages are ours already */
-        r = w32_alloc_at(w, a, end - a, 1) ? a : (type & 0x1000 ? a : 0);
+        /* commit on an already-reserved range is the common case: reserve mapped the
+         * pages RW already (we do not do reserve-without-commit), so leave them be --
+         * a fresh MAP_FIXED would zero them and, on a 16 KB host, their neighbours */
+        uint64_t hp = hpage(), ha = a & ~(hp - 1), he = (end + hp - 1) & ~(hp - 1);
+        if ((type & 0x1000) && msync(W32P(w, ha), he - ha, MS_ASYNC) == 0) r = a;
+        else r = w32_alloc_at(w, a, end - a, 1) ? a : (type & 0x1000 ? a : 0);
     } else r = w32_alloc(w, size, 1);
     if (!r) w32_set_last_error(w, ERROR_NOT_ENOUGH_MEMORY);
     return r;
@@ -267,26 +274,30 @@ static void k_VirtualFree(w32 *w) {
     if (type == 0x8000 /* MEM_RELEASE */ || !w->is32) {
         /* we do not track sizes for VirtualAlloc; releasing a whole region without a
          * size is only possible for the last allocation -- accept and leak otherwise */
-        if (size && !w->is32) munmap(W32P(w, addr & ~0xFFFull), (size + 0xFFF) & ~0xFFFull);
-    } else if (size) mmap(W32P(w, addr & ~0xFFFull), (size + 0xFFF) & ~0xFFFull, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (size && !w->is32) munmap(W32P(w, addr & ~(hpage() - 1)), (size + hpage() - 1) & ~(hpage() - 1));
+    } else if (size) {
+        /* decommit: only the host pages the range covers entirely -- a MAP_FIXED
+         * over a shared host page would take a neighbour's data with it */
+        uint64_t a = (addr + hpage() - 1) & ~(hpage() - 1), e = (addr + size) & ~(hpage() - 1);
+        if (e > a) mmap(W32P(w, a), e - a, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    }
     RET(1);
 }
+/* Guest memory is never executed by the host (see w32_alloc), so PAGE_EXECUTE_*
+ * maps to the readable/writable part only. */
 static int prot_of(uint32_t p) {
     switch (p & 0xFF) {
     case 0x01: return PROT_NONE;
-    case 0x02: return PROT_READ;
-    case 0x04: case 0x08: return PROT_READ | PROT_WRITE;
-    case 0x10: return PROT_EXEC | PROT_READ;
-    case 0x20: return PROT_EXEC | PROT_READ;
-    default:   return PROT_EXEC | PROT_READ | PROT_WRITE;
+    case 0x02: case 0x10: case 0x20: return PROT_READ;
+    default:   return PROT_READ | PROT_WRITE;
     }
 }
 static void k_VirtualProtect(w32 *w) {
     uint64_t addr = ARG(0), size = ARG(1); uint32_t np = (uint32_t)ARG(2), old = ARG(3);
-    uint64_t a = addr & ~0xFFFull;
+    uint64_t a = addr & ~(hpage() - 1), e = (addr + size + hpage() - 1) & ~(hpage() - 1);
     /* the JIT keeps code in the interpreter's block cache: a page that becomes writable may change */
-    xc_cache_invalidate(a, a + ((addr + size + 0xFFF) & ~0xFFFull) - a);
-    mprotect(W32P(w, a), (addr + size + 0xFFF) / 0x1000 * 0x1000 - a, prot_of(np) | PROT_READ);
+    xc_cache_invalidate(a, e);
+    mprotect(W32P(w, a), e - a, prot_of(np) | PROT_READ);
     if (old) w32_write(w, old, 4, 0x40);
     RET(1);
 }

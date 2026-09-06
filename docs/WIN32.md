@@ -43,6 +43,20 @@ Every API implementation is written once against `w32_arg(i)`, `w32_ret()`,
 ABI called them. `hello32.exe`/`hello64.exe`, `crt32.exe`/`crt64.exe` and
 `nbody32.exe`/`nbody64.exe` are the same sources built for both.
 
+Two facts about the host shape guest memory. Guest pages are never executed
+by the host — the interpreter reads them, the dynarec translates them — so
+they are mapped read/write whatever `PAGE_EXECUTE_*` the image or
+`VirtualAlloc` asked for; Apple silicon refuses RWX mappings outside
+`MAP_JIT` and iOS refuses them outright (the first Apple-silicon CI run of
+this layer died on exactly that: the stub page came back unmapped and the
+first `int3` was written to address 0). And the guest's 4 KB pages are a
+fiction on Apple silicon, whose kernel maps in 16 KB units and rejects
+`mmap(MAP_FIXED)`/`mprotect` on anything less aligned; `w32_alloc*`,
+`VirtualFree` and `VirtualProtect` widen guest ranges to host pages
+(`w32_host_page()`), and the Linux CI job runs the suite once more with
+`WINRUN_HOST_PAGE=16384` so the 16 KB path is exercised on every push, not
+only on the Mac.
+
 ## What the process looks like from inside
 
 TEB (gs on x64, fs on x86) with stack limits, Self, ClientId, LastErrorValue,
@@ -73,9 +87,12 @@ with recordings: the three-import `hello`, the full mingw-w64 CRT program
 `printf`, `snprintf`, exit code) and the n-body benchmark, each as PE32 and
 PE32+. The 64-bit n-body output is byte-identical to the Linux build of the
 same source (`tests/guest/nbody`), which is byte-identical to native x86. The
-suite runs on the x86 runner (interpreter), under `qemu-aarch64` (JIT) and
-natively on the Apple-silicon CI job (JIT). `winrun` builds on Linux and macOS
-and will build for iOS unchanged: it is plain C over `mmap`.
+suite runs on the x86 runner (interpreter, 4 KB and simulated 16 KB pages),
+under `qemu-aarch64` (JIT) and natively on the Apple-silicon CI job (JIT,
+16 KB pages). `winrun` builds on Linux and macOS and will build for iOS
+unchanged: it is plain C over `mmap`. A host crash prints the guest RIP/RSP,
+the runtime's map (image, stubs, TEB, stack, heap) and a host backtrace, so a
+CI log is enough to start from.
 
 ## Measured, and what it says about the road ahead
 

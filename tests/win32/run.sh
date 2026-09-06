@@ -13,7 +13,7 @@ check() {   # name expected_rc args...
         # diagnostics: is it the JIT? what does -v say?
         got2=$(XCORE_JIT=0 "$winrun" "./$name" "$@" 2>/dev/null); rc2=$?
         [ "$got2" = "$exp" ] && [ "$rc2" -eq "$erc" ] && echo "  (passes with XCORE_JIT=0: JIT-specific)" || echo "  (also fails with XCORE_JIT=0, rc=$rc2)"
-        "$winrun" -v "./$name" "$@" 2>&1 >/dev/null | tail -8 | sed 's/^/  | /'
+        "$winrun" -v "./$name" "$@" 2>&1 >/dev/null | tail -24 | sed 's/^/  | /'
     else echo "ok   $name"; fi
 }
 check hello64.exe 7 a b

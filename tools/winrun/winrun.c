@@ -36,38 +36,65 @@ void *W32P(w32 *w, uint64_t addr) {
 
 static uint64_t g_bump32 = 0x10000000u;        /* arena bump allocator: 256 MB .. 3.5 GB */
 
+/* The host's page size. The guest thinks in 4 KB pages; Apple silicon (macOS
+ * and iOS) maps in 16 KB ones, and mmap(MAP_FIXED) / mprotect reject an
+ * address that is not a multiple of it. Guest ranges are therefore widened
+ * to host pages before they reach the kernel. */
+static uint64_t g_hpage;
+uint64_t w32_host_page(void) {
+    if (!g_hpage) {
+        long p = sysconf(_SC_PAGESIZE);
+        const char *sim = getenv("WINRUN_HOST_PAGE");         /* test hook: pretend to be a 16 KB host */
+        if (sim && atol(sim) > p) p = atol(sim);
+        g_hpage = p > (long)PAGE ? (uint64_t)p : PAGE;
+    }
+    return g_hpage;
+}
+#define hpage() w32_host_page()
+#define HP_DOWN(x) ((x) & ~(hpage() - 1))
+#define HP_UP(x)   (((x) + hpage() - 1) & ~(hpage() - 1))
+
+/* Guest memory is never executed by the host -- the interpreter reads it and
+ * the dynarec translates it -- so it is always mapped RW, whatever the guest
+ * asked for. That matters: Apple silicon refuses RWX mappings that are not
+ * MAP_JIT, and iOS refuses them outright. `exec` is kept in the signature as
+ * documentation of what the guest wanted. */
+#define GUEST_PROT (PROT_READ | PROT_WRITE)
+
 uint64_t w32_alloc_at(w32 *w, uint64_t addr, uint64_t size, int exec) {
+    (void)exec;
     size = PAGE_UP(size);
-    int prot = PROT_READ | PROT_WRITE | (exec ? PROT_EXEC : 0);
     if (w->is32) {
         if (addr + size > 0xF0000000ull || addr < 0x10000) return 0;
         /* the arena is one PROT_NONE reservation; claiming a range is a MAP_FIXED over it.
          * We do not track what the image already claimed -- callers ask for the
-         * image first, then everything else comes from the bump allocator above 256 MB. */
-        void *p = mmap(w->base + addr, size, prot, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (p == MAP_FAILED) return 0;
-        if (addr + size > g_bump32 && addr < 0xF0000000ull && addr >= 0x10000000ull) g_bump32 = addr + size;
+         * image first, then everything else comes from the bump allocator above 256 MB.
+         * Widen to host pages (a MAP_FIXED replaces what was there, so the bump
+         * allocator below hands out host-page-aligned ranges and nothing shares one). */
+        uint64_t a0 = HP_DOWN(addr), a1 = HP_UP(addr + size);
+        void *p = mmap(w->base + a0, a1 - a0, GUEST_PROT, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) { if (w->verbose) fprintf(stderr, "winrun: map %#llx+%#llx: %s\n", (unsigned long long)a0, (unsigned long long)(a1 - a0), strerror(errno)); return 0; }
+        if (a1 > g_bump32 && a0 < 0xF0000000ull && a0 >= 0x10000000ull) g_bump32 = a1;
         return addr;
     }
 #ifdef MAP_FIXED_NOREPLACE
-    void *p = mmap((void *)(uintptr_t)addr, size, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    void *p = mmap((void *)(uintptr_t)addr, size, GUEST_PROT, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
 #else
-    void *p = mmap((void *)(uintptr_t)addr, size, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);   /* hint; verified below */
+    void *p = mmap((void *)(uintptr_t)addr, size, GUEST_PROT, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);   /* hint; verified below */
 #endif
     if (p == MAP_FAILED) return 0;
     if ((uint64_t)(uintptr_t)p != addr) { munmap(p, size); return 0; }
     return addr;
 }
 uint64_t w32_alloc(w32 *w, uint64_t size, int exec) {
-    size = PAGE_UP(size);
+    size = HP_UP(PAGE_UP(size));
     if (w->is32) {
-        uint64_t a = g_bump32;
+        uint64_t a = HP_UP(g_bump32);
         if (a + size > 0xF0000000ull) return 0;
         g_bump32 = a + size;
         return w32_alloc_at(w, a, size, exec) ? a : 0;
     }
-    int prot = PROT_READ | PROT_WRITE | (exec ? PROT_EXEC : 0);
-    void *p = mmap(0, size, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void *p = mmap(0, size, GUEST_PROT, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     return p == MAP_FAILED ? 0 : (uint64_t)(uintptr_t)p;
 }
 
@@ -299,6 +326,7 @@ static void stubs_init(w32 *w) {
     w->stub_base = w->is32 ? w32_alloc_at(w, 0x7F000000u, 0x10000u * (NDLLS + 1), 1)
                            : w32_alloc_at(w, 0x7FF700000000ull, 0x10000u * (NDLLS + 1), 1);
     if (!w->stub_base) w->stub_base = w32_alloc(w, 0x10000u * (NDLLS + 1), 1);
+    if (!w->stub_base) { fprintf(stderr, "winrun: cannot map the import stubs: %s\n", strerror(errno)); exit(2); }
     uint8_t *p = W32P(w, w->stub_base);
     for (int i = 0; i < W32_MAX_STUBS; i++) { p[16 * i] = 0xCC; memset(p + 16 * i + 1, 0x90, 15); }
     /* fake module pages: "MZ" so nothing that peeks falls over */
@@ -411,6 +439,7 @@ static void process_init(w32 *w, int argc, char **argv) {
     uint64_t stack_size = 1u << 20;
     w->stack_limit = w32_alloc(w, stack_size, 0);
     w->stack_base = w->stack_limit + stack_size;
+    if (!w->teb || !w->peb || !w->stack_limit) { fprintf(stderr, "winrun: cannot map TEB/PEB/stack: %s\n", strerror(errno)); exit(2); }
     if (w->is32) {
         w32_write(w, w->teb + 0x00, 4, 0xFFFFFFFFu);          /* ExceptionList: end of chain */
         w32_write(w, w->teb + 0x04, 4, w->stack_base);
@@ -457,21 +486,38 @@ static void process_init(w32 *w, int argc, char **argv) {
  * the arena/identity model does not cover, or a JIT bug. Say where we were
  * so a CI log is enough to start from, then die with the original signal. */
 #include <signal.h>
+#if defined(__GLIBC__) || defined(__APPLE__)
+#include <execinfo.h>
+#define HAVE_BACKTRACE 1
+#endif
 static void on_crash(int sig, siginfo_t *si, void *uctx) {
     (void)uctx;
     xc_cpu *c = g_w.c;
     uint64_t lo = 0, hi = 0; int have = xc_jit_code_range(&lo, &hi);
     uint64_t fault = (uint64_t)(uintptr_t)si->si_addr;
-    char buf[512];
+    char buf[768];
     int n = snprintf(buf, sizeof buf,
-        "winrun: host %s at address %#llx; guest rip=%#llx rsp=%#llx (%d-bit, %s); fault %s the JIT code region%s\n",
+        "winrun: host %s at address %#llx; guest rip=%#llx rsp=%#llx (%d-bit, %s); fault %s the JIT code region%s\n"
+        "winrun: state: image %#llx+%#x entry %#llx stubs %#llx teb %#llx peb %#llx stack %#llx..%#llx heap %#llx depth %d exited %d\n",
         sig == SIGSEGV ? "SIGSEGV" : "SIGBUS", (unsigned long long)fault,
-        (unsigned long long)c->rip, (unsigned long long)c->gpr[XC_RSP], g_w.is32 ? 32 : 64,
+        (unsigned long long)(c ? c->rip : 0), (unsigned long long)(c ? c->gpr[XC_RSP] : 0), g_w.is32 ? 32 : 64,
         xc_jit_enabled() ? "jit" : "interpreter",
         have && fault >= lo && fault < hi ? "inside" : "outside",
         g_w.is32 && fault >= (uint64_t)(uintptr_t)g_w.base && fault < (uint64_t)(uintptr_t)g_w.base + (1ull << 32)
-            ? " -- inside the 4 GB arena (unmapped guest page)" : "");
+            ? " -- inside the 4 GB arena (unmapped guest page)" : "",
+        (unsigned long long)g_w.image_base, (unsigned)g_w.image_size, (unsigned long long)g_w.entry,
+        (unsigned long long)g_w.stub_base, (unsigned long long)g_w.teb, (unsigned long long)g_w.peb,
+        (unsigned long long)g_w.stack_limit, (unsigned long long)g_w.stack_base, (unsigned long long)g_w.heap_cur,
+        g_w.depth, g_w.exited);
     if (write(2, buf, (size_t)(n > 0 ? n : 0)) < 0) { }
+#ifdef HAVE_BACKTRACE
+    /* where the host was: the frames name the runtime function (or the core
+     * primitive) that touched the bad address -- async-signal-unsafe in
+     * theory, good enough for a last message in practice */
+    void *frames[32]; int nf = backtrace(frames, 32);
+    if (write(2, "winrun: host backtrace:\n", 24) < 0) { }
+    backtrace_symbols_fd(frames, nf, 2);
+#endif
     signal(sig, SIG_DFL);
     raise(sig);
 }
