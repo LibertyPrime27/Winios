@@ -216,6 +216,29 @@ uint64_t xc_jit_links(void) { return g_stat_links; }
 /* Called from generated code. All of them may clobber x0-x17, so the
  * compiler spills the guest register cache around every call. */
 
+/* MXCSR <-> host FP control/status. The rounding mode and flush-to-zero are
+ * mirrored into FPCR while JIT code runs; exception flags accumulate in FPSR
+ * and are folded into MXCSR's sticky bits whenever C code (which may read or
+ * clear them) is about to run. FPSR: IOC 0, DZC 1, OFC 2, UFC 3, IXC 4, IDC 7;
+ * MXCSR: IE 0, DE 1, ZE 2, OE 3, UE 4, PE 5. */
+static inline uint64_t rd_fpsr(void) { uint64_t v; __asm__ volatile("mrs %0, fpsr" : "=r"(v)); return v; }
+static inline void wr_fpsr(uint64_t v) { __asm__ volatile("msr fpsr, %0" :: "r"(v)); }
+static inline uint64_t rd_fpcr(void) { uint64_t v; __asm__ volatile("mrs %0, fpcr" : "=r"(v)); return v; }
+static inline void wr_fpcr(uint64_t v) { __asm__ volatile("msr fpcr, %0" :: "r"(v)); }
+static uint64_t g_host_fpcr;
+static void fold_fpsr(xc_cpu *c) {
+    uint64_t f = rd_fpsr() & 0x9f;
+    if (!f) return;
+    c->mxcsr |= (uint32_t)((f & 1) | ((f & 0x1e) << 1) | (((f >> 7) & 1) << 1));
+    wr_fpsr(0);
+}
+static void fpcr_from_mxcsr(const xc_cpu *c) {
+    static const uint64_t rmode[4] = { 0, 2, 1, 3 };           /* x86 RN,RM,RP,RZ -> ARM RN,RP,RM,RZ */
+    uint64_t v = (g_host_fpcr & ~((3ull << 22) | (1ull << 24))) | (rmode[(c->mxcsr >> 13) & 3] << 22);
+    if ((c->mxcsr & 0x8040) == 0x8040) v |= 1ull << 24;          /* FTZ+DAZ -> FZ */
+    wr_fpcr(v);
+}
+
 /* One instruction through the interpreter. Returns 1 if the block must exit
  * afterwards (stop condition, or RIP left the straight line), else 0. */
 static uint32_t g_callout_hist[ZYDIS_MNEMONIC_MAX_VALUE + 1];
@@ -235,7 +258,9 @@ static int jit_callout(xc_cpu *c, const dinsn *d) {
     g_stat_callouts++;
     if (g_callout_stats) { if (!g_stat_callouts_reg) { atexit(callout_report); g_stat_callouts_reg = 1; } g_callout_hist[d->in.mnemonic]++; }
     xc_flags_sync(c);
+    fold_fpsr(c);
     xc_stop st = xc_exec_decoded(c, &d->in, xc_cache_ops(d));
+    fpcr_from_mxcsr(c);                     /* the interpreter may have changed MXCSR, or reset the host rounding mode */
     if (st != XC_STOP_NONE) return 1;
     return c->rip != d->rip + d->in.length;
 }
@@ -321,7 +346,8 @@ enum { LZ_UNKNOWN = 0, LZ_VALID /* rflags exact, lz_op NONE */, LZ_LOGIC0 /* CF 
 typedef struct {
     a64 a;
     int mode;                   /* 32 or 64 */
-    uint16_t loaded, dirty;
+    uint16_t loaded, dirty;     /* guest GPRs cached in HREG[] */
+    uint16_t xloaded, xdirty;   /* guest XMMs cached in v16-v31 */
     int nz, nz_bits;
     int lz;
     const block *b;
@@ -340,11 +366,26 @@ static int greg(jc *j, int g) {
     return HREG[g];
 }
 static void gdirty(jc *j, int g) { j->loaded |= 1u << g; j->dirty |= 1u << g; }
-static void flush(jc *j) {
-    for (int g = 0; g < 16; g++) if (j->dirty & (1u << g)) a64_str_off(&j->a, 3, HREG[g], R_CPU, OFF(gpr) + 8u * g);
-    j->dirty = 0;
+/* XMM0-15 live in v16-v31 while a block runs; v0-v3 are temporaries. Both
+ * ranges are caller-saved, so a C call clobbers them -- the cache is spilled
+ * and invalidated around every call, as for the GPRs. */
+#define VREG(x) (16 + (x))
+enum { VT0 = 0, VT1 = 1, VT2 = 2, VT3 = 3 };
+static int xreg(jc *j, int x) {
+    if (!(j->xloaded & (1u << x))) {
+        a64_fldst_off(&j->a, 2, 1, VREG(x), R_CPU, OFF(xmm) + 16u * x);
+        j->xloaded |= 1u << x;
+    }
+    return VREG(x);
 }
-static void invalidate(jc *j) { j->loaded = j->dirty = 0; }
+static void xset(jc *j, int x) { j->xloaded |= 1u << x; j->xdirty |= 1u << x; }   /* about to be fully overwritten */
+/* Emit the stores for every dirty register without changing compile state. */
+static void spill(jc *j) {
+    for (int g = 0; g < 16; g++) if (j->dirty & (1u << g)) a64_str_off(&j->a, 3, HREG[g], R_CPU, OFF(gpr) + 8u * g);
+    for (int x = 0; x < 16; x++) if (j->xdirty & (1u << x)) a64_fldst_off(&j->a, 2, 0, VREG(x), R_CPU, OFF(xmm) + 16u * x);
+}
+static void flush(jc *j) { spill(j); j->dirty = 0; j->xdirty = 0; }
+static void invalidate(jc *j) { j->loaded = j->dirty = 0; j->xloaded = j->xdirty = 0; }
 
 /* Address of a memory operand into `rd`. Returns 1 if the address is a
  * 32-bit quantity (use uxtw addressing), 0 if 64-bit. */
@@ -391,7 +432,7 @@ static void emit_bounds(jc *j, int bytes) {
     a64_cmp(&j->a, 0, T4, T3);
     uint32_t ok = a64_here(&j->a); a64_bcond(&j->a, CC_LS, 0);
     /* out of range: spill, report, leave */
-    uint16_t dirty = j->dirty; flush(j); j->dirty = dirty;      /* this path does not change compile state */
+    spill(j);                                                   /* this path does not change compile state */
     a64_mov_reg(&j->a, 1, 0, R_CPU);
     a64_mov_reg(&j->a, 1, 1, T4);
     a64_mov_imm(&j->a, 2, j->d->rip);
@@ -544,6 +585,8 @@ static void emit_sync(jc *j) {
     j->lz = LZ_VALID;
 }
 
+#include "jit_sse.h"
+
 /* --- conditions --- */
 
 /* x86 condition code 0..15 for the Jcc/SETcc/CMOVcc mnemonic, or -1 */
@@ -594,6 +637,14 @@ static void emit_cond_to_w0(jc *j, int cc) {
         break;
     case NZ_INC:
         switch (base) { case 0: ac = CC_VS; break; case 2: ac = CC_EQ; break; case 4: ac = CC_MI; break; case 6: ac = CC_LT; break; case 7: ac = CC_LE; break; }
+        break;
+    case NZ_FCMP:
+        /* after fcmp: less N=1; equal Z=1; greater C=1; unordered C=V=1.
+         * x86 COMIS: CF = less|unord, ZF = equal|unord, PF = unord */
+        switch (base) { case 1: ac = CC_LT; break; case 3: ac = CC_LE; break; case 5: ac = CC_VS; break;
+                        case 2: if (!neg) { a64_cset(&j->a, 0, T0, CC_EQ); a64_cset(&j->a, 0, T1, CC_VS); a64_orr(&j->a, 0, T0, T0, T1); }
+                                else      { a64_cset(&j->a, 0, T0, CC_NE); a64_cset(&j->a, 0, T1, CC_VC); a64_and(&j->a, 0, T0, T0, T1); }
+                                return; }
         break;
     }
     if (constant >= 0) { a64_movz(&j->a, 0, T0, (uint16_t)(constant ^ neg), 0); return; }
@@ -830,7 +881,11 @@ static int flag_use(const ZydisDecodedInstruction *in, const xop *ops) {
     case ZYDIS_MNEMONIC_MOVAPS: case ZYDIS_MNEMONIC_MOVUPS: case ZYDIS_MNEMONIC_MOVDQA: case ZYDIS_MNEMONIC_MOVDQU:
     case ZYDIS_MNEMONIC_MOVQ: case ZYDIS_MNEMONIC_MOVD: case ZYDIS_MNEMONIC_MOVSS: case ZYDIS_MNEMONIC_MOVSD:
         return in->meta.category == ZYDIS_CATEGORY_STRINGOP ? FR : 0;
+    case ZYDIS_MNEMONIC_COMISS: case ZYDIS_MNEMONIC_COMISD: case ZYDIS_MNEMONIC_UCOMISS: case ZYDIS_MNEMONIC_UCOMISD:
+        return FW_ALL;
     default:
+        for (int i = 0; i < in->operand_count_visible; i++)
+            if (ops[i].type == XOP_REG && ops[i].rcls == XR_XMM && in->mnemonic != ZYDIS_MNEMONIC_PTEST) return 0;   /* SSE data ops leave rflags alone */
         return FR | FW_PART;         /* conservative: callout reads exact flags and may change them */
     }
 }
@@ -841,6 +896,10 @@ static void emit_insn(jc *j) {
     const xop *ops = j->ops;
     ZydisMnemonic m = in->mnemonic;
     int cc;
+
+    /* anything touching an XMM register goes to the SSE lowering */
+    for (int i = 0; i < in->operand_count_visible; i++)
+        if (ops[i].type == XOP_REG && ops[i].rcls == XR_XMM) { if (!emit_sse(j)) emit_callout(j); return; }
 
     /* operands the native paths cannot describe: segment/other registers,
      * far pointers, anything wider than a GPR */
@@ -1166,7 +1225,12 @@ xc_stop xc_run_jit(xc_cpu *c, uint64_t max_steps) {
     c->steps = (int64_t)(max_steps > INT64_MAX ? INT64_MAX : max_steps);
     c->stop = XC_STOP_NONE;
     c->jit_base = c->mem->mode == XC_MODE_64 ? 0 : (uint64_t)(uintptr_t)c->mem->base;
+    g_host_fpcr = rd_fpcr();
+    fpcr_from_mxcsr(c);
+    wr_fpsr(0);
     xc_stop st = g_enter(c);
+    fold_fpsr(c);
+    wr_fpcr(g_host_fpcr);
     xc_flags_sync(c);
     if (st == XC_STOP_STEPS) c->stop = XC_STOP_STEPS;
     return st;

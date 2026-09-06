@@ -25,9 +25,55 @@ spills its registers, calls the interpreter for that one instruction, reloads,
 and carries on. Coverage grows by moving instructions from the callout path to
 native lowering; correctness never depends on how far that has got. Today the
 native set is the integer core — moves, LEA, the ALU group, INC/DEC/NEG/NOT,
-shifts and rotates, IMUL, PUSH/POP/CALL/RET/LEAVE, JMP/Jcc/SETcc/CMOVcc, the
-sign-extension group — in all four operand widths, both address modes, both
-guest modes. SSE, x87, string ops, DIV/MUL and the rare things call out.
+shifts and rotates, IMUL, BSWAP, PUSH/POP/CALL/RET/LEAVE, JMP/Jcc/SETcc/CMOVcc,
+the sign-extension group — in all four operand widths, both address modes,
+both guest modes; REP MOVS/STOS through a helper that memmoves host memory;
+and most of SSE/SSE2 on NEON (below). x87, DIV/MUL, CMPXCHG, BSF/BSR, CPUID
+and the rare things call out. `XCORE_JIT_CALLOUTS=1` prints a histogram of
+what still calls out, which is how the next lowering target is picked.
+
+## Block chaining
+
+A block whose exit target is a constant (JMP rel, Jcc both ways, CALL rel,
+fall-through) ends in a patchable `b` followed by the slow path: store RIP,
+hand the address of that `b` to the dispatcher in x1. The first time the
+dispatcher resolves the target it patches the `b` to jump straight into the
+target's code and records the site on the target block. From then on the two
+blocks run back to back with no dispatcher, hash lookup or byte check in
+between. When the cache drops a block (self-modifying code, unmapping) the
+recorded sites are patched back to the slow path first, so a stale chain can
+never be followed. Because chained entries bypass the dispatcher, the step
+budget is checked in each block's prologue instead. `XCORE_JIT_CHAIN=0` turns
+chaining off for A/B runs. The trade-off is documented rather than hidden: a
+chained target skips the per-execution SMC byte check; write tracking is the
+runtime's job.
+
+## SSE on NEON
+
+XMM0–15 live in v16–v31 while a block runs, with the same load-on-use /
+store-on-exit discipline as the GPRs; v0–v3 are temporaries. Integer SIMD,
+moves, shuffles, packs and logic lower one-to-one (PMULHW is
+`smull; smull2; uzp2`, PMOVMSKB is a shift-and-or cascade with no constant
+loads). Floating point is where the ISAs disagree, and only in one place:
+**NaN results**. x86 propagates the first NaN operand and its default NaN is
+negative; ARM prefers an SNaN in either position and its default NaN is
+positive. So every FP operation computes into a temporary, tests the result
+for NaN (one `fcmp` for scalars, `fcmeq; uminv` for vectors) and, if it is,
+leaves the block through the interpreter, which redoes the instruction from
+the untouched inputs. Non-NaN IEEE results are bit-identical by definition, so
+this is exact; NaN results are rare in real code, so the guard costs two to
+four instructions and the slow path almost never runs. Conversions use the
+same trick for x86's "integer indefinite" on overflow and NaN; MIN/MAX are
+`fcmgt; bsl`, which reproduces x86's "second operand wins on NaN or equal
+zeros" rule; COMISS/UCOMISS turn `fcmp`'s NZCV directly into CF/ZF/PF, and a
+following Jcc maps onto the ARM condition (JB after COMISS is `b.lt`).
+
+MXCSR: the rounding mode and flush-to-zero are mirrored into FPCR while JIT
+code runs; the sticky exception flags accumulate in FPSR and are folded into
+MXCSR at callouts and exits. The denormal-operand flag (DE) is not tracked
+natively, and FTZ/DAZ are honoured together (ARM's FZ) but not separately.
+RCPPS/RSQRTPS (implementation-specific approximations), the pack/unpack
+oddities not listed in `jit_sse.h` and everything SSE3+ still call out.
 
 ## Flags
 
@@ -82,6 +128,14 @@ Three layers, from cheapest to most authoritative:
    self-test and the guest programs (i386 and x86-64, musl and glibc) through
    the JIT under `qemu-aarch64`. This is also the local development loop on an
    x86 machine: `cmake -S . -B build-a64 -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64-linux.cmake`.
+2b. **JIT vs interpreter, every difftest case** (`tests/test_jitdiff.c`).
+   Takes all 315 x86-64 cases of the differential suite — memory operands,
+   flags and MXCSR included, which the on-device replay cannot cover — seeds
+   registers, memory and XMM state (with extra seeds full of NaNs of both
+   kinds, infinities, signed zeros, denormals and conversion-boundary values,
+   and others that change the rounding mode), runs each through the
+   interpreter and the JIT, and requires identical final states. 63 000 runs,
+   0 differences. Runs under qemu in CI and natively on the Apple-silicon job.
 3. **Apple silicon.** The macOS CI job runs the self-test natively; MemProbe
    runs it on the iPad and iPhone inside a debugger-blessed arena
    (`xc_jit_set_code`), which is the real target environment.
@@ -103,20 +157,28 @@ writes every compiled block's bytes for `objdump -D -b binary -m aarch64`.
 
 ## Measured
 
-Under `qemu-aarch64` (so absolute numbers are meaningless, only the ratio
-matters): a 30 M-iteration integer loop runs 8.7× faster through the JIT than
-through the interpreter's block cache. Real numbers come from the devices.
+Under `qemu-aarch64` (so absolute numbers are meaningless, only the ratios
+matter):
+
+| workload | interpreter | JIT, no chaining | JIT + chaining + SSE |
+|---|---|---|---|
+| 30 M-iteration integer loop | 1× | 8.7× | — |
+| busybox `sha256sum` of a 3.5 MB file (252 M instructions) | — | 3.82 s, 968 k callouts | 1.35 s, 1.4 k callouts |
+| `tests/guest/nbody 300000` (double-precision n-body + packed float loop) | 70.2 s | — | 1.3 s (54×) |
+
+Output is byte-identical to the native x86 run in every case. Real numbers
+come from the devices.
 
 ## What comes next, in order
 
-1. **Block chaining.** Today every block returns to the dispatcher (a hash
-   lookup) and reloads its registers. Patching direct jumps between compiled
-   blocks, and keeping registers in their host homes across the link, removes
-   most of the remaining overhead for hot loops.
-2. **SSE natively.** Packed integer and scalar/packed float on NEON; x87 stays
-   in the interpreter (SoftFloat) — its exactness is the point, and 32-bit
-   games' float math runs through D3D9's 24-bit mode where speed matters less
-   than the rounding being right.
+1. **Registers live across links.** Chaining removed the dispatcher from the
+   hot path; the remaining overhead in a hot loop is the store-on-exit /
+   load-on-entry of guest registers at every block boundary. Keeping them in
+   their host homes across a chained link (a per-block entry convention) is
+   the next speed step.
+2. **Indirect branch prediction.** RET and `jmp reg` still go through the
+   dispatcher's hash lookup; an inline cache keyed by target address would
+   cover most of them.
 3. **Faults.** Map host SIGSEGV/SIGBUS inside guest code to guest faults with
    the interpreter's `XC_STOP_FAULT` semantics.
 4. **A code cache on disk**, keyed by the block's bytes, so later launches

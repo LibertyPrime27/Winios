@@ -175,6 +175,157 @@ static inline void a64_ret(a64 *a) { a64_emit(a, 0xD65F03C0u); }
 static inline void a64_nop(a64 *a) { a64_emit(a, 0xD503201Fu); }
 static inline void a64_brk(a64 *a, int imm) { a64_emit(a, 0xD4200000u | (imm << 5)); }
 
+/* ---- SIMD & FP ----
+ * Vector registers are numbered 0-31 like the others. `sz` picks the lane:
+ * for integer ops 0 = 8-bit, 1 = 16, 2 = 32, 3 = 64; for FP ops 0 = single,
+ * 1 = double. All vector forms are the 128-bit (Q=1) shape unless named
+ * otherwise. */
+/* loads/stores with unsigned scaled immediate: size 0 s, 1 d, 2 q */
+static inline void a64_fldst_off(a64 *a, int fsz, int load, int rt, int rn, uint32_t byteoff) {
+    static const uint32_t base[3] = { 0xBD000000u, 0xFD000000u, 0x3D800000u };
+    a64_emit(a, base[fsz] | ((uint32_t)load << 22) | ((byteoff >> (2 + fsz)) << 10) | (rn << 5) | rt);
+}
+/* register offset: option 3 = LSL/x, 2 = uxtw */
+static inline void a64_fldst_reg(a64 *a, int fsz, int load, int rt, int rn, int rm, int option) {
+    static const uint32_t base[3] = { 0xBC200800u, 0xFC200800u, 0x3CA00800u };
+    a64_emit(a, base[fsz] | ((uint32_t)load << 22) | (rm << 16) | (option << 13) | (rn << 5) | rt);
+}
+/* three-same: op = U<<5 | opcode; size = lane size (bits 22-23) */
+static inline void a64_v3(a64 *a, int U, int size, int opcode, int rd, int rn, int rm) {
+    a64_emit(a, 0x4E200400u | ((uint32_t)U << 29) | ((uint32_t)size << 22) | (rm << 16) | ((uint32_t)opcode << 11) | (rn << 5) | rd);
+}
+static inline void a64_vadd(a64 *a, int sz, int rd, int rn, int rm)   { a64_v3(a, 0, sz, 0x10, rd, rn, rm); }
+static inline void a64_vsub(a64 *a, int sz, int rd, int rn, int rm)   { a64_v3(a, 1, sz, 0x10, rd, rn, rm); }
+static inline void a64_vmul(a64 *a, int sz, int rd, int rn, int rm)   { a64_v3(a, 0, sz, 0x13, rd, rn, rm); }
+static inline void a64_vcmeq(a64 *a, int sz, int rd, int rn, int rm)  { a64_v3(a, 1, sz, 0x11, rd, rn, rm); }
+static inline void a64_vcmgt(a64 *a, int sz, int rd, int rn, int rm)  { a64_v3(a, 0, sz, 0x06, rd, rn, rm); }
+static inline void a64_vcmhi(a64 *a, int sz, int rd, int rn, int rm)  { a64_v3(a, 1, sz, 0x06, rd, rn, rm); }
+static inline void a64_vuqadd(a64 *a, int sz, int rd, int rn, int rm) { a64_v3(a, 1, sz, 0x01, rd, rn, rm); }
+static inline void a64_vsqadd(a64 *a, int sz, int rd, int rn, int rm) { a64_v3(a, 0, sz, 0x01, rd, rn, rm); }
+static inline void a64_vuqsub(a64 *a, int sz, int rd, int rn, int rm) { a64_v3(a, 1, sz, 0x05, rd, rn, rm); }
+static inline void a64_vsqsub(a64 *a, int sz, int rd, int rn, int rm) { a64_v3(a, 0, sz, 0x05, rd, rn, rm); }
+static inline void a64_vsmax(a64 *a, int sz, int rd, int rn, int rm)  { a64_v3(a, 0, sz, 0x0C, rd, rn, rm); }
+static inline void a64_vsmin(a64 *a, int sz, int rd, int rn, int rm)  { a64_v3(a, 0, sz, 0x0D, rd, rn, rm); }
+static inline void a64_vumax(a64 *a, int sz, int rd, int rn, int rm)  { a64_v3(a, 1, sz, 0x0C, rd, rn, rm); }
+static inline void a64_vumin(a64 *a, int sz, int rd, int rn, int rm)  { a64_v3(a, 1, sz, 0x0D, rd, rn, rm); }
+static inline void a64_vurhadd(a64 *a, int sz, int rd, int rn, int rm){ a64_v3(a, 1, sz, 0x02, rd, rn, rm); }
+static inline void a64_vushl(a64 *a, int sz, int rd, int rn, int rm)  { a64_v3(a, 1, sz, 0x08, rd, rn, rm); }
+static inline void a64_vsshl(a64 *a, int sz, int rd, int rn, int rm)  { a64_v3(a, 0, sz, 0x08, rd, rn, rm); }
+static inline void a64_vand(a64 *a, int rd, int rn, int rm) { a64_v3(a, 0, 0, 0x03, rd, rn, rm); }
+static inline void a64_vbic(a64 *a, int rd, int rn, int rm) { a64_v3(a, 0, 1, 0x03, rd, rn, rm); }
+static inline void a64_vorr(a64 *a, int rd, int rn, int rm) { a64_v3(a, 0, 2, 0x03, rd, rn, rm); }
+static inline void a64_vorn(a64 *a, int rd, int rn, int rm) { a64_v3(a, 0, 3, 0x03, rd, rn, rm); }
+static inline void a64_veor(a64 *a, int rd, int rn, int rm) { a64_v3(a, 1, 0, 0x03, rd, rn, rm); }
+static inline void a64_vbsl(a64 *a, int rd, int rn, int rm) { a64_v3(a, 1, 1, 0x03, rd, rn, rm); }
+static inline void a64_vmov(a64 *a, int rd, int rn) { a64_vorr(a, rd, rn, rn); }
+/* FP three-same: fsz 0 single (4s), 1 double (2d); size field = hi<<1 | fsz */
+static inline void a64_vfadd(a64 *a, int fsz, int rd, int rn, int rm)  { a64_v3(a, 0, fsz, 0x1A, rd, rn, rm); }
+static inline void a64_vfsub(a64 *a, int fsz, int rd, int rn, int rm)  { a64_v3(a, 0, 2 | fsz, 0x1A, rd, rn, rm); }
+static inline void a64_vfmul(a64 *a, int fsz, int rd, int rn, int rm)  { a64_v3(a, 1, fsz, 0x1B, rd, rn, rm); }
+static inline void a64_vfdiv(a64 *a, int fsz, int rd, int rn, int rm)  { a64_v3(a, 1, fsz, 0x1F, rd, rn, rm); }
+static inline void a64_vfcmeq(a64 *a, int fsz, int rd, int rn, int rm) { a64_v3(a, 0, fsz, 0x1C, rd, rn, rm); }
+static inline void a64_vfcmge(a64 *a, int fsz, int rd, int rn, int rm) { a64_v3(a, 1, fsz, 0x1C, rd, rn, rm); }
+static inline void a64_vfcmgt(a64 *a, int fsz, int rd, int rn, int rm) { a64_v3(a, 1, 2 | fsz, 0x1C, rd, rn, rm); }
+/* two-register misc: 0x4E200800 | U<<29 | size<<22 | opcode<<12 */
+static inline void a64_v2(a64 *a, int Q, int U, int size, int opcode, int rd, int rn) {
+    a64_emit(a, 0x0E200800u | ((uint32_t)Q << 30) | ((uint32_t)U << 29) | ((uint32_t)size << 22) | ((uint32_t)opcode << 12) | (rn << 5) | rd);
+}
+static inline void a64_vfsqrt(a64 *a, int fsz, int rd, int rn)  { a64_v2(a, 1, 1, 2 | fsz, 0x1F, rd, rn); }
+static inline void a64_vfcvtzs(a64 *a, int fsz, int rd, int rn) { a64_v2(a, 1, 0, 2 | fsz, 0x1B, rd, rn); }
+static inline void a64_vscvtf(a64 *a, int fsz, int rd, int rn)  { a64_v2(a, 1, 0, fsz, 0x1D, rd, rn); }
+static inline void a64_vfrintx(a64 *a, int fsz, int rd, int rn) { a64_v2(a, 1, 1, fsz, 0x19, rd, rn); }
+static inline void a64_vfcvtl(a64 *a, int rd, int rn)  { a64_v2(a, 0, 0, 1, 0x17, rd, rn); }     /* fcvtl vd.2d, vn.2s */
+static inline void a64_vfcvtn(a64 *a, int rd, int rn)  { a64_v2(a, 0, 0, 1, 0x16, rd, rn); }     /* fcvtn vd.2s, vn.2d */
+static inline void a64_vnot(a64 *a, int rd, int rn)    { a64_v2(a, 1, 1, 0, 0x05, rd, rn); }
+static inline void a64_vneg(a64 *a, int sz, int rd, int rn) { a64_v2(a, 1, 1, sz, 0x0B, rd, rn); }
+static inline void a64_vsqxtn(a64 *a, int hi, int sz, int rd, int rn)  { a64_v2(a, hi, 0, sz, 0x14, rd, rn); }   /* sz = destination lane size */
+static inline void a64_vsqxtun(a64 *a, int hi, int sz, int rd, int rn) { a64_v2(a, hi, 1, sz, 0x12, rd, rn); }
+static inline void a64_vuqxtn(a64 *a, int hi, int sz, int rd, int rn)  { a64_v2(a, hi, 1, sz, 0x14, rd, rn); }
+static inline void a64_vxtn(a64 *a, int hi, int sz, int rd, int rn)    { a64_v2(a, hi, 0, sz, 0x12, rd, rn); }
+/* across lanes: uminv sd, vn.4s */
+static inline void a64_vuminv4s(a64 *a, int rd, int rn) { a64_emit(a, 0x6EB1A800u | (rn << 5) | rd); }
+/* shift by immediate: 0x4F000400 | U<<29 | immh:immb<<16 | opcode<<11 */
+static inline void a64_vshift_imm(a64 *a, int U, int opcode, int immhb, int rd, int rn) {
+    a64_emit(a, 0x4F000400u | ((uint32_t)U << 29) | ((uint32_t)immhb << 16) | ((uint32_t)opcode << 11) | (rn << 5) | rd);
+}
+static inline int a64_shl_hb(int sz, int amt) { return (8 << sz) + amt; }        /* immh:immb for left shifts */
+static inline int a64_shr_hb(int sz, int amt) { return (16 << sz) - amt; }       /* immh:immb for right shifts */
+static inline void a64_vshl(a64 *a, int sz, int rd, int rn, int amt)  { a64_vshift_imm(a, 0, 0x0A, a64_shl_hb(sz, amt), rd, rn); }
+static inline void a64_vushr(a64 *a, int sz, int rd, int rn, int amt) { a64_vshift_imm(a, 1, 0x00, a64_shr_hb(sz, amt), rd, rn); }
+static inline void a64_vsshr(a64 *a, int sz, int rd, int rn, int amt) { a64_vshift_imm(a, 0, 0x00, a64_shr_hb(sz, amt), rd, rn); }
+/* ext vd.16b, vn.16b, vm.16b, #imm */
+static inline void a64_vext(a64 *a, int rd, int rn, int rm, int imm) { a64_emit(a, 0x6E000000u | (rm << 16) | ((uint32_t)imm << 11) | (rn << 5) | rd); }
+/* permutes */
+static inline void a64_vzip1(a64 *a, int sz, int rd, int rn, int rm) { a64_emit(a, 0x4E003800u | ((uint32_t)sz << 22) | (rm << 16) | (rn << 5) | rd); }
+static inline void a64_vzip2(a64 *a, int sz, int rd, int rn, int rm) { a64_emit(a, 0x4E007800u | ((uint32_t)sz << 22) | (rm << 16) | (rn << 5) | rd); }
+static inline void a64_vuzp1(a64 *a, int sz, int rd, int rn, int rm) { a64_emit(a, 0x4E001800u | ((uint32_t)sz << 22) | (rm << 16) | (rn << 5) | rd); }
+static inline void a64_vuzp2(a64 *a, int sz, int rd, int rn, int rm) { a64_emit(a, 0x4E005800u | ((uint32_t)sz << 22) | (rm << 16) | (rn << 5) | rd); }
+/* widening multiply: smull/umull vd.2d, vn.2s, vm.2s (hi = second half) */
+static inline void a64_vmull(a64 *a, int hi, int U, int sz, int rd, int rn, int rm) {
+    a64_emit(a, 0x0E20C000u | ((uint32_t)hi << 30) | ((uint32_t)U << 29) | ((uint32_t)sz << 22) | (rm << 16) | (rn << 5) | rd);
+}
+/* element moves. imm5 encodes lane size and index */
+static inline int a64_imm5(int sz, int idx) { return (idx << (sz + 1)) | (1 << sz); }
+static inline void a64_ins_elem(a64 *a, int sz, int rd, int di, int rn, int si) {   /* mov vd.T[di], vn.T[si] */
+    a64_emit(a, 0x6E000400u | ((uint32_t)a64_imm5(sz, di) << 16) | ((uint32_t)(si << sz) << 11) | (rn << 5) | rd);
+}
+static inline void a64_ins_gen(a64 *a, int sz, int rd, int di, int rn) {           /* mov vd.T[di], wn/xn */
+    a64_emit(a, 0x4E001C00u | ((uint32_t)a64_imm5(sz, di) << 16) | (rn << 5) | rd);
+}
+static inline void a64_umov(a64 *a, int sz, int rd, int rn, int si) {              /* umov wd/xd, vn.T[si] */
+    a64_emit(a, 0x0E003C00u | ((uint32_t)(sz == 3) << 30) | ((uint32_t)a64_imm5(sz, si) << 16) | (rn << 5) | rd);
+}
+static inline void a64_dup_elem(a64 *a, int sz, int rd, int rn, int si) {          /* dup vd.T, vn.T[si] */
+    a64_emit(a, 0x4E000400u | ((uint32_t)a64_imm5(sz, si) << 16) | (rn << 5) | rd);
+}
+static inline void a64_dup_gen(a64 *a, int sz, int rd, int rn) {                   /* dup vd.T, wn/xn */
+    a64_emit(a, 0x4E000C00u | ((uint32_t)a64_imm5(sz, 0) << 16) | (rn << 5) | rd);
+}
+static inline void a64_dup_scalar(a64 *a, int sz, int rd, int rn, int si) {        /* mov dd, vn.d[si] (scalar dup) */
+    a64_emit(a, 0x5E000400u | ((uint32_t)a64_imm5(sz, si) << 16) | (rn << 5) | rd);
+}
+static inline void a64_vmovi0(a64 *a, int rd) { a64_emit(a, 0x6F00E400u | rd); }   /* movi vd.2d, #0 */
+/* scalar FP: type 0 single, 1 double */
+static inline void a64_fop2(a64 *a, int type, uint32_t base, int rd, int rn, int rm) { a64_emit(a, base | ((uint32_t)type << 22) | (rm << 16) | (rn << 5) | rd); }
+static inline void a64_fadd(a64 *a, int t, int rd, int rn, int rm) { a64_fop2(a, t, 0x1E202800u, rd, rn, rm); }
+static inline void a64_fsub(a64 *a, int t, int rd, int rn, int rm) { a64_fop2(a, t, 0x1E203800u, rd, rn, rm); }
+static inline void a64_fmul(a64 *a, int t, int rd, int rn, int rm) { a64_fop2(a, t, 0x1E200800u, rd, rn, rm); }
+static inline void a64_fdiv(a64 *a, int t, int rd, int rn, int rm) { a64_fop2(a, t, 0x1E201800u, rd, rn, rm); }
+static inline void a64_fsqrt(a64 *a, int t, int rd, int rn) { a64_emit(a, 0x1E21C000u | ((uint32_t)t << 22) | (rn << 5) | rd); }
+static inline void a64_fmov_ss(a64 *a, int t, int rd, int rn) { a64_emit(a, 0x1E204000u | ((uint32_t)t << 22) | (rn << 5) | rd); }
+static inline void a64_fcmp(a64 *a, int t, int rn, int rm) { a64_emit(a, 0x1E202000u | ((uint32_t)t << 22) | (rm << 16) | (rn << 5)); }
+static inline void a64_fcvt_sd(a64 *a, int rd, int rn) { a64_emit(a, 0x1E22C000u | (rn << 5) | rd); }   /* fcvt dd, sn */
+static inline void a64_fcvt_ds(a64 *a, int rd, int rn) { a64_emit(a, 0x1E624000u | (rn << 5) | rd); }   /* fcvt sd, dn */
+static inline void a64_scvtf(a64 *a, int sf, int t, int rd, int rn)  { a64_emit(a, 0x1E220000u | ((uint32_t)sf << 31) | ((uint32_t)t << 22) | (rn << 5) | rd); }
+static inline void a64_fcvtzs(a64 *a, int sf, int t, int rd, int rn) { a64_emit(a, 0x1E380000u | ((uint32_t)sf << 31) | ((uint32_t)t << 22) | (rn << 5) | rd); }
+static inline void a64_frintx(a64 *a, int t, int rd, int rn) { a64_emit(a, 0x1E274000u | ((uint32_t)t << 22) | (rn << 5) | rd); }
+/* fmov between general and FP registers */
+static inline void a64_fmov_ws(a64 *a, int rd, int rn) { a64_emit(a, 0x1E260000u | (rn << 5) | rd); }   /* fmov wd, sn */
+static inline void a64_fmov_sw(a64 *a, int rd, int rn) { a64_emit(a, 0x1E270000u | (rn << 5) | rd); }   /* fmov sd, wn */
+static inline void a64_fmov_xd(a64 *a, int rd, int rn) { a64_emit(a, 0x9E660000u | (rn << 5) | rd); }   /* fmov xd, dn */
+static inline void a64_fmov_dx(a64 *a, int rd, int rn) { a64_emit(a, 0x9E670000u | (rn << 5) | rd); }   /* fmov dd, xn */
+/* system registers */
+static inline void a64_mrs_fpsr(a64 *a, int rd) { a64_emit(a, 0xD53B4420u | rd); }
+static inline void a64_msr_fpsr(a64 *a, int rn) { a64_emit(a, 0xD51B4420u | rn); }
+static inline void a64_bic_reg(a64 *a, int sf, int rd, int rn, int rm) { a64_logic_reg(a, sf, 0, 1, rd, rn, rm, 0, 0); }
+
+static inline void a64_fcmpe(a64 *a, int t, int rn, int rm) { a64_emit(a, 0x1E202010u | ((uint32_t)t << 22) | (rm << 16) | (rn << 5)); }
+static inline void a64_frintz(a64 *a, int t, int rd, int rn) { a64_emit(a, 0x1E25C000u | ((uint32_t)t << 22) | (rn << 5) | rd); }
+static inline void a64_vfrintz(a64 *a, int fsz, int rd, int rn) { a64_v2(a, 1, 0, 2 | fsz, 0x19, rd, rn); }
+static inline void a64_vsxtl(a64 *a, int rd, int rn) { a64_emit(a, 0x0F20A400u | (rn << 5) | rd); }        /* sxtl vd.2d, vn.2s */
+/* umaxv sd, vn.4s */
+static inline void a64_vumaxv4s(a64 *a, int rd, int rn) { a64_emit(a, 0x6EB0A800u | (rn << 5) | rd); }
+/* movi vd.16b, #imm8 ; mvni vd.4s, #imm8, lsl #24 */
+static inline void a64_vmovi8(a64 *a, int rd, int imm8) { a64_emit(a, 0x4F00E400u | ((uint32_t)(imm8 >> 5) << 16) | ((uint32_t)(imm8 & 31) << 5) | rd); }
+static inline void a64_vmvni32_lsl24(a64 *a, int rd, int imm8) { a64_emit(a, 0x6F006400u | ((uint32_t)(imm8 >> 5) << 16) | ((uint32_t)(imm8 & 31) << 5) | rd); }
+/* eor rd, rn, rm, asr #amt */
+static inline void a64_eor_asr(a64 *a, int sf, int rd, int rn, int rm, int amt) { a64_logic_reg(a, sf, 2, 0, rd, rn, rm, SH_ASR, amt); }
+
+/* scalar FP compares producing a mask: fcmeq/fcmge/fcmgt sd/dd, sn, sm */
+static inline void a64_fcmeq_s(a64 *a, int fsz, int rd, int rn, int rm) { a64_emit(a, 0x5E20E400u | ((uint32_t)fsz << 22) | (rm << 16) | (rn << 5) | rd); }
+static inline void a64_fcmge_s(a64 *a, int fsz, int rd, int rn, int rm) { a64_emit(a, 0x7E20E400u | ((uint32_t)fsz << 22) | (rm << 16) | (rn << 5) | rd); }
+static inline void a64_fcmgt_s(a64 *a, int fsz, int rd, int rn, int rm) { a64_emit(a, 0x7EA0E400u | ((uint32_t)fsz << 22) | (rm << 16) | (rn << 5) | rd); }
+
 /* Patch a forward branch at word index `at` to land on word index `target`. */
 static inline void a64_patch_b(a64 *a, uint32_t at, uint32_t target) {
     if (at >= a->cap) return;

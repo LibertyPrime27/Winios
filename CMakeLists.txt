@@ -35,6 +35,12 @@ add_test(NAME selftest COMMAND test_selftest)
 
 # --- AArch64 encoder sanity: emits one of everything; bytes are checked by
 # hand against the system disassembler (see the file) -----------------------
+# JIT vs interpreter on every difftest case (passes trivially where there is no JIT)
+add_executable(test_jitdiff tests/test_jitdiff.c)
+target_link_libraries(test_jitdiff PRIVATE xcore)
+target_include_directories(test_jitdiff PRIVATE tests)
+add_test(NAME jitdiff COMMAND test_jitdiff)
+
 add_executable(test_a64 tests/test_a64.c)
 add_test(NAME a64_encoder COMMAND test_a64)
 

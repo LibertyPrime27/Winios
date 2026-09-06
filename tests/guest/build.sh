@@ -7,4 +7,5 @@ set -e
 cd "$(dirname "$0")"
 gcc      -O2 -static-pie -nostdlib -fno-stack-protector -o hello      hello.c
 musl-gcc -O2 -static-pie -o libc_hello libc_hello.c
+musl-gcc -O2 -static-pie -o nbody nbody.c -lm
 gcc -m32 -O2 -static -nostdlib -fno-stack-protector -o hello32 hello32.c

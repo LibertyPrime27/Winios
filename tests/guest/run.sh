@@ -5,7 +5,7 @@
 # compare xrun against the native run -- the CI oracle for the arena model.
 #   run.sh <xrun> <guest dir>
 xrun=$(cd "$(dirname "$1")" && pwd)/$(basename "$1"); cd "$2" || exit 2; fail=0
-for g in hello libc_hello hello32; do
+for g in hello libc_hello hello32 nbody; do
     exp=$(cat "$g.expected")
     got=$("$xrun" "./$g" 2>/tmp/xrun_err.$$) ; rc=$?
     if [ "$got" != "$exp" ] || [ $rc -ne 0 ]; then
