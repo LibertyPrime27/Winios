@@ -130,8 +130,12 @@ int w32_load_pe(w32 *w, const char *path) {
         uint64_t raw_start = plus ? RD64(t) : RD32(t), raw_end = plus ? RD64(t + 8) : RD32(t + 4);
         uint64_t idx_addr = plus ? RD64(t + 16) : RD32(t + 8), cb_addr = plus ? RD64(t + 24) : RD32(t + 12);
         uint32_t zero_fill = RD32(t + (plus ? 32 : 16));
-        /* the directory holds VAs relative to the *preferred* base */
-        raw_start += (uint64_t)delta; raw_end += (uint64_t)delta; idx_addr += (uint64_t)delta; if (cb_addr) cb_addr += (uint64_t)delta;
+        /* the directory holds absolute VAs; the base-relocation pass above has
+         * normally fixed them already, but a linker that omitted those fixups
+         * would leave them at the preferred base -- rebase only in that case */
+        #define REBASE(v) do { if ((v) && (v) >= pref_base && (v) < pref_base + size_image && base != pref_base) (v) += (uint64_t)delta; } while (0)
+        REBASE(raw_start); REBASE(raw_end); REBASE(idx_addr); REBASE(cb_addr);
+        #undef REBASE
         uint64_t size = raw_end - raw_start + zero_fill;
         uint64_t block = w32_alloc(w, size + 16, 0);
         if (raw_end > raw_start) memcpy(W32P(w, block), W32P(w, raw_start), raw_end - raw_start);

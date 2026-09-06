@@ -209,6 +209,15 @@ void xc_jit_stats(uint64_t *blocks, uint64_t *callouts, uint64_t *bytes) {
     if (bytes) *bytes = g_code_used;
 }
 uint64_t xc_jit_links(void) { return g_stat_links; }
+/* Where the generated code lives (execute side), for crash reports. */
+int xc_jit_code_range(uint64_t *lo, uint64_t *hi) {
+#if XC_JIT_HOST
+    if (!g_code_rx) return 0;
+    *lo = (uint64_t)(uintptr_t)g_code_rx; *hi = *lo + g_code_cap; return 1;
+#else
+    (void)lo; (void)hi; return 0;
+#endif
+}
 
 #if XC_JIT_HOST
 

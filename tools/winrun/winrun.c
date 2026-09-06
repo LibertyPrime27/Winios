@@ -453,8 +453,33 @@ static void process_init(w32 *w, int argc, char **argv) {
     (void)psz;
 }
 
+/* A host crash (SIGSEGV/SIGBUS) is almost always a guest access to memory
+ * the arena/identity model does not cover, or a JIT bug. Say where we were
+ * so a CI log is enough to start from, then die with the original signal. */
+#include <signal.h>
+static void on_crash(int sig, siginfo_t *si, void *uctx) {
+    (void)uctx;
+    xc_cpu *c = g_w.c;
+    uint64_t lo = 0, hi = 0; int have = xc_jit_code_range(&lo, &hi);
+    uint64_t fault = (uint64_t)(uintptr_t)si->si_addr;
+    char buf[512];
+    int n = snprintf(buf, sizeof buf,
+        "winrun: host %s at address %#llx; guest rip=%#llx rsp=%#llx (%d-bit, %s); fault %s the JIT code region%s\n",
+        sig == SIGSEGV ? "SIGSEGV" : "SIGBUS", (unsigned long long)fault,
+        (unsigned long long)c->rip, (unsigned long long)c->gpr[XC_RSP], g_w.is32 ? 32 : 64,
+        xc_jit_enabled() ? "jit" : "interpreter",
+        have && fault >= lo && fault < hi ? "inside" : "outside",
+        g_w.is32 && fault >= (uint64_t)(uintptr_t)g_w.base && fault < (uint64_t)(uintptr_t)g_w.base + (1ull << 32)
+            ? " -- inside the 4 GB arena (unmapped guest page)" : "");
+    if (write(2, buf, (size_t)(n > 0 ? n : 0)) < 0) { }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
 int main(int argc, char **argv) {
     w32 *w = &g_w;
+    { struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_sigaction = on_crash; sa.sa_flags = SA_SIGINFO;
+      sigaction(SIGSEGV, &sa, 0); sigaction(SIGBUS, &sa, 0); }
     int ai = 1;
     while (ai < argc && argv[ai][0] == '-') {
         if (!strcmp(argv[ai], "-v")) w->verbose++;
