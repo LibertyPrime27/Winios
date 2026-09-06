@@ -24,5 +24,9 @@ check nbody64.exe 0
 check nbody32.exe 0
 check dlltest64.exe 0
 check dlltest32.exe 0
+check d3dtest64.exe 0
+check d3dtest32.exe 0
+check d3dframe64.exe 0
+check d3dframe32.exe 0
 rm -f /tmp/winrun_err.$$
 exit $fail

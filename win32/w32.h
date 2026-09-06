@@ -62,6 +62,18 @@ typedef struct {
     int      seq;                /* order this image *finished* loading: dependency order */
 } w32_module;
 
+/* A COM interface: methods in vtable order, `nmethods` of them, with a NULL
+ * name for a slot we have not implemented. `nargs` counts `this`, which is
+ * argument 0 in both bitnesses. See com.c. */
+typedef struct {
+    const char    *name;         /* "IDirect3DDevice9" */
+    const w32_api *methods;
+    int            nmethods;
+    int            tag;          /* identifies the class in an object header */
+    uint64_t       vtable;       /* guest address, built on first use */
+    w32_dll        dll;          /* so the dispatcher can name the method */
+} w32_com_class;
+
 typedef enum { H_NONE = 0, H_FILE, H_PROCESS, H_THREAD, H_HEAP, H_EVENT, H_MUTEX } w32_htype;
 typedef struct { w32_htype type; int fd; int flags; } w32_handle;
 
@@ -152,11 +164,31 @@ uint64_t w32_module_export(w32 *w, uint64_t hmodule, const char *name, int ordin
 uint64_t w32_import_addr(w32 *w, const char *dll, const char *name, int ordinal, int depth);
 void     w32_attach_modules(w32 *w);                                /* DllMain(DLL_PROCESS_ATTACH) for every new DLL */
 
+/* COM (com.c) */
+uint64_t w32_com_vtable(w32 *w, w32_com_class *cls);
+uint64_t w32_com_new(w32 *w, w32_com_class *cls, uint32_t nfields);
+uint64_t w32_com_get(w32 *w, uint64_t obj, int n);          /* object field n (64-bit slots) */
+void     w32_com_set(w32 *w, uint64_t obj, int n, uint64_t v);
+int      w32_com_tag(w32 *w, uint64_t obj);
+void     w32_com_reset(void);                               /* a new process: forget every built vtable */
+void     w32_com_QueryInterface(w32 *w);                    /* IUnknown, shared by every interface */
+void     w32_com_AddRef(w32 *w);
+void     w32_com_Release(w32 *w);
+/* one int3 stub bound to `api`, or a named "not implemented" stub when it is NULL */
+uint64_t w32_stub_alloc(w32 *w, const w32_dll *dll, const w32_api *api, char *missing);
+
 /* the DLLs */
 extern const w32_api w32_kernel32[];
 extern const w32_api w32_msvcrt[];
 extern const w32_api w32_ntdll[];
 extern const w32_api w32_user32[];
+extern const w32_api w32_d3d9[];
+
+/* d3d9.c: where a presented frame goes. NULL simply drops it, which is what
+ * the headless test and CI want; the iOS app sets it to a Metal blit. */
+typedef void (*w32_present_fn)(void *ctx, const void *pixels, int width, int height, int pitch);
+void w32_set_present(w32_present_fn fn, void *ctx);
+void w32_d3d9_reset(void);
 
 /* msvcrt.c: drop every cached guest address, so a second process can start
  * in the same host process (see winrun_main). */

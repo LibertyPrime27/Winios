@@ -186,14 +186,21 @@ the ladder just to see the GPU result again.
   the round trip is skipped and it executes immediately. The only thing that
   stops the automatic execute is a crash marker from an earlier attempt, which
   **Reset results** clears.
-- **5 · Windows .exe** — runs the six mingw-w64 guests bundled with the app
-  (`hello`, `crt` and `nbody`, each as PE32 and PE32+) through `winrun_lib` and
-  compares stdout and exit code against the recorded expectations. This is the
-  PE loader, the host-implemented kernel32/msvcrt, and the dynarec, end to end
-  on the device.
+- **5 · Windows .exe** — runs the twelve mingw-w64 guests bundled with the app
+  (`hello`, `crt`, `nbody`, the DLL-chain loader test `dlltest`, and the two
+  Direct3D 9 programs `d3dtest` and `d3dframe`, each as PE32 and PE32+) through
+  `winrun_lib` and compares stdout and exit code against the recorded
+  expectations. This is the PE loader, DLL loading, the host-implemented
+  kernel32/msvcrt/d3d9, and the dynarec, end to end on the device.
 - **x87 fast path** — the same machinery on `nbody32.exe` alone, the guest whose
   float work is entirely x87, with its timing and its lowered-versus-called-out
   counts. The quickest way to see the 53-bit lowering working on hardware.
+- **7 · D3D9 frame** — runs `d3dframe32.exe`, which creates a Direct3D 9
+  device, locks its back buffer, draws into it and presents — and shows the
+  frame that arrived, right there in the app. The device, the back buffer and
+  `Present` are real; the pixels come from the guest's own x86 code on the
+  dynarec, because `DrawPrimitive` is not implemented yet. It is the first
+  thing this project has put on a screen. **Clear frame** hides it again.
 - **6 · Memory ladder** — the ladder on its own.
 - **Copy report** puts the whole screen on the clipboard. **Reset results**
   clears everything, including the JIT crash marker.

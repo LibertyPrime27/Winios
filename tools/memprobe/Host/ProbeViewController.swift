@@ -22,6 +22,9 @@ import os
 final class ProbeViewController: UIViewController {
 
     private let results = UITextView()
+    /// The last frame a guest presented through d3d9. Hidden until there is one.
+    private let frameView = UIImageView()
+    private var frameImage: UIImage?
     private let store = UserDefaults.standard
     private var cpuLine: String { get { store.string(forKey: "cpu") ?? "not run" } set { store.set(newValue, forKey: "cpu") } }
     private var benchLine: String { get { store.string(forKey: "bench") ?? "not run" } set { store.set(newValue, forKey: "bench") } }
@@ -44,13 +47,24 @@ final class ProbeViewController: UIViewController {
         results.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         results.alwaysBounceVertical = true
 
+        // Nearest-neighbour, because the frame is small and the point is to
+        // see the pixels the guest actually wrote, not a smoothed version.
+        frameView.contentMode = .scaleAspectFit
+        frameView.layer.magnificationFilter = .nearest
+        frameView.layer.borderWidth = 1
+        frameView.layer.borderColor = UIColor.separator.cgColor
+        frameView.isHidden = true
+        frameView.heightAnchor.constraint(equalToConstant: 180).isActive = true
+
         let stack = UIStackView(arrangedSubviews: [
             button("▶  Run all probes", #selector(runAll)),
             row([("1 · CPU vectors", #selector(runCPU)), ("2 · Benchmark", #selector(runBench))]),
             row([("3 · GPU (D3D9/11/12)", #selector(runGPU)), ("5 · Windows .exe", #selector(runWindows))]),
-            row([("x87 fast path", #selector(runX87)), ("6 · Memory ladder", #selector(runLadder))]),
+            row([("x87 fast path", #selector(runX87)), ("7 · D3D9 frame", #selector(runFrame))]),
+            row([("6 · Memory ladder", #selector(runLadder)), ("Clear frame", #selector(clearFrame))]),
             button("4 · JIT: attach StikDebug, then execute in a blessed arena", #selector(attachJIT)),
             row([("Copy report", #selector(copyReport)), ("Reset results", #selector(resetAll))]),
+            frameView,
             results,
         ])
         stack.axis = .vertical
@@ -133,6 +147,11 @@ final class ProbeViewController: UIViewController {
     @objc private func runGPU()  { work("GPU")         { self.gpuProbe() } }
     @objc private func runWindows() { work("Windows guests") { self.windowsProbe(single: nil) } }
     @objc private func runX87()  { work("x87")         { self.windowsProbe(single: "nbody32.exe") } }
+    @objc private func runFrame() { work("frame")      { self.frameProbe() } }
+    @objc private func clearFrame() {
+        frameImage = nil
+        DispatchQueue.main.async { self.frameView.image = nil; self.frameView.isHidden = true }
+    }
     @objc private func runLadder() {
         work("memory ladder") { Ladder.climb(host: "app", paused: { !self.isActive }) }
     }
@@ -209,6 +228,67 @@ final class ProbeViewController: UIViewController {
     /// end on the device. `single` runs just one of them (the x87 button uses
     /// nbody32.exe, whose float work is all x87).
     ///
+    /// A Windows program that produces a frame and presents it, shown as it
+    /// arrived. The Direct3D 9 device, its back buffer and Present are real;
+    /// the pixels are drawn by the guest's own x86 code through a locked
+    /// surface, running on the dynarec, because DrawPrimitive is not
+    /// implemented yet. Everything between that code and this image view --
+    /// the PE loader, the COM vtables, the back buffer in guest memory --
+    /// is the path the GPU one will take.
+    private func frameProbe() {
+        DispatchQueue.main.async { self.winLine = "running…"; self.refresh() }
+        guard let dir = Bundle.main.resourceURL?.appendingPathComponent("win32") else {
+            DispatchQueue.main.async { self.winLine = "guests not bundled"; self.refresh() }
+            return
+        }
+        if let arena = ensureArena() { _ = handArenaToXcore(arena) }
+
+        let exe = dir.appendingPathComponent("d3dframe32.exe").path
+        var out = [CChar](repeating: 0, count: 4096)
+        var ns: UInt64 = 0
+        xc_jit_enable(1)
+        let rc = exe.withCString { win_probe_run($0, nil, nil, &out, out.count, &ns, nil, nil) }
+        xc_jit_enable(0)
+
+        var text = "d3dframe32.exe — Direct3D 9 through the PE loader and the dynarec\n"
+        text += String(cString: out)
+        text += "  exit \(rc), \(ns / 1_000_000) ms\n"
+
+        var w: Int32 = 0, h: Int32 = 0, pitch: Int32 = 0
+        if rc == 0, let px = win_probe_frame(&w, &h, &pitch), w > 0, h > 0 {
+            text += "  presented \(w)x\(h), \(pitch) bytes per row — the image below is that frame\n"
+            let bytes = Int(h) * Int(pitch)
+            let data = Data(bytes: px, count: bytes)
+            // X8R8G8B8: B,G,R,X in memory, so little-endian 32-bit with the
+            // high byte ignored.
+            let info: CGBitmapInfo = [.byteOrder32Little,
+                                      CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue)]
+            if let provider = CGDataProvider(data: data as CFData),
+               let cg = CGImage(width: Int(w), height: Int(h), bitsPerComponent: 8, bitsPerPixel: 32,
+                                bytesPerRow: Int(pitch), space: CGColorSpaceCreateDeviceRGB(),
+                                bitmapInfo: info, provider: provider, decode: nil,
+                                shouldInterpolate: false, intent: .defaultIntent) {
+                frameImage = UIImage(cgImage: cg)
+            } else {
+                text += "  (could not build an image from those bytes)\n"
+            }
+        } else if rc == 0 {
+            text += "  the guest presented no frame\n"
+        }
+        let img = frameImage
+        DispatchQueue.main.async {
+            self.frameView.image = img
+            self.frameView.isHidden = img == nil
+            self.winLine = text
+            self.refresh()
+        }
+    }
+
+    /// d3dtest is a Windows program calling Direct3D 9 -- Direct3DCreate9,
+    /// CreateDevice, Clear, Present, and reading the back buffer back through
+    /// a locked surface. Every one of those goes through a COM vtable built in
+    /// guest memory, so it is also what checks the vtable slot numbers.
+    ///
     /// dlltest is the loader test: a static import chain the device has to
     /// walk (dlltest -> mid.dll -> sub.dll), DllMain ordering across it, and
     /// LoadLibrary/GetProcAddress at run time -- the machinery a game's own
@@ -227,6 +307,7 @@ final class ProbeViewController: UIViewController {
             ("crt64.exe", [], 3),           ("crt32.exe", [], 3),
             ("nbody64.exe", [], 0),         ("nbody32.exe", [], 0),
             ("dlltest64.exe", [], 0),       ("dlltest32.exe", [], 0),
+            ("d3dtest64.exe", [], 0),       ("d3dtest32.exe", [], 0),
         ]
         let cases = single.map { s in all.filter { $0.0 == s } } ?? all
 

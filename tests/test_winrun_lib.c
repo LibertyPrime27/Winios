@@ -19,6 +19,8 @@ int main(int argc, char **argv) {
         { "crt64.exe", 3 },   { "crt32.exe", 3 },
         { "nbody64.exe", 0 }, { "nbody32.exe", 0 },
         { "dlltest64.exe", 0 }, { "dlltest32.exe", 0 },
+        { "d3dtest64.exe", 0 },  { "d3dtest32.exe", 0 },
+        { "d3dframe64.exe", 0 }, { "d3dframe32.exe", 0 },
     };
     const int n = (int)(sizeof G / sizeof G[0]);
     int bad = 0;

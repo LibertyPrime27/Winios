@@ -23,4 +23,7 @@ for a in 32 64; do
     $CC -O2 -s -DSUBDLL=\"sub$a.dll\" -DLATEDLL=\"late$a.dll\" \
         -o dlltest$a.exe dlltest.c -L. -l:libmid$a.a -l:libsub$a.a
     rm -f dlllate$a.def libsub$a.a libmid$a.a
+    # Direct3D 9 through d3d9.dll: COM vtables in guest memory
+    $CC -O2 -s -o d3dtest$a.exe  d3dtest.c  -ld3d9
+    $CC -O2 -s -o d3dframe$a.exe d3dframe.c -ld3d9
 done

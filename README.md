@@ -7,17 +7,16 @@ Run 32-bit and 64-bit Windows games on iOS. Sideloaded, JIT-enabled, maximum per
 ## Status
 
 Running real Windows executables on an iPad, through a from-scratch x86 core
-and dynarec, with Direct3D shaders compiled to Metal. Not a game yet — no
-threads, no D3D API surface — but every layer underneath one is now working on
-hardware, and a program's own DLLs load and initialise the way Windows does
-it.
+and dynarec, with Direct3D shaders compiled to Metal. Not a game yet — no threads,
+and nothing draws geometry — but a Windows program now creates a Direct3D 9
+device, presents a frame, and that frame appears on the iPad.
 
 | Piece | State |
 |---|---|
 | Architecture (why two engines, what blocks 64-bit) | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
 | JIT acquisition and probing design | [`docs/JIT-DESIGN.md`](docs/JIT-DESIGN.md) |
 | CI — unsigned IPA on every push, core tests on Linux | [`.github/workflows/ios-build.yml`](.github/workflows/ios-build.yml) |
-| **Win32 layer** — PE32/PE32+ loader with real DLL loading (export tables, forwarders, DllMain ordering, LoadLibrary/GetProcAddress), TEB/PEB, kernel32 + msvcrt on the host, imports as `int3` stubs | [`docs/WIN32.md`](docs/WIN32.md), [`win32/`](win32), [`tools/winrun/`](tools/winrun) — **runs real Windows executables**: a three-import hello, a full mingw-w64 CRT program (TLS callbacks, malloc, printf, exit code), the n-body benchmark and a DLL-chain loader test, each as 32- and 64-bit, output byte-identical to the Linux build; interpreter, qemu JIT, Apple-silicon CI — and **on both devices, through MemProbe** |
+| **Win32 layer** — PE32/PE32+ loader with real DLL loading (export tables, forwarders, DllMain ordering, LoadLibrary/GetProcAddress), COM vtables in guest memory, **`d3d9.dll`**, TEB/PEB, kernel32 + msvcrt on the host, imports as `int3` stubs | [`docs/WIN32.md`](docs/WIN32.md), [`win32/`](win32), [`tools/winrun/`](tools/winrun) — **runs real Windows executables**: a three-import hello, a full mingw-w64 CRT program (TLS callbacks, malloc, printf, exit code), the n-body benchmark, a DLL-chain loader test and two Direct3D 9 programs, each as 32- and 64-bit, output byte-identical to the Linux build; interpreter, qemu JIT, Apple-silicon CI — and **on both devices, through MemProbe** |
 | **dynarec** — x86 basic blocks → ARM64 code, block chaining that carries guest registers across the link, SSE/SSE2 on NEON, x87 (53-bit precision) on NEON doubles, lazy flags, callouts to the interpreter for the rest | [`docs/DYNAREC.md`](docs/DYNAREC.md), [`core/src/jit/`](core/src/jit) — **passes all 2388 silicon vectors on the M3 iPad and the A19 Pro iPhone** (and under qemu-aarch64 / Apple-silicon CI); JIT-vs-interpreter differential over every difftest case, 67 000 runs identical; **on the iPad: ~1600 MIPS integer, ~820 SSE2, ~650 x87 — roughly 165× / 65× / 53× the interpreter** |
 | **MemProbe** — the device app: CPU vectors, on-device benchmark, GPU probe, JIT bless, **real Windows .exe**, memory ladder | [`docs/MEMPROBE.md`](docs/MEMPROBE.md), [`tools/memprobe/`](tools/memprobe) — one button per probe; runs the six mingw-w64 guests through the PE loader on the device itself, and is where the only non-qemu performance numbers come from |
 | **xcore** — one CPU core for 32- and 64-bit x86, interpreter + differential tests | [`docs/CPU-CORE.md`](docs/CPU-CORE.md), [`core/`](core) — full baseline x86 + SSE2 + x87 in both 64- and 32-bit mode, 542 cases verified against silicon; `xrun` runs static Linux binaries (musl, glibc, busybox; i386 glibc through the 4 GB arena) |

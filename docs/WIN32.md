@@ -1,6 +1,6 @@
 # The Win32 layer: Windows executables on xcore
 
-**Where:** `win32/` (`pe.c` loader, `kernel32.c`, `msvcrt.c`, `w32.h`),
+**Where:** `win32/` (`pe.c` loader, `kernel32.c`, `msvcrt.c`, `com.c`, `d3d9.c`, `w32.h`),
 `tools/winrun/winrun.c` (runtime and command-line driver),
 `tests/win32/` (mingw-built .exe guests with recorded output).
 
@@ -72,6 +72,43 @@ Nothing is ever unmapped: `FreeLibrary` decrements a count and returns
 success, because an emulator that keeps a dead image mapped is strictly safer
 than one that unmaps it under a live return address.
 
+## COM, and d3d9.dll
+
+Direct3D is not a set of exported functions. `dev->lpVtbl->Clear(dev, ...)`
+compiles to an indirect call through a slot the guest computes itself, so an
+interface is only usable if the **vtable lives in guest memory** and every
+slot in it is something the guest can call — which is what the import stubs
+already are. `com.c` builds a vtable per interface: one `int3` stub per slot,
+landing in the same dispatcher an imported function does, with `this` as
+argument 0 (pushed first for x86 stdcall, `rcx` on x64 — the same place in
+both). An object's state lives in guest memory right after its vtable pointer
+and reference count, so the host side holds nothing and there is nothing to
+free or reset.
+
+`d3d9.c` is that mechanism plus one export. `Direct3DCreate9` returns an
+`IDirect3D9`; `CreateDevice` returns an `IDirect3DDevice9` with a back buffer
+allocated in **guest memory**, which is what makes both ends work — the guest
+can lock and read it directly, and the host can hand the same bytes to Metal
+without a copy through a second address space. `Clear`, `BeginScene`,
+`EndScene`, `Present`, `GetBackBuffer` and the surface's `LockRect` are real;
+the state setters accept and ignore, because there is nothing to draw with
+yet. Where a presented frame goes is a host callback (`w32_set_present`):
+nothing by default, a `.ppm` per frame under `WINRUN_PRESENT_PPM=<prefix>`,
+and on the device the image MemProbe displays.
+
+**Vtable order is load-bearing.** A slot in the wrong place is an indirect
+call to the wrong function, so the tables carry explicit slot numbers taken
+from `d3d9.h`, and every slot that is not implemented gets a stub that names
+its interface and index. That is not decoration: the first version of
+`IDirect3DDevice9` was missing `CreateDepthStencilSurface` at slot 29, so
+everything after it was one out, and what came back was
+`call to unimplemented IDirect3DDevice9::slot 57` — the guest asking for
+`SetRenderState` at 57 while the table had it at 56.
+
+Drawing is the part that is not here. `DrawPrimitive` and the shader entry
+points are unimplemented slots. d12mt already compiles D3D9 SM3 shaders to
+MSL and passes 27/27 on both devices; joining the two is the next step.
+
 ## Both bitnesses, one implementation
 
 A PE32 image gets the 4 GB arena (guest address = base + zext32), a PE32+
@@ -119,11 +156,22 @@ compiled code for pages that become writable.
 
 ## Verified
 
-`tests/win32/run.sh` runs eight executables and compares stdout and exit code
+`tests/win32/run.sh` runs twelve executables and compares stdout and exit code
 with recordings: the three-import `hello`, the full mingw-w64 CRT program
 (`crt.c`: TLS callbacks, `__getmainargs`, `_initterm`, malloc/free, `sqrt`,
-`printf`, `snprintf`, exit code), the n-body benchmark, and the loader test
-`dlltest`, each as PE32 and PE32+.
+`printf`, `snprintf`, exit code), the n-body benchmark, the loader test
+`dlltest`, and the two Direct3D 9 programs `d3dtest` and `d3dframe`, each as
+PE32 and PE32+.
+
+`d3dtest` calls Direct3D 9 the way a game starts up — `Direct3DCreate9`,
+`GetAdapterIdentifier`, `CreateDevice`, `Clear`, `Present`, then
+`GetBackBuffer` and `LockRect` to read the pixels back — and every one of
+those goes through a COM vtable, so it is also what keeps the slot numbers
+honest. `d3dframe` produces an actual picture: it locks the back buffer and
+draws a gradient, a disc and a checkerboard with integer arithmetic (so PE32
+and PE32+ produce byte-identical output), presents it, and prints an FNV-1a
+checksum of the frame. Both are recorded like the others, and the same
+checksum comes out of the interpreter, the qemu JIT and the device.
 
 `dlltest` is built as a chain — `dlltest.exe` statically imports `mid.dll`,
 which statically imports `sub.dll`, and `late.dll` is in nobody's import table

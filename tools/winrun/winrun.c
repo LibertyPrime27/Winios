@@ -289,6 +289,7 @@ static const w32_dll g_dlls[] = {
     { "msvcrt.dll",   w32_msvcrt,   0 },
     { "ntdll.dll",    w32_ntdll,    0 },
     { "user32.dll",   w32_user32,   0 },
+    { "d3d9.dll",     w32_d3d9,     0 },
 };
 enum { NDLLS = sizeof g_dlls / sizeof g_dlls[0], STUB_RETURN = 0, STUB_EXIT = 1, STUB_FIRST = 2 };
 
@@ -299,6 +300,13 @@ static int stub_new(w32 *w, const w32_dll *dll, const w32_api *api, const char *
     int i = w->nstubs++;
     w->stubs[i].dll = dll; w->stubs[i].api = api; w->stubs[i].missing = missing;
     return i;
+}
+
+/* One stub bound to a given implementation -- what com.c builds vtables out
+ * of. Import stubs go through w32_stub_for, which finds the implementation by
+ * name first; a vtable slot already knows which one it wants. */
+uint64_t w32_stub_alloc(w32 *w, const w32_dll *dll, const w32_api *api, char *missing) {
+    return stub_addr(w, stub_new(w, dll, api, missing));
 }
 
 uint64_t w32_module_handle(w32 *w, const char *name) {
@@ -364,7 +372,8 @@ static void dispatch(w32 *w, int i) {
         w32_exit(w, 127);
         return;
     }
-    if (w->verbose > 1) fprintf(stderr, "winrun: %s!%s(%#llx, %#llx, %#llx, %#llx)\n", w->stubs[i].dll->name, a->name,
+    if (w->verbose > 1) fprintf(stderr, "winrun: %s!%s(%#llx, %#llx, %#llx, %#llx)\n",
+                                w->stubs[i].dll ? w->stubs[i].dll->name : "?", a->name,
                                 (unsigned long long)w32_arg(w, 0), (unsigned long long)w32_arg(w, 1),
                                 (unsigned long long)w32_arg(w, 2), (unsigned long long)w32_arg(w, 3));
     uint64_t rsp = c->gpr[XC_RSP];
@@ -553,7 +562,30 @@ static void winrun_reset(void) {
     memset(g_free, 0, sizeof g_free);
     g_bump32 = 0x10000000u;
     w32_reset_statics();
+    w32_com_reset();
+    w32_d3d9_reset();
     xc_cache_flush();
+}
+
+/* WINRUN_PRESENT_PPM=<prefix>: write every presented frame as <prefix>NNN.ppm.
+ * The only way to look at what a guest drew when there is no screen -- CI, a
+ * headless run, or checking a change by eye. */
+static void present_ppm(void *ctx, const void *pixels, int width, int height, int pitch) {
+    static int n;
+    char path[512];
+    snprintf(path, sizeof path, "%s%03d.ppm", (const char *)ctx, n++);
+    FILE *f = fopen(path, "wb");
+    if (!f) { perror(path); return; }
+    fprintf(f, "P6\n%d %d\n255\n", width, height);
+    for (int y = 0; y < height; y++) {
+        const uint8_t *row = (const uint8_t *)pixels + (size_t)y * pitch;
+        for (int x = 0; x < width; x++) {          /* X8R8G8B8 in memory is B,G,R,X */
+            uint8_t rgb[3] = { row[x * 4 + 2], row[x * 4 + 1], row[x * 4 + 0] };
+            fwrite(rgb, 1, 3, f);
+        }
+    }
+    fclose(f);
+    fprintf(stderr, "winrun: presented frame -> %s (%dx%d)\n", path, width, height);
 }
 
 int winrun_main(int argc, char **argv) {
@@ -598,6 +630,7 @@ int winrun_main(int argc, char **argv) {
         xc_cpu_init(w->c, XC_MODE_64, w->mem);
     }
     stubs_init(w);
+    { const char *ppm = getenv("WINRUN_PRESENT_PPM"); if (ppm) w32_set_present(present_ppm, (void *)ppm); }
     /* TEB/PEB/stack/heap first (TLS callbacks need them); they come from the
      * arena's bump allocator or host mmap, neither of which lands on a PE32+
      * preferred base (0x140000000) or a PE32 one (0x400000) */

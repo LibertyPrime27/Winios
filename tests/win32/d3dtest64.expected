@@ -1,0 +1,16 @@
+Direct3DCreate9: ok
+adapters: 1
+adapter: xcore d3d9 on Metal (d12mt) (vendor 0x106b)
+display mode: 1280x720 fmt 22
+CreateDevice: ok
+TestCooperativeLevel: ok
+Clear: ok
+Present: ok
+GetBackBuffer: ok
+back buffer: 64x32 fmt 22
+LockRect: ok pitch 256
+pixel(0,0)   = ff306090
+pixel(63,31) = ff306090
+cleared uniformly: yes
+device refs after Release: 0
+d3d refs after Release: 0

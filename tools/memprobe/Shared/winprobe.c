@@ -11,6 +11,7 @@
  */
 #include "winprobe.h"
 #include "winrun.h"
+#include "w32.h"
 #include "xcore/cpu.h"
 
 #include <fcntl.h>
@@ -19,6 +20,28 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+/* Presented frames are copied out rather than referenced: the guest memory
+ * they live in is unmapped when the next run resets the process, and the UI
+ * keeps showing the last frame until then. */
+static uint8_t *g_frame;
+static int g_fw, g_fh, g_fpitch;
+
+static void grab_frame(void *ctx, const void *pixels, int width, int height, int pitch) {
+    (void)ctx;
+    size_t n = (size_t)height * (size_t)pitch;
+    uint8_t *p = realloc(g_frame, n);
+    if (!p) return;
+    memcpy(p, pixels, n);
+    g_frame = p; g_fw = width; g_fh = height; g_fpitch = pitch;
+}
+
+const void *win_probe_frame(int *width, int *height, int *pitch) {
+    if (width) *width = g_fw;
+    if (height) *height = g_fh;
+    if (pitch) *pitch = g_fpitch;
+    return g_fw && g_fh ? g_frame : 0;
+}
 
 static uint64_t now_ns(void) {
     struct timespec ts;
@@ -34,6 +57,9 @@ int win_probe_run(const char *exe_path, const char *arg1, const char *arg2,
     const char *tmpdir = getenv("TMPDIR");
     char tmp[1024];
     snprintf(tmp, sizeof tmp, "%swinprobe.%d.out", tmpdir && *tmpdir ? tmpdir : "/tmp/", (int)getpid());
+
+    g_fw = g_fh = 0;
+    w32_set_present(grab_frame, 0);
 
     uint64_t n0 = 0, c0 = 0;
     xc_jit_x87_stats(&n0, &c0);

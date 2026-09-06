@@ -16,6 +16,11 @@ int win_probe_run(const char *exe_path, const char *arg1, const char *arg2,
                   char *out, size_t out_len, uint64_t *ns, uint64_t *x87_native,
                   uint64_t *x87_callout);
 
+/* The last frame the guest presented through d3d9, as X8R8G8B8 rows (B,G,R,X
+ * in memory), owned here and valid until the next win_probe_run. NULL if the
+ * guest presented nothing. */
+const void *win_probe_frame(int *width, int *height, int *pitch);
+
 #ifdef __cplusplus
 }
 #endif
