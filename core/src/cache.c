@@ -117,7 +117,7 @@ static block *build(xc_cpu *c, uint64_t rip) {
     block *b = &g_blocks[h];
     if (!b->rip) g_nblocks++;
     b->rip = rip; b->first = first; b->count = count; b->mode = (uint8_t)c->mode;
-    b->bytes = bytes; b->len = (uint16_t)(at - rip); b->code = 0; b->links = 0;
+    b->bytes = bytes; b->len = (uint16_t)(at - rip); b->code = 0; b->warm = 0; b->live_in = 0; b->links = 0;
     g_stat_builds++;
     return b;
 }

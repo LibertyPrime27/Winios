@@ -15,9 +15,10 @@ to a small dispatcher loop with `RIP` set.
 There is no intermediate representation. Each x86 instruction — already in the
 pre-resolved `xop` operand form — lowers directly to a few ARM64 instructions.
 Guest registers RAX..R15 have a fixed home in host registers (x8–x17, x19–x24;
-x18 is Apple's platform register and is never touched) and are loaded from the
-CPU struct on first use in a block and written back at the block's exits, so a
-block only touches the registers it names. x25 holds the arena base, x26 the
+x18 is Apple's platform register and is never touched). A block loads the ones
+it uses in its prologue and writes the dirty ones back at its exits, so it only
+touches the registers it names — and a chained predecessor that already holds
+them lets it skip the prologue entirely ("Registers across a link"). x25 holds the arena base, x26 the
 CPU struct, x27 the dispatcher's address.
 
 Whatever the compiler does not handle natively is a **callout**: the block
@@ -48,6 +49,46 @@ budget is checked in each block's prologue instead. `XCORE_JIT_CHAIN=0` turns
 chaining off for A/B runs. The trade-off is documented rather than hidden: a
 chained target skips the per-execution SMC byte check; write tracking is the
 runtime's job.
+
+## Registers across a link
+
+Chaining removed the dispatcher from a hot loop; what was left was a store and
+a reload of every guest register the loop touches, once per iteration, purely
+because a block used to begin with nothing in its host registers and end with
+everything back in `xc_cpu`. A link now carries the registers.
+
+Every block gets a **prologue** that loads its entry set into their fixed host
+registers, and `block.warm` is the entry just past it. A chained exit writes,
+in a word beside its patchable `b`, the set it is leaving live. When the
+dispatcher makes the link it compares the two: if the predecessor already
+holds everything the target wants, the branch goes straight to `warm` and
+nothing is reloaded; otherwise a small stub loads the difference and jumps
+there. A loop that chains back to itself is the first case — its registers
+stay in x8–x24 and v16–v31 for as long as it spins. If there is nothing in
+common, or no room for a stub, the branch goes to the cold entry, which loads
+the whole set: that is always correct, and it is what happened before.
+
+Getting the entry set right turned out to matter more than getting it. Reading
+it off the decoded operands is cheap, but it names registers the block
+*mentions* rather than the ones its lowering actually reads, and each surplus
+one lengthens the cold entry and every stub — that version made the synthetic
+integer loop 61% faster and `nbody` slower. So a block is compiled twice into
+the same buffer: a probe pass with the old lazy loads, which records exactly
+what was loaded (and stops recording after the first callout, since a callout
+invalidates the cache and anything fetched after it would be fetched again
+anyway), and then the real pass with that set hoisted into the prologue.
+Compiling twice costs a fraction of a percent of the time a hot block spends
+running.
+
+The stores are still there. An exit flushes dirty registers to `xc_cpu` before
+it leaves, because a callout, a fault or a dispatcher exit further down the
+chain has to find the architectural state where it has always been. Removing
+those as well needs the dirty set to reach a fixpoint around the loop, which
+is a larger change; so are the x87 stack registers, whose compile-time TOP and
+rename would have to agree across the edge. Both are still on the list.
+
+`winrun -v` and `xrun -v` report the split (`457 links (200 warm, 156 topped
+up)`), and so does MemProbe's dynarec section on the device.
 
 ## SSE on NEON
 
@@ -244,6 +285,11 @@ Absolute numbers are meaningless here, only the ratios matter:
 | `tests/guest/nbody 300000` (SSE2 double-precision n-body) | 70.2 s | 1.3 s (54×) |
 | `nbody32.exe 200000` (the same, built i686 = **x87** math) | 89.3 s | 2.1 s (43×) |
 
+`test_bench`, the same loops MemProbe runs on the device, under qemu-aarch64:
+carrying registers across links took the integer loop from 298 to 482 MIPS
+(+62%); the SSE2 and x87 loops moved by a few percent, because their register
+traffic is FP and the FP registers do not cross a link yet.
+
 The 32-bit x87 build was 43× slower than the SSE2 build before x87 lowering
 (every FLD/FADD/FMUL a callout); it is now within ~2.3× of it, the gap being
 the range and stack guards. Output is byte-identical to the native x86 run in
@@ -251,11 +297,12 @@ every case. Real numbers come from the devices.
 
 ## What comes next, in order
 
-1. **Registers live across links.** Chaining removed the dispatcher from the
-   hot path; the remaining overhead in a hot loop is the store-on-exit /
-   load-on-entry of guest registers at every block boundary. Keeping them in
-   their host homes across a chained link (a per-block entry convention) is
-   the next speed step.
+1. **The stores, and the x87 registers.** Links now carry guest registers into
+   a block (above) but every exit still writes the dirty ones back, and the
+   x87 stack is reloaded at each boundary — which is why `nbody` gains nothing
+   from the change while an integer loop gains 60%. Dropping the stores needs
+   the dirty set to reach a fixpoint around a loop; carrying x87 needs the
+   compile-time TOP and rename to agree across the edge.
 2. **Indirect branch prediction.** RET and `jmp reg` still go through the
    dispatcher's hash lookup; an inline cache keyed by target address would
    cover most of them.

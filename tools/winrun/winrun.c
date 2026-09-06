@@ -635,10 +635,11 @@ int winrun_main(int argc, char **argv) {
     int code = w32_run(w);
     fflush(stdout);
     if (w->verbose) {
-        uint64_t jb, jco, jbytes; xc_jit_stats(&jb, &jco, &jbytes);
-        fprintf(stderr, "winrun: exit %d; jit: %s, %llu blocks (%llu KB), %llu callouts, %llu links\n", code,
+        uint64_t jb, jco, jbytes, jl, jlw, jls; xc_jit_stats(&jb, &jco, &jbytes);
+        xc_jit_link_stats(&jl, &jlw, &jls);
+        fprintf(stderr, "winrun: exit %d; jit: %s, %llu blocks (%llu KB), %llu callouts, %llu links (%llu warm, %llu topped up)\n", code,
                 xc_jit_enabled() ? "on" : "off", (unsigned long long)jb, (unsigned long long)(jbytes >> 10),
-                (unsigned long long)jco, (unsigned long long)xc_jit_links());
+                (unsigned long long)jco, (unsigned long long)jl, (unsigned long long)jlw, (unsigned long long)jls);
     }
     return code;
 }

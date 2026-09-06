@@ -19,6 +19,8 @@ typedef struct {
     uint16_t len;               /* its length */
     uint8_t  mode;
     void    *code;              /* compiled native code, or NULL */
+    void    *warm;              /* dynarec: entry past the prologue, for a chained predecessor that already holds `live_in` */
+    uint32_t live_in;           /* dynarec: guest registers the prologue loads -- GPR g in bit g, XMM x in bit 16+x */
     uint32_t links;             /* dynarec: head of the list of branch sites chained to this block (0 = none) */
 } block;
 

@@ -455,13 +455,14 @@ int main(int argc, char **argv, char **envp) {
         code = 125; break;
     }
     if (verbose) {
-        uint64_t hits, builds, flushes, smc, jb, jco, jbytes;
+        uint64_t hits, builds, flushes, smc, jb, jco, jbytes, jl, jlw, jls;
         xc_cache_stats(&hits, &builds, &flushes, &smc);
         xc_jit_stats(&jb, &jco, &jbytes);
-        fprintf(stderr, "xrun: exit %d after ~%llu steps; blocks built %llu, hits %llu, smc %llu; jit: %s, %llu blocks (%llu KB), %llu callouts, %llu links\n",
+        xc_jit_link_stats(&jl, &jlw, &jls);
+        fprintf(stderr, "xrun: exit %d after ~%llu steps; blocks built %llu, hits %llu, smc %llu; jit: %s, %llu blocks (%llu KB), %llu callouts, %llu links (%llu warm, %llu topped up)\n",
                 code, (unsigned long long)steps, (unsigned long long)builds, (unsigned long long)hits, (unsigned long long)smc,
                 xc_jit_enabled() ? "on" : "off", (unsigned long long)jb, (unsigned long long)(jbytes >> 10), (unsigned long long)jco,
-                (unsigned long long)xc_jit_links());
+                (unsigned long long)jl, (unsigned long long)jlw, (unsigned long long)jls);
     }
     return code;
 }

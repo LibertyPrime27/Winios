@@ -179,11 +179,26 @@ int xc_jit_enabled(void) {
  * site on the target block so the link can be undone if the target is ever
  * dropped (self-modifying code, unmapping). After that the two blocks run
  * back to back with no dispatcher, no hash lookup and no byte check in
- * between; the step budget is checked in each block's prologue instead. */
+ * between; the step budget is checked in each block's prologue instead.
+ *
+ * A link also carries the guest registers. Every block begins with a prologue
+ * that loads the registers it refers to (`block.live_in`) into their fixed
+ * host registers, and `block.warm` is the entry just past it. A chained exit
+ * publishes, in a word next to its branch, the set it is leaving live; when
+ * the link is made, whatever the target wants and the predecessor does not
+ * already hold is loaded by a small stub, and the branch goes to `warm`. A
+ * loop that chains back to itself needs no stub at all and reloads nothing:
+ * its registers stay in x8-x24 and v16-v31 for as long as it spins.
+ *
+ * The stores are still there -- an exit flushes dirty registers to xc_cpu
+ * before it leaves, because a callout, a fault or a dispatcher exit further
+ * down the chain has to find the architectural state where it always was.
+ * Dropping those too needs the dirty set to reach a fixpoint around the loop,
+ * which is a bigger change than this one. */
 typedef struct { uint32_t *site_rw, *site_rx; uint32_t next; } link_rec;
 enum { MAX_LINKS = 1u << 17 };
 static uint32_t g_nlinks;                                 /* index 0 is the list terminator */
-static uint64_t g_stat_links;
+static uint64_t g_stat_links, g_stat_link_warm, g_stat_link_stub;
 #if XC_JIT_HOST
 static link_rec *g_links;
 static int g_chain = -1;
@@ -197,7 +212,7 @@ void xc_jit_unlink(block *b) {
     for (uint32_t i = b->links; i; ) {
         link_rec *l = &g_links[i];
         code_write_begin();
-        *l->site_rw = 0x14000001u;                      /* b +4: back to the slow path */
+        *l->site_rw = 0x14000002u;                      /* b +8: over the live-out word, back to the slow path */
         code_write_end(l->site_rw, 4, l->site_rx);
         i = l->next;
     }
@@ -213,6 +228,11 @@ void xc_jit_stats(uint64_t *blocks, uint64_t *callouts, uint64_t *bytes) {
     if (bytes) *bytes = g_code_used;
 }
 uint64_t xc_jit_links(void) { return g_stat_links; }
+void xc_jit_link_stats(uint64_t *links, uint64_t *warm, uint64_t *stub) {
+    if (links) *links = g_stat_links;
+    if (warm) *warm = g_stat_link_warm;
+    if (stub) *stub = g_stat_link_stub;
+}
 void xc_jit_x87_stats(uint64_t *native, uint64_t *callout) {
     if (native) *native = g_stat_x87_native;
     if (callout) *callout = g_stat_x87_callout;
@@ -380,6 +400,9 @@ typedef struct {
     int flags_live;             /* after the current instruction */
     int failed;
     int ended;                  /* the block was closed early (an exit was emitted); stop compiling */
+    int probe;                  /* first pass: emitting only to find out what the block loads (see compile) */
+    int invalidated;            /* a callout has cleared the cache, so later loads are not entry loads */
+    uint32_t lazy;              /* registers loaded on demand before that point -- GPR g in bit g, XMM x in bit 16+x */
     uint64_t bound;             /* arena size when smaller than 4 GB (32-bit mode), else 0: no checks */
 
     /* x87 (see jit_x87.h). The eight physical registers live in d8-d15 as
@@ -405,6 +428,7 @@ static int greg(jc *j, int g) {
     if (!(j->loaded & (1u << g))) {
         a64_ldr_off(&j->a, 3, HREG[g], R_CPU, OFF(gpr) + 8u * g);
         j->loaded |= 1u << g;
+        if (!j->invalidated) j->lazy |= 1u << g;
     }
     return HREG[g];
 }
@@ -418,10 +442,20 @@ static int xreg(jc *j, int x) {
     if (!(j->xloaded & (1u << x))) {
         a64_fldst_off(&j->a, 2, 1, VREG(x), R_CPU, OFF(xmm) + 16u * x);
         j->xloaded |= 1u << x;
+        if (!j->invalidated) j->lazy |= 0x10000u << x;
     }
     return VREG(x);
 }
 static void xset(jc *j, int x) { j->xloaded |= 1u << x; j->xdirty |= 1u << x; }   /* about to be fully overwritten */
+/* Load the guest registers in `mask` (GPR g in bit g, XMM x in bit 16+x) into
+ * their fixed host registers. The block prologue and the link stubs share it,
+ * which is what lets a chained edge hand registers over: both sides agree on
+ * where a guest register lives, so the only question is who loaded it. */
+static void emit_reg_loads(a64 *a, uint32_t mask) {
+    for (int g = 0; g < 16; g++) if (mask & (1u << g)) a64_ldr_off(a, 3, HREG[g], R_CPU, OFF(gpr) + 8u * g);
+    for (int x = 0; x < 16; x++) if (mask & (0x10000u << x)) a64_fldst_off(a, 2, 1, VREG(x), R_CPU, OFF(xmm) + 16u * x);
+}
+static int reg_count(uint32_t mask) { int n = 0; for (; mask; mask &= mask - 1) n++; return n; }
 static void x87_spill(jc *j);       /* jit_x87.h: dirty ST registers, TOP/tags, FPSR flags -> cpu */
 static void x87_flushed(jc *j);
 static void x87_invalidate(jc *j);
@@ -432,7 +466,10 @@ static void spill(jc *j) {
     x87_spill(j);
 }
 static void flush(jc *j) { spill(j); j->dirty = 0; j->xdirty = 0; x87_flushed(j); }
-static void invalidate(jc *j) { j->loaded = j->dirty = 0; j->xloaded = j->xdirty = 0; x87_invalidate(j); }
+/* A C call clobbered the caches. Loads after this point are not entry loads:
+ * whatever the block needs it will fetch again anyway, so hoisting them into
+ * the prologue would only make the cold path and the link stubs longer. */
+static void invalidate(jc *j) { j->loaded = j->dirty = 0; j->xloaded = j->xdirty = 0; j->invalidated = 1; x87_invalidate(j); }
 
 /* Address of a memory operand into `rd`. Returns 1 if the address is a
  * 32-bit quantity (use uxtw addressing), 0 if 64-bit. */
@@ -552,7 +589,11 @@ static void emit_exit_imm(jc *j, uint64_t rip) {
     if (g_chain < 0) { const char *e = getenv("XCORE_JIT_CHAIN"); g_chain = !(e && e[0] == '0'); }
     if (!g_chain) { emit_set_rip_imm(j, rip); a64_br(&j->a, R_DISP); return; }
     uint32_t site = a64_here(&j->a);
-    a64_b(&j->a, 1);                                   /* patched to `b <target block>` once known */
+    a64_b(&j->a, 2);                                   /* patched to `b <target block>` once known */
+    /* Not executed: the registers this exit leaves live, for chain() to read.
+     * flush() stored the dirty ones, so a live register and its xc_cpu slot
+     * agree -- the target may keep it or reload it, whichever is cheaper. */
+    a64_emit(&j->a, (uint32_t)j->loaded | ((uint32_t)j->xloaded << 16));
     emit_set_rip_imm(j, rip);
     a64_adr(&j->a, 1, -(int32_t)((a64_here(&j->a) - site) * 4));   /* x1 = the site, for the dispatcher to patch */
     a64_add_imm(&j->a, 1, R_TMP, R_DISP, 4);           /* dispatcher entry that keeps x1 */
@@ -1135,10 +1176,6 @@ static void emit_insn(jc *j) {
 static void *compile(xc_cpu *c, block *b) {
     size_t room = g_code_cap - g_code_used;
     if (room < 65536) return 0;                       /* caller flushes and retries */
-    jc j; memset(&j, 0, sizeof j);
-    j.a.buf = (uint32_t *)(g_code_rw + g_code_used); j.a.cap = (uint32_t)(room / 4);
-    j.mode = c->mode; j.b = b;
-    j.bound = (c->mode == XC_MODE_32 && c->mem->size < (1ull << 32)) ? c->mem->size : 0;
     const dinsn *insns = xc_cache_insns(b);
 
     /* liveness of flags after each instruction, backwards from "live at exit" */
@@ -1151,31 +1188,61 @@ static void *compile(xc_cpu *c, block *b) {
     }
 
     code_write_begin();
-    /* step budget: a chained entry skips the dispatcher, so the block itself
-     * refuses to start once the budget is gone (rip = its own start, as the
-     * dispatcher would have reported) */
-    a64_ldr_off(&j.a, 3, T0, R_CPU, OFF(steps));
-    a64_cmp_imm(&j.a, 1, T0, 0);
-    uint32_t ok = a64_here(&j.a); a64_bcond(&j.a, CC_GT, 0);
-    emit_set_rip_imm(&j, b->rip);
-    a64_br(&j.a, R_DISP);
-    a64_patch_bcond(&j.a, ok, a64_here(&j.a));
-    a64_sub_imm(&j.a, 1, T0, T0, b->count);
-    a64_str_off(&j.a, 3, T0, R_CPU, OFF(steps));
+    /* Two passes over the same buffer. The first is a probe: it emits the
+     * block as before, with greg()/xreg() loading registers where they are
+     * first used, and records which ones (`lazy`). The second emits the real
+     * code with exactly those loaded up front, in a prologue, and nothing
+     * lazily after it -- so a chained predecessor that already holds them can
+     * jump past the prologue to `warm` and reload nothing.
+     *
+     * Asking the operands instead of the emitter would be cheaper, but it
+     * answers a different question: it names registers the block mentions,
+     * not the ones its lowering actually reads, and hoisting a load the block
+     * never needed makes both the cold entry and every link stub longer. That
+     * cost real time on nbody; this does not. Compiling twice does not --
+     * compilation is a fraction of a percent of the time a hot block spends
+     * running. */
+    jc j;
+    uint32_t livein = 0, warm = 0;
+    size_t bytes = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        memset(&j, 0, sizeof j);
+        j.a.buf = (uint32_t *)(g_code_rw + g_code_used); j.a.cap = (uint32_t)(room / 4);
+        j.mode = c->mode; j.b = b;
+        j.bound = (c->mode == XC_MODE_32 && c->mem->size < (1ull << 32)) ? c->mem->size : 0;
+        j.probe = pass == 0;
 
-    x87_block_begin(&j, c);
-    uint32_t i;
-    for (i = 0; i < b->count; i++) {
-        j.d = &insns[i]; j.ops = xc_cache_ops(j.d); j.flags_live = live[i];
-        emit_insn(&j);
-        if (j.failed) { code_write_end(j.a.buf, 0, RX(j.a.buf)); return 0; }
-        if (j.ended) break;
+        emit_reg_loads(&j.a, livein);            /* nothing on the probe pass */
+        warm = a64_here(&j.a);                   /* chained predecessors enter here */
+        j.loaded = (uint16_t)livein; j.xloaded = (uint16_t)(livein >> 16);
+
+        /* step budget: a chained entry skips the dispatcher, so the block itself
+         * refuses to start once the budget is gone (rip = its own start, as the
+         * dispatcher would have reported) */
+        a64_ldr_off(&j.a, 3, T0, R_CPU, OFF(steps));
+        a64_cmp_imm(&j.a, 1, T0, 0);
+        uint32_t ok = a64_here(&j.a); a64_bcond(&j.a, CC_GT, 0);
+        emit_set_rip_imm(&j, b->rip);
+        a64_br(&j.a, R_DISP);
+        a64_patch_bcond(&j.a, ok, a64_here(&j.a));
+        a64_sub_imm(&j.a, 1, T0, T0, b->count);
+        a64_str_off(&j.a, 3, T0, R_CPU, OFF(steps));
+
+        x87_block_begin(&j, c);
+        uint32_t i;
+        for (i = 0; i < b->count; i++) {
+            j.d = &insns[i]; j.ops = xc_cache_ops(j.d); j.flags_live = live[i];
+            emit_insn(&j);
+            if (j.failed) { code_write_end(j.a.buf, 0, RX(j.a.buf)); return 0; }
+            if (j.ended) break;
+        }
+        /* fell off the end (block ended at a decode failure or MAX_BLOCK): continue sequentially */
+        if (!j.ended) { const dinsn *last = &insns[b->count - 1]; emit_exit_imm(&j, last->rip + last->in.length); }
+
+        if (j.a.overflow) { code_write_end(j.a.buf, 0, RX(j.a.buf)); return 0; }
+        if (pass == 0) livein = j.lazy;   /* pass 1 preloads them, so its own lazy set is empty */
+        bytes = (size_t)j.a.n * 4;
     }
-    /* fell off the end (block ended at a decode failure or MAX_BLOCK): continue sequentially */
-    if (!j.ended) { const dinsn *last = &insns[b->count - 1]; emit_exit_imm(&j, last->rip + last->in.length); }
-
-    if (j.a.overflow) { code_write_end(j.a.buf, 0, RX(j.a.buf)); return 0; }
-    size_t bytes = (size_t)j.a.n * 4;
     void *rx = RX(j.a.buf);
     code_write_end(j.a.buf, bytes, rx);
     if (getenv("XCORE_JIT_DUMP")) {          /* raw code for `objdump -D -b binary -m aarch64` */
@@ -1184,6 +1251,8 @@ static void *compile(xc_cpu *c, block *b) {
     }
     g_code_used += (bytes + 15) & ~(size_t)15;
     g_stat_blocks++;
+    b->warm = (uint8_t *)rx + warm * 4;
+    b->live_in = livein;
     return rx;
 }
 
@@ -1195,13 +1264,47 @@ static void *compile(xc_cpu *c, block *b) {
 typedef xc_stop (*enter_fn)(xc_cpu *);
 static enter_fn g_enter;
 
-/* Patch the `b` at a link site to jump into `b`'s code, and remember it. */
+/* Build the stub that tops a link up: load the registers the target wants and
+ * the predecessor is not already holding, then jump to the target's warm
+ * entry. Returns the stub's execute address, or NULL if there is no room --
+ * in which case the caller falls back to the cold entry, which loads them
+ * all. Stubs are ordinary arena code and go away with the next code reset;
+ * an unlinked site simply stops branching to one. */
+static void *link_stub(uint32_t need, void *warm) {
+    uint32_t words = (uint32_t)reg_count(need) + 1;
+    if (g_code_cap - g_code_used < (size_t)words * 4 + 64) return 0;
+    uint32_t *rw = (uint32_t *)(g_code_rw + g_code_used);
+    uint32_t *rx = (uint32_t *)RX(rw);
+    a64 a = { rw, 0, words, 0 };
+    code_write_begin();
+    emit_reg_loads(&a, need);
+    intptr_t off = ((uint8_t *)warm - (uint8_t *)(rx + a.n)) / 4;
+    if (a.overflow || off < -(1 << 25) || off >= (1 << 25)) { code_write_end(rw, 0, rx); return 0; }
+    a64_b(&a, (int32_t)off);
+    code_write_end(rw, (size_t)a.n * 4, rx);
+    g_code_used += ((size_t)a.n * 4 + 15) & ~(size_t)15;
+    return rx;
+}
+
+/* Patch the `b` at a link site to jump into `b`'s code, and remember it. The
+ * word after the site says which guest registers the exiting block left live
+ * (see emit_exit_imm); the target's cold entry is always a correct
+ * destination, and everything here is about arriving somewhere cheaper. */
 static void chain(uint32_t *site_rx, block *b) {
     if (!g_links) g_links = malloc(sizeof(link_rec) * MAX_LINKS);
     if (!g_links || g_nlinks + 1 >= MAX_LINKS) return;
-    intptr_t off = ((uint8_t *)b->code - (uint8_t *)site_rx) / 4;
-    if (off < -(1 << 25) || off >= (1 << 25)) return;
     uint32_t *site_rw = (uint32_t *)((uint8_t *)site_rx - g_code_rx + g_code_rw);
+    void *dest = b->code;
+    if (b->warm) {
+        uint32_t need = b->live_in & ~site_rw[1];
+        if (!need) { dest = b->warm; g_stat_link_warm++; }
+        else if (need != b->live_in) {
+            void *stub = link_stub(need, b->warm);
+            if (stub) { dest = stub; g_stat_link_stub++; }
+        }
+    }
+    intptr_t off = ((uint8_t *)dest - (uint8_t *)site_rx) / 4;
+    if (off < -(1 << 25) || off >= (1 << 25)) return;
     if (g_nlinks == 0) g_nlinks = 1;
     link_rec *l = &g_links[g_nlinks];
     l->site_rw = site_rw; l->site_rx = site_rx; l->next = b->links;

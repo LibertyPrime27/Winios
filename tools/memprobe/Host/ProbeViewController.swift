@@ -164,14 +164,18 @@ final class ProbeViewController: UIViewController {
         // total instead makes the same probe read 436 blocks on one launch and
         // 2580 on the next, purely by what was tapped first.
         var b0: UInt64 = 0, c0: UInt64 = 0, y0: UInt64 = 0, xn0: UInt64 = 0, xc0: UInt64 = 0
+        var l0: UInt64 = 0, lw0: UInt64 = 0, ls0: UInt64 = 0
         xc_jit_stats(&b0, &c0, &y0)
         xc_jit_x87_stats(&xn0, &xc0)
+        xc_jit_link_stats(&l0, &lw0, &ls0)
         xc_jit_enable(1)
         var buf2 = [CChar](repeating: 0, count: 8192)
         let bad2 = xc_selftest(&buf2, buf2.count, 12)
         var b1: UInt64 = 0, c1: UInt64 = 0, y1: UInt64 = 0, xn1: UInt64 = 0, xc1: UInt64 = 0
+        var l1: UInt64 = 0, lw1: UInt64 = 0, ls1: UInt64 = 0
         xc_jit_stats(&b1, &c1, &y1)
         xc_jit_x87_stats(&xn1, &xc1)
+        xc_jit_link_stats(&l1, &lw1, &ls1)
         xc_jit_enable(0)
         let blocks = b1 - b0, callouts = c1 - c0, bytes = y1 - y0
         let x87n = xn1 - xn0, x87c = xc1 - xc0
@@ -179,6 +183,7 @@ final class ProbeViewController: UIViewController {
             + String(cString: buf2)
             + "    this replay: \(blocks) blocks compiled, \(bytes >> 10) KB of ARM64, \(callouts) interpreter callouts\n"
             + "    x87: \(x87n) instructions lowered onto NEON, \(x87c) left to the interpreter\n"
+            + "    links: \(l1 - l0) blocks chained — \(lw1 - lw0) kept every register the next block wanted, \(ls1 - ls0) needed a top-up\n"
         DispatchQueue.main.async { self.cpuLine = cpu; self.refresh() }
     }
 
