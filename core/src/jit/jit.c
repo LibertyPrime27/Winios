@@ -73,6 +73,9 @@
 static size_t g_code_used;
 static uint64_t g_stat_blocks, g_stat_callouts;
 static int g_enabled = -1;
+#if XC_JIT_HOST
+static int g_callout_stats, g_stat_callouts_reg;   /* XCORE_JIT_CALLOUTS=1: histogram of interpreter callouts at exit */
+#endif
 
 #if XC_JIT_HOST
 #include <sys/mman.h>
@@ -165,13 +168,47 @@ int xc_jit_enabled(void) {
     if (g_enabled < 0) { const char *e = getenv("XCORE_JIT"); g_enabled = XC_JIT_HOST && !(e && e[0] == '0'); }
     return g_enabled && xc_jit_available();
 }
-void xc_jit_code_reset(void) { g_code_used = 0; }
+/* Block chaining. A block whose exit target is a constant ends in a `b` that
+ * initially falls through to the slow path (store rip, hand the site address
+ * to the dispatcher). The first time the dispatcher resolves that target it
+ * patches the `b` to jump straight into the target's code, and records the
+ * site on the target block so the link can be undone if the target is ever
+ * dropped (self-modifying code, unmapping). After that the two blocks run
+ * back to back with no dispatcher, no hash lookup and no byte check in
+ * between; the step budget is checked in each block's prologue instead. */
+typedef struct { uint32_t *site_rw, *site_rx; uint32_t next; } link_rec;
+enum { MAX_LINKS = 1u << 17 };
+static uint32_t g_nlinks;                                 /* index 0 is the list terminator */
+static uint64_t g_stat_links;
+#if XC_JIT_HOST
+static link_rec *g_links;
+static int g_chain = -1;
+#endif
+
+void xc_jit_code_reset(void) { g_code_used = 0; g_nlinks = 0; }
+
+#if XC_JIT_HOST
+void xc_jit_unlink(block *b) {
+    if (!g_links) return;
+    for (uint32_t i = b->links; i; ) {
+        link_rec *l = &g_links[i];
+        code_write_begin();
+        *l->site_rw = 0x14000001u;                      /* b +4: back to the slow path */
+        code_write_end(l->site_rw, 4, l->site_rx);
+        i = l->next;
+    }
+    b->links = 0;
+}
+#else
+void xc_jit_unlink(block *b) { (void)b; }
+#endif
 
 void xc_jit_stats(uint64_t *blocks, uint64_t *callouts, uint64_t *bytes) {
     if (blocks) *blocks = g_stat_blocks;
     if (callouts) *callouts = g_stat_callouts;
     if (bytes) *bytes = g_code_used;
 }
+uint64_t xc_jit_links(void) { return g_stat_links; }
 
 #if XC_JIT_HOST
 
@@ -181,12 +218,68 @@ void xc_jit_stats(uint64_t *blocks, uint64_t *callouts, uint64_t *bytes) {
 
 /* One instruction through the interpreter. Returns 1 if the block must exit
  * afterwards (stop condition, or RIP left the straight line), else 0. */
+static uint32_t g_callout_hist[ZYDIS_MNEMONIC_MAX_VALUE + 1];
+static void callout_report(void) {
+    int top[12] = {0}; int n = 0;
+    for (int m = 0; m <= ZYDIS_MNEMONIC_MAX_VALUE; m++) {
+        if (!g_callout_hist[m]) continue;
+        int i = n < 12 ? n++ : 11;
+        if (i == 11 && g_callout_hist[m] <= g_callout_hist[top[11]]) continue;
+        top[i] = m;
+        for (; i > 0 && g_callout_hist[top[i]] > g_callout_hist[top[i - 1]]; i--) { int t = top[i]; top[i] = top[i - 1]; top[i - 1] = t; }
+    }
+    fprintf(stderr, "[jit] callouts by mnemonic:\n");
+    for (int i = 0; i < n; i++) fprintf(stderr, "  %10u  %s\n", g_callout_hist[top[i]], ZydisMnemonicGetString((ZydisMnemonic)top[i]));
+}
 static int jit_callout(xc_cpu *c, const dinsn *d) {
     g_stat_callouts++;
+    if (g_callout_stats) { if (!g_stat_callouts_reg) { atexit(callout_report); g_stat_callouts_reg = 1; } g_callout_hist[d->in.mnemonic]++; }
     xc_flags_sync(c);
     xc_stop st = xc_exec_decoded(c, &d->in, xc_cache_ops(d));
     if (st != XC_STOP_NONE) return 1;
     return c->rip != d->rip + d->in.length;
+}
+/* REP MOVS / REP STOS (and the single-shot forms) on host pointers: one call
+ * per instruction instead of one interpreter element step per byte. Falls
+ * back to the interpreter for DF=1, unmapped ranges and overlapping copies,
+ * whose byte-serial semantics the interpreter already has right. */
+static int jit_string(xc_cpu *c, const dinsn *d) {
+    const ZydisDecodedInstruction *in = &d->in;
+    int aw = in->address_width, bits, movs;
+    switch (in->mnemonic) {
+    case ZYDIS_MNEMONIC_MOVSB: bits = 8;  movs = 1; break;
+    case ZYDIS_MNEMONIC_MOVSW: bits = 16; movs = 1; break;
+    case ZYDIS_MNEMONIC_MOVSD: bits = 32; movs = 1; break;
+    case ZYDIS_MNEMONIC_MOVSQ: bits = 64; movs = 1; break;
+    case ZYDIS_MNEMONIC_STOSB: bits = 8;  movs = 0; break;
+    case ZYDIS_MNEMONIC_STOSW: bits = 16; movs = 0; break;
+    case ZYDIS_MNEMONIC_STOSD: bits = 32; movs = 0; break;
+    default:                   bits = 64; movs = 0; break;
+    }
+    int esz = bits / 8;
+    int rep = (in->attributes & ZYDIS_ATTRIB_HAS_REP) != 0;
+    uint64_t amask = aw == 64 ? ~0ull : 0xFFFFFFFFull;
+    if (c->rflags & (1u << 10)) return jit_callout(c, d);               /* DF: backwards */
+    uint64_t n = rep ? (c->gpr[XC_RCX] & amask) : 1;
+    if (n == 0) { c->rip = d->rip + in->length; return 0; }
+    uint64_t di = c->gpr[XC_RDI] & amask, si = c->gpr[XC_RSI] & amask, len = n * (uint64_t)esz;
+    if (len / esz != n || di + len < di || (movs && si + len < si)) return jit_callout(c, d);
+    uint8_t *dst = xc_mem_ptr(c->mem, di, len);
+    if (!dst) return jit_callout(c, d);
+    if (movs) {
+        const uint8_t *src = xc_mem_ptr(c->mem, si, len);
+        if (!src || (dst > src && dst < src + len)) return jit_callout(c, d);   /* forward-overlap: byte-serial semantics */
+        memmove(dst, src, len);
+        c->gpr[XC_RSI] = (si + len) & amask;
+    } else {
+        uint64_t v = c->gpr[XC_RAX];
+        if (esz == 1) memset(dst, (int)(v & 0xff), len);
+        else for (uint64_t i = 0; i < n; i++) memcpy(dst + i * esz, &v, esz);
+    }
+    c->gpr[XC_RDI] = (di + len) & amask;
+    if (rep) c->gpr[XC_RCX] = 0;
+    c->rip = d->rip + in->length;
+    return 0;
 }
 /* Evaluate an x86 condition (0..15) against the true flags. */
 static int jit_cc(xc_cpu *c, int cc) {
@@ -365,7 +458,18 @@ static void st_op(jc *j, const xop *op, int rs) {
 /* --- exits --- */
 
 static void emit_set_rip_imm(jc *j, uint64_t rip) { a64_mov_imm(&j->a, T0, rip); a64_str_off(&j->a, 3, T0, R_CPU, OFF(rip)); }
-static void emit_exit_imm(jc *j, uint64_t rip) { flush(j); emit_set_rip_imm(j, rip); a64_br(&j->a, R_DISP); }
+/* Exit to a constant address: a chainable link site (see xc_jit_unlink). */
+static void emit_exit_imm(jc *j, uint64_t rip) {
+    flush(j);
+    if (g_chain < 0) { const char *e = getenv("XCORE_JIT_CHAIN"); g_chain = !(e && e[0] == '0'); }
+    if (!g_chain) { emit_set_rip_imm(j, rip); a64_br(&j->a, R_DISP); return; }
+    uint32_t site = a64_here(&j->a);
+    a64_b(&j->a, 1);                                   /* patched to `b <target block>` once known */
+    emit_set_rip_imm(j, rip);
+    a64_adr(&j->a, 1, -(int32_t)((a64_here(&j->a) - site) * 4));   /* x1 = the site, for the dispatcher to patch */
+    a64_add_imm(&j->a, 1, R_TMP, R_DISP, 4);           /* dispatcher entry that keeps x1 */
+    a64_br(&j->a, R_TMP);
+}
 static void emit_exit_reg(jc *j, int r) {     /* r must not be a guest register that flush() rewrites... it only stores, fine */
     flush(j);
     a64_str_off(&j->a, 3, r, R_CPU, OFF(rip));
@@ -391,6 +495,17 @@ static void emit_callout(jc *j) {
     a64_cbz(&j->a, 0, 0, 2);
     a64_br(&j->a, R_DISP);
     j->nz = NZ_NONE; j->lz = LZ_VALID;
+}
+
+/* MOVS/STOS through jit_string: like a callout, minus the flag sync (only DF
+ * is read, and DF is never lazy). */
+static void emit_string(jc *j) {
+    emit_set_rip_imm(j, j->d->rip);
+    emit_call(j, (void *)jit_string, (uint64_t)(uintptr_t)j->d, 1, -1);
+    a64_cbz(&j->a, 0, 0, 2);
+    a64_br(&j->a, R_DISP);
+    /* the fallback path may have run the interpreter, which leaves rflags exact */
+    j->nz = NZ_NONE; if (j->lz != LZ_VALID) j->lz = LZ_UNKNOWN;
 }
 
 /* --- lazy flag state --- */
@@ -783,6 +898,19 @@ static void emit_insn(jc *j) {
         if (emit_imul(j)) return;
         break;
 
+    case ZYDIS_MNEMONIC_BSWAP: {
+        int h = greg(j, ops[0].ridx);
+        if (ops[0].size == 64) a64_rev(&j->a, 1, h, h); else a64_rev(&j->a, 0, h, h);   /* 32-bit write zero-extends */
+        gdirty(j, ops[0].ridx);
+        return;
+    }
+    case ZYDIS_MNEMONIC_MOVSB: case ZYDIS_MNEMONIC_MOVSW: case ZYDIS_MNEMONIC_MOVSQ:
+    case ZYDIS_MNEMONIC_STOSB: case ZYDIS_MNEMONIC_STOSW: case ZYDIS_MNEMONIC_STOSD: case ZYDIS_MNEMONIC_STOSQ:
+        emit_string(j); return;
+    case ZYDIS_MNEMONIC_MOVSD:
+        if (in->meta.category == ZYDIS_CATEGORY_STRINGOP) { emit_string(j); return; }
+        break;
+
     /* sign extension */
     case ZYDIS_MNEMONIC_CBW:  { int h = greg(j, XC_RAX); a64_sxtb(&j->a, 0, T0, h); a64_bfi(&j->a, 1, h, T0, 0, 16); gdirty(j, XC_RAX); return; }
     case ZYDIS_MNEMONIC_CWDE: { int h = greg(j, XC_RAX); a64_sxth(&j->a, 0, h, h); gdirty(j, XC_RAX); return; }   /* 32-bit write zero-extends */
@@ -821,8 +949,13 @@ static void emit_insn(jc *j) {
     case ZYDIS_MNEMONIC_CALL: {
         uint64_t next = j->d->rip + in->length;
         int r;
-        if (ops[0].type == XOP_IMM) { a64_mov_imm(&j->a, T1, ops[0].imm); r = T1; }
-        else { r = ld_op(j, &ops[0], T1, 0); if (r != T1) { a64_mov_reg(&j->a, 1, T1, r); r = T1; } }
+        if (ops[0].type == XOP_IMM) {                  /* direct call: push the return address, chain to the target */
+            a64_mov_imm(&j->a, T0, next);
+            emit_push_reg(j, T0);
+            emit_exit_imm(j, ops[0].imm);
+            return;
+        }
+        r = ld_op(j, &ops[0], T1, 0); if (r != T1) { a64_mov_reg(&j->a, 1, T1, r); r = T1; }
         a64_mov_imm(&j->a, T0, next);
         emit_push_reg(j, T0);
         emit_exit_reg(j, T1);
@@ -893,8 +1026,15 @@ static void *compile(xc_cpu *c, block *b) {
     }
 
     code_write_begin();
-    /* step budget */
+    /* step budget: a chained entry skips the dispatcher, so the block itself
+     * refuses to start once the budget is gone (rip = its own start, as the
+     * dispatcher would have reported) */
     a64_ldr_off(&j.a, 3, T0, R_CPU, OFF(steps));
+    a64_cmp_imm(&j.a, 1, T0, 0);
+    uint32_t ok = a64_here(&j.a); a64_bcond(&j.a, CC_GT, 0);
+    emit_set_rip_imm(&j, b->rip);
+    a64_br(&j.a, R_DISP);
+    a64_patch_bcond(&j.a, ok, a64_here(&j.a));
     a64_sub_imm(&j.a, 1, T0, T0, b->count);
     a64_str_off(&j.a, 3, T0, R_CPU, OFF(steps));
 
@@ -928,8 +1068,27 @@ static void *compile(xc_cpu *c, block *b) {
 typedef xc_stop (*enter_fn)(xc_cpu *);
 static enter_fn g_enter;
 
+/* Patch the `b` at a link site to jump into `b`'s code, and remember it. */
+static void chain(uint32_t *site_rx, block *b) {
+    if (!g_links) g_links = malloc(sizeof(link_rec) * MAX_LINKS);
+    if (!g_links || g_nlinks + 1 >= MAX_LINKS) return;
+    intptr_t off = ((uint8_t *)b->code - (uint8_t *)site_rx) / 4;
+    if (off < -(1 << 25) || off >= (1 << 25)) return;
+    uint32_t *site_rw = (uint32_t *)((uint8_t *)site_rx - g_code_rx + g_code_rw);
+    if (g_nlinks == 0) g_nlinks = 1;
+    link_rec *l = &g_links[g_nlinks];
+    l->site_rw = site_rw; l->site_rx = site_rx; l->next = b->links;
+    b->links = g_nlinks++;
+    code_write_begin();
+    *site_rw = 0x14000000u | ((uint32_t)off & 0x3FFFFFF);
+    code_write_end(site_rw, 4, site_rx);
+    g_stat_links++;
+}
+
 static int g_trace = -1;
-static void *lookup_compile(xc_cpu *c) {
+/* `site` is the link site of the block that just exited to a constant
+ * target (or NULL): once the target has code, the site is chained to it. */
+static void *lookup_compile(xc_cpu *c, uint32_t *site) {
     if (g_trace < 0) g_trace = getenv("XCORE_JIT_TRACE") != 0;
     block *b = xc_cache_lookup(c);
     if (!b) return 0;
@@ -941,11 +1100,13 @@ static void *lookup_compile(xc_cpu *c) {
         b->code = compile(c, b);
         if (!b->code && g_code_cap - g_code_used < 65536) {   /* code memory full: flush everything, once */
             xc_cache_flush();
+            site = 0;                                           /* the site's memory went with it */
             b = xc_cache_lookup(c);
             if (b) b->code = compile(c, b);
         }
         if (!b || !b->code) { if (c->stop == XC_STOP_NONE) c->stop = XC_STOP_UNDEFINED; return 0; }
     }
+    if (site) chain(site, b);
     return b->code;
 }
 
@@ -961,6 +1122,8 @@ static void build_enter(void) {
     a64_mov_reg(&a, 1, R_CPU, 0);
     a64_ldr_off(&a, 3, R_BASE, R_CPU, OFF(jit_base));
     uint32_t loop = a64_here(&a);
+    a64_movz(&a, 1, 1, 0, 0);                                     /* x1 = no link site (plain `br x27` exits) */
+    /* loop+4: link-site exits land here with x1 = the site to patch */
     a64_mov_imm4(&a, R_DISP, (uint64_t)(uintptr_t)(xbuf + loop));  /* blocks return here with br x27 */
     /* stop set? steps exhausted? */
     a64_ldr_off(&a, 2, 0, R_CPU, OFF(stop));
@@ -968,7 +1131,7 @@ static void build_enter(void) {
     a64_ldr_off(&a, 3, 0, R_CPU, OFF(steps));
     a64_cmp_imm(&a, 1, 0, 0);
     uint32_t b_steps = a64_here(&a); a64_bcond(&a, CC_LE, 0);
-    a64_mov_reg(&a, 1, 0, R_CPU);
+    a64_mov_reg(&a, 1, 0, R_CPU);                                 /* x1 still holds the site */
     a64_mov_imm(&a, R_TMP, (uint64_t)(uintptr_t)lookup_compile);
     a64_blr(&a, R_TMP);
     uint32_t b_null = a64_here(&a); a64_cbz(&a, 1, 0, 0);
@@ -999,7 +1162,7 @@ static void build_enter(void) {
 xc_stop xc_run_jit(xc_cpu *c, uint64_t max_steps) {
 #if XC_JIT_HOST
     if (!g_code_rw && !code_alloc(64u << 20)) return XC_STOP_UNDEFINED;
-    if (!g_enter) build_enter();
+    if (!g_enter) { build_enter(); g_callout_stats = getenv("XCORE_JIT_CALLOUTS") != 0; }
     c->steps = (int64_t)(max_steps > INT64_MAX ? INT64_MAX : max_steps);
     c->stop = XC_STOP_NONE;
     c->jit_base = c->mem->mode == XC_MODE_64 ? 0 : (uint64_t)(uintptr_t)c->mem->base;

@@ -197,6 +197,25 @@ static long host(long nr, long a, long b, long c_, long d, long e, long f) {
  * the guest tests on an ARM64 host; the 32-bit path (linux32.c) is complete. */
 #include <sys/uio.h>
 #include <sys/ioctl.h>
+#include <sys/utsname.h>
+#include <sys/time.h>
+#include <sys/resource.h>
+#include <sys/sysinfo.h>
+#include <sys/random.h>
+#include <sys/syscall.h>
+#include <poll.h>
+#include <time.h>
+/* x86-64 struct stat (144 bytes) from the host's */
+static void put_stat_x64(void *dst, const struct stat *s) {
+    uint64_t *q = (uint64_t *)dst; uint32_t *w;
+    memset(dst, 0, 144);
+    q[0] = s->st_dev; q[1] = s->st_ino; q[2] = s->st_nlink;
+    w = (uint32_t *)&q[3]; w[0] = s->st_mode; w[1] = s->st_uid; w[2] = s->st_gid;
+    q[5] = s->st_rdev; q[6] = (uint64_t)s->st_size; q[7] = (uint64_t)s->st_blksize; q[8] = (uint64_t)s->st_blocks;
+    q[9] = (uint64_t)s->st_atim.tv_sec; q[10] = (uint64_t)s->st_atim.tv_nsec;
+    q[11] = (uint64_t)s->st_mtim.tv_sec; q[12] = (uint64_t)s->st_mtim.tv_nsec;
+    q[13] = (uint64_t)s->st_ctim.tv_sec; q[14] = (uint64_t)s->st_ctim.tv_nsec;
+}
 static int do_syscall(xc_cpu *c, int *code) {
     uint64_t nr = c->gpr[XC_RAX];
     long a0 = (long)ARG(0), a1 = (long)ARG(1), a2 = (long)ARG(2);
@@ -223,6 +242,52 @@ static int do_syscall(xc_cpu *c, int *code) {
         g_im.brk_cur = want; r = (long)want; break;
     }
     case 13: case 14: case 131: case 273: r = 0; break;  /* rt_sigaction, rt_sigprocmask, sigaltstack, set_robust_list */
+    /* files: pointers are host pointers; only struct stat needs the x86-64 layout */
+    case 2:   r = open((const char *)a0, (int)a1, (mode_t)a2); if (r < 0) r = -errno; break;
+    case 257: r = openat((int)a0, (const char *)a1, (int)a2, (mode_t)ARG(3)); if (r < 0) r = -errno; break;
+    case 4:   { struct stat st; r = stat((const char *)a0, &st) < 0 ? -errno : 0; if (!r) put_stat_x64((void *)a1, &st); break; }
+    case 6:   { struct stat st; r = lstat((const char *)a0, &st) < 0 ? -errno : 0; if (!r) put_stat_x64((void *)a1, &st); break; }
+    case 5:   { struct stat st; r = fstat((int)a0, &st) < 0 ? -errno : 0; if (!r) put_stat_x64((void *)a1, &st); break; }
+    case 262: { struct stat st; r = fstatat((int)a0, (const char *)a1, &st, (int)ARG(3)) < 0 ? -errno : 0; if (!r) put_stat_x64((void *)a2, &st); break; }
+    case 8:   r = lseek((int)a0, (off_t)a1, (int)a2); if (r < 0) r = -errno; break;
+    case 17:  r = pread((int)a0, (void *)a1, (size_t)a2, (off_t)ARG(3)); if (r < 0) r = -errno; break;
+    case 18:  r = pwrite((int)a0, (const void *)a1, (size_t)a2, (off_t)ARG(3)); if (r < 0) r = -errno; break;
+    case 19:  r = readv((int)a0, (const struct iovec *)a1, (int)a2); if (r < 0) r = -errno; break;
+    case 21:  r = access((const char *)a0, (int)a1) < 0 ? -errno : 0; break;
+    case 269: r = faccessat((int)a0, (const char *)a1, (int)a2, 0) < 0 ? -errno : 0; break;
+    case 32:  r = dup((int)a0); if (r < 0) r = -errno; break;
+    case 33:  r = dup2((int)a0, (int)a1); if (r < 0) r = -errno; break;
+    case 72:  r = fcntl((int)a0, (int)a1, a2); if (r < 0) r = -errno; break;
+    case 79:  r = getcwd((char *)a0, (size_t)a1) ? (long)strlen((char *)a0) + 1 : -errno; break;
+    case 80:  r = chdir((const char *)a0) < 0 ? -errno : 0; break;
+    case 83:  r = mkdir((const char *)a0, (mode_t)a1) < 0 ? -errno : 0; break;
+    case 87:  r = unlink((const char *)a0) < 0 ? -errno : 0; break;
+    case 89:  r = readlink((const char *)a0, (char *)a1, (size_t)a2); if (r < 0) r = -errno; break;
+    case 267: r = readlinkat((int)a0, (const char *)a1, (char *)a2, (size_t)ARG(3)); if (r < 0) r = -errno; break;
+    case 217: r = syscall(SYS_getdents64, (int)a0, (void *)a1, (unsigned)a2); if (r < 0) r = -errno; break;   /* linux_dirent64 is arch-independent */
+    case 63:  { struct utsname u; r = uname(&u) < 0 ? -errno : 0; if (!r) { strncpy(u.machine, "x86_64", sizeof u.machine); memcpy((void *)a0, &u, sizeof u); } break; }
+    case 96:  { struct timeval tv; r = gettimeofday(&tv, 0) < 0 ? -errno : 0; if (!r && a0) memcpy((void *)a0, &tv, sizeof tv); break; }
+    case 97:  r = getrlimit((int)a0, (struct rlimit *)a1) < 0 ? -errno : 0; break;
+    case 302: r = prlimit((pid_t)a0, (int)a1, (const struct rlimit *)a2, (struct rlimit *)ARG(3)) < 0 ? -errno : 0; break;
+    case 99:  r = sysinfo((struct sysinfo *)a0) < 0 ? -errno : 0; break;
+    case 102: r = getuid(); break;
+    case 104: r = getgid(); break;
+    case 105: r = setuid((uid_t)a0) < 0 ? -errno : 0; break;
+    case 106: r = setgid((gid_t)a0) < 0 ? -errno : 0; break;
+    case 107: r = geteuid(); break;
+    case 108: r = getegid(); break;
+    case 110: r = getppid(); break;
+    case 186: r = getpid(); break;                          /* gettid: single thread */
+    case 157: r = 0; break;                                 /* prctl */
+    case 318: r = getrandom((void *)a0, (size_t)a1, (unsigned)a2); if (r < 0) r = -errno; break;
+    case 293: r = pipe2((int *)a0, (int)a1) < 0 ? -errno : 0; break;
+    case 7:   r = poll((struct pollfd *)a0, (nfds_t)a1, (int)a2); if (r < 0) r = -errno; break;
+    case 35:  r = nanosleep((const struct timespec *)a0, (struct timespec *)a1) < 0 ? -errno : 0; break;
+    case 24:  r = 0; break;                                 /* sched_yield */
+    case 202: r = ((a1 & 0x7f) == 1) ? 0 : -EAGAIN; break;  /* futex: single thread */
+    case 200: case 62:
+        fprintf(stderr, "xrun: guest raised signal %ld\n", a2 ? a2 : a1);
+        *code = 128 + (int)(a2 ? a2 : a1); return 0;
     case 158:
         if (a0 == 0x1002) { c->fs_base = (uint64_t)a1; r = 0; } else if (a0 == 0x1001) { c->gs_base = (uint64_t)a1; r = 0; } else r = -EINVAL;
         break;
@@ -393,9 +458,10 @@ int main(int argc, char **argv, char **envp) {
         uint64_t hits, builds, flushes, smc, jb, jco, jbytes;
         xc_cache_stats(&hits, &builds, &flushes, &smc);
         xc_jit_stats(&jb, &jco, &jbytes);
-        fprintf(stderr, "xrun: exit %d after ~%llu steps; blocks built %llu, hits %llu, smc %llu; jit: %s, %llu blocks (%llu KB), %llu callouts\n",
+        fprintf(stderr, "xrun: exit %d after ~%llu steps; blocks built %llu, hits %llu, smc %llu; jit: %s, %llu blocks (%llu KB), %llu callouts, %llu links\n",
                 code, (unsigned long long)steps, (unsigned long long)builds, (unsigned long long)hits, (unsigned long long)smc,
-                xc_jit_enabled() ? "on" : "off", (unsigned long long)jb, (unsigned long long)(jbytes >> 10), (unsigned long long)jco);
+                xc_jit_enabled() ? "on" : "off", (unsigned long long)jb, (unsigned long long)(jbytes >> 10), (unsigned long long)jco,
+                (unsigned long long)xc_jit_links());
     }
     return code;
 }

@@ -122,6 +122,9 @@ static inline void a64_ror_imm(a64 *a, int sf, int rd, int rn, int sh) { a64_ext
 /* variable shifts: lslv/lsrv/asrv/rorv */
 static inline void a64_shiftv(a64 *a, int sf, int op, int rd, int rn, int rm) { a64_emit(a, (sf << 31) | 0x1AC02000u | (rm << 16) | (op << 10) | (rn << 5) | rd); }
 
+/* ---- byte reverse ---- rev wd/xd */
+static inline void a64_rev(a64 *a, int sf, int rd, int rn) { a64_emit(a, sf ? (0xDAC00C00u | (rn << 5) | rd) : (0x5AC00800u | (rn << 5) | rd)); }
+
 /* ---- multiply ---- */
 static inline void a64_madd(a64 *a, int sf, int rd, int rn, int rm, int ra) { a64_emit(a, (sf << 31) | 0x1B000000u | (rm << 16) | (ra << 10) | (rn << 5) | rd); }
 static inline void a64_mul(a64 *a, int sf, int rd, int rn, int rm) { a64_madd(a, sf, rd, rn, rm, ZR); }
@@ -164,6 +167,8 @@ static inline void a64_cbz(a64 *a, int sf, int rt, int32_t off) { a64_emit(a, (s
 static inline void a64_cbnz(a64 *a, int sf, int rt, int32_t off) { a64_emit(a, (sf << 31) | 0x35000000u | (((uint32_t)off & 0x7FFFF) << 5) | rt); }
 static inline void a64_tbz(a64 *a, int rt, int bit, int32_t off) { a64_emit(a, 0x36000000u | (((bit >> 5) & 1) << 31) | ((bit & 31) << 19) | (((uint32_t)off & 0x3FFF) << 5) | rt); }
 static inline void a64_tbnz(a64 *a, int rt, int bit, int32_t off) { a64_emit(a, 0x37000000u | (((bit >> 5) & 1) << 31) | ((bit & 31) << 19) | (((uint32_t)off & 0x3FFF) << 5) | rt); }
+/* adr Xd, pc+off (bytes, +-1 MB) */
+static inline void a64_adr(a64 *a, int rd, int32_t off) { a64_emit(a, 0x10000000u | (((uint32_t)off & 3) << 29) | ((((uint32_t)off >> 2) & 0x7FFFF) << 5) | rd); }
 static inline void a64_br(a64 *a, int rn) { a64_emit(a, 0xD61F0000u | (rn << 5)); }
 static inline void a64_blr(a64 *a, int rn) { a64_emit(a, 0xD63F0000u | (rn << 5)); }
 static inline void a64_ret(a64 *a) { a64_emit(a, 0xD65F03C0u); }

@@ -65,7 +65,7 @@ void xc_cache_invalidate(uint64_t lo, uint64_t hi) {
     for (uint32_t i = 0; i < HASH_SIZE; i++) {
         block *b = &g_blocks[i];
         if (!b->rip) continue;
-        if (b->rip < hi && b->rip + b->len > lo) b->rip = ~0ull;   /* tombstone: never matches a real address */
+        if (b->rip < hi && b->rip + b->len > lo) { xc_jit_unlink(b); b->rip = ~0ull; }   /* tombstone: never matches a real address */
     }
 }
 
@@ -117,7 +117,7 @@ static block *build(xc_cpu *c, uint64_t rip) {
     block *b = &g_blocks[h];
     if (!b->rip) g_nblocks++;
     b->rip = rip; b->first = first; b->count = count; b->mode = (uint8_t)c->mode;
-    b->bytes = bytes; b->len = (uint16_t)(at - rip); b->code = 0;
+    b->bytes = bytes; b->len = (uint16_t)(at - rip); b->code = 0; b->links = 0;
     g_stat_builds++;
     return b;
 }
@@ -143,6 +143,7 @@ block *xc_cache_lookup(xc_cpu *c) {
         const void *now = xc_mem_ptr(c->mem, b->rip, b->len);
         if (now && !memcmp(now, g_bytes + b->bytes, b->len)) return b;
         g_stat_smc++;
+        xc_jit_unlink(b);
         b->rip = ~0ull;
     }
 }

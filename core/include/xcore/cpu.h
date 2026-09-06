@@ -137,6 +137,7 @@ void xc_jit_enable(int on);
 int  xc_jit_set_code(void *rw, void *rx, size_t size);
 int  xc_jit_enabled(void);
 void xc_jit_stats(uint64_t *blocks_compiled, uint64_t *callouts, uint64_t *code_bytes);
+uint64_t xc_jit_links(void);          /* block-to-block links patched so far */
 
 /* Execute exactly one instruction. */
 xc_stop xc_step(xc_cpu *c);

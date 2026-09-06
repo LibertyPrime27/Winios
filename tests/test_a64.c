@@ -43,6 +43,8 @@ int main(int argc, char **argv) {
     a64_stp_pre(&a, 29, 30, SP, -16); a64_ldp_post(&a, 29, 30, SP, 16);
     a64_b(&a, 4); a64_bcond(&a, CC_NE, -2); a64_cbz(&a, 0, 5, 3); a64_cbnz(&a, 1, 5, -3); a64_tbnz(&a, 5, 33, 2);
     a64_br(&a, 27); a64_blr(&a, 28); a64_ret(&a); a64_nop(&a); a64_brk(&a, 1);
+    a64_adr(&a, 1, -0x20); a64_adr(&a, 1, 0x1004);  /* adr x1, pc-0x20 ; adr x1, pc+0x1004 */
+    a64_rev(&a, 0, 2, 3); a64_rev(&a, 1, 2, 3);     /* rev w2, w3 ; rev x2, x3 */
     if (argc > 1) { FILE *f = fopen(argv[1], "wb"); fwrite(buf, 4, a.n, f); fclose(f); }
     printf("%u words\n", a.n);
     return a.overflow;

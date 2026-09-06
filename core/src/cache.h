@@ -19,6 +19,7 @@ typedef struct {
     uint16_t len;               /* its length */
     uint8_t  mode;
     void    *code;              /* compiled native code, or NULL */
+    uint32_t links;             /* dynarec: head of the list of branch sites chained to this block (0 = none) */
 } block;
 
 enum { MAX_BLOCK = 64 };
@@ -36,5 +37,6 @@ xc_stop xc_exec_decoded(xc_cpu *c, const ZydisDecodedInstruction *in_, const xop
 /* dynarec entry points (jit.c) */
 xc_stop xc_run_jit(xc_cpu *c, uint64_t max_steps);
 void xc_jit_code_reset(void);       /* the cache was flushed: all block->code pointers are gone */
+void xc_jit_unlink(block *b);       /* the block is being dropped: chained branches into it must go back through the dispatcher */
 
 #endif
