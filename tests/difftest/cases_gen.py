@@ -341,6 +341,28 @@ CASES = [
     ("fabs; fyl2x",                 "ALL", "0", "fabs\n fyl2x",               "FSW_TOP", 1),
     ("fabs; fyl2xp1",               "ALL", "0", "fabs\n fdiv st(0), st(0)\n fyl2xp1", "FSW_TOP", 1),   # x/x = 1 -> log2(2)
     ("f2xm1 (small)",               "ALL", "0", "fld1\n fdiv st(0), st(1)\n f2xm1", "FSW_TOP", 1),      # 1/x in (-1,1) mostly
+    # --- sequences the way compilers emit them (the dynarec's stack model at work) ---
+    ("fld m64; fadd st1; fstp m64",       "ALL", "0", "fld qword ptr [rdi]\n fadd st(0), st(1)\n fstp qword ptr [rdi+8]", "FSW_NOCC", 0),
+    ("fld m64; fmul m64; fxch; fstp x2",  "ALL", "0", "fld qword ptr [rdi]\n fmul qword ptr [rdi+8]\n fxch st(1)\n fstp qword ptr [rdi+16]\n fstp qword ptr [rdi+24]", "FSW_NOCC", 0),
+    ("fld m32; fdivr st1; fstp m32",      "ALL", "0", "fld dword ptr [rdi]\n fdivr st(0), st(1)\n fstp dword ptr [rdi+8]", "FSW_NOCC", 0),
+    ("fild m32; fistp m32",               "ALL", "0", "fild dword ptr [rdi]\n fistp dword ptr [rdi+8]", "FSW_NOCC", 0),
+    ("fild m64; fistp m64",               "ALL", "0", "fild qword ptr [rdi]\n fistp qword ptr [rdi+8]", "FSW_NOCC", 0),
+    ("fld m64; fisttp m32",               "ALL", "0", "fld qword ptr [rdi]\n fisttp dword ptr [rdi+8]", "FSW_NOCC", 0),
+    ("fld m64; fistp m16",                "ALL", "0", "fld qword ptr [rdi]\n fistp word ptr [rdi+8]", "FSW_NOCC", 0),
+    ("fld1; fchs; fadd st1,st0; fcomp; fnstsw", "ALL", "0", "fld1\n fchs\n fadd st(1), st(0)\n fcomp st(1)\n fnstsw ax", "FSW_ALL", 0),
+    ("fxch st2; fsubp st1,st0",           "ALL", "0", "fxch st(2)\n fsubp st(1), st(0)", "FSW_NOCC", 0),
+    ("fld x2; fmulp; fsqrt; fstp m64",    "ALL", "0", "fld qword ptr [rdi]\n fld qword ptr [rdi+8]\n fmulp st(1), st(0)\n fabs\n fsqrt\n fstp qword ptr [rdi+16]", "FSW_NOCC", 0),
+    ("fld m64; fld st0; fmulp; faddp; fstp m64", "ALL", "0", "fld qword ptr [rdi]\n fld st(0)\n fmulp st(1), st(0)\n faddp st(1), st(0)\n fstp qword ptr [rdi+8]", "FSW_NOCC", 0),
+    ("fcom m64; fnstsw ax; test ah,0x41", "ALL", "0", "fcom qword ptr [rdi]\n fnstsw ax\n test ah, 0x41", "FSW_ALL", 0),
+    ("fucomip; fstp st0",                 "ALL", "0", "fucomip st(0), st(1)\n fstp st(0)", "FSW_ALL", 0),
+    ("sse + x87 interleaved",             "ALL", "0", "movsd xmm1, qword ptr [rdi]\n fld qword ptr [rdi]\n addsd xmm1, xmm1\n fadd st(0), st(0)\n mulsd xmm1, qword ptr [rdi+8]\n fmul qword ptr [rdi+8]\n fstp qword ptr [rdi+16]", "FSW_NOCC", 0),
+    ("fldcw pc=53; fld; fmul st0; fstp",  "ALL", "0", "mov word ptr [rdi], 0x027F\n fldcw [rdi]\n fld qword ptr [rdi+8]\n fmul st(0), st(0)\n fstp qword ptr [rdi+16]", "FSW_NOCC", 0),
+    ("fldcw rc=zero; fld; fistp; fldcw rn", "ALL", "0", "mov word ptr [rdi], 0x0F7F\n fldcw [rdi]\n fld qword ptr [rdi+8]\n fistp dword ptr [rdi+16]\n mov word ptr [rdi+2], 0x027F\n fldcw [rdi+2]", "FSW_NOCC", 0),
+    ("fld m64; fcmovnbe; fstp st1",       "ALL", "0", "fld qword ptr [rdi]\n fcmovnbe st(0), st(2)\n fstp st(1)", "FSW_NOCC", 0),
+    ("fldz; fld1; fdivp (inf)",           "ALL", "0", "fldz\n fld1\n fdivrp st(1), st(0)", "FSW_NOCC", 0),
+    ("fld m64 x2; fsubp (zero)",          "ALL", "0", "fld qword ptr [rdi]\n fld qword ptr [rdi]\n fsubp st(1), st(0)", "FSW_NOCC", 0),
+    ("fld1; fld1; fdivp; frndint; fstp m64", "ALL", "0", "fld1\n fld st(1)\n fdivrp st(1), st(0)\n frndint\n fstp qword ptr [rdi]", "FSW_NOCC", 0),
+    ("nbody inner (add eax between x87)", "ALL", "s_eax0", "fld qword ptr [rdi]\n fld qword ptr [rdi+8]\n add eax, 0x38\n fmul st, st(1)\n faddp st(4), st\n fld qword ptr [rdi+16]\n fmul st, st(1)\n faddp st(2), st", "FSW_NOCC", 0),
 ]
 
 # 32-bit mode: run natively in compatibility mode. edi/esi point at the data

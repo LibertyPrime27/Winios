@@ -5,6 +5,7 @@
  * single: the same bits must come out of the interpreter, the dynarec and
  * an x86 CPU. Iteration count is small so the test stays quick under
  * qemu; pass an argument to scale it (xrun ./nbody 200000 for a benchmark). */
+#include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -75,6 +76,12 @@ static float vecs(int n) {
 
 int main(int argc, char **argv) {
     int n = argc > 1 ? atoi(argv[1]) : 2000;
+#ifdef __i386__
+    /* mingw's startup runs FNINIT (64-bit precision); MSVC programs run in
+     * 53-bit mode, and that is the mode the dynarec lowers natively -- so the
+     * 32-bit guest asks for it the way an MSVC CRT would */
+    _controlfp(_PC_53, _MCW_PC);
+#endif
     double px = 0, py = 0, pz = 0;
     for (int i = 0; i < 5; i++) { px += bodies[i].vx * bodies[i].mass; py += bodies[i].vy * bodies[i].mass; pz += bodies[i].vz * bodies[i].mass; }
     bodies[0].vx = -px / SOLAR_MASS; bodies[0].vy = -py / SOLAR_MASS; bodies[0].vz = -pz / SOLAR_MASS;

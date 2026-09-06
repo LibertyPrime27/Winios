@@ -256,8 +256,47 @@ static void m___lc_codepage_func(w32 *w) { RET(1252); }
 static void m___mb_cur_max_func(w32 *w) { RET(1); }
 static void m_localeconv(w32 *w) { ensure_state(w); RET(g_lconv); }
 static void m_setlocale(w32 *w) { static uint64_t c; if (!c) c = w32_strdup(w, "C"); RET(c); }
-static void m__controlfp(w32 *w) { RET(0x9001F); }
-static void m__controlfp_s(w32 *w) { if (ARG(0)) w32_write(w, ARG(0), 4, 0x9001F); RET(0); }
+/* _controlfp/_control87: the CRT's view of the FPU control word. Abstract
+ * bits: _MCW_EM 0x0008001F (inexact 1, underflow 2, overflow 4, zerodivide 8,
+ * invalid 0x10, denormal 0x80000), _MCW_RC 0x300 (near/down/up/chop),
+ * _MCW_PC 0x30000 (64 = 0, 53 = 0x10000, 24 = 0x20000), _MCW_IC 0x40000,
+ * _MCW_DN 0x3000000. x87 FCW: masks IM 1 DM 2 ZM 4 OM 8 UM 0x10 PM 0x20,
+ * PC bits 8-9 (24 = 0, 53 = 2, 64 = 3), RC bits 10-11. Both units follow
+ * (the CRT does the same on an SSE2 machine): the rounding mode and masks
+ * go to MXCSR too. This is how MSVC-built programs end up in 53-bit mode
+ * -- the dynarec's native x87 mode -- so it has to be real. */
+static uint32_t cw_abstract(const w32 *w) {
+    uint16_t f = w->c->fcw; uint32_t a = 0;
+    if (f & 0x20) a |= 0x01; if (f & 0x10) a |= 0x02; if (f & 0x08) a |= 0x04; if (f & 0x04) a |= 0x08; if (f & 0x01) a |= 0x10; if (f & 0x02) a |= 0x80000;
+    a |= ((f >> 10) & 3) << 8;
+    switch ((f >> 8) & 3) { case 0: a |= 0x20000; break; case 2: a |= 0x10000; break; default: break; }
+    return a;
+}
+static void cw_apply(w32 *w, uint32_t a) {
+    uint16_t f = (uint16_t)(w->c->fcw & ~0x0F3Fu);
+    if (a & 0x01) f |= 0x20; if (a & 0x02) f |= 0x10; if (a & 0x04) f |= 0x08; if (a & 0x08) f |= 0x04; if (a & 0x10) f |= 0x01; if (a & 0x80000) f |= 0x02;
+    f |= (uint16_t)(((a >> 8) & 3) << 10);
+    switch (a & 0x30000) { case 0x20000: break; case 0x10000: f |= 0x200; break; default: f |= 0x300; break; }
+    w->c->fcw = f;
+    uint32_t m = w->c->mxcsr & ~0x7F80u;                      /* masks 7-12, RC 13-14 */
+    m |= (uint32_t)(f & 0x3F) << 7; m |= (uint32_t)((f >> 10) & 3) << 13;
+    w->c->mxcsr = m;
+}
+static void m__controlfp(w32 *w) {
+    uint32_t nw = (uint32_t)ARG(0), mask = (uint32_t)ARG(1), cur = cw_abstract(w);
+    if (mask) cw_apply(w, (cur & ~mask) | (nw & mask));
+    RET(cw_abstract(w));
+}
+static void m__control87(w32 *w) { m__controlfp(w); }
+static void m__controlfp_s(w32 *w) {
+    uint32_t nw = (uint32_t)ARG(1), mask = (uint32_t)ARG(2), cur = cw_abstract(w);
+    if (mask) cw_apply(w, (cur & ~mask) | (nw & mask));
+    if (ARG(0)) w32_write(w, ARG(0), 4, cw_abstract(w));
+    RET(0);
+}
+static void m__fpreset(w32 *w) { w->c->fcw = 0x027F; w->c->fsw = 0; w->c->ftag_empty = 0xFF; w->c->mxcsr = 0x1F80; }
+static void m__clearfp(w32 *w) { uint32_t sw = w->c->fsw & 0x3F; w->c->fsw &= ~0x80FFu; RET(sw); }
+static void m__statusfp(w32 *w) { RET(w->c->fsw & 0x3F); }
 static void m__configthreadlocale(w32 *w) { RET(0); }
 static void m__set_invalid_parameter_handler(w32 *w) { RET(0); }
 static void m__crt_atexit(w32 *w) { m_atexit(w); }
@@ -464,7 +503,7 @@ const w32_api w32_msvcrt[] = {
     F(_onexit, 1), F(atexit, 1), F(__dllonexit, 3), F(_amsg_exit, 1), F(abort, 0), F(signal, 2), F(raise, 1),
     F(__p__fmode, 0), F(__p__commode, 0), F(__p___argc, 0), F(__p___argv, 0), F(__p__environ, 0), F(_errno, 0), F(__iob_func, 0), F(__acrt_iob_func, 1),
     F(__setusermatherr, 1), F(_lock, 1), F(_unlock, 1), { "___lc_codepage_func", 0, 1, m___lc_codepage_func, 0 }, { "___mb_cur_max_func", 0, 1, m___mb_cur_max_func, 0 }, F(localeconv, 0), F(setlocale, 2),
-    F(_controlfp, 2), F(_controlfp_s, 3), F(_configthreadlocale, 1), F(_set_invalid_parameter_handler, 1), F(_crt_atexit, 1),
+    F(_controlfp, 2), F(_controlfp_s, 3), F(_control87, 2), F(_fpreset, 0), F(_clearfp, 0), F(_statusfp, 0), F(_configthreadlocale, 1), F(_set_invalid_parameter_handler, 1), F(_crt_atexit, 1),
     F(_get_initial_narrow_environment, 0), F(_initialize_narrow_environment, 0), F(__p___initenv, 0), F(_XcptFilter, 2),
     F(__C_specific_handler, 4), F(_except_handler3, 4), F(_except_handler4_common, 6), F(_beginthreadex, 6), F(_time64, 1), F(time, 1), F(clock, 0), F(getenv, 1),
     D(__initenv, 8), D(_commode, 4), D(_fmode, 4), D(__mb_cur_max, 4), D(_iob, 3 * 48), D(__argc, 4), D(__argv, 8), D(_environ, 8),

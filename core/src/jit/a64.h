@@ -310,6 +310,19 @@ static inline void a64_msr_fpsr(a64 *a, int rn) { a64_emit(a, 0xD51B4420u | rn);
 static inline void a64_bic_reg(a64 *a, int sf, int rd, int rn, int rm) { a64_logic_reg(a, sf, 0, 1, rd, rn, rm, 0, 0); }
 
 static inline void a64_fcmpe(a64 *a, int t, int rn, int rm) { a64_emit(a, 0x1E202010u | ((uint32_t)t << 22) | (rm << 16) | (rn << 5)); }
+/* --- scalar FP for the x87 lowering --- */
+static inline void a64_fabs(a64 *a, int t, int rd, int rn) { a64_emit(a, 0x1E20C000u | ((uint32_t)t << 22) | (rn << 5) | rd); }
+static inline void a64_fneg(a64 *a, int t, int rd, int rn) { a64_emit(a, 0x1E214000u | ((uint32_t)t << 22) | (rn << 5) | rd); }
+static inline void a64_fcmp0(a64 *a, int t, int rn)  { a64_emit(a, 0x1E202008u | ((uint32_t)t << 22) | (rn << 5)); }    /* fcmp  dn, #0.0 */
+static inline void a64_fcmpe0(a64 *a, int t, int rn) { a64_emit(a, 0x1E202018u | ((uint32_t)t << 22) | (rn << 5)); }    /* fcmpe dn, #0.0 */
+/* FP -> signed int with an explicit rounding mode: 0 nearest-even, 1 +inf, 2 -inf, 3 zero */
+static inline void a64_fcvts(a64 *a, int sf, int t, int rmode, int rd, int rn) {
+    a64_emit(a, 0x1E200000u | ((uint32_t)sf << 31) | ((uint32_t)t << 22) | ((uint32_t)rmode << 19) | (rn << 5) | rd);
+}
+static inline void a64_fcsel(a64 *a, int t, int rd, int rn, int rm, int cond) { a64_emit(a, 0x1E200C00u | ((uint32_t)t << 22) | (rm << 16) | ((uint32_t)cond << 12) | (rn << 5) | rd); }
+/* stp/ldp of D registers, pre-/post-indexed (the enter stub saves d8-d15) */
+static inline void a64_fstp_pre(a64 *a, int rt, int rt2, int rn, int imm) { a64_emit(a, 0x6D800000u | (((imm / 8) & 0x7F) << 15) | (rt2 << 10) | (rn << 5) | rt); }
+static inline void a64_fldp_post(a64 *a, int rt, int rt2, int rn, int imm) { a64_emit(a, 0x6CC00000u | (((imm / 8) & 0x7F) << 15) | (rt2 << 10) | (rn << 5) | rt); }
 static inline void a64_frintz(a64 *a, int t, int rd, int rn) { a64_emit(a, 0x1E25C000u | ((uint32_t)t << 22) | (rn << 5) | rd); }
 static inline void a64_vfrintz(a64 *a, int fsz, int rd, int rn) { a64_v2(a, 1, 0, 2 | fsz, 0x19, rd, rn); }
 static inline void a64_vsxtl(a64 *a, int rd, int rn) { a64_emit(a, 0x0F20A400u | (rn << 5) | rd); }        /* sxtl vd.2d, vn.2s */

@@ -263,13 +263,20 @@ static void callout_report(void) {
     fprintf(stderr, "[jit] callouts by mnemonic:\n");
     for (int i = 0; i < n; i++) fprintf(stderr, "  %10u  %s\n", g_callout_hist[top[i]], ZydisMnemonicGetString((ZydisMnemonic)top[i]));
 }
+static void x87_materialize(xc_cpu *c);
+static void x87_refresh(xc_cpu *c);
 static int jit_callout(xc_cpu *c, const dinsn *d) {
     g_stat_callouts++;
     if (g_callout_stats) { if (!g_stat_callouts_reg) { atexit(callout_report); g_stat_callouts_reg = 1; } g_callout_hist[d->in.mnemonic]++; }
     xc_flags_sync(c);
     fold_fpsr(c);
+    x87_materialize(c);                     /* registers the JIT holds as doubles -> fpr[] */
+    wr_fpcr(g_host_fpcr);                   /* the interpreter's own C math (libm transcendentals) runs in the host's mode... */
     xc_stop st = xc_exec_decoded(c, &d->in, xc_cache_ops(d));
+    wr_fpsr(0);                             /* ...and whatever flags it raised are not the guest's */
     fpcr_from_mxcsr(c);                     /* the interpreter may have changed MXCSR, or reset the host rounding mode */
+    if (d->in.meta.isa_ext == ZYDIS_ISA_EXT_X87 || d->in.mnemonic == ZYDIS_MNEMONIC_FXRSTOR || d->in.mnemonic == ZYDIS_MNEMONIC_FXRSTOR64)
+        x87_refresh(c);                     /* fpr[] changed: which registers are doubles now? */
     if (st != XC_STOP_NONE) return 1;
     return c->rip != d->rip + d->in.length;
 }
@@ -364,7 +371,26 @@ typedef struct {
     const xop *ops;
     int flags_live;             /* after the current instruction */
     int failed;
+    int ended;                  /* the block was closed early (an exit was emitted); stop compiling */
     uint64_t bound;             /* arena size when smaller than 4 GB (32-bit mode), else 0: no checks */
+
+    /* x87 (see jit_x87.h). The eight physical registers live in d8-d15 as
+     * doubles while the block runs; x87_v[] is the renaming (FXCH swaps
+     * entries). TOP and the tag word are compile-time state, checked by a
+     * guard when the block first touches the FPU. */
+    int x87_on;                 /* this block may lower x87 natively (mode allowed it at compile time) */
+    int x87_guarded;            /* the guard has been emitted */
+    int x87_top;                /* static TOP */
+    uint8_t x87_empty;          /* static tag word: bit p = empty */
+    uint8_t x87_empty0;         /* ... as it was at the last writeback */
+    int x87_v[8];               /* host D register holding physical register p */
+    uint8_t x87_loaded, x87_dirty;
+    int x87_touched;            /* fsw/tag need writing back at the exit */
+    int x87_c1clr;              /* C1 reads 0 at the exit */
+    int x87_ixc;                /* a fast-path op since the last fold may have left IXC in FPSR */
+    int x87_rc;                 /* rounding mode assumed (x86 encoding) */
+    int fp_unit;                /* who owns the flags in FPSR: UNIT_MXCSR (default) or UNIT_X87 */
+    uint16_t x87_fcw; uint32_t x87_mxcsr;   /* the control words the block was compiled for */
 } jc;
 
 static int greg(jc *j, int g) {
@@ -388,13 +414,17 @@ static int xreg(jc *j, int x) {
     return VREG(x);
 }
 static void xset(jc *j, int x) { j->xloaded |= 1u << x; j->xdirty |= 1u << x; }   /* about to be fully overwritten */
+static void x87_spill(jc *j);       /* jit_x87.h: dirty ST registers, TOP/tags, FPSR flags -> cpu */
+static void x87_flushed(jc *j);
+static void x87_invalidate(jc *j);
 /* Emit the stores for every dirty register without changing compile state. */
 static void spill(jc *j) {
     for (int g = 0; g < 16; g++) if (j->dirty & (1u << g)) a64_str_off(&j->a, 3, HREG[g], R_CPU, OFF(gpr) + 8u * g);
     for (int x = 0; x < 16; x++) if (j->xdirty & (1u << x)) a64_fldst_off(&j->a, 2, 0, VREG(x), R_CPU, OFF(xmm) + 16u * x);
+    x87_spill(j);
 }
-static void flush(jc *j) { spill(j); j->dirty = 0; j->xdirty = 0; }
-static void invalidate(jc *j) { j->loaded = j->dirty = 0; j->xloaded = j->xdirty = 0; }
+static void flush(jc *j) { spill(j); j->dirty = 0; j->xdirty = 0; x87_flushed(j); }
+static void invalidate(jc *j) { j->loaded = j->dirty = 0; j->xloaded = j->xdirty = 0; x87_invalidate(j); }
 
 /* Address of a memory operand into `rd`. Returns 1 if the address is a
  * 32-bit quantity (use uxtw addressing), 0 if 64-bit. */
@@ -520,9 +550,12 @@ static void emit_exit_imm(jc *j, uint64_t rip) {
     a64_add_imm(&j->a, 1, R_TMP, R_DISP, 4);           /* dispatcher entry that keeps x1 */
     a64_br(&j->a, R_TMP);
 }
-static void emit_exit_reg(jc *j, int r) {     /* r must not be a guest register that flush() rewrites... it only stores, fine */
-    flush(j);
+/* Exit to a computed address in `r`. flush() may clobber x0-x2 (the x87
+ * writeback uses them as scratch), so store the target before flushing --
+ * r is a scratch temp holding the value, not a guest register. */
+static void emit_exit_reg(jc *j, int r) {
     a64_str_off(&j->a, 3, r, R_CPU, OFF(rip));
+    flush(j);
     a64_br(&j->a, R_DISP);
 }
 
@@ -545,6 +578,7 @@ static void emit_callout(jc *j) {
     a64_cbz(&j->a, 0, 0, 2);
     a64_br(&j->a, R_DISP);
     j->nz = NZ_NONE; j->lz = LZ_VALID;
+    j->x87_guarded = 0;                     /* the interpreter may have changed FCW/MXCSR (LDMXCSR, ...) */
 }
 
 /* MOVS/STOS through jit_string: like a callout, minus the flag sync (only DF
@@ -595,6 +629,7 @@ static void emit_sync(jc *j) {
 }
 
 #include "jit_sse.h"
+#include "jit_x87.h"
 
 /* --- conditions --- */
 
@@ -891,8 +926,13 @@ static int flag_use(const ZydisDecodedInstruction *in, const xop *ops) {
     case ZYDIS_MNEMONIC_MOVQ: case ZYDIS_MNEMONIC_MOVD: case ZYDIS_MNEMONIC_MOVSS: case ZYDIS_MNEMONIC_MOVSD:
         return in->meta.category == ZYDIS_CATEGORY_STRINGOP ? FR : 0;
     case ZYDIS_MNEMONIC_COMISS: case ZYDIS_MNEMONIC_COMISD: case ZYDIS_MNEMONIC_UCOMISS: case ZYDIS_MNEMONIC_UCOMISD:
+    case ZYDIS_MNEMONIC_FCOMI: case ZYDIS_MNEMONIC_FCOMIP: case ZYDIS_MNEMONIC_FUCOMI: case ZYDIS_MNEMONIC_FUCOMIP:
         return FW_ALL;
+    case ZYDIS_MNEMONIC_FCMOVB: case ZYDIS_MNEMONIC_FCMOVE: case ZYDIS_MNEMONIC_FCMOVBE: case ZYDIS_MNEMONIC_FCMOVU:
+    case ZYDIS_MNEMONIC_FCMOVNB: case ZYDIS_MNEMONIC_FCMOVNE: case ZYDIS_MNEMONIC_FCMOVNBE: case ZYDIS_MNEMONIC_FCMOVNU:
+        return FR;
     default:
+        if (in->meta.isa_ext == ZYDIS_ISA_EXT_X87) return 0;     /* the FPU never touches rflags */
         for (int i = 0; i < in->operand_count_visible; i++)
             if (ops[i].type == XOP_REG && ops[i].rcls == XR_XMM && in->mnemonic != ZYDIS_MNEMONIC_PTEST) return 0;   /* SSE data ops leave rflags alone */
         return FR | FW_PART;         /* conservative: callout reads exact flags and may change them */
@@ -906,9 +946,18 @@ static void emit_insn(jc *j) {
     ZydisMnemonic m = in->mnemonic;
     int cc;
 
+    /* the FPU: its own lowering, or a callout that also closes the block
+     * (afterwards TOP and the tags are whatever the interpreter made them) */
+    if (in->meta.isa_ext == ZYDIS_ISA_EXT_X87 || m == ZYDIS_MNEMONIC_FXSAVE || m == ZYDIS_MNEMONIC_FXSAVE64 ||
+        m == ZYDIS_MNEMONIC_FXRSTOR || m == ZYDIS_MNEMONIC_FXRSTOR64) { emit_x87(j); return; }
+
     /* anything touching an XMM register goes to the SSE lowering */
     for (int i = 0; i < in->operand_count_visible; i++)
-        if (ops[i].type == XOP_REG && ops[i].rcls == XR_XMM) { if (!emit_sse(j)) emit_callout(j); return; }
+        if (ops[i].type == XOP_REG && ops[i].rcls == XR_XMM) {
+            if (j->fp_unit == UNIT_X87) x87_fold_fpsr(j, 1);          /* FPSR flags so far belong to the FPU */
+            if (!emit_sse(j)) emit_callout(j);
+            return;
+        }
 
     /* operands the native paths cannot describe: segment/other registers,
      * far pointers, anything wider than a GPR */
@@ -1106,14 +1155,16 @@ static void *compile(xc_cpu *c, block *b) {
     a64_sub_imm(&j.a, 1, T0, T0, b->count);
     a64_str_off(&j.a, 3, T0, R_CPU, OFF(steps));
 
-    for (uint32_t i = 0; i < b->count; i++) {
+    x87_block_begin(&j, c);
+    uint32_t i;
+    for (i = 0; i < b->count; i++) {
         j.d = &insns[i]; j.ops = xc_cache_ops(j.d); j.flags_live = live[i];
         emit_insn(&j);
         if (j.failed) { code_write_end(j.a.buf, 0, RX(j.a.buf)); return 0; }
+        if (j.ended) break;
     }
     /* fell off the end (block ended at a decode failure or MAX_BLOCK): continue sequentially */
-    const dinsn *last = &insns[b->count - 1];
-    emit_exit_imm(&j, last->rip + last->in.length);
+    if (!j.ended) { const dinsn *last = &insns[b->count - 1]; emit_exit_imm(&j, last->rip + last->in.length); }
 
     if (j.a.overflow) { code_write_end(j.a.buf, 0, RX(j.a.buf)); return 0; }
     size_t bytes = (size_t)j.a.n * 4;
@@ -1187,6 +1238,10 @@ static void build_enter(void) {
     a64_stp_pre(&a, 23, 24, SP, -16);
     a64_stp_pre(&a, 25, 26, SP, -16);
     a64_stp_pre(&a, 27, 28, SP, -16);
+    a64_fstp_pre(&a, 8, 9, SP, -16);                              /* d8-d15: the x87 registers while a block runs */
+    a64_fstp_pre(&a, 10, 11, SP, -16);
+    a64_fstp_pre(&a, 12, 13, SP, -16);
+    a64_fstp_pre(&a, 14, 15, SP, -16);
     a64_mov_reg(&a, 1, R_CPU, 0);
     a64_ldr_off(&a, 3, R_BASE, R_CPU, OFF(jit_base));
     uint32_t loop = a64_here(&a);
@@ -1213,6 +1268,10 @@ static void build_enter(void) {
     a64_patch_bcond(&a, b_stop, x_stop);
     a64_patch_bcond(&a, b_null, x_stop);
     a64_ldr_off(&a, 2, 0, R_CPU, OFF(stop));         /* return value: cpu->stop */
+    a64_fldp_post(&a, 14, 15, SP, 16);
+    a64_fldp_post(&a, 12, 13, SP, 16);
+    a64_fldp_post(&a, 10, 11, SP, 16);
+    a64_fldp_post(&a, 8, 9, SP, 16);
     a64_ldp_post(&a, 27, 28, SP, 16);
     a64_ldp_post(&a, 25, 26, SP, 16);
     a64_ldp_post(&a, 23, 24, SP, 16);
@@ -1237,8 +1296,10 @@ xc_stop xc_run_jit(xc_cpu *c, uint64_t max_steps) {
     g_host_fpcr = rd_fpcr();
     fpcr_from_mxcsr(c);
     wr_fpsr(0);
+    x87_refresh(c);                         /* the interpreter may have run since: rebuild the double shadow */
     xc_stop st = g_enter(c);
     fold_fpsr(c);
+    x87_materialize(c);
     wr_fpcr(g_host_fpcr);
     xc_flags_sync(c);
     if (st == XC_STOP_STEPS) c->stop = XC_STOP_STEPS;

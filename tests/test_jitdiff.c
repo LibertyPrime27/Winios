@@ -24,7 +24,7 @@
 typedef void (*setup_fn)(uint64_t g[16], uint64_t *f);
 typedef struct {
     const char *name; const uint8_t *code; size_t len; uint64_t flag_mask; setup_fn setup;
-    unsigned fsw_mask; int fuzzy; int mode;
+    unsigned fsw_mask; int fuzzy; int mode; int x87;
 } tcase;
 
 #define ALL  XC_ARITH_FLAGS
@@ -64,10 +64,11 @@ static void s_rcx100(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RCX] = 100; }
 static void s_div32(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RDX] = 0; g[XC_RCX] |= 1; g[XC_RAX] &= 0x7FFFFFFF; }
 static void s_div8(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RCX] |= 0x80; g[XC_RAX] &= 0x7FFF; }
 static void s_ecx0(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RCX] = 0; }
+static void s_eax0(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RAX] = 0; }
 
 #define B(...) ((const uint8_t[]){ __VA_ARGS__ })
-#define T(nm, mask, setup, ...) { nm, B(__VA_ARGS__), sizeof(B(__VA_ARGS__)), mask, setup, 0, 0, 64 }
-#define TX(nm, mask, fsw, fuzzy, setup, ...) { nm, B(__VA_ARGS__), sizeof(B(__VA_ARGS__)), mask, setup, fsw, fuzzy, 64 }
+#define T(nm, mask, setup, ...) { nm, B(__VA_ARGS__), sizeof(B(__VA_ARGS__)), mask, setup, 0, 0, 64, 0 }
+#define TX(nm, mask, fsw, fuzzy, setup, ...) { nm, B(__VA_ARGS__), sizeof(B(__VA_ARGS__)), mask, setup, fsw, fuzzy, 64, 1 }
 static const tcase CASES[] = {
 #include "difftest/cases_gen.inc"
 };
@@ -96,6 +97,65 @@ static const uint32_t SPECIAL32[] = {
     0x00000000u, 0x80000000u, 0x00000001u, 0x807FFFFFu, 0x4F000000u, 0xCF000000u,
     0x4EFFFFFFu, 0x3FC00000u, 0xBFC00000u, 0x42C80000u, 0x5F000000u,
 };
+
+/* f64 -> f80, exact (FLD m64) */
+static xc_f80 f80_of_double(double d) {
+    uint64_t bits; memcpy(&bits, &d, 8);
+    xc_f80 r; uint16_t sign = (uint16_t)((bits >> 63) << 15);
+    unsigned e = (unsigned)((bits >> 52) & 0x7FF); uint64_t frac = bits & 0xFFFFFFFFFFFFFull;
+    if (e == 0) {
+        if (!frac) { r.mant = 0; r.se = sign; return r; }
+        int sh = 0; while (!(frac >> 52)) { frac <<= 1; sh++; }
+        r.mant = frac << 11; r.se = (uint16_t)(sign | (0x3FFF - 1022 - sh)); return r;
+    }
+    if (e == 0x7FF) { r.mant = (1ull << 63) | (frac << 11); r.se = (uint16_t)(sign | 0x7FFF); return r; }
+    r.mant = (1ull << 63) | (frac << 11); r.se = (uint16_t)(sign | (e - 1023 + 0x3FFF));
+    return r;
+}
+/* doubles at the edges the x87 lowering has to hand back to the interpreter */
+static const uint64_t X87EDGE[] = {
+    0x7FE0000000000000ull, 0xFFE0000000000000ull,   /* +/- 2^1023: products overflow a double */
+    0x0010000000000000ull, 0x8010000000000000ull,   /* +/- DBL_MIN */
+    0x0020000000000000ull,                          /* 2 * DBL_MIN */
+    0x1000000000000000ull,                          /* 2^-767: products underflow a double */
+    0x0000000000000001ull, 0x800FFFFFFFFFFFFFull,   /* denormals */
+    0x7FF8000000000000ull, 0xFFF0000000000001ull,   /* QNaN, -SNaN */
+    0x7FF0000000000000ull,                          /* inf */
+    0x43F0000000000000ull, 0xC3E0000000000000ull,   /* 2^64, -2^63: FIST overflow */
+    0x41DFFFFFFFC00000ull, 0x41E0000000000000ull,   /* 2^31 - 1, 2^31 */
+    0x40D0000000000000ull, 0xC0E0000000000000ull,   /* 16384, -32768 */
+    0x0000000000000000ull, 0x8000000000000000ull,   /* +/- 0 */
+    0x3FF0000000000000ull, 0x3FF0000000000001ull,   /* 1, 1 + ulp */
+};
+/* An x87 stack of 3..6 registers, mostly modest doubles, under the Windows
+ * control word (PC=53) -- the mode the dynarec lowers natively -- with some
+ * seeds in 64-bit precision, other rounding modes, or FPU/SSE modes that
+ * disagree, and edge values or 64-bit significands sprinkled in. */
+static void seed_x87(xc_cpu *c, uint64_t seed) {
+    uint64_t r = seed ^ 0x3C3C3C3C3C3C3C3Cull;
+    int n = 3 + (int)((xs(&r) >> 8) % 4);
+    c->fcw = (seed % 8 == 7) ? 0x037F : 0x027F;
+    if (seed % 16 == 5) { unsigned rc = (unsigned)(seed >> 4) & 3; c->fcw = (uint16_t)((c->fcw & ~0x0C00u) | (rc << 10)); c->mxcsr = 0x1F80 | (rc << 13); }
+    if (seed % 32 == 13) c->fcw ^= 0x0400;                          /* FPU and SSE rounding differ */
+    c->fsw = (uint16_t)((8 - n) << 11);
+    c->ftag_empty = 0xFF;
+    for (int i = 0; i < n; i++) {
+        int phys = (8 - n + i) & 7;
+        c->ftag_empty &= (uint8_t)~(1u << phys);
+        double d = (double)(int64_t)(xs(&r) % 40001) / 32.0 - 625.0;
+        c->fpr[phys] = f80_of_double(d);
+        if (seed % 3 == 1 && (xs(&r) & 1)) { uint64_t b = X87EDGE[xs(&r) % (sizeof X87EDGE / sizeof X87EDGE[0])]; double e; memcpy(&e, &b, 8); c->fpr[phys] = f80_of_double(e); }
+        if (seed % 5 == 2 && i == 2) { c->fpr[phys].mant = xs(&r) | (1ull << 63); c->fpr[phys].se = (uint16_t)(0x3FFF + (int)(xs(&r) % 20) - 10); }   /* not a double */
+    }
+    for (int i = 8 - n; i < 8; i++) { (void)i; }
+    /* memory the [rdi] cases read: doubles, ints, edge values */
+    for (int i = 0; i < 8; i++) {
+        double d = (double)(int64_t)(xs(&r) % 20001) / 16.0 - 625.0;
+        if (seed % 3 == 1 && (xs(&r) & 1)) { uint64_t b = X87EDGE[xs(&r) % (sizeof X87EDGE / sizeof X87EDGE[0])]; memcpy(g_data + 8 * i, &b, 8); }
+        else if (i & 1) { int64_t v = (int64_t)(xs(&r) % 200001) - 100000; if (seed % 7 == 3) v = (int64_t)xs(&r); memcpy(g_data + 8 * i, &v, 8); }
+        else memcpy(g_data + 8 * i, &d, 8);
+    }
+}
 
 static void seed_all(xc_cpu *c, const tcase *t, uint64_t seed) {
     uint64_t s = seed | 1;
@@ -138,6 +198,7 @@ static void seed_all(xc_cpu *c, const tcase *t, uint64_t seed) {
         }
     }
     if (seed % 4 == 3) c->mxcsr = 0x1F80 | (uint32_t)((seed >> 2) & 3) << 13;
+    if (t->x87) seed_x87(c, seed);
     if (t->setup) t->setup(c->gpr, &c->rflags);
 }
 
@@ -186,7 +247,8 @@ int main(int argc, char **argv) {
                 { printf("  [%s] seed %d: xmm%d %016llx%016llx vs jit %016llx%016llx\n", t->name, sd, x, (unsigned long long)a.xmm[x].hi, (unsigned long long)a.xmm[x].lo, (unsigned long long)b.xmm[x].hi, (unsigned long long)b.xmm[x].lo); fail = 1; }
             /* DE (denormal operand) is the one MXCSR bit the native path does not track */
             if ((a.mxcsr & ~2u) != (b.mxcsr & ~2u)) { printf("  [%s] seed %d: mxcsr %#x vs jit %#x\n", t->name, sd, a.mxcsr, b.mxcsr); fail = 1; }
-            int x87diff = a.fcw != b.fcw || a.fsw != b.fsw || a.ftag != b.ftag;
+            /* DE (denormal operand) is not tracked by the dynarec, for either unit */
+            int x87diff = a.fcw != b.fcw || (a.fsw & ~2u) != (b.fsw & ~2u) || a.ftag != b.ftag;
             for (int k = 0; k < 8; k++) if (a.fpr[k].mant != b.fpr[k].mant || a.fpr[k].se != b.fpr[k].se) x87diff = 1;   /* not memcmp: padding */
             if (x87diff) {
                 printf("  [%s] seed %d: x87 state differs (fsw %#x/%#x ftag %#x/%#x)\n", t->name, sd, a.fsw, b.fsw, a.ftag, b.ftag);

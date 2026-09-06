@@ -28,9 +28,10 @@ native set is the integer core — moves, LEA, the ALU group, INC/DEC/NEG/NOT,
 shifts and rotates, IMUL, BSWAP, PUSH/POP/CALL/RET/LEAVE, JMP/Jcc/SETcc/CMOVcc,
 the sign-extension group — in all four operand widths, both address modes,
 both guest modes; REP MOVS/STOS through a helper that memmoves host memory;
-and most of SSE/SSE2 on NEON (below). x87, DIV/MUL, CMPXCHG, BSF/BSR, CPUID
-and the rare things call out. `XCORE_JIT_CALLOUTS=1` prints a histogram of
-what still calls out, which is how the next lowering target is picked.
+and most of SSE/SSE2 on NEON, and x87 arithmetic in 53-bit precision (both
+below). DIV/MUL, CMPXCHG, BSF/BSR, CPUID and the rare things call out.
+`XCORE_JIT_CALLOUTS=1` prints a histogram of what still calls out, which is
+how the next lowering target is picked.
 
 ## Block chaining
 
@@ -74,6 +75,50 @@ MXCSR at callouts and exits. The denormal-operand flag (DE) is not tracked
 natively, and FTZ/DAZ are honoured together (ARM's FZ) but not separately.
 RCPPS/RSQRTPS (implementation-specific approximations), the pack/unpack
 oddities not listed in `jit_sse.h` and everything SSE3+ still call out.
+
+## x87 on NEON
+
+The 32-bit Windows games this project targets do their floating point on the
+x87 stack, not SSE — and an x87 register is 80 bits, which no ARM register
+holds. But MSVC-built code runs the FPU in **53-bit precision** (FCW `0x027F`,
+which the CRT sets and `winrun` starts a process in), and under 53-bit
+precision every FADD/FSUB/FMUL/FDIV/FSQRT result is rounded to exactly the
+53-bit significand an IEEE double has. The only thing the 80-bit format then
+still buys is its 15-bit exponent: a result below `2^-1022` or at/above
+`2^1024` stays finite and normal on the FPU where a double would go denormal
+or infinite. So `jit_x87.h` holds each stack register that *is* a double as
+one, in `d8`–`d15` (callee-saved, so a C call cannot lose them), and does the
+arithmetic with the host FP unit — then checks every result lies in the
+normal double range (or is an exact zero) and, if not, leaves the block
+through the interpreter, which redoes the instruction in 80-bit SoftFloat from
+the untouched inputs. The range check is six instructions and the escape
+almost never runs.
+
+Two things make this exact. **The stack is compile-time state.** Compiler
+output has a fixed FPU depth at every address, so a block is compiled for the
+TOP, tag word, FCW and MXCSR rounding seen when it was first reached and
+checks that word once, at its first x87 op; a mismatch runs that one
+instruction in the interpreter and leaves. FXCH is then a rename of two
+table entries (free); FLD/FSTP move TOP at compile time. **The 80-bit file
+stays authoritative.** `cpu->fpr[]` is still the architectural state the
+interpreter uses; beside it `cpu->fpr_d[]` shadows each register as a double,
+and C code that reads `fpr[]` (a callout, the end of `xc_run_jit`) first
+materialises any register the JIT holds only as a double — `f64→f80` is exact
+and bit-identical to `FLD m64`. Everything outside the fast set — 80-bit
+loads/stores, transcendentals, FPREM, the environment and save/restore
+instructions, a full-stack push or empty-register read known at compile time
+— calls out and ends the block, so the compile-time model never has to track
+what the interpreter did. FCW `0x037F` (64-bit precision) disables the fast
+path for the block and falls back to the interpreter, as does a FCW/MXCSR
+rounding-mode disagreement or flush-to-zero. `XCORE_JIT_X87=0` disables it
+entirely.
+
+Exception flags share FPSR with the SSE path: they are folded into whichever
+status word owns them (MXCSR by default, `fsw` while a block is between its
+first x87 op and its exit) at the switch. As with SSE, the denormal-operand
+flag (DE) is not tracked. The whole writeback path uses only `x2`/`x3`/`x28`
+and never touches NZCV, because a Jcc's condition or a computed exit address
+can be live in `x0`/`x1` across the register spill it triggers.
 
 ## Flags
 
@@ -129,13 +174,16 @@ Three layers, from cheapest to most authoritative:
    the JIT under `qemu-aarch64`. This is also the local development loop on an
    x86 machine: `cmake -S . -B build-a64 -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64-linux.cmake`.
 2b. **JIT vs interpreter, every difftest case** (`tests/test_jitdiff.c`).
-   Takes all 315 x86-64 cases of the differential suite — memory operands,
-   flags and MXCSR included, which the on-device replay cannot cover — seeds
-   registers, memory and XMM state (with extra seeds full of NaNs of both
-   kinds, infinities, signed zeros, denormals and conversion-boundary values,
-   and others that change the rounding mode), runs each through the
-   interpreter and the JIT, and requires identical final states. 63 000 runs,
-   0 differences. Runs under qemu in CI and natively on the Apple-silicon job.
+   Takes all 336 x86-64 cases of the differential suite — memory operands,
+   flags, MXCSR and the full x87 state included, which the on-device replay
+   cannot cover — seeds registers, memory, XMM and a partly-filled x87 stack
+   (with extra seeds full of NaNs of both kinds, infinities, signed zeros,
+   denormals, conversion-boundary values, doubles at the edges the x87 fast
+   path must hand back, 64-bit-significand registers, and seeds that change
+   the precision or rounding mode), runs each through the interpreter and the
+   JIT, and requires identical final states (x87 status masked only for DE).
+   67 000 runs, 0 differences. Runs under qemu in CI and natively on the
+   Apple-silicon job.
 3. **Apple silicon.** The macOS CI job runs the self-test natively; MemProbe
    runs it on the iPad and iPhone inside a debugger-blessed arena
    (`xc_jit_set_code`), which is the real target environment.
@@ -160,14 +208,17 @@ writes every compiled block's bytes for `objdump -D -b binary -m aarch64`.
 Under `qemu-aarch64` (so absolute numbers are meaningless, only the ratios
 matter):
 
-| workload | interpreter | JIT, no chaining | JIT + chaining + SSE |
-|---|---|---|---|
-| 30 M-iteration integer loop | 1× | 8.7× | — |
-| busybox `sha256sum` of a 3.5 MB file (252 M instructions) | — | 3.82 s, 968 k callouts | 1.35 s, 1.4 k callouts |
-| `tests/guest/nbody 300000` (double-precision n-body + packed float loop) | 70.2 s | — | 1.3 s (54×) |
+| workload | interpreter | JIT + chaining + SSE/x87 |
+|---|---|---|
+| 30 M-iteration integer loop | 1× | 8.7× |
+| busybox `sha256sum` of a 3.5 MB file (252 M instructions) | 3.82 s, 968 k callouts | 1.35 s, 1.4 k callouts |
+| `tests/guest/nbody 300000` (SSE2 double-precision n-body) | 70.2 s | 1.3 s (54×) |
+| `nbody32.exe 200000` (the same, built i686 = **x87** math) | 89.3 s | 2.1 s (43×) |
 
-Output is byte-identical to the native x86 run in every case. Real numbers
-come from the devices.
+The 32-bit x87 build was 43× slower than the SSE2 build before x87 lowering
+(every FLD/FADD/FMUL a callout); it is now within ~2.3× of it, the gap being
+the range and stack guards. Output is byte-identical to the native x86 run in
+every case. Real numbers come from the devices.
 
 ## What comes next, in order
 

@@ -94,19 +94,19 @@ unchanged: it is plain C over `mmap`. A host crash prints the guest RIP/RSP,
 the runtime's map (image, stubs, TEB, stack, heap) and a host backtrace, so a
 CI log is enough to start from.
 
-## Measured, and what it says about the road ahead
+## Measured
 
 `nbody64.exe 300000` through the JIT under qemu: 1.26 s — the same as the
-Linux binary, because it is the same SSE2 code. `nbody32.exe 300000`: 102 s.
-The i686 mingw compiler emits **x87** for `double`, and x87 is a callout to
-the SoftFloat interpreter today: twelve million `fsubr`, seven million
-`faddp`, seven million `fxch`. Fallout 3 and New Vegas are 32-bit programs
-compiled with the MSVC of their day, which also defaults to x87 for scalar
-float — so **x87 in the dynarec is the next performance item**, ahead of
-anything else: FLD/FST/FXCH/FADD/FSUB/FMUL/FDIV/FCOMI on the host's doubles
-when the precision control is 53 bits (or floats at 24, which is what D3D9
-sets), with SoftFloat kept for the 64-bit-mantissa mode and the
-transcendentals.
+Linux binary, because it is the same SSE2 code. `nbody32.exe`, built i686 so
+the compiler emits **x87** for `double`, used to take 102 s (every
+FLD/FADD/FMUL a callout to the SoftFloat interpreter). With x87 lowered onto
+NEON doubles (see the x87 section of `docs/DYNAREC.md`) it is 2.1 s for
+200000 iterations — 43× faster, and within ~2.3× of the SSE2 build. Windows
+processes start in 53-bit precision (the mode the lowering handles natively),
+which is what `winrun` and a real MSVC CRT both set; Fallout 3 and New Vegas
+are 32-bit MSVC programs that do their scalar float on the x87 stack, so this
+is the path they run on. `_controlfp`/`_control87` are implemented on the
+guest's real FCW/MXCSR so the CRT actually reaches that mode.
 
 ## What is deliberately not here yet
 

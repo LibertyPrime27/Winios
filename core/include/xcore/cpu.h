@@ -74,6 +74,13 @@ typedef struct xc_cpu {
     xc_f80   fpr[8];
     uint16_t fcw, fsw;
     uint8_t  ftag_empty;
+    /* Dynarec shadow of fpr[]: each register as a double, when it is one.
+     * fpr_dv bit p: fpr_d[p] equals fpr[p] exactly. fpr_dd bit p: the JIT
+     * wrote fpr_d[p] and fpr[p] is stale (xc_run_jit / callouts materialise
+     * before any C code reads fpr[]). Only the JIT and its C helpers touch
+     * these; the interpreter keeps working on fpr[]. */
+    double   fpr_d[8];
+    uint8_t  fpr_dv, fpr_dd;
     uint64_t tsc;              /* RDTSC counter: deterministic, advances per read */
     xc_mode  mode;
     xc_mem  *mem;

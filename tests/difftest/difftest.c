@@ -622,6 +622,7 @@ static void s_rcx100(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RCX] = 100; }
 static void s_div32(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RDX] = 0; g[XC_RCX] |= 1; g[XC_RAX] &= 0x7FFFFFFF; }
 static void s_div8(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RCX] |= 0x80; g[XC_RAX] &= 0x7FFF; }
 static void s_ecx0(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RCX] = 0; }
+static void s_eax0(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RAX] = 0; }
 static void s_xlat(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RBX] = (uint32_t)(uintptr_t)g_data32 + 100; }
 
 /* x87 status word: C1 is masked everywhere (it reports round-up, which the

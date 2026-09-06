@@ -580,6 +580,9 @@ int main(int argc, char **argv) {
         c->gpr[XC_RCX] = w->peb;                             /* what BaseThreadInitThunk passes */
     }
     c->rip = w->entry;
+    /* a Windows process starts with the FPU in 53-bit precision (FCW 0x027F),
+     * not the 8087 default the core's FNINIT sets; MSVC-built code relies on it */
+    c->fcw = 0x027F;
     /* TLS callbacks (DLL_PROCESS_ATTACH) before the entry point, as the loader does */
     if (w->tls_callbacks) {
         int psz = w->is32 ? 4 : 8;
