@@ -193,12 +193,18 @@ static void seed_regs(uint64_t gpr[16], uint64_t *flags, uint64_t seed, int need
 
 /* A partly filled x87 stack: 3..6 valid registers holding modest doubles,
  * ST(2) occasionally a full 64-bit-significand value so precision control has
- * something to round. Everything else empty. */
+ * something to round. Everything else empty.
+ *
+ * The precision control alternates by seed between the 8087 default (64-bit,
+ * 0x037F) and what Windows and every MSVC-built program run in (53-bit,
+ * 0x027F). That is not cosmetic: 53 bits is the mode the dynarec lowers onto
+ * NEON doubles, so recording only 0x037F would leave the on-device replay
+ * exercising nothing but the interpreter callout path for x87. */
 static void seed_x87(x87state *s, uint64_t seed) {
     uint64_t r = seed ^ 0x3C3C3C3C3C3C3C3Cull;
     int n = 3 + (int)((xs(&r) >> 8) % 4);
     memset(s, 0, sizeof *s);
-    s->fcw = 0x037F;
+    s->fcw = (seed & 1) ? 0x027F : 0x037F;
     s->fsw = (uint16_t)((8 - n) << 11);
     for (int i = 0; i < n; i++) {
         int phys = (8 - n + i) & 7;
