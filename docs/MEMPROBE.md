@@ -163,12 +163,22 @@ each rung's work took, so its duty cycle stays under 50% even in the foreground.
 
 ## The buttons
 
-**▶ Run all probes** runs everything in report order — CPU vectors, benchmark,
-GPU, Windows guests — and finally the memory ladder, last because the ladder
-may end with the system killing the process and by then everything else has
-been saved. Each probe also has its own button, because once something has
-failed you want to re-run that one thing, and because you rarely want to risk
-the ladder just to see the GPU result again.
+**▶ Run everything in order** is the one button: bless the arena, CPU vectors,
+benchmark, GPU, the Windows guests, the Direct3D 9 frames, then the memory
+ladder — and finally arm the next arena size if the ceiling is still unknown.
+
+The order is not cosmetic. The arena is blessed **first**, explicitly, so every
+later step runs with executable memory rather than blessing it as a side effect
+halfway through — and so the report says which size was blessed before anything
+depends on it. The memory ladder goes **last** because it is the one step that
+can end the process, and because holding several gigabytes would skew anything
+measured after it. Arming the next arena rung comes after all of that, so a
+launch that got through the whole sequence is what earns the bigger try:
+walking the ladder is "tap, relaunch, tap".
+
+Each probe also has its own button, because once something has failed you want
+to re-run that one thing, and because you rarely want to risk the ladder just
+to see the GPU result again.
 
 - **1 · CPU vectors** — the recorded silicon post-states, replayed through the
   interpreter and then through the dynarec. Since half the x87 vectors are now
@@ -195,12 +205,17 @@ the ladder just to see the GPU result again.
 - **x87 fast path** — the same machinery on `nbody32.exe` alone, the guest whose
   float work is entirely x87, with its timing and its lowered-versus-called-out
   counts. The quickest way to see the 53-bit lowering working on hardware.
-- **7 · D3D9 frame** — runs `d3dframe32.exe`, which creates a Direct3D 9
-  device, locks its back buffer, draws into it and presents — and shows the
-  frame that arrived, right there in the app. The device, the back buffer and
-  `Present` are real; the pixels come from the guest's own x86 code on the
-  dynarec, because `DrawPrimitive` is not implemented yet. It is the first
-  thing this project has put on a screen. **Clear frame** hides it again.
+- **7 · D3D9 frame** — both Direct3D 9 guests, with the frame shown in the app.
+  `d3dframe` paints its own pixels through a locked back buffer, the way a
+  software intro or a video player does. `d3ddraw` fills a vertex buffer and
+  calls `DrawPrimitive`, so its pixels come out of the reference rasterizer —
+  and because that rasterizer is integer by construction, its checksum has to
+  match the one recorded on an x86 runner and under qemu. Checking it here is
+  what proves that on real hardware. **Clear frame** hides the image again.
+
+  The device, the back buffer and `Present` are real; the GPU is not in this
+  path yet. Metal only uploads and scales what the guest and the rasterizer
+  computed.
 - **8 · Run a Windows program full screen** — the app rather than the probe.
   `d3dloop32.exe` runs its own frame loop (clear, draw, present, repeat) on a
   background queue while a `CAMetalLayer` shows each frame as it arrives, with

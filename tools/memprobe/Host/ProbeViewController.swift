@@ -31,6 +31,7 @@ final class ProbeViewController: UIViewController {
     private var gpuLine: String { get { store.string(forKey: "gpu") ?? "not run" } set { store.set(newValue, forKey: "gpu") } }
     private var jitLine: String { get { store.string(forKey: "jit") ?? "not run" } set { store.set(newValue, forKey: "jit") } }
     private var winLine: String { get { store.string(forKey: "win") ?? "not run" } set { store.set(newValue, forKey: "win") } }
+    private var d3dLine: String { get { store.string(forKey: "d3d") ?? "not run" } set { store.set(newValue, forKey: "d3d") } }
     private var running = false
     private var jitAttachPending = false
     /// False while the app is not frontmost. Probe work pauses on it: iOS kills
@@ -57,7 +58,7 @@ final class ProbeViewController: UIViewController {
         frameView.heightAnchor.constraint(equalToConstant: 180).isActive = true
 
         let stack = UIStackView(arrangedSubviews: [
-            button("▶  Run all probes", #selector(runAll)),
+            button("▶  Run everything in order (and step the JIT arena)", #selector(runAll)),
             row([("1 · CPU vectors", #selector(runCPU)), ("2 · Benchmark", #selector(runBench))]),
             row([("3 · GPU (D3D9/11/12)", #selector(runGPU)), ("5 · Windows .exe", #selector(runWindows))]),
             row([("x87 fast path", #selector(runX87)), ("7 · D3D9 frame", #selector(runFrame))]),
@@ -144,13 +145,26 @@ final class ProbeViewController: UIViewController {
     /// harmless, so they go first and get saved. The memory ladder goes last
     /// because it may end with the system killing the process; by then
     /// everything else is on disk.
+    /// Everything, in the order that makes each step meaningful.
+    ///
+    /// The arena is blessed first, explicitly, so every later step runs with
+    /// executable memory rather than blessing it as a side effect halfway
+    /// through. The memory ladder goes last because it is the one step that
+    /// can end the process, and because holding gigabytes would skew anything
+    /// measured after it. Then, if the arena ceiling has not been found yet,
+    /// the next size up is armed for the next launch -- so walking the ladder
+    /// is "tap, relaunch, tap" rather than a separate ritual.
     @objc private func runAll() {
         work("everything") {
+            let jit = self.executeArena()
+            DispatchQueue.main.async { self.jitLine = jit; self.refresh() }
             self.cpuProbe()
             self.benchProbe()
             self.gpuProbe()
             self.windowsProbe(single: nil)
+            self.frameProbe()
             Ladder.climb(host: "app", paused: { !self.isActive })
+            self.armNextArena()
         }
     }
 
@@ -243,67 +257,85 @@ final class ProbeViewController: UIViewController {
         DispatchQueue.main.async { self.gpuLine = gpu; self.refresh() }
     }
 
-    /// Windows executables built with mingw-w64, bundled as resources: the PE
-    /// loader, the host-implemented kernel32/msvcrt, and the dynarec, end to
-    /// end on the device. `single` runs just one of them (the x87 button uses
-    /// nbody32.exe, whose float work is all x87).
+    /// Direct3D 9 on this device, with the frame it produced shown underneath.
     ///
-    /// A Windows program that produces a frame and presents it, shown as it
-    /// arrived. The Direct3D 9 device, its back buffer and Present are real;
-    /// the pixels are drawn by the guest's own x86 code through a locked
-    /// surface, running on the dynarec, because DrawPrimitive is not
-    /// implemented yet. Everything between that code and this image view --
-    /// the PE loader, the COM vtables, the back buffer in guest memory --
-    /// is the path the GPU one will take.
+    /// Two guests. `d3dframe` paints its own pixels through a locked back
+    /// buffer -- the path a software intro or a video player takes. `d3ddraw`
+    /// fills a vertex buffer and calls DrawPrimitive, so its pixels come out
+    /// of the reference rasterizer; because that rasterizer is integer by
+    /// construction, its checksum has to be the same here as on an x86 runner
+    /// and under qemu, and checking it against the recording is what proves
+    /// that on real hardware.
+    ///
+    /// The device, the back buffer and Present are real. What is not here yet
+    /// is the GPU: these pixels are computed by guest x86 on the dynarec and
+    /// by the host rasterizer, and Metal only uploads and scales them.
     private func frameProbe() {
-        DispatchQueue.main.async { self.winLine = "running…"; self.refresh() }
+        DispatchQueue.main.async { self.d3dLine = "running…"; self.refresh() }
         guard let dir = Bundle.main.resourceURL?.appendingPathComponent("win32") else {
-            DispatchQueue.main.async { self.winLine = "guests not bundled"; self.refresh() }
+            DispatchQueue.main.async { self.d3dLine = "guests not bundled"; self.refresh() }
             return
         }
         if let arena = ensureArena() { _ = handArenaToXcore(arena) }
 
-        let exe = dir.appendingPathComponent("d3dframe32.exe").path
-        var out = [CChar](repeating: 0, count: 4096)
-        var ns: UInt64 = 0
-        xc_jit_enable(1)
-        let rc = exe.withCString { win_probe_run($0, nil, nil, &out, out.count, &ns, nil, nil) }
-        xc_jit_enable(0)
-
-        var text = "d3dframe32.exe — Direct3D 9 through the PE loader and the dynarec\n"
-        text += String(cString: out)
-        text += "  exit \(rc), \(ns / 1_000_000) ms\n"
-
-        var w: Int32 = 0, h: Int32 = 0, pitch: Int32 = 0
-        if rc == 0, let px = win_probe_frame(&w, &h, &pitch), w > 0, h > 0 {
-            text += "  presented \(w)x\(h), \(pitch) bytes per row — the image below is that frame\n"
-            let bytes = Int(h) * Int(pitch)
-            let data = Data(bytes: px, count: bytes)
-            // X8R8G8B8: B,G,R,X in memory, so little-endian 32-bit with the
-            // high byte ignored.
-            let info: CGBitmapInfo = [.byteOrder32Little,
-                                      CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue)]
-            if let provider = CGDataProvider(data: data as CFData),
-               let cg = CGImage(width: Int(w), height: Int(h), bitsPerComponent: 8, bitsPerPixel: 32,
-                                bytesPerRow: Int(pitch), space: CGColorSpaceCreateDeviceRGB(),
-                                bitmapInfo: info, provider: provider, decode: nil,
-                                shouldInterpolate: false, intent: .defaultIntent) {
-                frameImage = UIImage(cgImage: cg)
-            } else {
-                text += "  (could not build an image from those bytes)\n"
+        // Both D3D9 guests, in this order so the drawn geometry is what stays
+        // on screen. d3dframe paints its pixels itself; d3ddraw goes through
+        // CreateVertexBuffer / SetStreamSource / DrawPrimitive and the
+        // reference rasterizer, so its checksum is the one that says this
+        // device rasterizes identically to the x86 runner and to qemu.
+        var text = ""
+        var failed = 0
+        for name in ["d3dframe32.exe", "d3ddraw32.exe"] {
+            let exe = dir.appendingPathComponent(name).path
+            var out = [CChar](repeating: 0, count: 8192)
+            var ns: UInt64 = 0
+            xc_jit_enable(1)
+            let rc = exe.withCString { win_probe_run($0, nil, nil, &out, out.count, &ns, nil, nil) }
+            xc_jit_enable(0)
+            let got = String(cString: out)
+            let want = (try? String(contentsOf: dir.appendingPathComponent(
+                            name.replacingOccurrences(of: ".exe", with: ".expected")), encoding: .utf8)) ?? ""
+            let ok = rc == 0 && got.trimmingCharacters(in: .whitespacesAndNewlines)
+                                 == want.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !ok { failed += 1 }
+            text += "\(ok ? "PASS" : "FAIL")  \(name)  exit \(rc), \(ns / 1_000_000) ms\n"
+            text += got.split(separator: "\n").map { "    " + $0 }.joined(separator: "\n") + "\n"
+            if !ok && !want.isEmpty {
+                text += "    expected:\n"
+                text += want.split(separator: "\n").map { "      " + $0 }.joined(separator: "\n") + "\n"
             }
-        } else if rc == 0 {
-            text += "  the guest presented no frame\n"
+
+            var w: Int32 = 0, h: Int32 = 0, pitch: Int32 = 0
+            if rc == 0, let px = win_probe_frame(&w, &h, &pitch), w > 0, h > 0 {
+                let data = Data(bytes: px, count: Int(h) * Int(pitch))
+                let info: CGBitmapInfo = [.byteOrder32Little,
+                                          CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue)]
+                if let provider = CGDataProvider(data: data as CFData),
+                   let cg = CGImage(width: Int(w), height: Int(h), bitsPerComponent: 8, bitsPerPixel: 32,
+                                    bytesPerRow: Int(pitch), space: CGColorSpaceCreateDeviceRGB(),
+                                    bitmapInfo: info, provider: provider, decode: nil,
+                                    shouldInterpolate: false, intent: .defaultIntent) {
+                    frameImage = UIImage(cgImage: cg)
+                }
+            }
         }
+        let head = failed == 0
+            ? "Direct3D 9 on this device: both frames match the recorded checksums\n"
+            : "Direct3D 9 on this device: \(failed) of 2 did NOT match\n"
         let img = frameImage
         DispatchQueue.main.async {
             self.frameView.image = img
             self.frameView.isHidden = img == nil
-            self.winLine = text
+            self.d3dLine = head + text
             self.refresh()
         }
     }
 
+    /// Windows executables built with mingw-w64, bundled as resources: the PE
+    /// loader, DLL loading, the host-implemented kernel32/msvcrt/d3d9, and the
+    /// dynarec, end to end on the device. `single` runs just one of them (the
+    /// x87 button uses nbody32.exe, whose float work is all x87).
+    ///
     /// d3dtest is a Windows program calling Direct3D 9 -- Direct3DCreate9,
     /// CreateDevice, Clear, Present, and reading the back buffer back through
     /// a locked surface. Every one of those goes through a COM vtable built in
@@ -380,7 +412,7 @@ final class ProbeViewController: UIViewController {
     @objc private func resetAll() {
         ResultStore.reset()
         markerPath.withCString { jit_probe_reset($0) }
-        ["cpu", "bench", "gpu", "jit", "win"].forEach { store.removeObject(forKey: $0) }
+        ["cpu", "bench", "gpu", "jit", "win", "d3d"].forEach { store.removeObject(forKey: $0) }
         // arenaGoodKB/arenaBadKB are findings about this device, not results:
         // they survive a reset. Only the in-flight attempt is cleared.
         arenaPendingKB = 0
@@ -506,6 +538,20 @@ final class ProbeViewController: UIViewController {
         arenaKB = next ?? Self.arenaLadder[0]
         jitLine = arenaStatus() + "\n    (restart the app to try it — the bless for this launch has already happened)"
         refresh()
+    }
+
+    /// Arm the next rung, but only while the ceiling is still unknown. Once a
+    /// size has failed we stay at the largest that worked -- there is nothing
+    /// left to learn and no reason to spend launches on it.
+    private func armNextArena() {
+        guard arenaBadKB == 0, arenaGoodKB >= arenaKB else { return }
+        guard let next = Self.arenaLadder.first(where: { $0 > arenaKB }) else { return }
+        arenaKB = next
+        store.synchronize()
+        DispatchQueue.main.async {
+            self.jitLine += "\n    next launch will ask for \(next >> 10) MB (tap Run all again after restarting)"
+            self.refresh()
+        }
     }
 
     private func arenaStatus() -> String {
@@ -656,8 +702,11 @@ final class ProbeViewController: UIViewController {
         \(jitLine)
         \(jitLive)
 
-        5 · WINDOWS EXECUTABLES (PE loader + kernel32/msvcrt + dynarec)
+        5 · WINDOWS EXECUTABLES (PE loader + DLL loading + kernel32/msvcrt/d3d9 + dynarec)
         \(winLine)
+
+        7 · DIRECT3D 9 (COM vtables in guest memory, vertex buffers, DrawPrimitive)
+        \(d3dLine)
 
         6 · MEMORY, app process (stops 256 MB short of the kill on purpose;
             pauses while the app is in the background)
