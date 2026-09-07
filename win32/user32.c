@@ -45,8 +45,31 @@
 #include <string.h>
 #include <time.h>
 
-/* The display we claim to be. Matches d3d9.c, which reports the same mode. */
-enum { SCREEN_W = 1280, SCREEN_H = 720 };
+/* The display we claim to be. d3d9.c reads the same pair through
+ * w32_screen_size(), rather than the two files holding the same constant and
+ * a comment asking them to stay in step.
+ *
+ * 1280x720 is the default because it is a mode every game recognises and it
+ * is half the pixels of 1080p. Lowering it is the biggest thing a person can
+ * do for frame rate while DrawPrimitive still goes through the software
+ * rasterizer, which is why the app can set it. */
+static int g_screen_w = 1280, g_screen_h = 720;
+
+void w32_set_screen_size(int cx, int cy) {
+    /* Bounded rather than trusted: a game that is told the screen is 8 pixels
+     * wide does something unhelpful, and one told it is 32768 wide tries to
+     * allocate a backbuffer that cannot exist. */
+    if (cx >= 320 && cy >= 200 && cx <= 7680 && cy <= 4320) {
+        g_screen_w = cx;
+        g_screen_h = cy;
+    }
+}
+void w32_screen_size(int *cx, int *cy) {
+    if (cx) *cx = g_screen_w;
+    if (cy) *cy = g_screen_h;
+}
+#define SCREEN_W g_screen_w
+#define SCREEN_H g_screen_h
 
 /* --- messages ------------------------------------------------------------ */
 
@@ -986,7 +1009,7 @@ static void u_EnumDisplaySettingsA(w32 *w) {
     if (!p) { RET(0); return; }
     if (mode != 0 && mode != 0xFFFFFFFFu) { RET(0); return; }   /* one mode, and ENUM_CURRENT */
     memset(W32P(w, p), 0, 156);
-    memcpy(W32P(w, p), "winios", 7);
+    memcpy(W32P(w, p), "Winios", 7);   /* dmDeviceName: the display we claim to be */
     w32_write(w, p + 32, 2, 0x0401);               /* dmSpecVersion */
     dm = 0x0004 | 0x0008 | 0x0010 | 0x0400;
     w32_write(w, p + 40, 4, dm);

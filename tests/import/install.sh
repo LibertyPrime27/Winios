@@ -40,7 +40,7 @@ for bits in 32 64; do
     # DLL-search narrowing it does first, and the older shell-folder pair it
     # resolves a Start Menu path through.
     check "narrowed the DLL search path"    "dllsearch: narrowed"
-    check "resolved the Start Menu"         "menu:  C:\\Users\\winios\\Start Menu\\Programs"
+    check "resolved the Start Menu"         "menu:  C:\\Users\\Winios\\Start Menu\\Programs"
     check "given the silent flags"          "/SILENT /SP- /NORESTART /DIR=C:\\fakesetup$bits"
     check "the guest saw them"              "silent=1 sp-=1 norestart=1"
     check "free space was reported"         "free:  enough"

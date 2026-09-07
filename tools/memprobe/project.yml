@@ -2,7 +2,7 @@
 #
 # Hand-written .xcodeproj files rot; this stays readable and diffable, and CI
 # regenerates it from scratch on every build.
-name: winios
+name: Winios
 options:
   bundleIdPrefix: winios
   deploymentTarget: { iOS: "15.0" }
@@ -12,7 +12,7 @@ settings:
   base:
     SWIFT_VERSION: "5.9"
     TARGETED_DEVICE_FAMILY: "1,2"
-    SWIFT_OBJC_BRIDGING_HEADER: Shared/winios-Bridging-Header.h
+    SWIFT_OBJC_BRIDGING_HEADER: Shared/Winios-Bridging-Header.h
     # xcore and Zydis are built by CMake (see CI) into build-xcore-ios/.
     HEADER_SEARCH_PATHS: $(SRCROOT)/Shared $(SRCROOT)/../../core/include $(SRCROOT)/../../win32 $(SRCROOT)/../../tools/winrun $(SRCROOT)/../../tools/import
     LIBRARY_SEARCH_PATHS: $(SRCROOT)/../../build-xcore-ios $(SRCROOT)/../../build-xcore-ios/core $(SRCROOT)/../../build-xcore-ios/core/zydis $(SRCROOT)/../../build-xcore-ios/core/zydis/zycore
@@ -32,7 +32,7 @@ settings:
     CODE_SIGN_IDENTITY: ""
 
 targets:
-  winios:
+  Winios:
     type: application
     platform: iOS
     sources:
@@ -64,10 +64,10 @@ targets:
         # they have to come after these.
         OTHER_LDFLAGS: -limport_lib -lwinrun_lib $(inherited) -lz
     dependencies:
-      - target: winiosProbe
+      - target: WiniosProbe
         embed: true
 
-  winiosProbe:
+  WiniosProbe:
     type: app-extension
     platform: iOS
     sources:

@@ -120,10 +120,10 @@ void w32_drive_init(void) {
         "Program Files", "Program Files (x86)", "Program Files/Common Files",
         "Windows", "Windows/System32", "Windows/Temp", "Windows/Fonts",
         "ProgramData", "Temp",
-        "Users", "Users/winios", "Users/winios/Desktop", "Users/winios/Documents",
-        "Users/winios/AppData", "Users/winios/AppData/Roaming",
-        "Users/winios/AppData/Local", "Users/winios/AppData/LocalLow",
-        "Users/winios/Saved Games", "Users/winios/Start Menu",
+        "Users", "Users/Winios", "Users/Winios/Desktop", "Users/Winios/Documents",
+        "Users/Winios/AppData", "Users/Winios/AppData/Roaming",
+        "Users/Winios/AppData/Local", "Users/Winios/AppData/LocalLow",
+        "Users/Winios/Saved Games", "Users/Winios/Start Menu",
         "Users/Public", "Users/Public/Documents",
     };
     for (size_t i = 0; i < sizeof dirs / sizeof dirs[0]; i++) {
@@ -1049,7 +1049,7 @@ static void k_GetDiskFreeSpaceW(w32 *w) { disk_free_old(w); }
 /* NTFS, because an installer that finds FAT32 refuses to write a file over
  * 4 GB and some refuse to install at all. */
 static void volume_info(w32 *w, int wide) {
-    const char *label = "winios", *fs = "NTFS";
+    const char *label = "Winios", *fs = "NTFS";
     #define PUT(a, n, s) do { if ((a) && (uint32_t)(n) > strlen(s)) { \
         if (wide) { uint16_t *d = W32P(w, (a)); \
                     if (d) { size_t i = 0; \

@@ -58,17 +58,17 @@ enum { S_OK_ = 0, E_FAIL_ = (int)0x80004005, E_INVALIDARG_ = (int)0x80070057 };
 static const char *csidl_path(uint32_t id) {
     switch (id & CSIDL_FLAG_MASK) {
     case CSIDL_DESKTOP:
-    case CSIDL_DESKTOPDIRECTORY:     return "C:\\Users\\winios\\Desktop";
-    case CSIDL_PERSONAL:             return "C:\\Users\\winios\\Documents";
-    case CSIDL_MYMUSIC:              return "C:\\Users\\winios\\Music";
-    case CSIDL_MYVIDEO:              return "C:\\Users\\winios\\Videos";
-    case CSIDL_MYPICTURES:           return "C:\\Users\\winios\\Pictures";
-    case CSIDL_APPDATA:              return "C:\\Users\\winios\\AppData\\Roaming";
-    case CSIDL_LOCAL_APPDATA:        return "C:\\Users\\winios\\AppData\\Local";
-    case CSIDL_PROFILE:              return "C:\\Users\\winios";
-    case CSIDL_STARTMENU:            return "C:\\Users\\winios\\Start Menu";
-    case CSIDL_PROGRAMS:             return "C:\\Users\\winios\\Start Menu\\Programs";
-    case CSIDL_STARTUP:              return "C:\\Users\\winios\\Start Menu\\Programs\\Startup";
+    case CSIDL_DESKTOPDIRECTORY:     return "C:\\Users\\Winios\\Desktop";
+    case CSIDL_PERSONAL:             return "C:\\Users\\Winios\\Documents";
+    case CSIDL_MYMUSIC:              return "C:\\Users\\Winios\\Music";
+    case CSIDL_MYVIDEO:              return "C:\\Users\\Winios\\Videos";
+    case CSIDL_MYPICTURES:           return "C:\\Users\\Winios\\Pictures";
+    case CSIDL_APPDATA:              return "C:\\Users\\Winios\\AppData\\Roaming";
+    case CSIDL_LOCAL_APPDATA:        return "C:\\Users\\Winios\\AppData\\Local";
+    case CSIDL_PROFILE:              return "C:\\Users\\Winios";
+    case CSIDL_STARTMENU:            return "C:\\Users\\Winios\\Start Menu";
+    case CSIDL_PROGRAMS:             return "C:\\Users\\Winios\\Start Menu\\Programs";
+    case CSIDL_STARTUP:              return "C:\\Users\\Winios\\Start Menu\\Programs\\Startup";
     case CSIDL_COMMON_APPDATA:       return "C:\\ProgramData";
     case CSIDL_COMMON_DOCUMENTS:     return "C:\\Users\\Public\\Documents";
     case CSIDL_WINDOWS:              return "C:\\Windows";

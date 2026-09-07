@@ -1286,17 +1286,37 @@ int winrun_main(int argc, char **argv) {
         else if (!strcmp(argv[ai], "-k")) w->keep_going = 1;
         else if (!strcmp(argv[ai], "-t") && ai + 1 < argc) { w->deadline_ns = now_ns_host() + (uint64_t)atoll(argv[ai + 1]) * 1000000000ull; ai++; }
         else if (!strcmp(argv[ai], "-C") && ai + 1 < argc) { w32_set_drive_c(argv[ai + 1]); ai++; }
+        /* What the guest is told the display is. A game reads it before it
+         * picks a backbuffer, so this is how you make it draw fewer pixels --
+         * which matters while DrawPrimitive goes through the rasterizer. */
+        else if (!strcmp(argv[ai], "-screen") && ai + 1 < argc) {
+            int cx = 0, cy = 0;
+            if (sscanf(argv[ai + 1], "%dx%d", &cx, &cy) != 2 || cx <= 0 || cy <= 0) {
+                fprintf(stderr, "winrun: -screen wants WxH, e.g. -screen 640x360\n");
+                return 2;
+            }
+            w32_set_screen_size(cx, cy);
+            { int gx = 0, gy = 0; w32_screen_size(&gx, &gy);
+              if (gx != cx || gy != cy) {
+                  fprintf(stderr, "winrun: %dx%d is outside what a display can be; "
+                                  "still reporting %dx%d\n", cx, cy, gx, gy);
+                  return 2;
+              } }
+            ai++;
+        }
         else if (!strcmp(argv[ai], "-L") && ai + 1 < argc) {       /* extra directory to find guest DLLs in */
             static char dir[512];
             snprintf(dir, sizeof dir, "%s%s", argv[ai + 1], argv[ai + 1][strlen(argv[ai + 1]) - 1] == '/' ? "" : "/");
             w->dll_dir = dir; ai++;
         }
         else { fprintf(stderr, "usage: winrun [-v] [-imports] [-survey dir] [-k] [-t seconds]\n"
-                          "              [-C drive_c] [-L dlldir] [-input script] program.exe [args...]\n"); return 2; }
+                          "              [-C drive_c] [-L dlldir] [-input script] [-screen WxH]\n"
+                          "              program.exe [args...]\n"); return 2; }
         ai++;
     }
     if (ai >= argc) { fprintf(stderr, "usage: winrun [-v] [-imports] [-survey dir] [-k] [-t seconds]\n"
-                                      "              [-C drive_c] [-L dlldir] [-input script] program.exe [args...]\n"); return 2; }
+                                      "              [-C drive_c] [-L dlldir] [-input script] [-screen WxH]\n"
+                          "              program.exe [args...]\n"); return 2; }
     w->exe_path = argv[ai];
 
     /* bitness decides the memory model, so peek at the header first */

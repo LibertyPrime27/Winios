@@ -409,7 +409,7 @@ int wi_import_game(const char *src, const char *drive_c,
 static int is_not_the_install(const char *rel) {
     return !strncasecmp(rel, "Temp/", 5)
         || !strncasecmp(rel, "Windows/Temp/", 13)
-        || !strncasecmp(rel, "Users/winios/AppData/Local/Temp/", 32)
+        || !strncasecmp(rel, "Users/Winios/AppData/Local/Temp/", 32)
         || !strcasecmp(rel, "registry.txt");
 }
 

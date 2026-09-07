@@ -2,10 +2,11 @@ import UIKit
 
 /// The app's front door: the Windows programs on the device.
 ///
-/// The probes that used to be the whole app are still here, one tap away under
-/// Diagnostics, because they are how you tell "this program is broken" from
-/// "this device is broken" — but they are no longer what the app is *about*.
-/// What it is about is a list of programs and a Run button.
+/// A list of programs and a Run button. The probes that used to be the whole
+/// app are not offered any more — they were development tools, and the one
+/// part of them a person actually needs (turning the JIT on) lives in
+/// Settings now, with a status line at the top of this screen so nobody has
+/// to go looking for it.
 ///
 /// Every row says what we know before you tap it: bitness, and how many of its
 /// imports nothing here can satisfy. For anything real that second number will
@@ -15,23 +16,85 @@ final class LibraryViewController: UITableViewController {
 
     private var programs: [Program] = []
 
+    /// The JIT state, at the top of the app's front door.
+    ///
+    /// It is here rather than tucked away somewhere because it is the
+    /// single biggest thing that decides whether a game is playable, and
+    /// because on iOS it is not a property of the build: the dynarec needs an
+    /// executable region a debugger has authorised, once per launch. Without
+    /// it everything silently runs interpreted, and "silently" is the problem
+    /// -- a game just feels broken.
+    private let jitBanner = UILabel()
+    private let jitBannerHost = UIView()
+
     override func viewDidLoad() {
         super.viewDidLoad()
-        title = "winios"
+        title = "Winios"
         // C:\ for everything the library runs.
         if let c = ExeBrowser.driveC { c.path.withCString { w32_set_drive_c($0) } }
 
-        navigationItem.rightBarButtonItem = UIBarButtonItem(
-            barButtonSystemItem: .add, target: self, action: #selector(addProgram))
-        navigationItem.leftBarButtonItem = UIBarButtonItem(
-            title: "Diagnostics", style: .plain, target: self, action: #selector(showProbes))
+        navigationItem.rightBarButtonItems = [
+            UIBarButtonItem(barButtonSystemItem: .add, target: self, action: #selector(addProgram)),
+            UIBarButtonItem(title: "Settings", style: .plain, target: self, action: #selector(showSettings)),
+        ]
         tableView.register(UITableViewCell.self, forCellReuseIdentifier: "p")
         tableView.rowHeight = 62
+
+        // The display setting has to be in the emulator before anything runs.
+        Settings.apply()
+
+        jitBanner.font = .preferredFont(forTextStyle: .subheadline)
+        jitBanner.numberOfLines = 0
+        jitBanner.translatesAutoresizingMaskIntoConstraints = false
+        jitBannerHost.addSubview(jitBanner)
+        NSLayoutConstraint.activate([
+            jitBanner.leadingAnchor.constraint(equalTo: jitBannerHost.leadingAnchor, constant: 16),
+            jitBanner.trailingAnchor.constraint(equalTo: jitBannerHost.trailingAnchor, constant: -16),
+            jitBanner.centerYAnchor.constraint(equalTo: jitBannerHost.centerYAnchor),
+        ])
+        jitBannerHost.addGestureRecognizer(
+            UITapGestureRecognizer(target: self, action: #selector(jitTapped)))
+        // A frame, not autolayout: a table header view is positioned by the
+        // table from its frame, and a header sized only by constraints ends
+        // up zero-height.
+        jitBannerHost.frame = CGRect(x: 0, y: 0, width: tableView.bounds.width, height: 56)
+        tableView.tableHeaderView = jitBannerHost
     }
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         reload()
+        refreshJITBanner()
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        // Keep the header the table's width through rotation.
+        if jitBannerHost.frame.width != tableView.bounds.width {
+            jitBannerHost.frame = CGRect(x: 0, y: 0, width: tableView.bounds.width, height: 56)
+            tableView.tableHeaderView = jitBannerHost
+        }
+    }
+
+    private func refreshJITBanner() {
+        let on = Settings.jitReady
+        jitBanner.text = on
+            ? "JIT enabled — guest code is compiled to ARM64"
+            : "JIT disabled — running interpreted. Tap to turn it on."
+        jitBanner.textColor = on ? .systemGreen : .systemRed
+        jitBannerHost.backgroundColor = (on ? UIColor.systemGreen : UIColor.systemRed)
+            .withAlphaComponent(0.12)
+    }
+
+    /// Tapping it goes where it is turned on. Pointless when it is already
+    /// on, so then it goes to Settings, which is what someone tapping a
+    /// status line is probably looking for.
+    @objc private func jitTapped() {
+        if Settings.jitReady { showSettings() } else { showProbes() }
+    }
+
+    @objc private func showSettings() {
+        navigationController?.pushViewController(SettingsViewController(), animated: true)
     }
 
     private func reload() {
@@ -39,8 +102,11 @@ final class LibraryViewController: UITableViewController {
         tableView.reloadData()
     }
 
+    /// Where the JIT is turned on. The probe screen it reaches is in
+    /// JIT-only mode: the rest of it was a development tool and is no longer
+    /// offered anywhere in the app.
     @objc private func showProbes() {
-        navigationController?.pushViewController(ProbeViewController(), animated: true)
+        navigationController?.pushViewController(ProbeViewController(onlyJIT: true), animated: true)
     }
 
     /// Add a program. Two shapes arrive from outside -- a game that is already

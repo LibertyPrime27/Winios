@@ -121,11 +121,17 @@ final class GuestViewController: UIViewController {
         }
         let exe = dir.appendingPathComponent(exeName).path
         let dll = dllDir ?? ""
+        // Copied out before the closure: the log call below runs inside a
+        // [weak self] block, where a bare property reference would not
+        // resolve, and `self?.exeName` inside a nested async block is a way
+        // to end up logging nothing because self went away.
+        let name = exeName
         // Foreground band: a guest drawing frames is exactly the work this
         // app exists to do, and the efficiency cores would halve it.
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             var out = [CChar](repeating: 0, count: 4096)
             var ns: UInt64 = 0
+            Settings.apply()          /* what the guest is told the screen is */
             xc_jit_enable(1)
             // No frame limit and no time limit: it draws until Close makes
             // Present fail. The DLL directory goes with it so an imported
@@ -139,6 +145,7 @@ final class GuestViewController: UIViewController {
             let text = String(cString: out)
             DispatchQueue.main.async {
                 self?.output = text
+                Logs.record(program: name, exit: rc, ms: ns / 1_000_000, report: text)
                 self?.guestFinished(rc: rc, ns: ns)
             }
         }

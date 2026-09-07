@@ -71,7 +71,12 @@ void w32_d3d9_reset(void) {
 
 /* The display we claim to be. A game picks a back-buffer size from this when
  * it asks for a windowed device without saying how big. */
-enum { SCREEN_W = 1280, SCREEN_H = 720 };
+/* The mode we report. Read from user32.c rather than declared again here:
+ * a game asks both, and two constants that must match are one constant. */
+#define SCREEN_W d3d_screen_w()
+#define SCREEN_H d3d_screen_h()
+static int d3d_screen_w(void) { int v = 1280; w32_screen_size(&v, 0); return v; }
+static int d3d_screen_h(void) { int v = 720;  w32_screen_size(0, &v); return v; }
 
 /* ------------------------------------------------------ IDirect3DSurface9 */
 

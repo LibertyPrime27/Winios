@@ -39,12 +39,31 @@ final class ProbeViewController: UIViewController {
     /// cpu_resource_fatal report in docs/MEMPROBE.md).
     private var isActive = true
 
+    /// When true this screen is only the JIT step.
+    ///
+    /// The probes used to be the whole app and were reachable as
+    /// "Diagnostics"; they are development tools and are no longer offered.
+    /// One thing on this screen is not a development tool, though: the JIT
+    /// needs an executable region that a debugger authorises, once per
+    /// launch, and without it every guest runs interpreted. So Settings
+    /// reaches this screen in this mode, and the rest of it stays in the
+    /// codebase because the questions it answers -- is the CPU core right on
+    /// this silicon, how big an arena will bless -- have not stopped
+    /// mattering just because a user should not be asked them.
+    private let onlyJIT: Bool
+
+    init(onlyJIT: Bool = false) {
+        self.onlyJIT = onlyJIT
+        super.init(nibName: nil, bundle: nil)
+    }
+    required init?(coder: NSCoder) { fatalError("not used") }
+
     override func viewDidLoad() {
         super.viewDidLoad()
         // C:\ for anything the user opens: the app's own storage, so a program
         // copied in from Files can open its data with the paths it shipped with.
         if let c = ExeBrowser.driveC { c.path.withCString { w32_set_drive_c($0) } }
-        title = "Diagnostics · \(DeviceInfo.modelIdentifier)"
+        title = onlyJIT ? "Enable JIT" : "Diagnostics · \(DeviceInfo.modelIdentifier)"
         view.backgroundColor = .systemBackground
 
         results.isEditable = false
@@ -60,7 +79,7 @@ final class ProbeViewController: UIViewController {
         frameView.isHidden = true
         frameView.heightAnchor.constraint(equalToConstant: 180).isActive = true
 
-        let stack = UIStackView(arrangedSubviews: [
+        let everything: [UIView] = [
             button("▶  Run everything in order (and step the JIT arena)", #selector(runAll)),
             row([("1 · CPU vectors", #selector(runCPU)), ("2 · Benchmark", #selector(runBench))]),
             row([("3 · GPU (D3D9/11/12)", #selector(runGPU)), ("5 · Windows .exe", #selector(runWindows))]),
@@ -72,7 +91,22 @@ final class ProbeViewController: UIViewController {
             row([("Copy report", #selector(copyReport)), ("Reset results", #selector(resetAll))]),
             frameView,
             results,
-        ])
+        ]
+        let justTheJIT: [UIView] = [
+            explain("The dynarec compiles guest code to ARM64, and it needs a "
+                    + "region of memory a debugger has marked executable. That "
+                    + "has to happen once per launch, before anything runs. "
+                    + "StikDebug does it; this asks it to."),
+            button("Attach StikDebug and bless a JIT arena", #selector(attachJIT)),
+            explain("If a game later runs out of compiled-code space, ask for a "
+                    + "bigger region. It takes effect on the next launch, and a "
+                    + "size that fails is remembered so the launch after that "
+                    + "goes back to the last one that worked."),
+            button("Try a bigger arena next launch", #selector(stepArena)),
+            row([("Copy report", #selector(copyReport)), ("Reset results", #selector(resetAll))]),
+            results,
+        ]
+        let stack = UIStackView(arrangedSubviews: onlyJIT ? justTheJIT : everything)
         stack.axis = .vertical
         stack.spacing = 8
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -108,6 +142,18 @@ final class ProbeViewController: UIViewController {
     }
 
     /// Two buttons side by side, so ten of them still leave room for the report.
+    /// A paragraph of explanation above a button. In the JIT-only mode this
+    /// screen is shown to someone who did not come looking for a debugger, so
+    /// what the button is for has to be on the screen.
+    private func explain(_ s: String) -> UILabel {
+        let l = UILabel()
+        l.text = s
+        l.font = .preferredFont(forTextStyle: .footnote)
+        l.textColor = .secondaryLabel
+        l.numberOfLines = 0
+        return l
+    }
+
     private func row(_ items: [(String, Selector)]) -> UIStackView {
         let s = UIStackView(arrangedSubviews: items.map { button($0.0, $0.1) })
         s.axis = .horizontal
@@ -136,7 +182,8 @@ final class ProbeViewController: UIViewController {
             body()
             DispatchQueue.main.async {
                 self.running = false
-                self.title = "Diagnostics · \(DeviceInfo.modelIdentifier)"
+                self.title = self.onlyJIT ? "Enable JIT"
+                                          : "Diagnostics · \(DeviceInfo.modelIdentifier)"
                 self.refresh()
             }
         }

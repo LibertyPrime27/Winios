@@ -105,6 +105,7 @@ final class ProgramViewController: UIViewController {
             guard let self else { return }
             var out = [CChar](repeating: 0, count: 1 << 20)
             var ns: UInt64 = 0
+            Settings.apply()          /* what the guest is told the screen is */
             xc_jit_enable(1)
             // The program's own DLL directory goes with it: an imported game
             // loads its libraries from beside its executable, and for a deeply
@@ -130,6 +131,11 @@ final class ProgramViewController: UIViewController {
             p.lastExit = rc
             p.lastRunMs = ns / 1_000_000
             ProgramStore.update(p)
+            // The log, if it was asked for. Recorded here rather than in the
+            // C layer because this is where the run report and the outcome
+            // are both in hand.
+            Logs.record(program: p.name + "/" + exe.lastPathComponent,
+                        exit: rc, ms: ns / 1_000_000, report: text)
 
             DispatchQueue.main.async {
                 self.program = p

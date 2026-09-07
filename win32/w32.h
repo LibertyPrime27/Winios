@@ -218,6 +218,20 @@ void     w32_note_refused(w32 *w, const char *name);
  * observable and an empty drive is what the tests recorded. */
 void     w32_drive_init(void);
 
+/* What the guest is told the display is.
+ *
+ * A game asks GetSystemMetrics or EnumDisplaySettings before it chooses a
+ * backbuffer, so this is the number that decides how many pixels it draws --
+ * and until the Metal path exists those pixels go through a software
+ * rasterizer, which makes it the largest performance lever there is after the
+ * dynarec itself. Settable so the app can offer it.
+ *
+ * user32.c and d3d9.c have to agree, or a game picks a mode the device then
+ * reports differently; they used to agree by having the same constant typed
+ * into both, kept in step by a comment. */
+void     w32_set_screen_size(int cx, int cy);
+void     w32_screen_size(int *cx, int *cy);
+
 /* handles */
 uint64_t w32_handle_new(w32 *w, w32_htype t, int fd);
 w32_handle *w32_handle_get(w32 *w, uint64_t h);
