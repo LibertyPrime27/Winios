@@ -1,0 +1,19 @@
+/* A real dialog resource, compiled by windres into an RT_DIALOG the loader
+ * has to walk -- the point of the test is the template, so writing one by
+ * hand in C would test nothing. */
+#include <windows.h>
+
+100 DIALOGEX 0, 0, 260, 150
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Winios Setup"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    LTEXT           "Choose where to install this program.", 200, 12, 10, 236, 12
+    LTEXT           "&Destination folder:", 201, 12, 30, 80, 10
+    EDITTEXT        202, 12, 42, 236, 14, ES_AUTOHSCROLL
+    AUTOCHECKBOX    "Create a &Start Menu shortcut", 203, 12, 64, 150, 12
+    CONTROL         "", 204, "msctls_progress32", WS_BORDER, 12, 86, 236, 12
+    LTEXT           "Ready.", 205, 12, 104, 236, 12
+    DEFPUSHBUTTON   "&Install", IDOK, 140, 126, 50, 16
+    PUSHBUTTON      "Cancel", IDCANCEL, 198, 126, 50, 16
+END

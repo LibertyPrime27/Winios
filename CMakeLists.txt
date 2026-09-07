@@ -105,8 +105,19 @@ endif()
 # with mingw-w64 so nothing beyond a C compiler is needed to run them.
 if(NOT WIN32)
     # The same sources twice: once as the command-line tool, once as a library
-    # the device build links (tools/memprobe) so an iPad can run a .exe.
-    add_library(winrun_lib STATIC tools/winrun/winrun.c win32/pe.c win32/kernel32.c win32/msvcrt.c win32/com.c win32/d3d9.c win32/raster.c win32/stdcall_args.c win32/advapi32.c win32/seh.c win32/user32.c win32/dsound.c win32/xinput.c win32/thread.c win32/shell32.c win32/ole32.c)
+    # the device build links (tools/memprobe) so an iPad can run a .exe. Named
+    # once, because the two lists drifting apart is how a file ends up in the
+    # tool and missing from the app -- which fails at link time on a CI runner
+    # nobody can attach a debugger to.
+    set(WINRUN_SOURCES
+        tools/winrun/winrun.c
+        win32/pe.c win32/kernel32.c win32/msvcrt.c win32/com.c
+        win32/d3d9.c win32/raster.c win32/stdcall_args.c
+        win32/advapi32.c win32/seh.c win32/thread.c
+        win32/user32.c win32/gdi32.c win32/gdifont.c win32/comctl32.c
+        win32/dsound.c win32/xinput.c win32/shell32.c win32/ole32.c)
+
+    add_library(winrun_lib STATIC ${WINRUN_SOURCES})
     target_link_libraries(winrun_lib PUBLIC xcore)
     if(NOT APPLE)
         target_link_libraries(winrun_lib PUBLIC m)
@@ -116,7 +127,7 @@ if(NOT WIN32)
     set_property(TARGET winrun_lib PROPERTY C_STANDARD 11)
     target_compile_options(winrun_lib PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
-    add_executable(winrun tools/winrun/winrun.c win32/pe.c win32/kernel32.c win32/msvcrt.c win32/com.c win32/d3d9.c win32/raster.c win32/stdcall_args.c win32/advapi32.c win32/seh.c win32/user32.c win32/dsound.c win32/xinput.c win32/thread.c win32/shell32.c win32/ole32.c)
+    add_executable(winrun ${WINRUN_SOURCES})
     target_link_libraries(winrun PRIVATE xcore m)
     target_include_directories(winrun PRIVATE win32)
     set_property(TARGET winrun PROPERTY C_STANDARD 11)

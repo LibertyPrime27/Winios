@@ -190,21 +190,27 @@ final class ImportViewController: UIViewController, UIDocumentPickerDelegate {
         let a = UIAlertController(
             title: installerFirst ? "This looks like an installer" : "This looks like a game",
             message: installerFirst
-                ? "Running it will install the program onto this app's C: drive, "
-                + "using \(family)'s silent mode — its window cannot be drawn here, "
-                + "so the flags that skip it are what make this possible at all."
+                ? "Its screens can be drawn now, so you can go through it and choose "
+                + "where it goes — or \(family)'s silent mode can do the whole thing "
+                + "without asking. Either way, whatever it installs is found "
+                + "afterwards and added to your library."
                 : "It will be copied onto this app's C: drive as it is.",
             preferredStyle: .alert)
 
         let game = UIAlertAction(title: "Import as a game", style: .default) { _ in
-            self.run(src: src, installer: false, scoped: scoped)
+            self.run(src: src, installer: false, visible: false, scoped: scoped)
         }
-        let install = UIAlertAction(title: "Run it as an installer", style: .default) { _ in
-            self.run(src: src, installer: true, scoped: scoped)
+        let show = UIAlertAction(title: "Install, showing its screens", style: .default) { _ in
+            self.run(src: src, installer: true, visible: true, scoped: scoped)
         }
-        // Order matters: the first action is the one a hurried tap lands on.
-        if installerFirst { a.addAction(install); a.addAction(game) }
-        else { a.addAction(game); a.addAction(install) }
+        let install = UIAlertAction(title: "Install silently", style: .default) { _ in
+            self.run(src: src, installer: true, visible: false, scoped: scoped)
+        }
+        // Order matters: the first action is the one a hurried tap lands on,
+        // and going through the installer is the one that behaves the way a
+        // person expects an installer to behave.
+        if installerFirst { a.addAction(show); a.addAction(install); a.addAction(game) }
+        else { a.addAction(game); a.addAction(show); a.addAction(install) }
         a.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in
             if scoped { src.stopAccessingSecurityScopedResource() }
         })
@@ -258,7 +264,7 @@ final class ImportViewController: UIViewController, UIDocumentPickerDelegate {
 
     // MARK: - importing
 
-    private func run(src: URL, installer: Bool, scoped: Bool) {
+    private func run(src: URL, installer: Bool, visible: Bool, scoped: Bool) {
         guard let drive = ExeBrowser.driveC else {
             say("\nThere is no C: drive to import into.\n")
             if scoped { src.stopAccessingSecurityScopedResource() }
@@ -272,16 +278,37 @@ final class ImportViewController: UIViewController, UIDocumentPickerDelegate {
                 if scoped { src.stopAccessingSecurityScopedResource() }
                 return
             }
-            self.reallyRun(src: src, installer: installer, scoped: scoped, drive: drive)
+            self.reallyRun(src: src, installer: installer, visible: visible,
+                           scoped: scoped, drive: drive)
         }
     }
 
-    private func reallyRun(src: URL, installer: Bool, scoped: Bool, drive: URL) {
+    /// Up while a visible install runs, so its dialogs are on screen and the
+    /// taps get back to it.
+    private var installScreen: GuestViewController?
+
+    private func reallyRun(src: URL, installer: Bool, visible: Bool, scoped: Bool, drive: URL) {
         say(installer
-            ? "\nInstalling. This runs the setup program, so it may take a while.\n"
+            ? (visible
+               ? "\nStarting the installer. Its own screens are next — go through it "
+               + "as you would on a PC, and wherever you tell it to install to is "
+               + "where it will be found.\n"
+               : "\nInstalling. This runs the setup program, so it may take a while.\n")
             : "\nCopying.\n")
         holdOn()
         startTicking()
+
+        // The installer's screens, full screen and landscape, over this one.
+        // It is only a viewer: the run belongs to the import below, which has
+        // to see the drive before and after it.
+        if installer && visible {
+            let screen = GuestViewController(watching: src.lastPathComponent) {
+                win_probe_cancel_import()
+            }
+            screen.modalPresentationStyle = .fullScreen
+            installScreen = screen
+            present(screen, animated: true)
+        }
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             // The C side owns the whole import, including running a guest for
@@ -289,15 +316,31 @@ final class ImportViewController: UIViewController, UIDocumentPickerDelegate {
             // operations lives rather than two that can disagree.
             var detailBuf = [CChar](repeating: 0, count: 64 * 1024)
             var nameBuf = [CChar](repeating: 0, count: 256)
+            var dirBuf = [CChar](repeating: 0, count: 1024)
             var exeBuf = [CChar](repeating: 0, count: 512)
             var dllBuf = [CChar](repeating: 0, count: 1200)
             var is32: Int32 = -1, files: Int32 = 0, exes: Int32 = 0
+            // A visible install is a program a person is looking at and
+            // tapping, so it gets what a game gets: the display it is
+            // configured for, and the JIT. A silent one draws nothing and
+            // nobody is waiting on a frame.
+            if visible {
+                Settings.apply()
+                xc_jit_enable(1)
+            }
+            defer { if visible { xc_jit_enable(0) } }
             func attempt(_ keepGoing: Int32) -> Int32 {
                 src.path.withCString { s in
                     drive.path.withCString { d in
-                        win_probe_import(s, d, installer ? 1 : 0, keepGoing, 300,
+                        win_probe_import(s, d, installer ? 1 : 0, visible ? 1 : 0,
+                                         keepGoing,
+                                         // A person answering dialogs needs
+                                         // longer than a silent run: the thing
+                                         // being waited for is a person.
+                                         visible ? 3600 : 300,
                                          &detailBuf, detailBuf.count,
                                          &nameBuf, nameBuf.count,
+                                         &dirBuf, dirBuf.count,
                                          &exeBuf, exeBuf.count,
                                          &dllBuf, dllBuf.count,
                                          &is32, &files, &exes)
@@ -335,9 +378,10 @@ final class ImportViewController: UIViewController, UIDocumentPickerDelegate {
                 // attempt() overwrote the name and exe buffers with the loose
                 // run's findings; the strict run installed nothing, so they
                 // must not be used.
-                nameBuf[0] = 0; exeBuf[0] = 0; dllBuf[0] = 0
+                nameBuf[0] = 0; dirBuf[0] = 0; exeBuf[0] = 0; dllBuf[0] = 0
             }
             let name = String(cString: nameBuf)
+            let dirRel = String(cString: dirBuf)
             let exeRel = String(cString: exeBuf)
             let dllDir = String(cString: dllBuf)
             let ok = rc == 0
@@ -348,6 +392,12 @@ final class ImportViewController: UIViewController, UIDocumentPickerDelegate {
                 self.stopTicking()
                 self.letGo()
                 self.setBusy(false)
+                if let screen = self.installScreen {
+                    screen.finished(ok ? "Finished. Looking at what it installed…"
+                                       : "The installer stopped.")
+                    self.installScreen = nil
+                    screen.dismiss(animated: true)
+                }
                 self.output.text = detail
                 guard ok, !name.isEmpty else {
                     self.status.text = "That did not work — the report says how far it got."
@@ -358,7 +408,8 @@ final class ImportViewController: UIViewController, UIDocumentPickerDelegate {
                 // milliseconds.
                 var buf = [CChar](repeating: 0, count: 262_144)
                 var resolved = -1, missing = -1
-                if let exe = ProgramStore.exeURL(name: name, exeRelative: exeRel) {
+                if let exe = ProgramStore.exeURL(folder: dirRel.isEmpty ? name : dirRel,
+                                                 exeRelative: exeRel) {
                     _ = exe.path.withCString { win_probe_imports($0, &buf, buf.count) }
                     let report = String(cString: buf)
                     resolved = Self.number(before: " imports resolved", in: report)
@@ -370,7 +421,12 @@ final class ImportViewController: UIViewController, UIDocumentPickerDelegate {
                                 importsResolved: resolved, importsMissing: missing,
                                 lastExit: nil, lastRunMs: nil,
                                 dllDir: dllDir.isEmpty ? nil : dllDir,
-                                installed: installer)
+                                installed: installer,
+                                // Where it actually went. An installer the
+                                // person answered puts it where they said,
+                                // which is rarely a folder named after the
+                                // game at the top of the drive.
+                                dirRelative: dirRel.isEmpty || dirRel == name ? nil : dirRel)
                 // Saved now, not on a tap. The files are already on the drive
                 // and the library lists the drive, so the program appears
                 // either way -- withholding the entry would only mean it

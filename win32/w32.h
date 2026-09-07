@@ -83,6 +83,7 @@ typedef struct {
     uint64_t base, size;
     uint64_t entry;              /* DllMain, or the executable's entry point; 0 if none */
     uint32_t exp_rva, exp_size;  /* export directory, 0 if the image exports nothing */
+    uint32_t res_rva, res_size;  /* resource directory: dialogs, strings, icons */
     uint64_t tls_callbacks;
     int      is_exe;
     int      refs;               /* LoadLibrary count; nothing is ever unmapped */
@@ -144,6 +145,7 @@ struct w32 {
     int        nmods, nloaded;
     const char *dll_dir;         /* extra directory to search for guest DLLs (-L) */
     int        imports_only;     /* -imports: load, report what is missing, do not run */
+    int        dump_frame;      /* -frame: print what was drawn on the way out */
     int        keep_going;       /* -k: an unimplemented import returns 0 instead of ending the run */
 
     /* what was called that we do not implement, and how often. A run in
@@ -188,6 +190,7 @@ uint64_t w32_wstrdup(w32 *w, const char *s);                /* UTF-16 */
 size_t   w32_wcslen(w32 *w, uint64_t p);
 const char *w32_str(w32 *w, uint64_t addr);                 /* host pointer to a guest C string ("" for NULL) */
 void     w32_wtoa(w32 *w, uint64_t wp, char *out, size_t n);   /* UTF-16 -> ASCII-ish */
+void     w32_wtoa_n(w32 *w, uint64_t wp, int chars, char *out, size_t n);  /* counted run */
 /* A Windows path as the host sees it: under the drive root for an absolute
  * one, under the current directory for a relative one. Every file call goes
  * through this, so anything outside kernel32.c that touches a path has to use
@@ -327,6 +330,67 @@ extern const w32_api w32_d3d9[];
 extern const w32_api w32_advapi32[];
 extern const w32_api w32_shell32[];
 extern const w32_api w32_ole32[];
+extern const w32_api w32_gdi32[];
+extern const w32_api w32_comctl32[];
+
+/* --- the screen, and the windows on it -----------------------------------
+ *
+ * gdi32 draws into a surface user32 owns, and user32 draws its controls with
+ * gdi32's primitives, so the two files need each other. Rather than let
+ * either reach into the other's tables, everything that crosses is here.
+ */
+uint32_t *w32_desktop_bits(int *cx, int *cy);            /* the screen surface, BGRA */
+const uint32_t *w32_desktop_peek(int *cx, int *cy);
+void      w32_desktop_damaged(void);                     /* something drew: present it */
+int       w32_window_area(uint64_t hwnd, int whole, int *x, int *y, int *cx, int *cy);
+int       w32_dialog_pump(w32 *w);                       /* one pass for a host-owned loop */
+
+/* Windows, made from the host side: a dialog template creates controls, and
+ * it has no guest stack to read the arguments from. */
+uint64_t  w32_new_window(w32 *w, const char *cls, const char *text,
+                         uint32_t style, uint32_t exstyle, int x, int y, int cw, int ch,
+                         uint64_t parent, uint64_t id, uint64_t inst, uint64_t param,
+                         int run_wm_create);
+void      w32_destroy_window(w32 *w, uint64_t hwnd);
+void      w32_set_window_text(w32 *w, uint64_t hwnd, const char *s);
+void      w32_get_window_text(w32 *w, uint64_t hwnd, char *out, size_t n);
+void      w32_register_control_class(const char *name);  /* InitCommonControls */
+uint32_t  w32_sys_color(int index);
+/* comctl32's subclass chain, which is really a property of the window */
+void      w32_window_subclass(w32 *w, uint64_t hwnd, uint64_t proc, uint64_t ref);
+void      w32_window_unsubclass(w32 *w, uint64_t hwnd, uint64_t proc);
+uint64_t  w32_window_defproc(w32 *w, uint64_t hwnd, uint32_t msg, uint64_t wp, uint64_t lp);
+
+/* gdi32, for user32 */
+uint64_t  w32_dc_for_window(w32 *w, uint64_t hwnd, int whole_window);
+void      w32_dc_release(uint64_t hdc);
+uint64_t  w32_stock_object(int index);
+uint64_t  w32_make_solid_brush(uint32_t colorref);
+uint64_t  w32_make_font(int height, const char *face);
+void      w32_gdi_fill_rect(uint64_t hdc, int l, int t, int r, int b, uint32_t colorref);
+void      w32_gdi_frame_rect(uint64_t hdc, int l, int t, int r, int b, uint32_t colorref);
+void      w32_gdi_line(uint64_t hdc, int x0, int y0, int x1, int y1, uint32_t colorref);
+int       w32_gdi_text_at(uint64_t hdc, int x, int y, const char *s, int len);
+void      w32_gdi_text_extent(uint64_t hdc, int len, int *cx, int *cy);
+int       w32_gdi_line_height(uint64_t hdc);
+uint32_t  w32_gdi_brush_color(uint64_t hbrush, int *is_null);
+void      w32_gdi_set_text_color(uint64_t hdc, uint32_t colorref);
+void      w32_gdi_set_bk_color(uint64_t hdc, uint32_t colorref);
+void      w32_gdi_set_bk_mode(uint64_t hdc, int mode);
+uint64_t  w32_gdi_set_font(uint64_t hdc, uint64_t hfont);
+void      w32_gdi_clip_to(uint64_t hdc, int l, int t, int r, int b);
+
+/* pe.c: the resource directory, which is where a dialog template lives */
+uint64_t  w32_find_resource(w32 *w, uint64_t module, uint64_t type, uint64_t name, int wide);
+uint64_t  w32_resource_data(w32 *w, uint64_t hrsrc, uint32_t *size);
+/* kernel32.c: a string out of the RT_STRING blocks, for user32's LoadString */
+int       w32_load_string(w32 *w, uint64_t inst, uint32_t id, char *out, size_t cap);
+/* comctl32.c: what a new run has to start without */
+void      w32_comctl32_reset(void);
+/* comctl32.c: the documented ordinal-only exports, by number */
+const char *w32_ordinal_name(const char *dll, int ordinal);
+/* winrun.c: give the host a moment while a modal loop waits for input */
+void      w32_host_idle(void);
 
 /* advapi32.c: the registry is persisted next to the guest's C: drive. Called
  * when a run ends so an installer's writes survive to the next launch. */

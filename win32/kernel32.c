@@ -1725,6 +1725,60 @@ static void k_WritePrivateProfileStringW(w32 *w) {
 
 static void k_GetCurrentProcessorNumber(w32 *w) { RET(0); }
 
+/* ------------------------------------------------------------- resources */
+
+/* A program's own data, compiled into it: dialog templates, strings, icons,
+ * and for an installer the compressed payload itself. FindResource returns
+ * the address of the directory's data entry -- which is what Windows returns
+ * too -- so Load and Lock have nothing left to do but hand it on, and
+ * SizeofResource reads the length out of the same entry.
+ *
+ * A resource named by an integer arrives as a value below 0x10000 rather
+ * than as a pointer, which is what MAKEINTRESOURCE does, so the argument is
+ * passed through untouched and the finder decides which it is. */
+static void k_FindResourceA(w32 *w) { RET(w32_find_resource(w, ARG(0), ARG(2), ARG(1), 0)); }
+static void k_FindResourceW(w32 *w) { RET(w32_find_resource(w, ARG(0), ARG(2), ARG(1), 1)); }
+static void k_FindResourceExA(w32 *w) { RET(w32_find_resource(w, ARG(0), ARG(1), ARG(2), 0)); }
+static void k_FindResourceExW(w32 *w) { RET(w32_find_resource(w, ARG(0), ARG(1), ARG(2), 1)); }
+static void k_LoadResource(w32 *w) { RET(w32_resource_data(w, ARG(1), 0)); }
+/* The resource is already mapped, so locking it is returning the pointer --
+ * and on Windows since 3.1 that is literally all LockResource does. */
+static void k_LockResource(w32 *w) { RET(ARG(0)); }
+static void k_FreeResource(w32 *w) { (void)w; RET(0); }
+static void k_SizeofResource(w32 *w) {
+    uint32_t n = 0;
+    if (w32_resource_data(w, ARG(1), &n)) { RET(n); return; }
+    RET(0);
+}
+/* A string resource is sixteen strings to a block, each a word of length
+ * followed by that many UTF-16 characters, and the block holding id N is
+ * (N / 16) + 1. Nothing about that is guessable from the API, which is why
+ * a program that loads its messages this way otherwise gets nothing. */
+int w32_load_string(w32 *w, uint64_t inst, uint32_t id, char *out, size_t cap) {
+    out[0] = 0;
+    uint64_t hr = w32_find_resource(w, inst, 6 /* RT_STRING */, (id / 16) + 1, 0);
+    if (!hr) return 0;
+    uint32_t size = 0;
+    uint64_t p = w32_resource_data(w, hr, &size);
+    if (!p) return 0;
+    uint64_t at = p, end = p + size;
+    for (uint32_t k = 0; k < 16; k++) {
+        if (at + 2 > end) return 0;
+        uint32_t len = (uint32_t)w32_read(w, at, 2);
+        at += 2;
+        if (k == (id % 16)) {
+            size_t n = 0;
+            for (uint32_t i = 0; i < len && at + 2 <= end && n + 1 < cap; i++, at += 2) {
+                uint32_t ch = (uint32_t)w32_read(w, at, 2);
+                out[n++] = ch < 128 ? (char)ch : '?';
+            }
+            out[n] = 0;
+            return (int)n;
+        }
+        at += (uint64_t)len * 2;
+    }
+    return 0;
+}
 #define F(n, a)        { #n, a, 0, k_##n, 0 }
 #define FN(n, a, impl) { #n, a, 0, impl, 0 }
 const w32_api w32_kernel32[] = {
@@ -1734,6 +1788,8 @@ const w32_api w32_kernel32[] = {
     FN(GetEnvironmentStrings, 0, k_GetEnvironmentStringsA), F(GetEnvironmentVariableA, 3), F(GetEnvironmentVariableW, 3),
     F(GetModuleHandleA, 1), F(GetModuleHandleW, 1), F(GetModuleHandleExW, 3), F(LoadLibraryA, 1), F(LoadLibraryW, 1), F(LoadLibraryExA, 3), F(LoadLibraryExW, 3),
     F(FreeLibrary, 1), F(GetProcAddress, 2), F(GetModuleFileNameA, 3), F(GetModuleFileNameW, 3),
+    F(FindResourceA, 3), F(FindResourceW, 3), F(FindResourceExA, 4), F(FindResourceExW, 4),
+    F(LoadResource, 2), F(LockResource, 1), F(FreeResource, 1), F(SizeofResource, 2),
     F(IsDebuggerPresent, 0), F(OutputDebugStringA, 1),
     F(GetSystemInfo, 1), F(GetNativeSystemInfo, 1), F(GetVersion, 0), F(GetVersionExA, 1), F(GetVersionExW, 1),
     F(GetTickCount, 0), F(GetTickCount64, 0), F(QueryPerformanceCounter, 1), F(QueryPerformanceFrequency, 1),

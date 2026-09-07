@@ -40,7 +40,7 @@ static inline uint16_t RD16(const void *p) { const uint8_t *b = p; return (uint1
 static inline uint32_t RD32(const void *p) { const uint8_t *b = p; return (uint32_t)(b[0] | b[1] << 8 | b[2] << 16 | (uint32_t)b[3] << 24); }
 static inline uint64_t RD64(const void *p) { const uint8_t *b = p; return (uint64_t)RD32(b) | (uint64_t)RD32(b + 4) << 32; }
 
-enum { DIR_EXPORT = 0, DIR_IMPORT = 1, DIR_RELOC = 5, DIR_TLS = 9 };
+enum { DIR_EXPORT = 0, DIR_IMPORT = 1, DIR_RESOURCE = 2, DIR_RELOC = 5, DIR_TLS = 9 };
 enum { DLL_PROCESS_ATTACH = 1 };
 
 typedef struct { uint32_t rva, size; } datadir;
@@ -169,6 +169,11 @@ uint64_t w32_load_library(w32 *w, const char *name) {
  * as a stub that reports itself if it is ever called). */
 uint64_t w32_import_addr(w32 *w, const char *dll, const char *name, int ordinal, int depth) {
     char lname[128]; mod_name(dll, lname, sizeof lname);
+    /* An import with no name is not anonymous: comctl32's InitCommonControls
+     * has been ordinal 17 since 1995, and an installer names the number. Turn
+     * the documented ones back into names before anything looks them up, so
+     * the lookup finds the implementation and the report reads like English. */
+    if (!name) { const char *o = w32_ordinal_name(lname, ordinal); if (o) name = o; }
     uint64_t h = w32_load_library(w, lname);
     w32_module *m = h ? w32_module_at(w, h) : 0;
     if (m) {
@@ -179,6 +184,104 @@ uint64_t w32_import_addr(w32 *w, const char *dll, const char *name, int ordinal,
     char buf[32];
     if (!name) { snprintf(buf, sizeof buf, "#%d", ordinal); name = buf; }
     return w32_stub_for(w, lname, name);
+}
+
+/* ------------------------------------------------------------- resources */
+
+/* The resource directory is three nested tables -- type, then name, then
+ * language -- and every offset in it is relative to the directory's own start
+ * rather than to the image. That is the detail that makes a hand-rolled
+ * walker go wrong, so `base` below is the directory, never the module.
+ *
+ * A leaf is an IMAGE_RESOURCE_DATA_ENTRY: { RVA, size, codepage, 0 }. Its
+ * address *is* the HRSRC that FindResource returns on Windows, which is why
+ * LoadResource and SizeofResource need nothing more than the handle.
+ */
+enum { RES_DIR_HDR = 16, RES_ENT = 8 };
+
+/* A directory entry's name matches `want`: an integer id when `want` is
+ * below 0x10000, otherwise the guest string it points at, compared without
+ * case as Windows does. */
+static int res_name_match(w32 *w, const uint8_t *base, uint32_t entry_name,
+                          uint64_t want, int wide, uint32_t dirsize) {
+    if (want < 0x10000) return !(entry_name & 0x80000000u) && entry_name == (uint32_t)want;
+    if (!(entry_name & 0x80000000u)) return 0;
+    uint32_t off = entry_name & 0x7FFFFFFFu;
+    if (off + 2 > dirsize) return 0;
+    uint32_t len = RD16(base + off);
+    if (off + 2 + len * 2u > dirsize || len > 512) return 0;
+    const uint16_t *nm = (const uint16_t *)(base + off + 2);
+    char host[513];
+    if (wide) w32_wtoa(w, want, host, sizeof host);
+    else snprintf(host, sizeof host, "%.512s", w32_str(w, want));
+    if (strlen(host) != len) return 0;
+    for (uint32_t i = 0; i < len; i++) {
+        int a = nm[i], b = (unsigned char)host[i];
+        if (a >= 'A' && a <= 'Z') a += 32;
+        if (b >= 'A' && b <= 'Z') b += 32;
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+/* One level: find the entry matching `want` and return its offset, with
+ * `*is_dir` saying whether it points at another table or at a leaf. `want`
+ * of 0 with `any` set takes the first entry, which is what the language
+ * level needs -- a program asks for a language it will not get, and the
+ * resource it wants is the only one there. */
+static int res_step(w32 *w, const uint8_t *base, uint32_t dirsize, uint32_t at,
+                    uint64_t want, int wide, int any, uint32_t *out, int *is_dir) {
+    if (at + RES_DIR_HDR > dirsize) return 0;
+    uint32_t named = RD16(base + at + 12), ids = RD16(base + at + 14);
+    uint32_t n = named + ids;
+    if (at + RES_DIR_HDR + n * (uint64_t)RES_ENT > dirsize) return 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t *e = base + at + RES_DIR_HDR + i * RES_ENT;
+        uint32_t nm = RD32(e), off = RD32(e + 4);
+        if (any || res_name_match(w, base, nm, want, wide, dirsize)) {
+            *is_dir = (off & 0x80000000u) != 0;
+            *out = off & 0x7FFFFFFFu;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* The IMAGE_RESOURCE_DATA_ENTRY for (type, name) in `module`, as a guest
+ * address, or 0. */
+uint64_t w32_find_resource(w32 *w, uint64_t module, uint64_t type, uint64_t name, int wide) {
+    w32_module *m = module ? w32_module_at(w, module) : 0;
+    if (!m && !module) for (int i = 0; i < w->nmods; i++) if (w->mods[i].is_exe) m = &w->mods[i];
+    if (!m || !m->res_rva) return 0;
+    const uint8_t *base = (const uint8_t *)W32P(w, m->base + m->res_rva);
+    if (!base) return 0;
+    uint32_t sz = m->res_size, at = 0;
+    int is_dir = 0;
+    if (!res_step(w, base, sz, at, type, wide, 0, &at, &is_dir) || !is_dir) return 0;
+    if (!res_step(w, base, sz, at, name, wide, 0, &at, &is_dir) || !is_dir) return 0;
+    /* Language: take whichever one is present. A template asks for
+     * MAKELANGID(LANG_NEUTRAL, ...) and the file holds one localised copy. */
+    if (!res_step(w, base, sz, at, 0, 0, 1, &at, &is_dir) || is_dir) return 0;
+    if (at + 16 > sz) return 0;
+    return m->base + m->res_rva + at;
+}
+
+/* The data behind a handle FindResource returned, and its size. */
+uint64_t w32_resource_data(w32 *w, uint64_t hrsrc, uint32_t *size) {
+    if (!hrsrc) return 0;
+    uint32_t rva = (uint32_t)w32_read(w, hrsrc, 4);
+    uint32_t len = (uint32_t)w32_read(w, hrsrc + 4, 4);
+    if (!rva) return 0;
+    /* The RVA is relative to whichever image the entry lives in. */
+    for (int i = 0; i < w->nmods; i++) {
+        w32_module *m = &w->mods[i];
+        if (hrsrc >= m->base && hrsrc < m->base + m->size) {
+            if (!in_image(m, rva, len)) return 0;
+            if (size) *size = len;
+            return m->base + rva;
+        }
+    }
+    return 0;
 }
 
 /* --------------------------------------------------------------- loading */
@@ -295,6 +398,9 @@ static int load_image(w32 *w, const char *path, const char *lname, int is_exe, w
     m->entry = entry_rva ? base + entry_rva : 0;
     if (dir[DIR_EXPORT].size && in_image(m, dir[DIR_EXPORT].rva, 40)) {
         m->exp_rva = dir[DIR_EXPORT].rva; m->exp_size = dir[DIR_EXPORT].size;
+    }
+    if (dir[DIR_RESOURCE].size && in_image(m, dir[DIR_RESOURCE].rva, 16)) {
+        m->res_rva = dir[DIR_RESOURCE].rva; m->res_size = dir[DIR_RESOURCE].size;
     }
     if (out) *out = m;
 

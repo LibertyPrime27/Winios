@@ -311,6 +311,10 @@ int wi_import_game(const char *src, const char *drive_c,
     { char stem[256]; stem_of(src, stem, sizeof stem); wi_safe_component(stem, want, sizeof want); }
     unique_dest(drive_c, want, name, sizeof name, dest, sizeof dest);
     snprintf(out->name, sizeof out->name, "%s", name);
+    /* A copied game is a folder at the top of the drive, so its path and its
+     * name are the same thing. An installed one need not be -- see the
+     * installer path below. */
+    snprintf(out->dir_rel, sizeof out->dir_rel, "%s", name);
 
     wi_probe_result p = wi_probe(src);
 
@@ -357,6 +361,7 @@ int wi_import_game(const char *src, const char *drive_c,
             wi_safe_component(only, want2, sizeof want2);
             unique_dest(drive_c, want2, name, sizeof name, dest, sizeof dest);
             snprintf(out->name, sizeof out->name, "%s", name);
+            snprintf(out->dir_rel, sizeof out->dir_rel, "%s", name);
             char inner[2400];
             snprintf(inner, sizeof inner, "%s/%s", stage, only);
             if (rename(inner, dest)) { addf(out, "could not move %s into place\n", only); return -1; }
@@ -417,9 +422,49 @@ typedef struct {
     wi_result *r;
     int n;
     int exes;
-    char deepest_exe_dir[1024];
+    char shallowest_exe_dir[1024];
     char lines[3072];
 } added_ctx;
+
+/* The folder a person would call "the game", given a folder that holds one of
+ * its executables.
+ *
+ * The two are often not the same. A setup program is entitled to install to
+ * C:\\Program Files\\Some Game and put the binary in a bin\\ or Binaries\\Win64\\
+ * below that -- so taking the executable's own directory would put "bin" in
+ * the library, pointing at a folder that is not the game, and the data beside
+ * it would be outside the entry.
+ *
+ * So climb, and stop at the first parent that is somewhere programs are kept
+ * rather than a program. Those names are a short, closed list -- they are the
+ * standard shell folders, and an installer that writes outside them is
+ * writing into its own directory, where the drive root ends the climb
+ * instead.
+ */
+static int is_container_dir(const char *name) {
+    static const char *CONTAINERS[] = {
+        "program files", "program files (x86)", "programdata", "users",
+        "windows", "games", "appdata", "local", "roaming", "documents",
+    };
+    for (size_t i = 0; i < sizeof CONTAINERS / sizeof CONTAINERS[0]; i++)
+        if (!strcasecmp(name, CONTAINERS[i])) return 1;
+    return 0;
+}
+
+static void install_root(const char *exe_dir, char *out, size_t n) {
+    snprintf(out, n, "%s", exe_dir);
+    for (;;) {
+        char *slash = strrchr(out, '/');
+        if (!slash) return;                   /* already directly under C:\ */
+        char parent[1024];
+        snprintf(parent, sizeof parent, "%.*s", (int)(slash - out), out);
+        const char *pname = base_of(parent);
+        /* The parent is a place programs live: this is the program. */
+        if (is_container_dir(pname)) return;
+        /* The parent is another folder of this program: keep climbing. */
+        snprintf(out, n, "%s", parent);
+    }
+}
 
 static int added_step(void *c, const char *rel, uint64_t size) {
     added_ctx *a = (added_ctx *)c;
@@ -434,8 +479,8 @@ static int added_step(void *c, const char *rel, uint64_t size) {
         char dir[1024]; snprintf(dir, sizeof dir, "%s", rel);
         char *slash = strrchr(dir, '/');
         if (slash) *slash = 0; else dir[0] = 0;
-        if (!a->deepest_exe_dir[0] || strlen(dir) < strlen(a->deepest_exe_dir))
-            snprintf(a->deepest_exe_dir, sizeof a->deepest_exe_dir, "%s", dir);
+        if (!a->shallowest_exe_dir[0] || strlen(dir) < strlen(a->shallowest_exe_dir))
+            snprintf(a->shallowest_exe_dir, sizeof a->shallowest_exe_dir, "%s", dir);
     }
     if (a->n <= 40) {
         size_t used = strlen(a->lines);
@@ -447,7 +492,7 @@ static int added_step(void *c, const char *rel, uint64_t size) {
 }
 
 int wi_import_installer(const char *setup, const char *drive_c,
-                        wi_runner run, int keep_going, int timeout_s,
+                        wi_runner run, int visible, int keep_going, int timeout_s,
                         wi_progress cb, void *ctx, wi_result *out) {
     memset(out, 0, sizeof *out);
     out->is32 = -1;
@@ -503,9 +548,14 @@ int wi_import_installer(const char *setup, const char *drive_c,
 
     w32_drive_init();
 
-    if (!p.setup.silent_supported)
+    if (!visible && !p.setup.silent_supported)
         addf(out, "\nRunning it anyway, because the alternative is not trying -- but "
                   "this family is not expected to finish here.\n");
+    if (visible)
+        addf(out, "\nRunning it with its own screens, so you choose where it goes.\n"
+                  "Wherever that turns out to be, it is found afterwards by looking "
+                  "at what appeared on the drive rather than by trusting the "
+                  "directory it was offered.\n");
 
     /* Before. */
     if (cb) cb(ctx, "looking at the drive", 0, 0);
@@ -515,7 +565,10 @@ int wi_import_installer(const char *setup, const char *drive_c,
      * flags with the destination substituted in. */
     const char *sargs[SK_MAX_ARGS];
     char scratch[SK_MAX_ARGS * 1024];
-    int ns = sk_silent_argv(&p.setup, win_dir, sargs, scratch, sizeof scratch);
+    /* A visible run gets no arguments at all. Its silent flags are exactly
+     * what suppress the screens we are running it for, and half of them also
+     * fix the destination -- which is the choice we are handing back. */
+    int ns = visible ? 0 : sk_silent_argv(&p.setup, win_dir, sargs, scratch, sizeof scratch);
 
     char *argv[SK_MAX_ARGS + 10];
     char tbuf[32];
@@ -535,7 +588,7 @@ int wi_import_installer(const char *setup, const char *drive_c,
     for (int i = 5; i < argc; i++) addf(out, " %s", i == 5 ? base_of(argv[i]) : argv[i]);
     addf(out, "\n");
 
-    if (cb) cb(ctx, "installing", 0, 0);
+    if (cb) cb(ctx, visible ? "waiting for the installer" : "installing", 0, 0);
     int rc = run(argc, argv);
     addf(out, "The installer exited %d.\n", rc);
 
@@ -548,9 +601,14 @@ int wi_import_installer(const char *setup, const char *drive_c,
 
     out->files = a.n;
     if (a.n == 0) {
-        addf(out, "\nNothing new appeared on the drive, so nothing was installed.\n"
-                  "The run report above lists what it called that is not implemented "
-                  "here -- that list is the reason, and it is the work.\n");
+        addf(out, "\nNothing new appeared on the drive, so nothing was installed.\n");
+        if (visible)
+            addf(out, "If you cancelled it, that is why. If you did not get as far as "
+                      "a screen you could answer, the run report above lists what it "
+                      "called that is not implemented here.\n");
+        else
+            addf(out, "The run report above lists what it called that is not implemented "
+                      "here -- that list is the reason, and it is the work.\n");
         return -1;
     }
 
@@ -567,22 +625,31 @@ int wi_import_installer(const char *setup, const char *drive_c,
     }
 
     /* Where to look for the program. The directory it was told to use, if it
-     * honoured it; otherwise wherever the executables actually landed. */
+     * honoured it; otherwise wherever the executables actually landed. A
+     * visible install almost always takes the second path, because the
+     * destination was the person's to choose and they were not obliged to
+     * choose ours. */
     char entry[2048];
     struct stat st;
     if (stat(dest, &st) == 0 && S_ISDIR(st.st_mode)) {
         snprintf(entry, sizeof entry, "%s", dest);
-    } else if (a.deepest_exe_dir[0]) {
-        snprintf(entry, sizeof entry, "%s/%s", drive_c, a.deepest_exe_dir);
-        /* The entry name has to match where the files are, or the library
-         * would point at a folder that does not exist. */
-        const char *b = base_of(a.deepest_exe_dir);
+        snprintf(out->dir_rel, sizeof out->dir_rel, "%s", name);
+    } else if (a.shallowest_exe_dir[0]) {
+        char root[1024];
+        install_root(a.shallowest_exe_dir, root, sizeof root);
+        snprintf(entry, sizeof entry, "%s/%s", drive_c, root);
+        snprintf(out->dir_rel, sizeof out->dir_rel, "%s", root);
+        /* The entry is named after the folder the program is in, but it is
+         * *found* through dir_rel: an installer that went to Program Files
+         * leaves a folder whose name is the game and whose path is not. */
+        const char *b = base_of(root);
         snprintf(out->name, sizeof out->name, "%.*s",
                  (int)sizeof out->name - 1, b && *b ? b : name);
-        addf(out, "\nIt ignored the directory it was given and installed to %s instead.\n",
-             a.deepest_exe_dir);
+        addf(out, "\nIt installed to %s, so that is what has been added to your "
+                  "library as \"%s\".\n", root, out->name);
     } else {
         snprintf(entry, sizeof entry, "%s", drive_c);
+        snprintf(out->dir_rel, sizeof out->dir_rel, "%s", name);
     }
 
     pick_exe(out, drive_c, entry);

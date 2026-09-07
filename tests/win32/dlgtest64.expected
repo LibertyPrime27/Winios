@@ -1,0 +1,52 @@
+ok   a plain window can be created
+ok   GetDC gives a device context
+ok   FillRect fills
+ok   TextOut draws
+ok   text has a measurable size
+ok   DrawText with DT_WORDBREAK used more than one line
+ok   the font has metrics
+ok   the display is 32 bits per pixel
+ok   LineTo draws
+ok   WM_INITDIALOG carries the DialogBoxParam parameter
+ok   GetDlgItem finds the edit control
+ok   GetDlgItem finds the progress bar
+ok   GetDlgItem finds the default button
+ok   GetDlgItem returns NULL for an id that is not there
+ok   GetDlgCtrlID gives the id back
+ok   the dialog's caption came from the template
+ok   a control's text came from the template
+ok   SetDlgItemText round-trips
+ok   the progress bar keeps its position
+ok   a check box checks
+ok   MapDialogRect converts dialog units to pixels
+ok   the dialog is the size its template asked for
+ok   the button reported BN_CLICKED
+ok   the notification named the button
+ok   DialogBoxParam returned what EndDialog was given
+25 checks, 0 failures
+
+screen 640x400 1 frames crc fc422e00
+|................................................................|
+|................................................................|
+|................................................................|
+|................................................................|
+|.........:-::::---::::::::::::::::::::::::::::::::::::..........|
+|.........=++++++++++++++++++++++++++++++++++++++++++++=.........|
+|.........*%####*###########*##%%%%%%%%%%%%%%%%%%%%%%%%+.........|
+|.........*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%+.........|
+|.........*%########*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%+.........|
+|.........*%#%#%%%#%%#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%+.........|
+|.........*%%%%###%%%#%#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%+.........|
+|.........*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%+.........|
+|.........*%#%########*##*##%%%%%%%%%%%%%%%%%%%%%%%%%%%+.........|
+|.........*%#########################%%%%%%%%%%%%%%%%%%+.........|
+|.........*%+========================%%%%%%%%%%%%%%%%#%+.........|
+|.........*%#######%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%+.........|
+|.........*%%#%#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%+.........|
+|.........*%%%%%%%%%%%%%%%%%%%%%%%%#########%%%%%%%%%%%+.........|
+|.........*%%%%%%%%%%%%%%%%%%%%%%%#%%####%%#%%%#*##%%#%+.........|
+|.........+############################################+.........|
+|................................................................|
+|................................................................|
+|................................................................|
+|................................................................|

@@ -68,5 +68,46 @@ for bits in 32 64; do
     rm -rf "$drive"
 done
 
+# --- and the same installer, run the way a person sees it ---------------------
+#
+# No silent flags: fakesetup puts up its own dialog out of its own resources,
+# and installs where the dialog says rather than where we asked. Nobody clicks
+# it here -- it clicks its own Install button -- so what this checks is that
+# the template was found and walked, the controls were made, the dialog was
+# drawn, and a click came back as a WM_COMMAND. A finger on the glass is the
+# one part a test cannot supply.
+#
+# The destination is deliberately awkward: Program Files\Fake Game NN\bin. An
+# importer that named the library entry after the folder holding the .exe would
+# call it "bin", and one that assumed the folder sits at the top of the drive
+# would point at nothing. Both are the failure a person would report as "it
+# installed and then vanished".
+for bits in 32 64; do
+    setup="$guests/fakesetup$bits.exe"
+    [ -f "$setup" ] || continue
+    drive="$scratch/v$bits"
+    rm -rf "$drive"; mkdir -p "$drive"
+
+    out=$("$wimport" install "$setup" "$drive" -visible -t 120 2>&1) || true
+    checkv() {
+        if printf '%s\n' "$out" | grep -qF "$2"; then echo "ok   $bits-bit visible: $1"
+        else echo "FAIL $bits-bit visible: $1"; fail=1
+             printf '%s\n' "$out" | tail -25 | sed 's/^/  | /'; fi
+    }
+    checkv "it was run with no arguments"    "Running: fakesetup$bits.exe"
+    checkv "the dialog chose the destination" "visible: installing to C:\\Program Files\\Fake Game $bits\\bin"
+    checkv "the install was found"           "Program Files/Fake Game $bits/bin/FakeGame.exe"
+    checkv "the entry is named after the game, not the bin folder" \
+                                             'added to your library as "Fake Game '"$bits"'"'
+    checkv "and it runs the executable below it" "Will run: bin/FakeGame.exe"
+
+    if [ -f "$drive/Program Files/Fake Game $bits/bin/FakeGame.exe" ]; then
+        echo "ok   $bits-bit visible: the installed executable is on the drive"
+    else
+        echo "FAIL $bits-bit visible: nothing was installed"; fail=1
+    fi
+    rm -rf "$drive"
+done
+
 rmdir "$scratch" 2>/dev/null || true
 exit $fail

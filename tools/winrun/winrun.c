@@ -247,6 +247,15 @@ void w32_wtoa(w32 *w, uint64_t wp, char *out, size_t n) {
     if (s) for (; s[i] && i + 1 < n; i++) out[i] = s[i] < 128 ? (char)s[i] : '?';
     out[i] = 0;
 }
+/* The same, but for a string given as a pointer and a count -- which is how
+ * every drawing call takes one, because text on screen is a run, not
+ * necessarily a whole C string. A negative count means "to the terminator". */
+void w32_wtoa_n(w32 *w, uint64_t wp, int chars, char *out, size_t n) {
+    const uint16_t *s = W32P(w, wp); size_t i = 0;
+    if (s) for (; (chars < 0 ? s[i] != 0 : i < (size_t)chars) && i + 1 < n; i++)
+        out[i] = s[i] && s[i] < 128 ? (char)s[i] : s[i] ? '?' : ' ';
+    out[i] = 0;
+}
 uint64_t w32_read(w32 *w, uint64_t addr, int bytes) {
     uint64_t v = 0; const void *p = W32P(w, addr);
     if (p) memcpy(&v, p, bytes);
@@ -257,6 +266,14 @@ void w32_write(w32 *w, uint64_t addr, int bytes, uint64_t v) {
     if (p) memcpy(p, &v, bytes);
 }
 uint64_t w32_ptrsize(w32 *w) { return w->is32 ? 4 : 8; }
+
+/* A modal loop with an empty queue would otherwise spin a core flat while it
+ * waits for the next tap. A millisecond is short enough that a click still
+ * feels immediate and long enough that the loop costs nothing. */
+void w32_host_idle(void) {
+    struct timespec ts = { 0, 1000000 };
+    nanosleep(&ts, 0);
+}
 
 /* --------------------------------------------------- calling convention */
 
@@ -371,6 +388,10 @@ static const w32_dll g_dlls[] = {
     { "xinput9_1_0.dll", { w32_xinput },                                  0 },
     { "d3d9.dll",     { w32_d3d9 },                                       0 },
     { "advapi32.dll", { w32_advapi32 },                                   0 },
+    /* Where an installer's user interface comes from: gdi32 draws it and
+     * comctl32 is what it calls first. */
+    { "gdi32.dll",    { w32_gdi32 },                                      0 },
+    { "comctl32.dll", { w32_comctl32 },                                   0 },
 };
 enum { NDLLS = sizeof g_dlls / sizeof g_dlls[0], STUB_RETURN = 0, STUB_EXIT = 1, STUB_FIRST = 2 };
 
@@ -824,6 +845,8 @@ static void on_crash(int sig, siginfo_t *si, void *uctx) {
  * button is tapped again. The block cache must go too: a second executable
  * maps its own code at the same guest addresses (0x400000 for a PE32), and a
  * stale compiled block there would run the previous program's instructions. */
+static void present_hook(void *ctx, const void *px, int w, int h, int pitch);
+
 static void winrun_reset(void) {
     if (g_w.is32 && g_w.base) munmap(g_w.base, 1ull << 32);
     for (int i = 0; i < g_nmaps; i++) munmap(g_maps[i].p, g_maps[i].n);
@@ -842,7 +865,18 @@ static void winrun_reset(void) {
     w32_xinput_reset();
     w32_thread_reset();
     g_nscript = 0; g_frame = 0;
-    if (g_hook_on) { w32_set_present(g_next_present, g_next_present_ctx); g_hook_on = 0; }
+    /* Undo *our* hook, not whoever's is there. When winrun is a library --
+     * which it is inside the app -- the embedder installs the present
+     * callback that puts frames on the screen before it calls in, and
+     * overwriting that here detaches the display for the rest of the run.
+     * It survives the second run and not the first, which is the kind of
+     * bug that gets blamed on the guest. */
+    if (g_hook_on) {
+        void *cur_ctx = 0;
+        if (w32_get_present(&cur_ctx) == present_hook)
+            w32_set_present(g_next_present, g_next_present_ctx);
+        g_hook_on = 0;
+    }
     g_next_present = 0; g_next_present_ctx = 0;
     w32_com_reset();
     w32_d3d9_reset();
@@ -1176,6 +1210,109 @@ static int survey(const char *root) {
     return 0;
 }
 
+/* What is on the screen, in two forms.
+ *
+ * The checksum is the machine's answer: the same guest drawing the same
+ * dialog produces the same 32 bits on an x86 runner, under qemu on aarch64,
+ * and on a phone -- every pixel is integer arithmetic, deliberately, so a
+ * difference is a bug and not a rounding.
+ *
+ * The thumbnail is the person's answer. A checksum that changes tells you
+ * something moved; a picture tells you what. It is worth the twenty lines.
+ */
+static uint32_t crc32_of(const void *data, size_t n) {
+    static uint32_t tab[256];
+    static int ready;
+    if (!ready) {
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            tab[i] = c;
+        }
+        ready = 1;
+    }
+    const uint8_t *p = data;
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++) c = tab[(c ^ p[i]) & 0xFF] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+
+/* Frames as the app would receive them, not as the surface happens to look
+ * at exit. The difference matters: by the time a program returns from its
+ * dialog the dialog has been destroyed and the screen is empty, so dumping
+ * the surface would prove only that the last thing drawn was nothing. This
+ * hook is the same one the iOS view attaches, so a frame counted here is a
+ * frame that would have reached the display. */
+static uint32_t *g_last_frame;
+static int g_last_w, g_last_h, g_frames;
+
+static void keep_frame(void *ctx, const void *pixels, int width, int height, int pitch) {
+    (void)ctx;
+    if (width <= 0 || height <= 0) return;
+    if (!g_last_frame || g_last_w != width || g_last_h != height) {
+        free(g_last_frame);
+        g_last_frame = malloc((size_t)width * height * 4);
+        if (!g_last_frame) { g_last_w = g_last_h = 0; return; }
+        g_last_w = width; g_last_h = height;
+    }
+    for (int y = 0; y < height; y++)
+        memcpy(g_last_frame + (size_t)y * width, (const uint8_t *)pixels + (size_t)y * pitch,
+               (size_t)width * 4);
+    g_frames++;
+}
+
+static void dump_frame(w32 *w) {
+    (void)w;
+    int cx = g_last_w, cy = g_last_h;
+    const uint32_t *bits = g_last_frame;
+    if (!bits || cx <= 0 || cy <= 0) { printf("\nscreen: nothing drawn\n"); return; }
+    printf("\nscreen %dx%d %d frames crc %08x\n", cx, cy, g_frames,
+           crc32_of(bits, (size_t)cx * cy * 4));
+
+    /* The full image, when someone wants to look at it rather than at a
+     * checksum. PPM because it is six lines of code and every viewer opens
+     * it; this is a debugging affordance, not a feature. */
+    const char *ppm = getenv("WINRUN_FRAME_PPM");
+    if (ppm) {
+        FILE *f = fopen(ppm, "wb");
+        if (f) {
+            fprintf(f, "P6\n%d %d\n255\n", cx, cy);
+            for (size_t i = 0; i < (size_t)cx * cy; i++) {
+                uint8_t rgb[3] = { (uint8_t)(bits[i] >> 16), (uint8_t)(bits[i] >> 8), (uint8_t)bits[i] };
+                fwrite(rgb, 1, 3, f);
+            }
+            fclose(f);
+        } else perror(ppm);
+    }
+
+    /* Average each cell and pick a character by brightness, darkest first.
+     * The ramp is short on purpose: more levels make the picture noisier,
+     * not clearer, at this size. */
+    static const char RAMP[] = " .:-=+*#%@";
+    enum { TW = 64, TH = 24 };
+    for (int ty = 0; ty < TH; ty++) {
+        char row[TW + 1];
+        for (int tx = 0; tx < TW; tx++) {
+            int x0 = tx * cx / TW, x1 = (tx + 1) * cx / TW;
+            int y0 = ty * cy / TH, y1 = (ty + 1) * cy / TH;
+            if (x1 <= x0) x1 = x0 + 1;
+            if (y1 <= y0) y1 = y0 + 1;
+            uint64_t sum = 0, n = 0;
+            for (int y = y0; y < y1 && y < cy; y++)
+                for (int x = x0; x < x1 && x < cx; x++) {
+                    uint32_t p = bits[(size_t)y * cx + x];
+                    /* Rec. 601 luma in integers: 299/587/114 per thousand. */
+                    sum += (299u * ((p >> 16) & 0xFF) + 587u * ((p >> 8) & 0xFF) + 114u * (p & 0xFF)) / 1000u;
+                    n++;
+                }
+            unsigned v = n ? (unsigned)(sum / n) : 0;
+            row[tx] = RAMP[v * (sizeof RAMP - 2) / 255];
+        }
+        row[TW] = 0;
+        printf("|%s|\n", row);
+    }
+}
+
 static void report_imports(w32 *w) {
     printf("%s: %d-bit\n", w->exe_path, w->is32 ? 32 : 64);
     printf("\nmodules loaded:\n");
@@ -1304,18 +1441,23 @@ int winrun_main(int argc, char **argv) {
               } }
             ai++;
         }
+        /* Dump what was drawn. A program cannot see its own pixels, so a
+         * test that says "the dialog was drawn" is only worth something if
+         * something outside it looks -- and a checksum plus a thumbnail is
+         * both machine-checkable and legible to a person reading a diff. */
+        else if (!strcmp(argv[ai], "-frame")) { w->dump_frame = 1; w32_set_present(keep_frame, 0); }
         else if (!strcmp(argv[ai], "-L") && ai + 1 < argc) {       /* extra directory to find guest DLLs in */
             static char dir[512];
             snprintf(dir, sizeof dir, "%s%s", argv[ai + 1], argv[ai + 1][strlen(argv[ai + 1]) - 1] == '/' ? "" : "/");
             w->dll_dir = dir; ai++;
         }
         else { fprintf(stderr, "usage: winrun [-v] [-imports] [-survey dir] [-k] [-t seconds]\n"
-                          "              [-C drive_c] [-L dlldir] [-input script] [-screen WxH]\n"
+                          "              [-C drive_c] [-L dlldir] [-input script] [-screen WxH] [-frame]\n"
                           "              program.exe [args...]\n"); return 2; }
         ai++;
     }
     if (ai >= argc) { fprintf(stderr, "usage: winrun [-v] [-imports] [-survey dir] [-k] [-t seconds]\n"
-                                      "              [-C drive_c] [-L dlldir] [-input script] [-screen WxH]\n"
+                                      "              [-C drive_c] [-L dlldir] [-input script] [-screen WxH] [-frame]\n"
                           "              program.exe [args...]\n"); return 2; }
     w->exe_path = argv[ai];
 
@@ -1423,6 +1565,7 @@ int winrun_main(int argc, char **argv) {
                             (unsigned long long)c->rip, (unsigned long long)c->gpr[XC_RSP], (unsigned long long)w32_self()->teb, (unsigned long long)w->peb);
     int code = w32_run(w);
     w32_guest_unlock();
+    if (w->dump_frame) dump_frame(w);
     fflush(stdout);
     /* A report whenever there is something to report: an abnormal end, or a
      * clean one that leaned on functions we do not have. */

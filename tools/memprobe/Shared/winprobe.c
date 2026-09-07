@@ -176,14 +176,14 @@ void win_probe_cancel_import(void) {
 
 typedef struct {
     const char *src, *drive_c;
-    int installer, keep_going, timeout_s;
+    int installer, visible, keep_going, timeout_s;
     wi_result *out;
 } import_args;
 
 static int call_import(void *ctx) {
     import_args *a = (import_args *)ctx;
     if (a->installer)
-        return wi_import_installer(a->src, a->drive_c, winrun_main,
+        return wi_import_installer(a->src, a->drive_c, winrun_main, a->visible,
                                    a->keep_going, a->timeout_s, import_progress, 0, a->out);
     return wi_import_game(a->src, a->drive_c, import_progress, 0, a->out);
 }
@@ -196,9 +196,10 @@ static void put(char *dst, size_t n, const char *src) {
 }
 
 int win_probe_import(const char *src, const char *drive_c, int installer,
-                     int keep_going, int timeout_s,
+                     int visible, int keep_going, int timeout_s,
                      char *detail, size_t detail_len,
                      char *name, size_t name_len,
+                     char *dir_rel, size_t dir_rel_len,
                      char *exe_rel, size_t exe_rel_len,
                      char *dll_dir, size_t dll_dir_len,
                      int *is32, int *files, int *exes) {
@@ -214,7 +215,15 @@ int win_probe_import(const char *src, const char *drive_c, int installer,
     pthread_mutex_unlock(&g_prog_lock);
     prog_set("starting", 0, 0);
 
-    import_args a = { src, drive_c, installer, keep_going, timeout_s, r };
+    import_args a = { src, drive_c, installer, visible, keep_going, timeout_s, r };
+    /* A visible install draws, so its frames have to reach the app the same
+     * way a game's do -- otherwise the installer is up on a screen nobody can
+     * see and the person is looking at a spinner. */
+    if (visible) {
+        g_fw = g_fh = 0;
+        w32_d3d9_device_lost(0);
+        w32_set_present(grab_frame, 0);
+    }
     char *guest = (char *)malloc(128 * 1024);
     int rc = with_capture(call_import, &a, guest, guest ? 128 * 1024 : 0);
 
@@ -239,6 +248,7 @@ int win_probe_import(const char *src, const char *drive_c, int installer,
 
     prog_set("", 0, 0);
     put(name, name_len, r->name);
+    put(dir_rel, dir_rel_len, r->dir_rel);
     put(exe_rel, exe_rel_len, r->exe_rel);
     put(dll_dir, dll_dir_len, r->dll_dir);
     if (is32)  *is32  = r->is32;

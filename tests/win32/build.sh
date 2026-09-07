@@ -23,6 +23,14 @@ for a in 32 64; do
     $CC -O2 -s -DSUBDLL=\"sub$a.dll\" -DLATEDLL=\"late$a.dll\" \
         -o dlltest$a.exe dlltest.c -L. -l:libmid$a.a -l:libsub$a.a
     rm -f dlllate$a.def libsub$a.a libmid$a.a
+    # A dialog with a real resource. windres compiles the .rc into an
+    # RT_DIALOG the loader has to walk -- writing the template by hand in C
+    # would test the parser against our own idea of the format rather than
+    # against what a resource compiler emits.
+    [ $a = 32 ] && RC=i686-w64-mingw32-windres || RC=x86_64-w64-mingw32-windres
+    $RC dlgtest.rc dlgres$a.o
+    $CC -O2 -s -o dlgtest$a.exe dlgtest.c dlgres$a.o -lgdi32 -lcomctl32 -luser32
+    rm -f dlgres$a.o
     # Direct3D 9 through d3d9.dll: COM vtables in guest memory
     $CC -O2 -s -o d3dtest$a.exe  d3dtest.c  -ld3d9
     $CC -O2 -s -o d3dframe$a.exe d3dframe.c -ld3d9
@@ -56,7 +64,9 @@ for a in 32 64; do
     # flags the Inno Setup family takes. Not in the guest suite: it is driven
     # by tests/import/install.sh through wimport, which is what exercises the
     # detection and the flag table as well as the run.
-    $CC -O2 -s -o fakesetup$a.exe fakesetup.c -ladvapi32 -lshell32
+    $RC fakesetup.rc fakesetupres$a.o
+    $CC -O2 -s -o fakesetup$a.exe fakesetup.c fakesetupres$a.o -ladvapi32 -lshell32 -lole32 -lcomctl32 -luser32
+    rm -f fakesetupres$a.o
 done
 
 # Not run by the suite: it calls things we do not implement, on purpose.

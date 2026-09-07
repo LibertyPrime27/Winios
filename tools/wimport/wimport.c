@@ -40,8 +40,9 @@ static int usage(void) {
         "usage: wimport <command> [args]\n"
         "  probe   <path>                     what is this: a game, an archive, or a setup?\n"
         "  game    <src> <drive_c>            import a folder, zip or .exe as a program\n"
-        "  install <setup> <drive_c> [-k] [-t s]\n"
-        "                                     run a setup program silently and keep what it makes\n"
+        "  install <setup> <drive_c> [-visible] [-k] [-t s]\n"
+        "                                     run a setup program and keep what it makes;\n"
+        "                                     -visible draws its screens instead of going silent\n"
         "  unzip   <archive> <dir>            just extract (works on a self-extracting .exe)\n"
         "  exes    <dir> [name]               rank the executables in a folder\n"
         "  space   <src> <drive_c>            how much room an import would need\n");
@@ -114,14 +115,19 @@ int main(int argc, char **argv) {
 
     if (!strcmp(cmd, "install")) {
         if (argc < 4) return usage();
-        int keep = 0, timeout = 300;
+        int keep = 0, timeout = 300, visible = WI_SILENT;
         for (int i = 4; i < argc; i++) {
             if (!strcmp(argv[i], "-k")) keep = 1;
+            /* Run it the way a person would see it, rather than in its own
+             * silent mode. Off the device this mostly proves the run reaches
+             * the installer's first screen; on the device it is how a person
+             * answers one. */
+            else if (!strcmp(argv[i], "-visible")) visible = WI_VISIBLE;
             else if (!strcmp(argv[i], "-t") && i + 1 < argc) timeout = atoi(argv[++i]);
             else return usage();
         }
         wi_result r;
-        int rc = wi_import_installer(argv[2], argv[3], winrun_main, keep, timeout, spinner, 0, &r);
+        int rc = wi_import_installer(argv[2], argv[3], winrun_main, visible, keep, timeout, spinner, 0, &r);
         spinner_done();
         fputs(r.detail, stdout);
         if (rc == 0) printf("\nlibrary entry: %s\n  run: %s\n  dlls: %s\n", r.name, r.exe_host, r.dll_dir);

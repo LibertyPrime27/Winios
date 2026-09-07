@@ -11,6 +11,7 @@ queued by window creation:
   WM_ACTIVATEAPP
   WM_ACTIVATE
   WM_SETFOCUS
+  WM_PAINT
 WndProc saw WM_SIZE 1, WM_ACTIVATE 1
   wndproc: WM_SIZE to 640x480
 

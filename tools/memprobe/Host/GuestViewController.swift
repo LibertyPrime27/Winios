@@ -38,13 +38,41 @@ final class GuestViewController: UIViewController {
     private var started = CFAbsoluteTimeGetCurrent()
     private var output = ""
 
+    /// True when this screen only *shows* a guest somebody else started.
+    /// A visible install is that case: the run belongs to the importer, which
+    /// has to look at the drive before and after it, so this screen cannot be
+    /// the thing that starts it.
+    private let watching: Bool
+    /// What Close should do when the run is not ours to end.
+    private var onClose: (() -> Void)?
+
     init(exe: String, root: URL? = nil, dllDir: String? = nil) {
         self.exeName = exe
         self.root = root
         self.dllDir = dllDir
+        self.watching = false
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    /// Show whatever the guest draws, without starting one. The owner runs
+    /// the guest and calls `finished` when it is over.
+    init(watching title: String, onClose: (() -> Void)? = nil) {
+        self.exeName = title
+        self.root = nil
+        self.dllDir = nil
+        self.watching = true
+        self.onClose = onClose
         super.init(nibName: nil, bundle: nil)
     }
     required init?(coder: NSCoder) { fatalError("not used") }
+
+    /// The owner's run has ended. Stops the display link and leaves the last
+    /// frame up; the owner dismisses when it has said what happened.
+    func finished(_ summary: String) {
+        link?.invalidate(); link = nil
+        running = false
+        hud.text = summary
+    }
 
     /// A running guest gets the whole screen, the long way round. A Windows
     /// game draws a 16:9 or 4:3 picture and there is nothing to be gained
@@ -115,6 +143,10 @@ final class GuestViewController: UIViewController {
         l.add(to: .main, forMode: .common)
         link = l
 
+        // Watching only: the frames are already on their way from somebody
+        // else's run, and starting one here would be a second guest.
+        if watching { hud.text = "\(exeName)…"; return }
+
         guard let dir = root ?? Bundle.main.resourceURL?.appendingPathComponent("win32") else {
             hud.text = "guests not bundled"
             return
@@ -160,6 +192,15 @@ final class GuestViewController: UIViewController {
     }
 
     @objc private func closeTapped() {
+        // When the run is somebody else's, stopping it is all this button
+        // does: the owner is still going to look at what it left behind and
+        // has to be the one to take the screen down.
+        if watching {
+            hud.text = "Stopping…"
+            onClose?()
+            win_probe_request_stop()
+            return
+        }
         win_probe_request_stop()          // the guest exits on its next Present
         dismiss(animated: true)
     }

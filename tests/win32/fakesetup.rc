@@ -1,0 +1,16 @@
+/* The wizard page fakesetup puts up when it is not given silent flags. Same
+ * shape as any installer's: a destination the person can change, a status
+ * line, and Install / Cancel. */
+#include <windows.h>
+
+100 DIALOGEX 0, 0, 240, 110
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Fake Game Setup"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    LTEXT           "Install &to:", 200, 10, 12, 60, 10
+    EDITTEXT        201, 10, 24, 220, 14, ES_AUTOHSCROLL
+    LTEXT           "", 202, 10, 48, 220, 12
+    DEFPUSHBUTTON   "&Install", IDOK, 120, 86, 52, 16
+    PUSHBUTTON      "Cancel", IDCANCEL, 178, 86, 52, 16
+END

@@ -119,6 +119,89 @@ static int test_input(const char *dir) {
     return bad;
 }
 
+/* A dialog drawn from the guest's own resources, and the frame it produced.
+ *
+ * This one is here rather than only in the shell suite because it is the
+ * device path: the app links this library, and what reaches the screen on a
+ * phone is a frame handed to a present callback. So the callback is attached
+ * here too, and what is checked is the checksum of the frame that arrived --
+ * not the surface at exit, which by then is empty because the dialog has been
+ * destroyed.
+ *
+ * The pixels are integer arithmetic throughout, so the checksum is the same
+ * on an x86 runner, under qemu on aarch64, and on an iPad. A difference is a
+ * bug rather than a rounding, which is the only reason a checksum is worth
+ * asserting at all. */
+static uint32_t g_frame_crc;
+static int g_frame_count, g_frame_w, g_frame_h;
+
+static uint32_t crc32_frame(const void *data, size_t n) {
+    static uint32_t tab[256];
+    static int ready;
+    if (!ready) {
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            tab[i] = c;
+        }
+        ready = 1;
+    }
+    const uint8_t *p = (const uint8_t *)data;
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++) c = tab[(c ^ p[i]) & 0xFF] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+
+static void dlg_present(void *ctx, const void *pixels, int width, int height, int pitch) {
+    (void)ctx;
+    if (width <= 0 || height <= 0) return;
+    /* Row by row, because a frame's pitch need not be its width. */
+    uint32_t c = 0;
+    for (int y = 0; y < height; y++)
+        c ^= crc32_frame((const uint8_t *)pixels + (size_t)y * pitch, (size_t)width * 4) + (uint32_t)y;
+    g_frame_crc = c;
+    g_frame_w = width; g_frame_h = height;
+    g_frame_count++;
+}
+
+static int test_dialog(const char *dir) {
+    char path[512];
+    int bad = 0;
+    for (int b = 0; b < 2; b++) {
+        snprintf(path, sizeof path, "%s/dlgtest%s.exe", dir, b ? "64" : "32");
+        g_frame_crc = 0; g_frame_count = 0; g_frame_w = g_frame_h = 0;
+        w32_set_screen_size(640, 400);
+        w32_set_present(dlg_present, 0);
+        char *av[4] = { (char *)"winrun", (char *)"-screen", (char *)"640x400", path };
+        fflush(stdout);
+        int rc = winrun_main(4, av);
+        fflush(stdout);
+        w32_set_present(0, 0);
+        if (rc != 0) { printf("FAIL dlgtest%s exited %d, want 0\n", b ? "64" : "32", rc); bad++; continue; }
+        if (g_frame_count < 1) {
+            printf("FAIL dlgtest%s drew a dialog but no frame reached the display\n", b ? "64" : "32");
+            bad++; continue;
+        }
+        if (g_frame_w != 640 || g_frame_h != 400) {
+            printf("FAIL dlgtest%s presented %dx%d, want 640x400\n", b ? "64" : "32", g_frame_w, g_frame_h);
+            bad++; continue;
+        }
+        /* Both bitnesses draw the same dialog from the same template, so they
+         * have to produce the same picture. Comparing them against each other
+         * rather than against a recorded number keeps the check meaningful
+         * when the font or a control's look is deliberately changed. */
+        static uint32_t first;
+        if (b == 0) first = g_frame_crc;
+        else if (g_frame_crc != first) {
+            printf("FAIL dlgtest: 32- and 64-bit drew different pixels (%08x vs %08x)\n",
+                   first, g_frame_crc);
+            bad++;
+        }
+    }
+    if (!bad) printf("ok   dlgtest: a dialog from the guest's own resources, drawn and presented\n");
+    return bad;
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : "tests/win32";
     /* C:\ for pathtest, and a check that the setting survives winrun_reset --
@@ -173,6 +256,7 @@ int main(int argc, char **argv) {
     bad += test_registry(dir);
     bad += test_faults(dir);
     bad += test_input(dir);
+    bad += test_dialog(dir);
     printf("test_winrun_lib: %d runs, %d failed\n", 2 * n, bad);
     return bad != 0;
 }

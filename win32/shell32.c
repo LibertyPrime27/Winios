@@ -19,9 +19,12 @@
 #define _GNU_SOURCE
 #include "w32.h"
 
+#include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 /* The CSIDL constants, as documented. Only the ones a program plausibly asks
  * for on the way to installing or saving; anything else falls through to
@@ -183,16 +186,187 @@ static void s_ShellExecuteExA(w32 *w) {
     w32_set_last_error(w, 120); RET(0);
 }
 
-/* SHFileOperation does bulk copy/move/delete from a double-null-terminated
- * list of paths. Implementing it properly means implementing the whole list
- * format and the recursion; installers that use it are the minority and they
- * use it for the same things CopyFile does. It reports itself rather than
- * claiming a copy happened, because a caller told "done" would then look for
- * files that are not there. */
-static void s_SHFileOperationA(w32 *w) {
-    w32_note_refused(w, "shell32!SHFileOperation (bulk copy/move/delete)");
-    RET(0x75);                                      /* DE_OPCANCELLED */
+/* ---- SHFileOperation ------------------------------------------------------
+ *
+ * Bulk copy, move and delete, over a list of paths that is double-null
+ * terminated -- "a\0b\0c\0\0" -- and may name directories, which are handled
+ * recursively. This is what an uninstaller uses to remove what it installed,
+ * and what a few installers use instead of CopyFile, so a refusal here means
+ * an uninstall that reports success and removes nothing.
+ *
+ * The structure has to be read by offset because it is not the same shape in
+ * both bitnesses: a pointer, then a UINT, then two pointers, then a WORD --
+ * which pads differently at 4 and 8 byte alignment.
+ */
+enum { FO_MOVE = 1, FO_COPY = 2, FO_DELETE = 3, FO_RENAME = 4 };
+enum { DE_OPCANCELLED = 0x75, DE_ERROR_MAX = 0xB7 };
+
+/* One path out of the list at `p`, advancing past its terminator. Returns 0
+ * at the end of the list -- an empty entry, which is the second null. */
+static int zz_next(w32 *w, uint64_t *p, int wide, char *out, size_t n) {
+    if (!*p) return 0;
+    if (wide) {
+        size_t i = 0;
+        for (;; i++) {
+            uint16_t c = (uint16_t)w32_read(w, *p + i * 2, 2);
+            if (!c) break;
+            if (i + 1 < n) out[i] = c < 128 ? (char)c : '?';
+        }
+        out[i < n ? i : n - 1] = 0;
+        *p += (i + 1) * 2;
+        return i > 0;
+    }
+    const char *s = w32_str(w, *p);
+    snprintf(out, n, "%.*s", (int)n - 1, s);
+    size_t len = strlen(s);
+    *p += len + 1;
+    return len > 0;
 }
+
+/* Recursive copy and remove, on host paths. Depth is bounded because a
+ * directory tree that contains itself through a symlink would otherwise not
+ * terminate, and an installer's payload is never deep. */
+static int host_copy_tree(const char *from, const char *to, int depth);
+static int host_remove_tree(const char *path, int depth);
+
+static int copy_one_file(const char *from, const char *to) {
+    FILE *in = fopen(from, "rb");
+    if (!in) return 0;
+    FILE *out = fopen(to, "wb");
+    if (!out) { fclose(in); return 0; }
+    char buf[65536];
+    size_t n;
+    int ok = 1;
+    while ((n = fread(buf, 1, sizeof buf, in)) > 0)
+        if (fwrite(buf, 1, n, out) != n) { ok = 0; break; }
+    if (ferror(in)) ok = 0;
+    fclose(in);
+    if (fclose(out)) ok = 0;
+    if (!ok) remove(to);
+    return ok;
+}
+
+static int host_copy_tree(const char *from, const char *to, int depth) {
+    if (depth > 32) return 0;
+    struct stat st;
+    if (lstat(from, &st)) return 0;
+    if (!S_ISDIR(st.st_mode)) return copy_one_file(from, to);
+    if (mkdir(to, 0777) && errno != EEXIST) return 0;
+    DIR *d = opendir(from);
+    if (!d) return 0;
+    int ok = 1;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char a[2048], b[2048];
+        snprintf(a, sizeof a, "%s/%s", from, e->d_name);
+        snprintf(b, sizeof b, "%s/%s", to, e->d_name);
+        if (!host_copy_tree(a, b, depth + 1)) ok = 0;
+    }
+    closedir(d);
+    return ok;
+}
+
+static int host_remove_tree(const char *path, int depth) {
+    if (depth > 32) return 0;
+    struct stat st;
+    if (lstat(path, &st)) return 0;
+    if (!S_ISDIR(st.st_mode)) return remove(path) == 0;
+    DIR *d = opendir(path);
+    if (!d) return 0;
+    int ok = 1;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char a[2048];
+        snprintf(a, sizeof a, "%s/%s", path, e->d_name);
+        if (!host_remove_tree(a, depth + 1)) ok = 0;
+    }
+    closedir(d);
+    if (rmdir(path)) ok = 0;
+    return ok;
+}
+
+/* Where one source lands. With several sources the destination is a
+ * directory and each keeps its own name; with one it may be either, and a
+ * destination that already exists as a directory takes the name too. */
+static void dest_for(const char *to_dir, const char *from, int many, char *out, size_t n) {
+    struct stat st;
+    int to_is_dir = !stat(to_dir, &st) && S_ISDIR(st.st_mode);
+    if (!many && !to_is_dir) { snprintf(out, n, "%s", to_dir); return; }
+    const char *base = strrchr(from, '/');
+    base = base ? base + 1 : from;
+    snprintf(out, n, "%s/%s", to_dir, base);
+}
+
+static void file_operation(w32 *w, int wide) {
+    uint64_t op = ARG(0);
+    if (!op) { RET(DE_OPCANCELLED); return; }
+    int ps = (int)w32_ptrsize(w);
+    /* hwnd, wFunc, pFrom, pTo, fFlags -- laid out for the bitness. */
+    uint64_t o_func = (uint64_t)ps;
+    uint64_t o_from = w->is32 ? 8 : 16;
+    uint64_t o_to   = w->is32 ? 12 : 24;
+    uint64_t o_abort = w->is32 ? 20 : 36;
+    uint32_t func = (uint32_t)w32_read(w, op + o_func, 4);
+    uint64_t from = w32_read(w, op + o_from, ps);
+    uint64_t to   = w32_read(w, op + o_to, ps);
+
+    char to_host[2048] = "";
+    if (to) {
+        uint64_t tp = to;
+        char win[1024];
+        if (zz_next(w, &tp, wide, win, sizeof win)) w32_host_path(w, win, to_host, sizeof to_host);
+    }
+    /* More than one source means the destination has to be a directory. */
+    int count = 0;
+    { uint64_t fp = from; char win[1024]; while (fp && zz_next(w, &fp, wide, win, sizeof win)) count++; }
+
+    int failed = 0, did = 0;
+    uint64_t fp = from;
+    char win[1024];
+    while (fp && zz_next(w, &fp, wide, win, sizeof win)) {
+        char src[2048];
+        w32_host_path(w, win, src, sizeof src);
+        /* A wildcard would need a directory walk of its own; nothing here
+         * expands one, and doing half of it silently would delete the wrong
+         * things. */
+        if (strchr(src, '*') || strchr(src, '?')) { failed = 1; continue; }
+        did++;
+        if (func == FO_DELETE) {
+            if (!host_remove_tree(src, 0)) failed = 1;
+            continue;
+        }
+        if (!to_host[0]) { failed = 1; continue; }
+        char dst[2400];
+        if (func == FO_RENAME) snprintf(dst, sizeof dst, "%s", to_host);
+        else dest_for(to_host, src, count > 1, dst, sizeof dst);
+        if (func == FO_MOVE || func == FO_RENAME) {
+            if (rename(src, dst) == 0) continue;
+            if (errno != EXDEV) { failed = 1; continue; }
+            /* Across devices rename cannot work, so it becomes copy then
+             * remove -- which is what the shell does too. */
+            if (!host_copy_tree(src, dst, 0)) { failed = 1; continue; }
+            if (!host_remove_tree(src, 0)) failed = 1;
+        } else if (func == FO_COPY) {
+            if (!host_copy_tree(src, dst, 0)) failed = 1;
+        } else failed = 1;
+    }
+    if (w32_read(w, op + o_abort, 4) || 1) w32_write(w, op + o_abort, 4, failed ? 1 : 0);
+    if (!did) { RET(DE_OPCANCELLED); return; }
+    RET(failed ? 0x71 : 0);                          /* DE_MANYSRC1DEST on failure */
+}
+static void s_SHFileOperationA(w32 *w) { file_operation(w, 0); }
+static void s_SHFileOperationW(w32 *w) { file_operation(w, 1); }
+
+/* SHBrowseForFolder puts up a folder picker. There is nowhere to put one and
+ * nobody to answer it, so it is cancelled -- which every caller handles,
+ * because a person pressing Cancel is the normal case. */
+static void s_SHBrowseForFolderA(w32 *w) {
+    w32_note_refused(w, "shell32!SHBrowseForFolder (no folder picker; treated as cancelled)");
+    RET(0);
+}
+static void s_SHBrowseForFolderW(w32 *w) { s_SHBrowseForFolderA(w); }
 
 /* SHGetFileInfo is asked for an icon or a display name. Neither exists here.
  * Zero is a documented failure and callers check it. */
@@ -264,8 +438,10 @@ const w32_api w32_shell32[] = {
     F(SHGetFolderPathA, 5), F(SHGetFolderPathW, 5),
     F(SHGetSpecialFolderPathA, 4), F(SHGetSpecialFolderPathW, 4),
     F(SHCreateDirectoryExA, 3), F(SHCreateDirectoryExW, 3),
-    F(ShellExecuteA, 6), F(ShellExecuteW, 6), F(ShellExecuteExA, 1),
-    F(SHFileOperationA, 1),
+    F(ShellExecuteA, 6), F(ShellExecuteW, 6),
+    F(ShellExecuteExA, 1), FN(ShellExecuteExW, 1, s_ShellExecuteExA),
+    F(SHFileOperationA, 1), F(SHFileOperationW, 1),
+    F(SHBrowseForFolderA, 1), F(SHBrowseForFolderW, 1),
     F(SHGetFileInfoA, 5), F(SHGetFileInfoW, 5),
     F(SHChangeNotify, 4), F(IsUserAnAdmin, 0),
     /* The older folder pair, which is the one installers use. */

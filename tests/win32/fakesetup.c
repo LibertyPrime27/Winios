@@ -19,6 +19,7 @@
  * it here is how the detection path gets exercised at all.
  */
 #include <windows.h>
+#include <commctrl.h>
 #include <shlobj.h>
 #include <stdio.h>
 #include <string.h>
@@ -27,6 +28,54 @@
 volatile const char *setup_marker = "TSetupLdrWindow Inno Setup 6.2.0";
 
 static int fail(const char *why) { printf("fakesetup: %s\n", why); return 2; }
+
+/* ---- the visible half ------------------------------------------------------
+ *
+ * With no flags, a real installer opens a window and waits. So does this one:
+ * a dialog out of its own resources, with a destination field and an Install
+ * button, which is the shape every wizard has.
+ *
+ * Nobody is going to click it in a test, so it clicks its own button -- and
+ * that is worth being clear about. What this proves is that the template was
+ * found and walked, the controls were created, the dialog was drawn and
+ * presented, and a click on a button came back to the dialog procedure as a
+ * WM_COMMAND. What it cannot prove is that a person's finger lands on the
+ * button, because there is no finger. That half is the touch mapping, which
+ * the input test covers separately.
+ *
+ * It also installs somewhere the person chose rather than somewhere we
+ * suggested -- into Program Files, with the binary a level below that -- so
+ * the importer has to find the install by looking at the drive, and has to
+ * name the library entry after the game's folder rather than after the folder
+ * the .exe happens to sit in.
+ */
+#define IDC_DEST  201
+#define IDC_STAT  202
+
+static char g_visible_dir[MAX_PATH];
+
+static INT_PTR CALLBACK setup_dlg(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
+    (void)lp;
+    switch (msg) {
+    case WM_INITDIALOG:
+        SetDlgItemTextA(dlg, IDC_DEST, g_visible_dir);
+        SetDlgItemTextA(dlg, IDC_STAT, "Ready to install.");
+        UpdateWindow(dlg);
+        SendMessageA(GetDlgItem(dlg, IDOK), BM_CLICK, 0, 0);
+        return TRUE;
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK) {
+            /* Whatever is in the field is where it goes -- which on a device
+             * is whatever the person typed. */
+            GetDlgItemTextA(dlg, IDC_DEST, g_visible_dir, sizeof g_visible_dir);
+            EndDialog(dlg, IDOK);
+            return TRUE;
+        }
+        if (LOWORD(wp) == IDCANCEL) { EndDialog(dlg, IDCANCEL); return TRUE; }
+        return FALSE;
+    }
+    return FALSE;
+}
 
 int main(int argc, char **argv) {
     (void)setup_marker;
@@ -42,10 +91,19 @@ int main(int argc, char **argv) {
     printf("flags: silent=%d sp-=%d norestart=%d\n", silent, sp_minus, norestart);
     printf("dir:   %s\n", dir[0] ? dir : "(none given)");
 
-    /* Without a silent flag a real installer opens a window, which is the one
-     * thing that cannot happen here -- so say so and stop, exactly as the
-     * importer's report would then have to explain. */
-    if (!silent) return fail("no silent flag: a real installer would open a window here");
+    /* Without a silent flag, do what a real installer does: put the window up
+     * and ask. The destination it offers is the standard one, not one the
+     * importer chose -- and the importer is going to have to find it. */
+    if (!silent) {
+        InitCommonControls();
+        snprintf(g_visible_dir, sizeof g_visible_dir,
+                 "C:\\Program Files\\Fake Game %d\\bin", (int)(sizeof(void *) * 8));
+        INT_PTR r = DialogBoxParamA(GetModuleHandleA(NULL), MAKEINTRESOURCEA(100),
+                                    NULL, setup_dlg, 0);
+        if (r != IDOK) return fail("cancelled");
+        snprintf(dir, sizeof dir, "%s", g_visible_dir);
+        printf("visible: installing to %s\n", dir);
+    }
     if (!dir[0]) return fail("no /DIR=: nowhere to install to");
 
     /* 0. Narrow the DLL search path, which is the first thing a real NSIS

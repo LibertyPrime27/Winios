@@ -28,6 +28,16 @@ struct Program: Codable {
     /// broken, the question "did the install finish?" is the first one, and it
     /// cannot be asked later without knowing there was an install.
     var installed: Bool?
+    /// Where the program's folder actually is, relative to the drive. For a
+    /// copied game that is the same as `name` and this stays nil; for an
+    /// installed one it need not be, because an installer the person answered
+    /// themselves goes wherever they told it to -- "Program Files/Some Game"
+    /// as often as not. Without this the library would look for a top-level
+    /// folder called "Some Game" and find nothing.
+    var dirRelative: String?
+
+    /// The folder to look in, whichever way this entry got here.
+    var folder: String { dirRelative?.isEmpty == false ? dirRelative! : name }
 
     var canProbablyRun: Bool { importsMissing == 0 }
     var subtitle: String {
@@ -62,9 +72,29 @@ enum ProgramStore {
         }
 
         var out: [Program] = []
+        var claimed = Set<String>()
+
+        // Remembered entries first, and located by their folder rather than
+        // by their name. An installed program can be several levels down --
+        // scanning only the top of the drive would lose it, and losing it
+        // looks exactly like the install having failed.
+        for p in cached.values {
+            let dir = c.appendingPathComponent(p.folder)
+            guard fm.fileExists(atPath: dir.path) else { continue }
+            out.append(p)
+            // So the scan below does not offer the same thing twice under a
+            // different name.
+            claimed.insert(p.folder.split(separator: "/").first.map(String.init) ?? p.folder)
+        }
+
         for item in onDisk {
             let name = item.lastPathComponent
             if name == "library.json" { continue }
+            if claimed.contains(name) { continue }
+            // The skeleton the drive is set up with. These are where programs
+            // are put, not programs, and listing them as entries would put
+            // "Windows" in somebody's game library.
+            if Self.systemFolders.contains(name.lowercased()) { continue }
             if let p = cached[name] { out.append(p); continue }
             // Not seen before: find an executable inside and record what we can.
             var isDir: ObjCBool = false
@@ -79,10 +109,17 @@ enum ProgramStore {
             }
             out.append(Program(name: name, exeRelative: isDir.boolValue ? exe : "",
                                is32: true, importsResolved: 0, importsMissing: -1,
-                               lastExit: nil, lastRunMs: nil, dllDir: nil, installed: nil))
+                               lastExit: nil, lastRunMs: nil, dllDir: nil, installed: nil,
+                               dirRelative: nil))
         }
         return out.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
+
+    /// The drive skeleton, which is scaffolding rather than content.
+    private static let systemFolders: Set<String> = [
+        "program files", "program files (x86)", "programdata", "users",
+        "windows", "temp", "$recycle.bin",
+    ]
 
     static func save(_ list: [Program]) {
         guard let u = indexURL, let d = try? JSONEncoder().encode(list) else { return }
@@ -97,19 +134,22 @@ enum ProgramStore {
 
     static func remove(_ p: Program) {
         guard let c = driveC else { return }
-        try? FileManager.default.removeItem(at: c.appendingPathComponent(p.name))
+        // The folder, not the name: they are the same for a copied game and
+        // are not for an installed one, and removing by name would delete
+        // nothing while the entry disappeared.
+        try? FileManager.default.removeItem(at: c.appendingPathComponent(p.folder))
         save(load().filter { $0.name != p.name })
     }
 
     /// The executable to hand to winrun.
-    static func exeURL(_ p: Program) -> URL? { exeURL(name: p.name, exeRelative: p.exeRelative) }
+    static func exeURL(_ p: Program) -> URL? { exeURL(folder: p.folder, exeRelative: p.exeRelative) }
 
     /// The same, before there is a Program: the importer has the two strings
     /// and needs the path in order to ask what the program requires, which it
     /// does before deciding whether to offer the entry at all.
-    static func exeURL(name: String, exeRelative: String) -> URL? {
-        guard let c = driveC else { return nil }
-        let base = c.appendingPathComponent(name)
+    static func exeURL(folder: String, exeRelative: String) -> URL? {
+        guard let c = driveC, !folder.isEmpty else { return nil }
+        let base = c.appendingPathComponent(folder)
         return exeRelative.isEmpty ? base : base.appendingPathComponent(exeRelative)
     }
 

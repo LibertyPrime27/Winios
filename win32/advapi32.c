@@ -295,8 +295,23 @@ static void a_RegCloseKey(w32 *w) {
     RET(ERROR_SUCCESS_);
 }
 
+/* Writing a name back to the caller, in whichever width it asked in. The
+ * count in *pcchName is characters both ways, not bytes -- which is the
+ * detail that makes a W caller with a correctly sized buffer fail if the
+ * name is written as bytes. */
+static void put_name(w32 *w, uint64_t out, uint64_t pcount, const char *name, int wide) {
+    uint32_t room = pcount ? (uint32_t)w32_read(w, pcount, 4) : 0;
+    uint32_t nl = (uint32_t)strlen(name);
+    if (out && room > nl) {
+        if (wide) {
+            for (uint32_t i = 0; i <= nl; i++) w32_write(w, out + (uint64_t)i * 2, 2, (uint8_t)name[i]);
+        } else memcpy(W32P(w, out), name, nl + 1);
+    }
+    if (pcount) w32_write(w, pcount, 4, nl);
+}
+
 /* RegEnumValue(hKey, index, name, pcchName, reserved, ptype, pdata, pcbData) */
-static void a_RegEnumValueA(w32 *w) {
+static void reg_enum_value(w32 *w, int wide) {
     char path[1024];
     reg_load();
     if (!key_path(w, ARG(0), "", path, sizeof path)) { RET(ERROR_INVALID_HANDLE_); return; }
@@ -304,11 +319,7 @@ static void a_RegEnumValueA(w32 *w) {
     for (int i = 0; i < g_nvals; i++) {
         if (strcasecmp(g_vals[i].key, path) || g_vals[i].type == REG_NONE_) continue;
         if (seen++ != want) continue;
-        uint64_t pn = ARG(3);
-        uint32_t room = pn ? (uint32_t)w32_read(w, pn, 4) : 0;
-        uint32_t nl = (uint32_t)strlen(g_vals[i].name);
-        if (ARG(2) && room > nl) memcpy(W32P(w, ARG(2)), g_vals[i].name, nl + 1);
-        if (pn) w32_write(w, pn, 4, nl);
+        put_name(w, ARG(2), ARG(3), g_vals[i].name, wide);
         if (ARG(5)) w32_write(w, ARG(5), 4, g_vals[i].type);
         uint64_t pcb = ARG(7);
         uint32_t cap = pcb ? (uint32_t)w32_read(w, pcb, 4) : 0;
@@ -321,16 +332,20 @@ static void a_RegEnumValueA(w32 *w) {
     RET(ERROR_NO_MORE_ITEMS_);
 }
 
-/* RegEnumKeyEx(hKey, index, name, pcchName, reserved, class, pcchClass, ftime).
- * The immediate children of a path, deduplicated -- the flat store means they
- * have to be derived rather than looked up. */
-static void a_RegEnumKeyExA(w32 *w) {
+/* The name of the `want`th immediate child of a key, or 0 if there is no
+ * such child. The store is flat -- a value knows its full key path -- so the
+ * children have to be derived by looking at what comes after this key's path
+ * and deduplicating, because one child holding three values is still one
+ * child. Both RegEnumKey and RegEnumKeyEx are this walk plus a different way
+ * of returning the name. */
+static int reg_child_name(w32 *w, uint64_t hkey, uint32_t want, char *out, size_t n) {
     char path[1024];
     reg_load();
-    if (!key_path(w, ARG(0), "", path, sizeof path)) { RET(ERROR_INVALID_HANDLE_); return; }
+    if (!key_path(w, hkey, "", path, sizeof path)) return -1;
     size_t pl = strlen(path);
-    uint32_t want = (uint32_t)ARG(1), seen = 0;
-    char seen_names[64][128]; int nseen = 0;
+    uint32_t seen = 0;
+    char seen_names[64][128];
+    int nseen = 0;
     for (int i = 0; i < g_nvals; i++) {
         if (strncasecmp(g_vals[i].key, path, pl) || g_vals[i].key[pl] != '\\') continue;
         const char *child = g_vals[i].key + pl + 1;
@@ -342,20 +357,41 @@ static void a_RegEnumKeyExA(w32 *w) {
         if (dup) continue;
         if (nseen < 64) snprintf(seen_names[nseen++], 128, "%s", name);
         if (seen++ != want) continue;
-        uint64_t pn = ARG(3);
-        uint32_t room = pn ? (uint32_t)w32_read(w, pn, 4) : 0;
-        uint32_t nl = (uint32_t)strlen(name);
-        if (ARG(2) && room > nl) memcpy(W32P(w, ARG(2)), name, nl + 1);
-        if (pn) w32_write(w, pn, 4, nl);
-        RET(ERROR_SUCCESS_);
-        return;
+        snprintf(out, n, "%s", name);
+        return 1;
     }
-    RET(ERROR_NO_MORE_ITEMS_);
+    return 0;
 }
 
-static void a_RegDeleteValueA(w32 *w) {
+/* RegEnumKeyEx(hKey, index, name, pcchName, reserved, class, pcchClass, ftime) */
+static void reg_enum_key(w32 *w, int wide) {
+    char name[128];
+    int r = reg_child_name(w, ARG(0), (uint32_t)ARG(1), name, sizeof name);
+    if (r < 0) { RET(ERROR_INVALID_HANDLE_); return; }
+    if (!r) { RET(ERROR_NO_MORE_ITEMS_); return; }
+    put_name(w, ARG(2), ARG(3), name, wide);
+    RET(ERROR_SUCCESS_);
+}
+/* RegEnumKey(hKey, index, name, cchName): the same walk, but the buffer size
+ * arrives *by value* rather than through a pointer. Handing that value to
+ * the Ex path would treat a small integer as a guest address. */
+static void reg_enum_key_plain(w32 *w, int wide) {
+    char name[128];
+    int r = reg_child_name(w, ARG(0), (uint32_t)ARG(1), name, sizeof name);
+    if (r < 0) { RET(ERROR_INVALID_HANDLE_); return; }
+    if (!r) { RET(ERROR_NO_MORE_ITEMS_); return; }
+    uint64_t out = ARG(2);
+    uint32_t cap = (uint32_t)ARG(3);
+    uint32_t nl = (uint32_t)strlen(name);
+    if (!out || cap <= nl) { RET(ERROR_MORE_DATA_); return; }
+    if (wide) for (uint32_t i = 0; i <= nl; i++) w32_write(w, out + (uint64_t)i * 2, 2, (uint8_t)name[i]);
+    else memcpy(W32P(w, out), name, nl + 1);
+    RET(ERROR_SUCCESS_);
+}
+
+static void reg_delete_value(w32 *w, int wide) {
     char name[512], path[1024];
-    wide_or_narrow(w, ARG(1), 0, name, sizeof name);
+    wide_or_narrow(w, ARG(1), wide, name, sizeof name);
     reg_load();
     if (!key_path(w, ARG(0), "", path, sizeof path)) { RET(ERROR_INVALID_HANDLE_); return; }
     reg_val *v = find_val(path, name);
@@ -366,9 +402,9 @@ static void a_RegDeleteValueA(w32 *w) {
     w32_registry_flush();
     RET(ERROR_SUCCESS_);
 }
-static void a_RegDeleteKeyA(w32 *w) {
+static void reg_delete_key(w32 *w, int wide) {
     char sub[512], path[1024];
-    wide_or_narrow(w, ARG(1), 0, sub, sizeof sub);
+    wide_or_narrow(w, ARG(1), wide, sub, sizeof sub);
     reg_load();
     if (!key_path(w, ARG(0), sub, path, sizeof path)) { RET(ERROR_INVALID_HANDLE_); return; }
     size_t pl = strlen(path);
@@ -389,6 +425,17 @@ static void a_RegDeleteKeyA(w32 *w) {
 /* RegQueryInfoKey(hKey, class, pcchClass, reserved, pcSubKeys, pcbMaxSubKeyLen,
  *                 pcbMaxClassLen, pcValues, pcbMaxValueNameLen,
  *                 pcbMaxValueLen, pcbSecurityDescriptor, ftime) */
+static void a_RegEnumValueA(w32 *w)  { reg_enum_value(w, 0); }
+static void a_RegEnumValueW(w32 *w)  { reg_enum_value(w, 1); }
+static void a_RegEnumKeyExA(w32 *w)  { reg_enum_key(w, 0); }
+static void a_RegEnumKeyExW(w32 *w)  { reg_enum_key(w, 1); }
+static void a_RegDeleteValueA(w32 *w) { reg_delete_value(w, 0); }
+static void a_RegDeleteValueW(w32 *w) { reg_delete_value(w, 1); }
+static void a_RegDeleteKeyA(w32 *w)  { reg_delete_key(w, 0); }
+static void a_RegDeleteKeyW(w32 *w)  { reg_delete_key(w, 1); }
+static void a_RegEnumKeyA(w32 *w) { reg_enum_key_plain(w, 0); }
+static void a_RegEnumKeyW(w32 *w) { reg_enum_key_plain(w, 1); }
+
 static void a_RegQueryInfoKeyA(w32 *w) {
     char path[1024];
     reg_load();
@@ -428,6 +475,97 @@ static void a_RegQueryInfoKeyA(w32 *w) {
 
 /* Enough of the rest of advapi32 that a program asking "who am I" gets an
  * answer instead of a stub report. */
+/* ------------------------------------------------------ tokens and access
+ *
+ * An installer asks for a privilege before it does something privileged --
+ * writing to Program Files, replacing a file on reboot, setting an ACL. On
+ * Windows those calls decide whether it is allowed to proceed. Here there is
+ * one process, one user, and a drive we made, so the answer is always yes,
+ * and saying yes is the accurate answer rather than a convenient one:
+ * refusing would make an installer report that it needs to be run as
+ * administrator, which is not true of this drive.
+ *
+ * Nothing here pretends to be a security model. There is nothing to secure
+ * against inside a sandbox that already holds one program.
+ */
+enum { TOKEN_HANDLE = 0x0B000001u };
+
+static void a_OpenProcessToken(w32 *w) {
+    if (ARG(2)) w32_write(w, ARG(2), (int)w32_ptrsize(w), TOKEN_HANDLE);
+    RET(1);
+}
+static void a_OpenThreadToken(w32 *w) {
+    if (ARG(3)) w32_write(w, ARG(3), (int)w32_ptrsize(w), TOKEN_HANDLE);
+    RET(1);
+}
+/* A LUID is a 64-bit value that only has to be consistent with itself, so it
+ * is derived from the name: the same privilege gets the same value every
+ * time, and two different ones never collide by accident. */
+static void lookup_priv(w32 *w, int wide) {
+    char name[128];
+    if (ARG(1)) { if (wide) w32_wtoa(w, ARG(1), name, sizeof name); else snprintf(name, sizeof name, "%.127s", w32_str(w, ARG(1))); }
+    else name[0] = 0;
+    uint32_t h = 2166136261u;                     /* FNV-1a, for a stable id */
+    for (const char *c = name; *c; c++) { h ^= (uint8_t)*c; h *= 16777619u; }
+    if (ARG(2)) {
+        w32_write(w, ARG(2), 4, h | 1u);          /* low part, never zero */
+        w32_write(w, ARG(2) + 4, 4, 0);           /* high part */
+    }
+    RET(1);
+}
+static void a_LookupPrivilegeValueA(w32 *w) { lookup_priv(w, 0); }
+static void a_LookupPrivilegeValueW(w32 *w) { lookup_priv(w, 1); }
+/* AdjustTokenPrivileges(token, disableAll, new, len, prev, retlen). The
+ * documented contract is that success does not mean every privilege was
+ * granted -- a caller checks GetLastError for ERROR_NOT_ALL_ASSIGNED. Here
+ * they all are, so the last error stays clear. */
+static void a_AdjustTokenPrivileges(w32 *w) {
+    if (ARG(5)) w32_write(w, ARG(5), 4, 0);
+    w32_set_last_error(w, 0);
+    RET(1);
+}
+static void a_PrivilegeCheck(w32 *w) {
+    if (ARG(2)) w32_write(w, ARG(2), 4, 1);
+    RET(1);
+}
+/* GetTokenInformation: the one class an installer asks for is TokenElevation
+ * (20), and the answer is that it is elevated -- because on this drive it
+ * can do everything an elevated process could. */
+static void a_GetTokenInformation(w32 *w) {
+    uint64_t out = ARG(2);
+    uint32_t cap = (uint32_t)ARG(3);
+    if (ARG(4)) w32_write(w, ARG(4), 4, 4);
+    if (!out || cap < 4) { w32_set_last_error(w, 122); RET(0); return; }  /* ERROR_INSUFFICIENT_BUFFER */
+    w32_write(w, out, 4, 1);
+    RET(1);
+}
+/* Security descriptors and ACLs: there are none, and a program that sets one
+ * is not made wrong by the fact that nothing records it. */
+static void a_SetFileSecurityA(w32 *w) { (void)w; RET(1); }
+static void a_SetFileSecurityW(w32 *w) { (void)w; RET(1); }
+static void a_GetFileSecurityA(w32 *w) {
+    if (ARG(4)) w32_write(w, ARG(4), 4, 0);
+    RET(1);
+}
+static void a_GetFileSecurityW(w32 *w) { a_GetFileSecurityA(w); }
+static void a_InitializeSecurityDescriptor(w32 *w) {
+    if (ARG(0)) { w32_write(w, ARG(0), 1, 1); w32_write(w, ARG(0) + 1, 1, 0); w32_write(w, ARG(0) + 2, 2, 0); }
+    RET(1);
+}
+static void a_SetSecurityDescriptorDacl(w32 *w) { (void)w; RET(1); }
+static void a_IsValidSecurityDescriptor(w32 *w) { (void)w; RET(1); }
+static void a_InitializeAcl(w32 *w) { (void)w; RET(1); }
+static void a_AllocateAndInitializeSid(w32 *w) {
+    if (ARG(8)) w32_write(w, ARG(8), (int)w32_ptrsize(w), 0);
+    RET(0);
+}
+static void a_FreeSid(w32 *w) { RET(ARG(0)); }
+static void a_EqualSid(w32 *w) { (void)w; RET(0); }
+static void a_CheckTokenMembership(w32 *w) {
+    if (ARG(2)) w32_write(w, ARG(2), 4, 1);
+    RET(1);
+}
+
 static void a_GetUserNameA(w32 *w) {
     const char *u = "xcore";
     uint32_t room = ARG(1) ? (uint32_t)w32_read(w, ARG(1), 4) : 0;
@@ -445,7 +583,19 @@ const w32_api w32_advapi32[] = {
     F(RegEnumValueA, 8), F(RegEnumKeyExA, 8),
     F(RegDeleteValueA, 2), F(RegDeleteKeyA, 2),
     F(RegQueryInfoKeyA, 12),
+    F(RegEnumValueW, 8), F(RegEnumKeyExW, 8), F(RegEnumKeyA, 4), F(RegEnumKeyW, 4),
+    F(RegDeleteValueW, 2), F(RegDeleteKeyW, 2),
     F(RegCloseKey, 1),
     F(GetUserNameA, 2),
+    /* What an installer asks before it writes somewhere privileged */
+    F(OpenProcessToken, 3), F(OpenThreadToken, 4),
+    F(LookupPrivilegeValueA, 3), F(LookupPrivilegeValueW, 3),
+    F(AdjustTokenPrivileges, 6), F(PrivilegeCheck, 3), F(GetTokenInformation, 5),
+    F(CheckTokenMembership, 3),
+    F(SetFileSecurityA, 3), F(SetFileSecurityW, 3),
+    F(GetFileSecurityA, 5), F(GetFileSecurityW, 5),
+    F(InitializeSecurityDescriptor, 2), F(SetSecurityDescriptorDacl, 4),
+    F(IsValidSecurityDescriptor, 1), F(InitializeAcl, 3),
+    F(AllocateAndInitializeSid, 9), F(FreeSid, 1), F(EqualSid, 2),
     { 0, 0, 0, 0, 0 },
 };

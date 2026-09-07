@@ -100,6 +100,19 @@ unset XCORE_JIT
 # recording of the tester's reflexes is not a test.
 check inputtest64.exe 0 6 -- -input inputtest.script
 check inputtest32.exe 0 6 -- -input inputtest.script
+# A dialog, from a real RT_DIALOG resource in the guest's own image, drawn.
+# The guest checks what a guest can check -- controls found by id, text set
+# and read back, a click coming back as WM_COMMAND -- and `-frame` checks
+# what it cannot: the pixels. The checksum is over the frame the app would
+# have been handed, so it covers the loader walking the resource directory,
+# the dialog-unit conversion, every control's own drawing, and the fact that
+# the finished frame was actually presented rather than merely composed.
+#
+# The arithmetic behind those pixels is all integer, deliberately, so the
+# checksum is the same on an x86 runner, under qemu on aarch64, and on a
+# phone. A difference is a bug, not a rounding.
+check dlgtest64.exe 0 -- -frame -screen 640x400
+check dlgtest32.exe 0 -- -frame -screen 640x400
 # Audio and a gamepad. Nothing makes a sound and no controller is attached --
 # what is checked is that a game's audio init succeeds (many abort when it
 # fails), that a sound buffer is memory the guest can write and read back,

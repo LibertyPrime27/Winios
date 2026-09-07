@@ -58,17 +58,30 @@ void win_probe_progress(char *stage, size_t stage_len, uint64_t *done, uint64_t 
 void win_probe_cancel_import(void);
 
 /* Import, in one of the two modes. Returns 0 when the program is ready to
- * run. `installer` picks the mode; `keep_going` and `timeout_s` apply only to
- * installer mode.
+ * run. `installer` picks the mode; `visible`, `keep_going` and `timeout_s`
+ * apply only to installer mode.
+ *
+ * `visible` non-zero runs the installer with its own screens drawn, so a
+ * person answers its questions and chooses where it goes; zero runs it in
+ * its family's silent mode. Either way the installed program is found the
+ * same way afterwards -- by looking at what appeared on the drive -- so a
+ * destination the person typed is found as reliably as one we chose. While a
+ * visible install runs, frames arrive through win_probe_copy_frame and input
+ * goes back through the win_probe_input_* calls, exactly as for a game.
  *
  * `detail` receives the report *and* the guest's own output -- when an install
  * produces nothing, the reason is in the run report and the importer's summary
- * only says that nothing appeared. `name` and `exe_rel` are the library entry;
- * `dll_dir` is where the program's own DLLs are, for win_probe_run_dir. */
+ * only says that nothing appeared. `name` is what to call the library entry and
+ * `dir_rel` is where its folder actually is, relative to the drive -- the two
+ * differ whenever an installer put the program somewhere structured, which a
+ * visible install nearly always does. `exe_rel` is which executable inside
+ * that folder to run and `dll_dir` is where the program's own DLLs are, for
+ * win_probe_run_dir. */
 int win_probe_import(const char *src, const char *drive_c, int installer,
-                     int keep_going, int timeout_s,
+                     int visible, int keep_going, int timeout_s,
                      char *detail, size_t detail_len,
                      char *name, size_t name_len,
+                     char *dir_rel, size_t dir_rel_len,
                      char *exe_rel, size_t exe_rel_len,
                      char *dll_dir, size_t dll_dir_len,
                      int *is32, int *files, int *exes);
