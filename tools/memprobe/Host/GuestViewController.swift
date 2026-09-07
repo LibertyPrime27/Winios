@@ -49,11 +49,18 @@ final class GuestViewController: UIViewController {
     private let watching: Bool
     /// What Close should do when the run is not ours to end.
     private var onClose: (() -> Void)?
+    /// Carried only so the crash breadcrumb can say which it was. A 32-bit
+    /// game and a 64-bit one fail in different places, and a report that does
+    /// not say which was running is a report that has to be asked about.
+    private let is32: Bool?
+    /// Removed when the screen goes away; see HardwareInput.observe.
+    private var hardwareObservers: [NSObjectProtocol] = []
 
-    init(exe: String, root: URL? = nil, dllDir: String? = nil) {
+    init(exe: String, root: URL? = nil, dllDir: String? = nil, is32: Bool? = nil) {
         self.exeName = exe
         self.root = root
         self.dllDir = dllDir
+        self.is32 = is32
         self.watching = false
         super.init(nibName: nil, bundle: nil)
     }
@@ -64,17 +71,21 @@ final class GuestViewController: UIViewController {
         self.exeName = title
         self.root = nil
         self.dllDir = nil
+        self.is32 = nil
         self.watching = true
         self.onClose = onClose
         super.init(nibName: nil, bundle: nil)
     }
     required init?(coder: NSCoder) { fatalError("not used") }
 
+    deinit { hardwareObservers.forEach { NotificationCenter.default.removeObserver($0) } }
+
     /// The owner's run has ended. Stops the display link and leaves the last
     /// frame up; the owner dismisses when it has said what happened.
     func finished(_ summary: String) {
         link?.invalidate(); link = nil
         running = false
+        CrashReports.guestFinished()
         hud.text = summary
     }
 
@@ -85,6 +96,28 @@ final class GuestViewController: UIViewController {
     override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .landscape }
     override var prefersStatusBarHidden: Bool { true }
     override var prefersHomeIndicatorAutoHidden: Bool { true }
+
+    /// Whether the system pointer is taken away and the mouse becomes motion
+    /// alone. Asked by UIKit, so the answer has to be a stored value and the
+    /// frame tick has to tell UIKit when it changes.
+    ///
+    /// Requested only while a mouse is connected and the guest has hidden its
+    /// own cursor -- a game that calls SetCursorPos every frame to recentre
+    /// wants the deltas and no pointer of the system's. iOS will refuse it
+    /// when the app is not the full screen (Split View, Slide Over), which is
+    /// why nothing here depends on it having worked: GCMouse reports relative
+    /// motion either way, and the capture only stops a visible pointer
+    /// sliding into the corner.
+    private var pointerLocked = false
+    override var prefersPointerLocked: Bool { pointerLocked }
+
+    /// The overlay is for when there is no keyboard. Attaching one used to
+    /// mean going to Settings and turning it off by hand; the app can see the
+    /// keyboard, so it does that itself now, and the setting stays as the way
+    /// to keep the keys hidden when there is no keyboard either.
+    private func refreshOnScreenKeys() {
+        keys.isHidden = watching || !Settings.onScreenKeys || HardwareInput.keyboardConnected
+    }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -105,8 +138,13 @@ final class GuestViewController: UIViewController {
         view.addSubview(dialogKeys)
         // A dialog is what a visible install puts on screen, and WASD is no
         // use against one. Only one of the two is ever up.
-        keys.isHidden = watching || !Settings.onScreenKeys
         dialogKeys.isHidden = !watching
+        refreshOnScreenKeys()
+        // A keyboard can be attached or unplugged while a game is running,
+        // and the overlay should follow it without anyone leaving the game.
+        hardwareObservers = HardwareInput.observe { [weak self] in
+            self?.refreshOnScreenKeys()
+        }
 
         hud.translatesAutoresizingMaskIntoConstraints = false
         hud.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
@@ -153,7 +191,17 @@ final class GuestViewController: UIViewController {
         started = CFAbsoluteTimeGetCurrent()
         // A hardware keyboard's presses arrive through the responder chain,
         // so something has to be first responder for them to arrive at all.
+        // It is re-taken from the frame tick as well, because there are
+        // several ways to lose it without noticing.
         input.becomeFirstResponder()
+        refreshOnScreenKeys()
+
+        // Before anything runs: a crash or a kill from here on can be
+        // attributed to this program, in this mode, on this device. The
+        // breadcrumb is written whether or not crash recording is on --
+        // a watchdog kill runs no handler and leaves nothing else behind.
+        CrashReports.guestStarting(program: exeName, is32: is32)
+        Logs.starting(program: exeName)
 
         let l = CADisplayLink(target: self, selector: #selector(tick))
         l.add(to: .main, forMode: .common)
@@ -194,6 +242,12 @@ final class GuestViewController: UIViewController {
             DispatchQueue.main.async {
                 self?.output = text
                 Logs.record(program: name, exit: rc, ms: ns / 1_000_000, report: text)
+                // Not through `self?`: Close dismisses this screen while the
+                // guest is still winding down, so by the time the run comes
+                // back there may be nothing here -- and a breadcrumb nobody
+                // cleared is read at the next launch as a run that killed the
+                // process.
+                CrashReports.guestFinished()
                 self?.guestFinished(rc: rc, ns: ns)
             }
         }
@@ -227,12 +281,23 @@ final class GuestViewController: UIViewController {
         hud.text = "\(exeName) exited \(rc)\n" + output
     }
 
+    /// A game hides and shows its cursor as it moves between play and menus,
+    /// so the capture has to follow it rather than being decided once when
+    /// the screen opened.
+    private func syncPointerLock() {
+        let want = input.wantsPointerLock
+        guard want != pointerLocked else { return }
+        pointerLocked = want
+        setNeedsUpdateOfPrefersPointerLocked()
+    }
+
     @objc private func tick() {
         var w: Int32 = 0, h: Int32 = 0, pitch: Int32 = 0
         let got = scratch.withUnsafeMutableBytes { buf -> Int32 in
             guard let base = buf.baseAddress else { return 0 }
             return win_probe_copy_frame(&seq, base, buf.count, &w, &h, &pitch)
         }
+        syncPointerLock()
         guard got == 1, w > 0, h > 0 else {
             input.syncCursor()
             return

@@ -1,6 +1,45 @@
 import UIKit
 import GameController
 
+/// What is actually plugged in, asked rather than assumed.
+///
+/// Settings used to carry a note telling people to turn the on-screen keys
+/// off when they attached a keyboard, which is asking someone to do something
+/// the system already knows. GameController answers both questions directly —
+/// `GCKeyboard.coalesced` is every attached keyboard merged into one,
+/// `GCMouse.mice()` is every mouse — and posts a notification when either
+/// changes, so the overlay can get out of the way on its own.
+///
+/// The line this puts on the Settings screen is the first thing to look at
+/// when input is not working. If it says nothing is connected, nothing below
+/// it can help: the keys are going somewhere else, or to nothing at all.
+enum HardwareInput {
+
+    static var keyboardConnected: Bool { GCKeyboard.coalesced != nil }
+    static var mouseConnected: Bool { !GCMouse.mice().isEmpty }
+
+    static var summary: String {
+        "Hardware keyboard: \(keyboardConnected ? "connected" : "not connected"). "
+        + "Mouse: \(mouseConnected ? "connected" : "not connected")."
+    }
+
+    /// Watch for either changing. The caller keeps the returned tokens and
+    /// removes them when it goes away: a block-based observer holds its
+    /// closure for as long as it is registered, and one that captures the
+    /// screen it was made for would keep that screen alive for the life of
+    /// the app.
+    static func observe(_ changed: @escaping () -> Void) -> [NSObjectProtocol] {
+        let c = NotificationCenter.default
+        let names: [Notification.Name] = [
+            .GCKeyboardDidConnect, .GCKeyboardDidDisconnect,
+            .GCMouseDidConnect, .GCMouseDidDisconnect,
+        ]
+        return names.map { n in
+            c.addObserver(forName: n, object: nil, queue: .main) { _ in changed() }
+        }
+    }
+}
+
 /// Keyboard and mouse for a running guest.
 ///
 /// Three sources, in the order a game would prefer them:
@@ -24,6 +63,9 @@ import GameController
 /// The guest tells us which mode it is in without being asked. A game that
 /// hides the cursor (`ShowCursor(FALSE)`) is saying "I am reading relative
 /// motion now" — so the crosshair disappears then, and reappears for menus.
+/// With a real mouse connected that same signal is what captures the pointer
+/// (`wantsPointerLock`), so the system pointer is out of the way for exactly
+/// as long as the game is recentring one of its own.
 ///
 /// Everything here runs on the main thread and calls into `w32_input_*`, which
 /// takes a lock; the guest is reading that state from its own thread. Nothing
@@ -39,6 +81,21 @@ final class GuestInputView: UIView, UIGestureRecognizerDelegate {
     private var heldByLongPress = false
     private var mouseConnected = false
     private var observers: [NSObjectProtocol] = []
+
+    /// The modifier virtual keys the guest has been told are down. Kept so a
+    /// modifier whose press or release never arrived can be corrected from
+    /// `UIKey.modifierFlags`, which comes with every key event.
+    private var heldModifiers: Set<Int> = []
+    private var capsOn = false
+
+    /// The mouse settings, read once a frame rather than once an event: a
+    /// hardware mouse can report a thousand movements a second and going to
+    /// UserDefaults on that path is not free.
+    private var sensitivity = 1.0
+    private var invertY = false
+    /// The fraction of a pixel each axis is owed. See `sendMotion`.
+    private var restX = 0.0
+    private var restY = 0.0
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -68,6 +125,8 @@ final class GuestInputView: UIView, UIGestureRecognizerDelegate {
     /// is (which a game may have moved itself with SetCursorPos), and take the
     /// guest's word for whether it should be visible at all.
     func syncCursor() {
+        keepKeyboardFocus()
+        refreshMouseSettings()
         pollWheel()
         var gx: Int32 = 0, gy: Int32 = 0
         w32_cursor_pos(&gx, &gy)
@@ -117,12 +176,52 @@ final class GuestInputView: UIView, UIGestureRecognizerDelegate {
 
     override var canBecomeFirstResponder: Bool { true }
 
+    /// Presses only ever reach the first responder, so this view has to be
+    /// one and has to stay one. There are several ways to quietly stop being
+    /// one — anything presented over the guest takes it and nothing gives it
+    /// back — and the symptom is a keyboard that worked a minute ago and now
+    /// does nothing at all, with no way to tell from the screen. So it is
+    /// re-taken from the frame tick, which costs a Bool comparison per frame
+    /// in the case where nothing is wrong.
+    func keepKeyboardFocus() {
+        if window != nil && !isFirstResponder { becomeFirstResponder() }
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil { becomeFirstResponder() }
+    }
+
+    /// The HID usages of the eight modifier keys, which are handled before
+    /// everything else in an event.
+    private static let modifierUsages = 0xE0...0xE7
+    /// Caps Lock's usage. Deliberately not fed in as a key: see syncModifiers.
+    private static let capsLockUsage = 0x39
+
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
         var handled = false
+        // Modifiers first, then the flags, then everything else. The order
+        // matters for a key pressed while Shift was already down: the guest
+        // has to see the Shift before the key it modified, and a Shift held
+        // from before this view had the keyboard exists only in the flags.
         for press in presses {
-            guard let key = press.key else { continue }
+            guard let key = press.key, Self.modifierUsages.contains(key.keyCode.rawValue)
+            else { continue }
             handled = true
             let vk = Self.virtualKey(forHID: key.keyCode.rawValue)
+            guard vk != 0 else { continue }
+            note(modifier: vk, down: true)
+            w32_input_key(Int32(vk), 1)
+        }
+        if let flags = presses.first(where: { $0.key != nil })?.key?.modifierFlags {
+            syncModifiers(flags)
+        }
+        for press in presses {
+            guard let key = press.key else { continue }
+            let hid = key.keyCode.rawValue
+            if Self.modifierUsages.contains(hid) || hid == Self.capsLockUsage { continue }
+            handled = true
+            let vk = Self.virtualKey(forHID: hid)
             // The system resolved the layout, so hand the character over with
             // the key rather than guessing at one. It is not queued as a
             // WM_CHAR here: TranslateMessage is where Windows produces those,
@@ -139,15 +238,74 @@ final class GuestInputView: UIView, UIGestureRecognizerDelegate {
         var handled = false
         for press in presses {
             guard let key = press.key else { continue }
+            let hid = key.keyCode.rawValue
+            if hid == Self.capsLockUsage { continue }
             handled = true
-            let vk = Self.virtualKey(forHID: key.keyCode.rawValue)
-            if vk != 0 { w32_input_key(Int32(vk), 0) }
+            let vk = Self.virtualKey(forHID: hid)
+            guard vk != 0 else { continue }
+            note(modifier: vk, down: false)
+            w32_input_key(Int32(vk), 0)
+        }
+        // After the releases, so anything the system says is still held gets
+        // put back and anything it says is not gets let go.
+        if let flags = presses.first(where: { $0.key != nil })?.key?.modifierFlags {
+            syncModifiers(flags)
         }
         if !handled { super.pressesEnded(presses, with: event) }
     }
 
     override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
         pressesEnded(presses, with: event)
+    }
+
+    /// Reconcile the modifier keys against what the system says is held.
+    ///
+    /// The press events on their own are not enough. A modifier pressed
+    /// before this view became first responder never produces a press here,
+    /// and one released while an alert or the app switcher was up never
+    /// produces a release — and either way the guest is left believing Shift
+    /// is down for the rest of the run, which a game shows as a walk key that
+    /// has stuck. `modifierFlags` arrives with every key event and is the
+    /// truth about right now, so every key event is a chance to correct it.
+    ///
+    /// The left-hand virtual key is the one sent for a flag with no press
+    /// behind it, because the flags do not say which side it came from. There
+    /// is no need to send VK_SHIFT, VK_CONTROL or VK_MENU as well: the guest
+    /// derives each of those from its own pair (w32_input_key_ch in
+    /// win32/user32.c), so sending it too would only give it a second opinion.
+    private func syncModifiers(_ flags: UIKeyModifierFlags) {
+        reconcile(flags.contains(.shift),     left: 0xA0, right: 0xA1)   // VK_LSHIFT/VK_RSHIFT
+        reconcile(flags.contains(.control),   left: 0xA2, right: 0xA3)   // VK_LCONTROL/VK_RCONTROL
+        reconcile(flags.contains(.alternate), left: 0xA4, right: 0xA5)   // VK_LMENU/VK_RMENU
+        reconcile(flags.contains(.command),   left: 0x5B, right: 0x5C)   // VK_LWIN/VK_RWIN
+        // Caps Lock is a lock, not a hold: the flag says the lock is on, not
+        // that the key is down. So a change in it is one press and release,
+        // and the physical key is skipped in pressesBegan/Ended — feeding in
+        // both would flip the guest's toggle bit twice and leave it wrong.
+        let caps = flags.contains(.alphaShift)
+        if caps != capsOn {
+            capsOn = caps
+            w32_input_key(0x14, 1)          // VK_CAPITAL
+            w32_input_key(0x14, 0)
+        }
+    }
+
+    private func reconcile(_ down: Bool, left: Int, right: Int) {
+        let held = heldModifiers.contains(left) || heldModifiers.contains(right)
+        if down && !held {
+            heldModifiers.insert(left)
+            w32_input_key(Int32(left), 1)
+        } else if !down && held {
+            if heldModifiers.remove(left) != nil { w32_input_key(Int32(left), 0) }
+            if heldModifiers.remove(right) != nil { w32_input_key(Int32(right), 0) }
+        }
+    }
+
+    /// Keep the reconciler's idea of what is held in step with the presses it
+    /// did see, so a real left/right key is not replaced by a synthetic one.
+    private func note(modifier vk: Int, down: Bool) {
+        guard (vk >= 0xA0 && vk <= 0xA5) || vk == 0x5B || vk == 0x5C else { return }
+        if down { heldModifiers.insert(vk) } else { heldModifiers.remove(vk) }
     }
 
     // MARK: a hardware mouse
@@ -158,18 +316,29 @@ final class GuestInputView: UIView, UIGestureRecognizerDelegate {
             self?.bind(mouse: n.object as? GCMouse)
         })
         observers.append(c.addObserver(forName: .GCMouseDidDisconnect, object: nil, queue: .main) { [weak self] _ in
-            self?.mouseConnected = GCMouse.mice().isEmpty == false
+            guard let self else { return }
+            // Let go of the one that left before looking for another, or its
+            // handlers keep it alive and the drawn crosshair stays hidden for
+            // a mouse that is not there any more.
+            self.boundMouse = nil
+            self.mouseConnected = false
+            self.bind(mouse: GCMouse.current)
         })
         bind(mouse: GCMouse.current)
     }
 
     private func bind(mouse: GCMouse?) {
-        guard let input = mouse?.mouseInput else { return }
+        guard let input = mouse?.mouseInput else {
+            mouseConnected = HardwareInput.mouseConnected
+            return
+        }
         mouseConnected = true
-        // Relative, which is the whole reason to use this API.
-        input.mouseMovedHandler = { _, dx, dy in
+        // Relative, which is the whole reason to use this API. GameController
+        // calls these on the main queue unless it is told otherwise, which is
+        // what makes it safe for them to touch the remainders in sendMotion.
+        input.mouseMovedHandler = { [weak self] _, dx, dy in
             // iOS reports y upward; Windows client coordinates go down.
-            w32_input_mouse_delta(Int32(dx.rounded()), Int32((-dy).rounded()))
+            self?.sendMotion(dx: Double(dx), dy: Double(-dy))
         }
         input.leftButton.pressedChangedHandler = { _, _, pressed in
             w32_input_mouse_button(0, pressed ? 1 : 0)
@@ -195,6 +364,45 @@ final class GuestInputView: UIView, UIGestureRecognizerDelegate {
         // WHEEL_DELTA is 120 per notch, and the sign agrees: away from you is
         // positive on both sides.
         w32_input_mouse_wheel(Int32((y * 120).rounded()))
+    }
+
+    /// True when the system pointer should be taken away and the mouse read
+    /// as motion alone.
+    ///
+    /// Only with a mouse connected, and only while the guest has hidden its
+    /// own cursor — which is the guest saying it is doing mouselook and
+    /// recentring the pointer itself with SetCursorPos every frame, exactly
+    /// the case where a visible system pointer sliding to the edge of the
+    /// screen is wrong. A menu leaves the cursor visible and keeps the
+    /// pointer, so Close and the dialog keys stay reachable with the mouse
+    /// rather than needing the screen touched.
+    var wantsPointerLock: Bool { mouseConnected && w32_cursor_visible() == 0 }
+
+    private func refreshMouseSettings() {
+        sensitivity = Settings.mouseSensitivity
+        invertY = Settings.mouseInvertY
+    }
+
+    /// Every source of motion goes through here, so the feel does not change
+    /// with the hardware.
+    ///
+    /// This is where the sensitivity and the invert switch are applied, which
+    /// until now was nowhere: Settings described both as being applied "to
+    /// every source of motion" and nothing was reading either of them, so the
+    /// slider moved and nothing happened.
+    ///
+    /// The remainder is kept rather than rounded away, per axis. At 0.3x a
+    /// one-pixel report rounds to zero, and a sensitivity that low would
+    /// otherwise not slow the pointer down but stop it dead.
+    private func sendMotion(dx: Double, dy: Double) {
+        restX += dx * sensitivity
+        restY += dy * sensitivity * (invertY ? -1.0 : 1.0)
+        let ix = restX.rounded(.towardZero)
+        let iy = restY.rounded(.towardZero)
+        restX -= ix
+        restY -= iy
+        guard ix != 0 || iy != 0 else { return }
+        w32_input_mouse_delta(Int32(ix), Int32(iy))
     }
 
     // MARK: the touchscreen
@@ -234,11 +442,9 @@ final class GuestInputView: UIView, UIGestureRecognizerDelegate {
         let t = g.translation(in: self)
         g.setTranslation(.zero, in: self)
         let d = clientDelta(fromView: t)
-        let dx = Int32(d.x.rounded()), dy = Int32(d.y.rounded())
-        guard dx != 0 || dy != 0 else { return }
         // Relative in both modes. When the guest is showing a cursor this
         // reads as a trackpad; when it has hidden one it *is* mouselook.
-        w32_input_mouse_delta(dx, dy)
+        sendMotion(dx: Double(d.x), dy: Double(d.y))
     }
 
     @objc private func tapped(_ g: UITapGestureRecognizer) {

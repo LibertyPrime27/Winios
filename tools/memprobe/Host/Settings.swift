@@ -111,11 +111,34 @@ enum Settings {
     // Applied in GuestViewController, which owns the overlay.
 
     /// The hold-to-press WASD overlay. On by default because without a
-    /// hardware keyboard there is otherwise no way to move; off is for when
-    /// a keyboard is attached and the overlay is just covering the game.
+    /// hardware keyboard there is otherwise no way to move.
+    ///
+    /// This is now the ceiling rather than the whole answer: GuestViewController
+    /// hides the overlay on its own while a hardware keyboard is connected,
+    /// because asking someone to come here and turn it off after plugging a
+    /// keyboard in was asking them to do something the app can see for
+    /// itself. Turning this off keeps it hidden either way.
     static var onScreenKeys: Bool {
         get { store.object(forKey: "onScreenKeys") as? Bool ?? true }
         set { store.set(newValue, forKey: "onScreenKeys") }
+    }
+
+    // MARK: crash reports
+    //
+    // Applied in CrashReports.swift, which arms the handlers at launch and
+    // again when this is switched on.
+
+    /// Off by default because it costs performance: the handlers have to be
+    /// armed before anything runs and stay armed, and the alternate signal
+    /// stack and the open report file are held for the life of the process
+    /// whether or not anything ever goes wrong.
+    ///
+    /// It is deliberately not a "record now" button. A crash does not
+    /// announce itself, so either the handlers were in place before it
+    /// happened or there is nothing to report.
+    static var recordCrashes: Bool {
+        get { store.object(forKey: "recordCrashes") as? Bool ?? false }
+        set { store.set(newValue, forKey: "recordCrashes") }
     }
 
     /// Send the display setting into the emulator. Called before a guest

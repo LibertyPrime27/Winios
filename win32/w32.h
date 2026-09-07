@@ -339,6 +339,7 @@ extern const w32_api w32_comctl32[];
 /* misc_dlls.c: the long tail a game engine links and rarely calls */
 extern const w32_api w32_imm32[];
 extern const w32_api w32_dwmapi[];
+extern const w32_api w32_uxtheme[];
 extern const w32_api w32_avrt[];
 extern const w32_api w32_version[];
 extern const w32_api w32_rpcrt4[];
@@ -439,6 +440,22 @@ int       w32_ui_dpi(void);
 int       w32_points_to_pixels(int points);
 int       w32_gdi_line_height(uint64_t hdc);
 uint32_t  w32_gdi_brush_color(uint64_t hbrush, int *is_null);
+
+/* Pictures, made on the gdi32 side because that is where the object table
+ * lives, but created by user32's LoadImage/LoadIcon and drawn by its window
+ * painting. `px` is 0xAARRGGBB and is taken over by the object.
+ *
+ * An icon and a cursor are the same thing here as they are on Windows: a
+ * bitmap with an alpha channel and a hot spot. Keeping them one type is why
+ * DrawIconEx can draw either. */
+uint64_t  w32_gdi_make_bitmap(int cx, int cy, uint32_t *px);
+uint64_t  w32_gdi_make_icon(int cx, int cy, uint32_t *px, int hx, int hy);
+int       w32_gdi_icon_size(uint64_t h, int *cx, int *cy, int *hx, int *hy);
+const uint32_t *w32_gdi_icon_bits(uint64_t h);
+void      w32_gdi_delete_object(uint64_t h);
+/* Alpha-blend an icon or bitmap into a DC, scaled to cx by cy (0 for its own
+ * size). This is what a title bar, a message box and DrawIconEx all use. */
+void      w32_gdi_draw_image(uint64_t hdc, uint64_t himg, int x, int y, int cx, int cy);
 void      w32_gdi_set_text_color(uint64_t hdc, uint32_t colorref);
 void      w32_gdi_set_bk_color(uint64_t hdc, uint32_t colorref);
 void      w32_gdi_set_bk_mode(uint64_t hdc, int mode);
@@ -564,6 +581,10 @@ int w32_run(w32 *w);
  * button -- and checked between execution slices, so it does not have to
  * interrupt anything. */
 void w32_request_stop(void);
+/* Something happened -- a frame was presented, input arrived. Resets the idle
+ * counter that paces a PeekMessage loop, so a busy game is never slowed and an
+ * idle one stops holding a core at 100%. */
+void w32_note_activity(void);
 
 /* Everything worth knowing about where a run ended: the reason, the guest's
  * registers, the instructions at RIP, the module map, and what it called that

@@ -2,10 +2,16 @@ import UIKit
 
 /// Settings, and the JIT state that belongs with them.
 ///
-/// Only things that change what the emulator does. The display mode is the
+/// Mostly things that change what the emulator does. The display mode is the
 /// real one — it decides how many pixels a game draws — and the mouse and
 /// keyboard settings are the ones people go looking for when a game feels
 /// wrong rather than looks wrong.
+///
+/// The two at the bottom are different in kind: the log and the crash report
+/// change nothing about a run, they are what is left to read afterwards.
+/// They are here because this is the screen somebody is already on when a
+/// game has just misbehaved, and a report they have to go looking for is a
+/// report that does not get sent.
 ///
 /// The JIT row is here as well as on the library screen, because this is
 /// where someone comes when a game runs badly, and "the dynarec is not on"
@@ -16,6 +22,14 @@ final class SettingsViewController: UIViewController {
     private let jitNote = UILabel()
     private let sensLabel = UILabel()
     private let sens = UISlider()
+    /// What is plugged in. The first line anyone should read when a game is
+    /// not responding to a keyboard or a mouse, so it is a line of its own
+    /// rather than a sentence inside a note.
+    private let hardware = UILabel()
+    private var hardwareObservers: [NSObjectProtocol] = []
+    private let crashStatus = UILabel()
+
+    deinit { hardwareObservers.forEach { NotificationCenter.default.removeObserver($0) } }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -57,10 +71,26 @@ final class SettingsViewController: UIViewController {
         keys.isOn = Settings.onScreenKeys
         keys.addTarget(self, action: #selector(keysChanged(_:)), for: .valueChanged)
 
+        // --- what is plugged in, and a watch on it changing while this
+        //     screen is open: somebody checking this line is quite likely to
+        //     be plugging something in as they read it.
+        hardware.font = .preferredFont(forTextStyle: .footnote)
+        hardware.numberOfLines = 0
+        hardwareObservers = HardwareInput.observe { [weak self] in self?.refreshHardware() }
+        refreshHardware()
+
         // --- logs
         let logs = UISwitch()
         logs.isOn = Logs.isEnabled
         logs.addTarget(self, action: #selector(logsChanged(_:)), for: .valueChanged)
+
+        // --- crash reports
+        let crashes = UISwitch()
+        crashes.isOn = Settings.recordCrashes
+        crashes.addTarget(self, action: #selector(crashesChanged(_:)), for: .valueChanged)
+        crashStatus.font = .preferredFont(forTextStyle: .footnote)
+        crashStatus.numberOfLines = 0
+        refreshCrash()
 
         let stack = UIStackView(arrangedSubviews: [
             jit, jitNote,
@@ -80,13 +110,26 @@ final class SettingsViewController: UIViewController {
                  + "does on a high-resolution laptop. Takes effect the next "
                  + "time an installer or a dialog opens."),
             scale,
+            heading("Hardware keyboard and mouse"),
+            hardware,
+            note("Both are used the moment they are connected; there is "
+                 + "nothing to switch on. A keyboard's keys reach the game "
+                 + "with the character its own layout produced rather than "
+                 + "one guessed at here, and a mouse reports movement rather "
+                 + "than a position — which is what a game doing mouselook "
+                 + "needs, and what a pointer stopped at the edge of the "
+                 + "screen cannot give it. While a game has its cursor hidden "
+                 + "the pointer is captured, so nothing of the system's is "
+                 + "drawn over it. If a game is ignoring a keyboard or a "
+                 + "mouse, the line above is the thing to check first."),
             heading("Mouse"),
             sensLabel, sens,
             switchRow("Invert vertical look", invert),
             heading("Keyboard"),
             switchRow("On-screen WASD keys", keys),
-            note("Turn these off when a hardware keyboard is attached — they "
-                 + "only cover the game up."),
+            note("These hide themselves while a hardware keyboard is "
+                 + "connected, so this switch is for keeping them out of the "
+                 + "way when there is not one."),
             heading("Logs"),
             note("Off by default. When on, every run is written to a file on "
                  + "this device along with what the device is — model, iOS "
@@ -97,18 +140,56 @@ final class SettingsViewController: UIViewController {
             switchRow("Record logs", logs),
             row([("View log", #selector(viewLog)), ("Copy", #selector(copyLog)),
                  ("Clear", #selector(clearLog))]),
+            heading("Crash reports"),
+            note("Off by default because it costs performance. When on, the "
+                 + "app installs its own handlers for the signals a crash "
+                 + "arrives as, and writes the signal, the fault address and "
+                 + "a backtrace into a file that was already open — so the "
+                 + "report survives the process dying. There is no start "
+                 + "button, because a crash never announces itself: either "
+                 + "the handlers were armed before it or there is nothing to "
+                 + "read afterwards."),
+            note("Worth having because the system's own report usually names "
+                 + "the wrong program. Launched through LiveContainer and "
+                 + "StikDebug, the process that dies is often one of those, "
+                 + "and the report is filed against it. Whatever a game was "
+                 + "doing when it went — which one, 32- or 64-bit, with or "
+                 + "without the JIT — is recorded here either way."),
+            switchRow("Record crashes", crashes),
+            crashStatus,
+            row([("View crash", #selector(viewCrash)), ("Copy", #selector(copyCrash)),
+                 ("Clear", #selector(clearCrash))]),
             UIView(),
         ])
         stack.axis = .vertical
         stack.spacing = 10
         stack.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(stack)
+
+        // In a scroll view since the crash section was added: the screen was
+        // already full on a phone in landscape, and a stack pinned to the
+        // safe area does not overflow, it squashes -- the last few rows come
+        // out unreadable rather than out of sight, which is a worse way to
+        // fail because nothing about it looks wrong.
+        let scroll = UIScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.alwaysBounceVertical = true
+        view.addSubview(scroll)
+        scroll.addSubview(stack)
+
         let g = view.safeAreaLayoutGuide
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: g.topAnchor, constant: 16),
-            stack.leadingAnchor.constraint(equalTo: g.leadingAnchor, constant: 16),
-            stack.trailingAnchor.constraint(equalTo: g.trailingAnchor, constant: -16),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: g.bottomAnchor, constant: -16),
+            scroll.topAnchor.constraint(equalTo: g.topAnchor),
+            scroll.leadingAnchor.constraint(equalTo: g.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: g.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: g.bottomAnchor),
+            stack.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor, constant: 16),
+            stack.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor, constant: 16),
+            stack.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor, constant: -16),
+            stack.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor, constant: -16),
+            // The content guide alone gives the stack no width, and every
+            // wrapping label then lays itself out at zero. This is what makes
+            // it scroll in one direction only.
+            stack.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor, constant: -32),
         ])
     }
 
@@ -117,6 +198,8 @@ final class SettingsViewController: UIViewController {
         // The arena may have been blessed from Diagnostics since this screen
         // was last looked at.
         refreshJIT()
+        refreshHardware()
+        refreshCrash()
     }
 
     // MARK: - rows
@@ -178,16 +261,23 @@ final class SettingsViewController: UIViewController {
 
     @objc private func viewLog() {
         let text = Logs.text()
+        pushText(title: "Log", text: text.isEmpty
+            ? (Logs.isEnabled ? "Nothing recorded yet — run a program."
+                              : "Log recording is off. Turn it on above, then run a program.")
+            : text)
+    }
+
+    /// One screen for both the log and the crash report, because they are the
+    /// same thing to read: a wall of monospaced text somebody is going to
+    /// copy out of.
+    private func pushText(title: String, text: String) {
         let vc = UIViewController()
-        vc.title = "Log"
+        vc.title = title
         vc.view.backgroundColor = .systemBackground
         let tv = UITextView()
         tv.isEditable = false
         tv.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
-        tv.text = text.isEmpty
-            ? (Logs.isEnabled ? "Nothing recorded yet — run a program."
-                              : "Log recording is off. Turn it on above, then run a program.")
-            : text
+        tv.text = text
         tv.translatesAutoresizingMaskIntoConstraints = false
         vc.view.addSubview(tv)
         let g = vc.view.safeAreaLayoutGuide
@@ -198,6 +288,33 @@ final class SettingsViewController: UIViewController {
             tv.bottomAnchor.constraint(equalTo: g.bottomAnchor),
         ])
         navigationController?.pushViewController(vc, animated: true)
+    }
+
+    /// Turning it on arms the handlers in this process rather than waiting
+    /// for the next launch: somebody switching this on has just had a crash
+    /// and asking them to relaunch first is asking them to reproduce it
+    /// twice. Turning it off takes effect at the next launch — the handlers
+    /// already installed are left where they are, since taking them down
+    /// while a guest is running is more risk than the switch is worth.
+    @objc private func crashesChanged(_ sw: UISwitch) {
+        Settings.recordCrashes = sw.isOn
+        CrashReports.arm()
+        refreshCrash()
+    }
+
+    @objc private func viewCrash() {
+        pushText(title: "Crash", text: CrashReports.report())
+    }
+
+    @objc private func copyCrash() {
+        UIPasteboard.general.string = CrashReports.report()
+        status("Copied.")
+    }
+
+    @objc private func clearCrash() {
+        CrashReports.clear()
+        refreshCrash()
+        status("Crash report cleared.")
     }
 
     @objc private func copyLog() {
@@ -239,6 +356,21 @@ final class SettingsViewController: UIViewController {
     }
     @objc private func invertChanged(_ sw: UISwitch) { Settings.mouseInvertY = sw.isOn }
     @objc private func keysChanged(_ sw: UISwitch) { Settings.onScreenKeys = sw.isOn }
+
+    private func refreshHardware() {
+        hardware.text = HardwareInput.summary
+        // Full-strength text when something is attached and dimmed when
+        // nothing is. Not a warning either way: running with neither is the
+        // ordinary case, and colouring it as a fault would be telling people
+        // something is wrong when nothing is.
+        let any = HardwareInput.keyboardConnected || HardwareInput.mouseConnected
+        hardware.textColor = any ? .label : .secondaryLabel
+    }
+
+    private func refreshCrash() {
+        crashStatus.text = CrashReports.summary
+        crashStatus.textColor = CrashReports.hasPrevious ? .systemRed : .secondaryLabel
+    }
 
     private func refreshJIT() {
         let on = Settings.jitReady

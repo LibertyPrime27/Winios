@@ -26,6 +26,7 @@
 #define _GNU_SOURCE
 #include "w32.h"
 #include "gdifont.h"
+#include "image.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -81,7 +82,7 @@ static uint32_t ref_of(uint32_t p) {
 
 /* ------------------------------------------------------------- objects */
 
-typedef enum { G_FREE = 0, G_PEN, G_BRUSH, G_FONT, G_BITMAP, G_REGION } gtype;
+typedef enum { G_FREE = 0, G_PEN, G_BRUSH, G_FONT, G_BITMAP, G_REGION, G_ICON } gtype;
 
 enum { PS_SOLID = 0, PS_NULL = 5 };
 enum { BS_SOLID = 0, BS_NULL = 1, BS_HATCHED = 2, BS_PATTERN = 3 };
@@ -92,10 +93,12 @@ typedef struct {
     uint32_t color;                /* COLORREF: pen or brush colour */
     int      style, width;         /* pen style/width, or brush style */
     /* font */
-    int      height, weight, italic, underline, strikeout;
+    int      height, weight, italic, underline, strikeout, pitch;
     char     face[32];
-    /* bitmap */
+    /* bitmap, and the icon or cursor that is a bitmap with a hot spot */
     int      bw, bh;
+    int      hx, hy;
+    int      own_pixels;           /* free bits on delete: a decoded image does */
     uint32_t *bits;
 } gobj;
 
@@ -319,102 +322,117 @@ static void line(gdc *d, int x0, int y0, int x1, int y1, uint32_t p, int thick) 
 
 /* ---------------------------------------------------------------- text */
 
-/* The scale a font of `height` draws at. GDI's LOGFONT height is the cell
- * height when positive and the character height when negative; both land in
- * the same place here because the design grid has one em from cap line to
- * descender. A zero height means "the default", not "invisible". */
-static void font_metrics(const gobj *f, int *cell, int *ascent, int *bold) {
-    int h = f ? f->height : -11;
-    if (h < 0) h = -h * 13 / 11;                   /* char height -> cell height */
-    if (h == 0) h = 13;
-    if (h < 6) h = 6;
-    if (h > 200) h = 200;
-    *cell = h;
-    *ascent = h * GF_BASE / GF_EM;
-    *bold = f && f->weight >= 600;
+/* The face a DC's font means, at the size it means.
+ *
+ * Cached on the object, because this is called for every string drawn and
+ * every string measured -- and a repaint measures a lot more than it draws. */
+static void font_of(const gobj *f, gf_font *out) {
+    gf_select(out, f ? f->face : "", f ? f->height : 0, f ? f->weight : 400,
+              f ? f->italic : 0,
+              /* LOGFONT lfPitchAndFamily: the low two bits are the pitch, and
+               * 1 is FIXED_PITCH. A program that asks for a fixed pitch and
+               * names no face means the typewriter font. */
+              f ? (f->pitch & 3) == 1 : 0);
 }
 
-/* One glyph's advance in pixels at this cell height. Rounded to the nearest
- * pixel rather than down, or every narrow letter collapses to the same width
- * at small sizes and the font stops being proportional where it matters
- * most. Never zero: a glyph that does not move is an infinite loop in any
- * caller that walks a string by width. */
-static int glyph_advance(int cell, uint32_t ch) {
-    int a = (gf_advance(ch) * cell + GF_EM / 2) / GF_EM;
-    return a < 1 ? 1 : a;
-}
-
-/* A whole run. This has to be a function of the *string*, not of its length
- * -- which is the whole reason the measuring API takes one. A proportional
- * font whose extent is computed from a character count is a monospaced font
- * with extra steps, and every control sized by GetTextExtentPoint32 comes
- * out the wrong width. */
-static int run_width(int cell, const char *s, int len) {
+/* A whole run's width, in 26.6 pixels.
+ *
+ * This has to be a function of the *string*, not of its length -- which is the
+ * whole reason the measuring API takes one. A proportional font whose extent
+ * is computed from a character count is a monospaced font with extra steps,
+ * and every control sized by GetTextExtentPoint32 comes out the wrong width.
+ *
+ * Accumulated in 64ths and rounded once at the end rather than rounding each
+ * character: rounding per glyph loses up to half a pixel per character, which
+ * over a sentence is several characters' worth of drift between where the
+ * text is measured to end and where it is drawn to end. */
+static int run_width64(const gf_font *ft, const char *s, int len) {
     int w = 0;
-    int tab = glyph_advance(cell, ' ') * 4;
+    int tab = gf_advance(ft, ' ') * 4;
+    if (tab < 64) tab = 64;
     for (int i = 0; i < len; i++) {
         unsigned char c = (unsigned char)s[i];
         if (c == '\t') { w = (w / tab + 1) * tab; continue; }
-        w += glyph_advance(cell, c);
+        w += gf_advance(ft, c);
     }
     return w;
 }
+static int run_width(const gf_font *ft, const char *s, int len) {
+    return (run_width64(ft, s, len) + 32) >> 6;
+}
 
-/* One character, its origin at the cell's top-left in DC space. */
-static void draw_glyph(gdc *d, int x, int y, uint32_t ch, int cell, int bold, uint32_t p) {
-    gf_point pts[GF_MAXPTS];
-    int n = gf_glyph(ch, pts, GF_MAXPTS);
-    int px0 = 0, py0 = 0;
-    /* A one-pixel stroke is right at 11 pixels and spidery at 30. Real text
-     * gets heavier as it gets bigger; a plotter font that does not looks
-     * like a wireframe of text rather than text. */
-    int weight = cell >= 34 ? 3 : cell >= 19 ? 2 : 1;
-    if (bold) weight++;
-    for (int i = 0; i < n; i++) {
-        /* +GF_EM/2 rounds to the nearest pixel instead of always down, which
-         * is the difference between a legible small size and a mush. */
-        int gx = x + (pts[i].x * cell + GF_EM / 2) / GF_EM;
-        int gy = y + (pts[i].y * cell + GF_EM / 2) / GF_EM;
-        if (!pts[i].move) {
-            /* Thickness by drawing the stroke again, offset -- a real pen
-             * width would need the outline of the stroke, and for a UI font
-             * at these sizes the difference is not visible. */
-            for (int k = 0; k < weight; k++) line(d, px0 + k, py0, gx + k, gy, p, 1);
-            if (weight > 1) for (int k = 0; k < weight - 1; k++)
-                line(d, px0, py0 + k, gx, gy + k, p, 1);
+/* One glyph, blended. `bx` is the pen position in 26.6 and `base` the
+ * baseline row; a glyph's own box is placed relative to those.
+ *
+ * Coverage is a straight lerp towards the text colour. GDI without ClearType
+ * does exactly this, and doing it per channel in integers keeps the result
+ * identical on every machine -- which matters because text is most of what is
+ * in the frames the tests compare. */
+static void blend_glyph(gdc *d, const tt_glyph *g, int bx, int base, uint32_t fg) {
+    /* d->ox/oy is the DC's origin -- a control's DC is the window's surface
+     * with an offset, so every primitive here adds it. Leaving it out draws
+     * the text at the top-left of the screen, or clips it away entirely. */
+    int x0 = ((bx + 32) >> 6) + g->left + d->ox, y0 = base - g->top + d->oy;
+    int fr = (int)((fg >> 16) & 0xFF), fg_ = (int)((fg >> 8) & 0xFF), fb = (int)(fg & 0xFF);
+    for (int y = 0; y < g->h; y++) {
+        int py = y0 + y;
+        if (py < d->ct || py >= d->cb || py < 0 || py >= d->sh) continue;
+        const unsigned char *row = g->a + (size_t)y * g->w;
+        uint32_t *dst = d->bits + (size_t)py * d->sw;
+        for (int x = 0; x < g->w; x++) {
+            unsigned a = row[x];
+            if (!a) continue;
+            int px_ = x0 + x;
+            if (px_ < d->cl || px_ >= d->cr || px_ < 0 || px_ >= d->sw) continue;
+            if (a == 255) { dst[px_] = fg; continue; }
+            uint32_t o = dst[px_];
+            unsigned ia = 255 - a;
+            unsigned r = (((o >> 16) & 0xFF) * ia + (unsigned)fr * a + 127) / 255;
+            unsigned gg = (((o >> 8) & 0xFF) * ia + (unsigned)fg_ * a + 127) / 255;
+            unsigned b = (((o) & 0xFF) * ia + (unsigned)fb * a + 127) / 255;
+            dst[px_] = (r << 16) | (gg << 8) | b;
         }
-        px0 = gx; py0 = gy;
     }
 }
 
 /* Text at (x, y), where y is the top of the cell. Returns the width drawn. */
 static int draw_text_run(gdc *d, int x, int y, const char *s, int len) {
     gobj *f = obj_of(d->font);
-    int cell, ascent, bold;
-    font_metrics(f, &cell, &ascent, &bold);
+    gf_font ft;
+    font_of(f, &ft);
     uint32_t fg = px(d->textcolor), bg = px(d->bkcolor);
-    if (d->bkmode == OPAQUE_) fill(d, x, y, x + run_width(cell, s, len), y + cell, bg);
-    int tab = glyph_advance(cell, ' ') * 4;
-    int cx = x;
+    if (d->bkmode == OPAQUE_)
+        fill(d, x, y, x + run_width(&ft, s, len), y + ft.height, bg);
+    int tab = gf_advance(&ft, ' ') * 4;
+    if (tab < 64) tab = 64;
+    int base = y + ft.ascent;
+    int pen = 0;
     for (int i = 0; i < len; i++) {
         unsigned char c = (unsigned char)s[i];
-        if (c == '\t') { cx = x + ((cx - x) / tab + 1) * tab; continue; }
-        draw_glyph(d, cx, y, c, cell, bold, fg);
-        cx += glyph_advance(cell, c);
+        if (c == '\t') { pen = (pen / tab + 1) * tab; continue; }
+        const tt_glyph *g = gf_glyph(&ft, c);
+        if (g) blend_glyph(d, g, (x << 6) + pen, base, fg);
+        pen += gf_advance(&ft, c);
     }
-    if (f && f->underline) fill(d, x, y + ascent + 2, cx, y + ascent + 3, fg);
-    if (f && f->strikeout)  fill(d, x, y + ascent * 2 / 3, cx, y + ascent * 2 / 3 + 1, fg);
+    int cx = x + ((pen + 32) >> 6);
+    if (f && f->underline) {
+        int uy = base + (ft.descent > 2 ? 2 : 1);
+        fill(d, x, uy, cx, uy + (ft.px >= 24 ? 2 : 1), fg);
+    }
+    if (f && f->strikeout) {
+        int sy = base - ft.ascent / 3;
+        fill(d, x, sy, cx, sy + (ft.px >= 24 ? 2 : 1), fg);
+    }
     return cx - x;
 }
 
 void w32_gdi_text_extent(uint64_t hdc, const char *s, int len, int *cx, int *cy) {
     gdc *d = dc_of(hdc);
     if (!d) { if (cx) *cx = 0; if (cy) *cy = 0; return; }
-    gobj *f = obj_of(d->font);
-    int cell, ascent, bold;
-    font_metrics(f, &cell, &ascent, &bold);
-    if (cx) *cx = s ? run_width(cell, s, len) : 0;
-    if (cy) *cy = cell;
+    gf_font ft;
+    font_of(obj_of(d->font), &ft);
+    if (cx) *cx = s ? run_width(&ft, s, len) : 0;
+    if (cy) *cy = ft.height;
 }
 /* The average character width, which is what a dialog's unit conversion is
  * defined in terms of -- not the width of any particular letter. Windows
@@ -423,20 +441,16 @@ void w32_gdi_text_extent(uint64_t hdc, const char *s, int len, int *cx, int *cy)
 int w32_gdi_average_width(uint64_t hdc) {
     gdc *d = dc_of(hdc);
     if (!d) return 6;
-    int cell, ascent, bold;
-    font_metrics(obj_of(d->font), &cell, &ascent, &bold);
-    int total = 0;
-    for (int c = 'A'; c <= 'Z'; c++) total += glyph_advance(cell, (uint32_t)c);
-    for (int c = 'a'; c <= 'z'; c++) total += glyph_advance(cell, (uint32_t)c);
-    int avg = total / 52;
-    return avg < 1 ? 1 : avg;
+    gf_font ft;
+    font_of(obj_of(d->font), &ft);
+    return gf_average_width(&ft);
 }
 int w32_gdi_line_height(uint64_t hdc) {
     gdc *d = dc_of(hdc);
     if (!d) return 13;
-    int cell, ascent, bold;
-    font_metrics(obj_of(d->font), &cell, &ascent, &bold);
-    return cell;
+    gf_font ft;
+    font_of(obj_of(d->font), &ft);
+    return ft.height;
 }
 
 /* --------------------------------------------------- the host-side API */
@@ -469,6 +483,85 @@ uint32_t w32_gdi_brush_color(uint64_t hbrush, int *is_null) {
     if (is_null) *is_null = !o || o->style == BS_NULL;
     return o ? o->color : 0xFFFFFF;
 }
+
+/* ------------------------------------------------------------- pictures */
+
+static uint64_t make_image(gtype t, int cx, int cy, uint32_t *px, int hx, int hy) {
+    stock_init();
+    if (cx <= 0 || cy <= 0 || !px) { free(px); return 0; }
+    gobj *o = obj_new(t);
+    if (!o) { free(px); return 0; }
+    o->bw = cx; o->bh = cy; o->bits = px; o->own_pixels = 1;
+    o->hx = hx; o->hy = hy;
+    return handle_of(o);
+}
+uint64_t w32_gdi_make_bitmap(int cx, int cy, uint32_t *px) {
+    return make_image(G_BITMAP, cx, cy, px, 0, 0);
+}
+uint64_t w32_gdi_make_icon(int cx, int cy, uint32_t *px, int hx, int hy) {
+    return make_image(G_ICON, cx, cy, px, hx, hy);
+}
+int w32_gdi_icon_size(uint64_t h, int *cx, int *cy, int *hx, int *hy) {
+    gobj *o = obj_of(h);
+    if (!o || (o->type != G_ICON && o->type != G_BITMAP) || !o->bits) return 0;
+    if (cx) *cx = o->bw;
+    if (cy) *cy = o->bh;
+    if (hx) *hx = o->hx;
+    if (hy) *hy = o->hy;
+    return 1;
+}
+/* Free an image object from the host side. DestroyIcon and DestroyCursor are
+ * user32 calls but the object lives here. */
+void w32_gdi_delete_object(uint64_t h) {
+    gobj *o = obj_of(h);
+    if (!o || o->stock) return;
+    if (o->own_pixels) free(o->bits);
+    memset(o, 0, sizeof *o);
+}
+const uint32_t *w32_gdi_icon_bits(uint64_t h) {
+    gobj *o = obj_of(h);
+    return o && o->bits ? o->bits : 0;
+}
+
+/* Source-over, straight alpha, integers. The rounding term is there so that
+ * blending white at alpha 128 onto black gives 128 rather than 127 -- a
+ * half-level either way is invisible on one pixel and visible as a seam
+ * along the edge of a scaled icon. */
+static uint32_t over(uint32_t dst, uint32_t src) {
+    unsigned a = src >> 24;
+    if (!a) return dst;
+    if (a == 255) return src & 0x00FFFFFFu;
+    unsigned ia = 255 - a;
+    unsigned r = ((((dst >> 16) & 0xFF) * ia) + (((src >> 16) & 0xFF) * a) + 127) / 255;
+    unsigned g = ((((dst >>  8) & 0xFF) * ia) + (((src >>  8) & 0xFF) * a) + 127) / 255;
+    unsigned b = ((((dst      ) & 0xFF) * ia) + (((src      ) & 0xFF) * a) + 127) / 255;
+    return r << 16 | g << 8 | b;
+}
+
+void w32_gdi_draw_image(uint64_t hdc, uint64_t himg, int x, int y, int cx, int cy) {
+    gdc *d = dc_of(hdc);
+    gobj *o = obj_of(himg);
+    if (!d || !o || !o->bits || o->bw <= 0 || o->bh <= 0) return;
+    if (cx <= 0) cx = o->bw;
+    if (cy <= 0) cy = o->bh;
+    if (cx > 4096 || cy > 4096) return;
+    for (int j = 0; j < cy; j++) {
+        int py = y + j + d->oy;
+        if (py < d->ct || py >= d->cb || py < 0 || py >= d->sh) continue;
+        /* Nearest neighbour. An icon is normally drawn at the size it was
+         * authored for -- the directory is searched for that size first --
+         * so this scales only when a program insists, and a soft icon would
+         * look more wrong than a crisp one that is off by a pixel. */
+        const uint32_t *srow = o->bits + (size_t)(j * o->bh / cy) * o->bw;
+        uint32_t *drow = d->bits + (size_t)py * d->sw;
+        for (int i = 0; i < cx; i++) {
+            int pxx = x + i + d->ox;
+            if (pxx < d->cl || pxx >= d->cr || pxx < 0 || pxx >= d->sw) continue;
+            drow[pxx] = over(drow[pxx], srow[i * o->bw / cx]);
+        }
+    }
+}
+
 void w32_gdi_set_text_color(uint64_t hdc, uint32_t c) { gdc *d = dc_of(hdc); if (d) d->textcolor = c; }
 void w32_gdi_set_bk_color(uint64_t hdc, uint32_t c)   { gdc *d = dc_of(hdc); if (d) d->bkcolor = c; }
 void w32_gdi_set_bk_mode(uint64_t hdc, int m)         { gdc *d = dc_of(hdc); if (d) d->bkmode = m; }
@@ -552,6 +645,7 @@ static void logfont(w32 *w, uint64_t p, int wide) {
     o->italic    = (int)w32_read(w, p + 20, 1);
     o->underline = (int)w32_read(w, p + 21, 1);
     o->strikeout = (int)w32_read(w, p + 22, 1);
+    o->pitch     = (int)w32_read(w, p + 27, 1);   /* lfPitchAndFamily */
     RET(handle_of(o));
 }
 static void g_CreateFontIndirectA(w32 *w) { logfont(w, ARG(0), 0); }
@@ -559,7 +653,8 @@ static void g_CreateFontIndirectW(w32 *w) { logfont(w, ARG(0), 1); }
 static void g_CreateFontA(w32 *w) {
     stock_init();
     gobj *o = mk_font((int)(int32_t)(uint32_t)ARG(0), (int)ARG(4), ARG(13) ? GSTR(ARG(13)) : "");
-    if (o) { o->italic = (int)ARG(5); o->underline = (int)ARG(6); o->strikeout = (int)ARG(7); }
+    if (o) { o->italic = (int)ARG(5); o->underline = (int)ARG(6); o->strikeout = (int)ARG(7);
+             o->pitch = (int)ARG(12); }
     RET(o ? handle_of(o) : 0);
 }
 static void g_CreateFontW(w32 *w) {
@@ -567,7 +662,8 @@ static void g_CreateFontW(w32 *w) {
     char face[32]; face[0] = 0;
     if (ARG(13)) w32_wtoa(w, ARG(13), face, sizeof face);
     gobj *o = mk_font((int)(int32_t)(uint32_t)ARG(0), (int)ARG(4), face);
-    if (o) { o->italic = (int)ARG(5); o->underline = (int)ARG(6); o->strikeout = (int)ARG(7); }
+    if (o) { o->italic = (int)ARG(5); o->underline = (int)ARG(6); o->strikeout = (int)ARG(7);
+             o->pitch = (int)ARG(12); }
     RET(o ? handle_of(o) : 0);
 }
 
@@ -692,13 +788,13 @@ static void g_GetTextAlign(w32 *w) { gdc *d = dc_of(ARG(0)); RET(d ? (uint64_t)d
  * does it by setting TA_CENTER and passing the centre, and ignoring that puts
  * every caption in the wrong place. */
 static void text_out(gdc *d, int x, int y, const char *s, int len) {
-    int cell, ascent, bold;
-    font_metrics(obj_of(d->font), &cell, &ascent, &bold);
-    int width = run_width(cell, s, len);
+    gf_font ft;
+    font_of(obj_of(d->font), &ft);
+    int width = run_width(&ft, s, len);
     if ((d->align & 6) == TA_CENTER) x -= width / 2;
     else if ((d->align & 6) == TA_RIGHT) x -= width;
-    if (d->align & TA_BASELINE) y -= ascent;
-    else if (d->align & TA_BOTTOM) y -= cell;
+    if (d->align & TA_BASELINE) y -= ft.ascent;
+    else if (d->align & TA_BOTTOM) y -= ft.height;
     draw_text_run(d, x, y, s, len);
 }
 
@@ -787,11 +883,16 @@ static void g_GetTextMetricsA(w32 *w) {
     gdc *d = dc_of(ARG(0));
     uint64_t p = ARG(1);
     if (!d || !p) { RET(0); return; }
-    int cell, ascent, bold;
-    font_metrics(obj_of(d->font), &cell, &ascent, &bold);
+    gf_font ft;
+    font_of(obj_of(d->font), &ft);
     int avg = w32_gdi_average_width(ARG(0));
-    int wide = glyph_advance(cell, 'W');
-    int32_t v[8] = { cell, ascent, cell - ascent, 0, 0, avg, wide, bold ? 700 : 400 };
+    int wide = (gf_advance(&ft, 'W') + 32) >> 6;
+    /* tmHeight, tmAscent, tmDescent, tmInternalLeading, tmExternalLeading,
+     * tmAveCharWidth, tmMaxCharWidth, tmWeight -- the eight a program reads
+     * before it decides how tall a row of its own list is. */
+    gobj *fo = obj_of(d->font);
+    int32_t v[8] = { ft.height, ft.ascent, ft.descent, 0, 0, avg, wide,
+                     fo && fo->weight >= 600 ? 700 : 400 };
     for (int i = 0; i < 8; i++) w32_write(w, p + (unsigned)i * 4, 4, (uint64_t)(uint32_t)v[i]);
     RET(1);
 }

@@ -107,6 +107,104 @@ const w32_api w32_dwmapi[] = {
 };
 #undef D
 
+/* ---------------------------------------------------------------- uxtheme
+ *
+ * Visual styles. A program with a comctl32 version 6 manifest asks the theme
+ * engine directly for the parts of a control it wants drawn: OpenThemeData
+ * for a class, then DrawThemeBackground for a button face, a tab body, a
+ * scroll-bar thumb.
+ *
+ * Nothing here reads a .msstyles file. Those are PE files full of somebody
+ * else's bitmaps and they are not ours to ship; user32 draws the themed look
+ * itself instead (see `g_themed` there), which is why these succeed rather
+ * than refuse. What matters to a caller is the answers: IsAppThemed and
+ * IsThemeActive say yes, so the program stops drawing its own Windows 95
+ * fallback, and OpenThemeData returns a handle so its themed path is the one
+ * it takes. DrawThemeBackground fills with the class's face colour -- less
+ * than the real thing, and much more than the nothing it used to be, which
+ * left holes where a themed panel should be.
+ */
+static void t_IsThemeActive(w32 *w) { (void)w; RET(1); }
+static void t_IsAppThemed(w32 *w) { (void)w; RET(1); }
+static void t_IsCompositionActive(w32 *w) { (void)w; RET(1); }
+/* A handle per open, distinct so a program can close them independently. */
+static uint64_t g_theme_next = 0x00A70000u;
+static void t_OpenThemeData(w32 *w) { RET(g_theme_next += 4); }
+static void t_OpenThemeDataForDpi(w32 *w) { RET(g_theme_next += 4); }
+static void t_CloseThemeData(w32 *w) { (void)w; RET(S_OK_); }
+static void t_SetWindowTheme(w32 *w) { (void)w; RET(S_OK_); }
+static void t_EnableThemeDialogTexture(w32 *w) { (void)w; RET(S_OK_); }
+/* DrawThemeBackground(theme, hdc, part, state, RECT*, clip). The face colour
+ * is the honest approximation: the shape a themed part has is mostly its
+ * fill, and a program drawing its own panel background this way gets a panel
+ * rather than a hole. */
+static void t_DrawThemeBackground(w32 *w) {
+    uint64_t r = ARG(4);
+    if (ARG(1) && r) {
+        int l = (int)(int32_t)w32_read(w, r, 4),      t = (int)(int32_t)w32_read(w, r + 4, 4);
+        int rr = (int)(int32_t)w32_read(w, r + 8, 4), b = (int)(int32_t)w32_read(w, r + 12, 4);
+        w32_gdi_fill_rect(ARG(1), l, t, rr, b, w32_sys_color(15 /* COLOR_BTNFACE */));
+    }
+    RET(S_OK_);
+}
+static void t_DrawThemeParentBackground(w32 *w) { (void)w; RET(S_OK_); }
+static void t_DrawThemeEdge(w32 *w) { (void)w; RET(S_OK_); }
+/* DrawThemeText(theme, hdc, part, state, text, len, flags, flags2, RECT*) */
+static void t_DrawThemeText(w32 *w) {
+    uint64_t r = ARG(8);
+    if (ARG(1) && ARG(4) && r) {
+        char buf[512];
+        w32_wtoa(w, ARG(4), buf, sizeof buf);
+        int l = (int)(int32_t)w32_read(w, r, 4), t = (int)(int32_t)w32_read(w, r + 4, 4);
+        w32_gdi_text_at(ARG(1), l, t, buf, (int)strlen(buf));
+    }
+    RET(S_OK_);
+}
+/* GetThemePartSize and GetThemeMargins: a program sizes its own layout from
+ * these, so the answer has to be a plausible size rather than zero -- a zero
+ * part size collapses whatever it was measuring. */
+static void t_GetThemePartSize(w32 *w) {
+    uint64_t out = ARG(5);
+    if (out) { w32_write(w, out, 4, 16); w32_write(w, out + 4, 4, 16); }
+    RET(S_OK_);
+}
+static void t_GetThemeMargins(w32 *w) {
+    uint64_t out = ARG(6);
+    for (int i = 0; out && i < 4; i++) w32_write(w, out + (unsigned)i * 4, 4, 2);
+    RET(S_OK_);
+}
+static void t_GetThemeColor(w32 *w) {
+    if (ARG(4)) w32_write(w, ARG(4), 4, 0x000000);
+    RET(S_OK_);
+}
+static void t_GetThemeSysColor(w32 *w) { RET(w32_sys_color((int)ARG(1))); }
+static void t_GetThemeSysFont(w32 *w) { (void)w; RET(S_OK_); }
+static void t_GetThemeBackgroundContentRect(w32 *w) {
+    /* Hand the rectangle straight back: with no bitmap borders to inset for,
+     * the content rectangle is the whole of it. */
+    uint64_t in = ARG(4), out = ARG(5);
+    if (in && out) for (int i = 0; i < 4; i++)
+        w32_write(w, out + (unsigned)i * 4, 4, w32_read(w, in + (unsigned)i * 4, 4));
+    RET(S_OK_);
+}
+static void t_IsThemeBackgroundPartiallyTransparent(w32 *w) { (void)w; RET(0); }
+static void t_BufferedPaintInit(w32 *w) { (void)w; RET(S_OK_); }
+static void t_BufferedPaintUnInit(w32 *w) { (void)w; RET(S_OK_); }
+
+#define T(n, a) { #n, a, 0, t_##n, 0 }
+const w32_api w32_uxtheme[] = {
+    T(IsThemeActive, 0), T(IsAppThemed, 0), T(IsCompositionActive, 0),
+    T(OpenThemeData, 2), T(OpenThemeDataForDpi, 3), T(CloseThemeData, 1),
+    T(SetWindowTheme, 3), T(EnableThemeDialogTexture, 2),
+    T(DrawThemeBackground, 6), T(DrawThemeParentBackground, 3), T(DrawThemeEdge, 8),
+    T(DrawThemeText, 9), T(GetThemePartSize, 6), T(GetThemeMargins, 7),
+    T(GetThemeColor, 5), T(GetThemeSysColor, 2), T(GetThemeSysFont, 3),
+    T(GetThemeBackgroundContentRect, 6), T(IsThemeBackgroundPartiallyTransparent, 3),
+    T(BufferedPaintInit, 0), T(BufferedPaintUnInit, 0),
+    { 0, 0, 0, 0, 0 },
+};
+#undef T
+
 /* ------------------------------------------------------------------- avrt
  *
  * Multimedia Class Scheduler: an audio thread asking the scheduler to treat

@@ -37,12 +37,19 @@ enum Logs {
     /// the JIT state and the display setting change between runs, and an
     /// entry that has to be cross-referenced with an earlier one is an entry
     /// that gets misread.
-    private static func header(_ program: String, exit code: Int32, ms: UInt64) -> String {
+    private static func header(_ program: String, exit code: Int32?, ms: UInt64?) -> String {
         let f = ISO8601DateFormatter()
         var s = "\n==== \(f.string(from: Date())) ====\n"
         s += "program     \(program)\n"
-        s += "exit        \(code)\(reason(code))\n"
-        s += "ran for     \(ms) ms\n"
+        // No outcome yet means this is the entry written when the run
+        // started, which is the only entry a run that never comes back
+        // leaves behind.
+        if let code {
+            s += "exit        \(code)\(reason(code))\n"
+        } else {
+            s += "exit        (started; this entry was written before it ran)\n"
+        }
+        if let ms { s += "ran for     \(ms) ms\n" }
         s += "app build   \(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?")"
         s += " (\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"))\n"
         s += "device      \(DeviceInfo.modelIdentifier)\n"
@@ -92,11 +99,35 @@ enum Logs {
         return bytes >> 20
     }
 
+    /// Note that a run is starting, before it has a chance to end badly.
+    ///
+    /// This is the bug behind "the in-app crash log tool does not work".
+    /// `record` was the only thing that ever wrote to this file, and it is
+    /// called after the run returns — so the runs most worth reading about,
+    /// the ones where the process was killed or faulted before returning,
+    /// wrote nothing at all, and the log came up empty in exactly the case
+    /// somebody had turned it on for. The machine block goes down first now
+    /// and the outcome is appended to it later, which costs one extra entry
+    /// per run and is worth it: a header with no outcome under it names the
+    /// program, the device, the JIT state and the resolution that died.
+    ///
+    /// Still gated on the switch, because that switch is about what gets
+    /// written to the device at all. The crash breadcrumb in
+    /// CrashReports.swift is not gated, and is what makes a run that killed
+    /// the process identifiable even with logging off.
+    static func starting(program: String) {
+        guard isEnabled else { return }
+        append(header(program, exit: nil, ms: nil))
+    }
+
     /// Record a run, however it ended.
     static func record(program: String, exit code: Int32, ms: UInt64, report: String) {
         guard isEnabled else { return }
+        append(header(program, exit: code, ms: ms) + "\n" + report + "\n")
+    }
+
+    private static func append(_ entry: String) {
         guard let u = url else { return }
-        let entry = header(program, exit: code, ms: ms) + "\n" + report + "\n"
         guard let data = entry.data(using: .utf8) else { return }
         if let h = try? FileHandle(forWritingTo: u) {
             // Appending rather than rewriting, and trimmed from the front when

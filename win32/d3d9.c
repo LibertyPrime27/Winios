@@ -246,6 +246,7 @@ static void d_Present(w32 *w) {
     int width = (int)w32_com_get(w, self, DEV_W), h = (int)w32_com_get(w, self, DEV_H);
     int pitch = (int)w32_com_get(w, self, DEV_PITCH);
     w32_com_set(w, self, DEV_FRAMES, w32_com_get(w, self, DEV_FRAMES) + 1);
+    w32_note_activity();          /* a frame is not idling */
     if (g_present) g_present(g_present_ctx, W32P(w, fb), width, h, pitch);
     RET(S_OK_);
 }

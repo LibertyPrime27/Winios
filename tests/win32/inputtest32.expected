@@ -2,7 +2,7 @@ RegisterClass: ok
 CreateWindowEx: ok
 WM_CREATE reached the WndProc before CreateWindowEx returned: yes
 IsWindowVisible: 1
-client rect: 640x480
+client rect: 640x460
 screen: 1280x720, mouse present 1, buttons 3
 
 queued by window creation:
@@ -13,7 +13,7 @@ queued by window creation:
   WM_SETFOCUS
   WM_PAINT
 WndProc saw WM_SIZE 1, WM_ACTIVATE 1
-  wndproc: WM_SIZE to 640x480
+  wndproc: WM_SIZE to 640x460
 
 frame 1:
   WM_KEYDOWN vk 87
@@ -27,7 +27,7 @@ frame 2:
   WM_KEYDOWN vk 16
   WM_LBUTTONDOWN at 100,120 keys 0x5
   wndproc: WM_KEYDOWN vk 16
-  wndproc: WM_LBUTTONDOWN at 100,120
+  wndproc: WM_LBUTTONDOWN at 100,100
   polled: W 1 A 0 S 0 D 0 shift 1, cursor 100,120, buttons L1 R0
 
 frame 3:

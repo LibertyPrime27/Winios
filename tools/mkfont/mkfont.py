@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Build the fonts the win32 layer draws with.
+
+Two steps, both reproducible and both checked in:
+
+  1. Subset Liberation Sans and Liberation Mono down to the characters a
+     Windows dialog, installer or game menu actually shows, and to the six
+     tables win32/truetype.c reads. That turns 410 KB per face into about
+     16 KB, and drops the hinting bytecode -- which the rasterizer does not
+     run, so keeping it would be carrying an interpreter's worth of data for
+     nothing.
+
+  2. Turn those .ttf files into win32/fontdata.c, a byte array per face.
+
+Step 2 is what the build needs; step 1 needs fontTools and the Liberation
+fonts installed, so its output (third_party/liberation/*.ttf) is committed and
+nobody has to reproduce it to build. Run with --subset to redo step 1.
+
+The subsets are Modified Versions under OFL section 2 and are named without
+the Reserved Font Name, as section 5 requires -- hence winios-sans rather than
+LiberationSans. See third_party/liberation/OFL.txt.
+
+  python3 tools/mkfont/mkfont.py [--subset]
+"""
+import os, sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+OUT_DIR = os.path.join(ROOT, "third_party", "liberation")
+
+# What to keep. ASCII is the floor; Latin-1 is what a European installer's
+# strings are in; the rest are the punctuation and symbols that turn up in
+# real UI text and look broken as a missing-glyph box. Windows-1252's 0x80-0x9F
+# maps into this set, which is how an ANSI string reaches these codepoints at
+# all.
+CODEPOINTS = (
+    list(range(0x20, 0x7F)) +              # ASCII
+    list(range(0xA0, 0x100)) +             # Latin-1 supplement
+    [0x2018, 0x2019, 0x201C, 0x201D,       # curly quotes
+     0x2013, 0x2014,                       # en/em dash
+     0x2022, 0x2026, 0x2039, 0x203A,       # bullet, ellipsis, guillemets
+     0x20AC, 0x2122,                       # euro, trademark
+     0x2190, 0x2191, 0x2192, 0x2193,       # arrows
+     0x2212, 0x2264, 0x2265, 0x221E,       # minus, <=, >=, infinity
+     0x25A0, 0x25B2, 0x25BC, 0x25B6, 0x25C0,   # the shapes a control draws
+     0x2713, 0x2714]                       # check marks
+)
+
+FACES = [
+    ("winios-sans.ttf",      "LiberationSans-Regular.ttf", "w32_font_sans"),
+    ("winios-sans-bold.ttf", "LiberationSans-Bold.ttf",    "w32_font_sans_bold"),
+    ("winios-mono.ttf",      "LiberationMono-Regular.ttf", "w32_font_mono"),
+]
+
+SEARCH = ["/usr/share/fonts/truetype/liberation",
+          "/usr/share/fonts/liberation",
+          "/usr/share/fonts/TTF",
+          "/Library/Fonts", os.path.expanduser("~/Library/Fonts")]
+
+
+def find_source(name):
+    for d in SEARCH:
+        p = os.path.join(d, name)
+        if os.path.exists(p):
+            return p
+    sys.exit("mkfont: cannot find %s. Install the Liberation fonts "
+             "(Debian: fonts-liberation2) or add its directory to SEARCH." % name)
+
+
+def subset_all():
+    try:
+        from fontTools import subset
+    except ImportError:
+        sys.exit("mkfont: --subset needs fontTools (pip install fonttools)")
+    os.makedirs(OUT_DIR, exist_ok=True)
+    for out, src, _ in FACES:
+        opts = subset.Options()
+        # Everything the rasterizer does not read. `name` goes too, which is
+        # also how the subset stops carrying the Reserved Font Name.
+        opts.drop_tables += ["GSUB", "GPOS", "GDEF", "BASE", "JSTF", "DSIG",
+                             "kern", "hdmx", "VDMX", "LTSH", "PCLT", "gasp",
+                             "fpgm", "prep", "cvt ", "post", "name", "OS/2"]
+        opts.hinting = False
+        opts.glyph_names = False
+        opts.legacy_kern = False
+        opts.notdef_outline = True      # so a missing character is a visible box
+        opts.recalc_bounds = True
+        f = subset.load_font(find_source(src), opts)
+        s = subset.Subsetter(options=opts)
+        s.populate(unicodes=CODEPOINTS)
+        s.subset(f)
+        path = os.path.join(OUT_DIR, out)
+        subset.save_font(f, path, opts)
+        print("%-22s %6d bytes  %s" % (out, os.path.getsize(path),
+                                       " ".join(sorted(t for t in f.keys()
+                                                       if t != "GlyphOrder"))))
+
+
+def emit_c():
+    parts = []
+    for name, _, sym in FACES:
+        path = os.path.join(OUT_DIR, name)
+        if not os.path.exists(path):
+            sys.exit("mkfont: %s is missing. Run with --subset to build it." % path)
+        data = open(path, "rb").read()
+        rows = []
+        for i in range(0, len(data), 16):
+            rows.append("    " + "".join("0x%02x," % b for b in data[i:i + 16]))
+        parts.append((sym, name, len(data), "\n".join(rows)))
+
+    body = "\n\n".join(
+        "/* %s */\nconst unsigned char %s[] = {\n%s\n};\nconst unsigned int %s_len = %du;"
+        % (name, sym, rows, sym, n) for sym, name, n, rows in parts)
+
+    text = '''/* The fonts, as bytes.
+ *
+ * GENERATED by tools/mkfont/mkfont.py -- do not edit.
+ *
+ * Subsets of Liberation Sans and Liberation Mono, under the SIL Open Font
+ * License 1.1; see third_party/liberation/OFL.txt. They are here as arrays
+ * rather than files on disk for two reasons. One is that there is then
+ * nothing to install, find, or fail to find: winrun on Linux, the test suite
+ * under qemu and the app on a phone all draw with the same bytes, which is
+ * what makes a frame checksum mean the same thing in all three. The other is
+ * that a font the program cannot open is a program that cannot draw a dialog,
+ * and that failure would arrive at the worst possible moment.
+ */
+#include "gdifont.h"
+
+%s
+''' % body
+    out = os.path.join(ROOT, "win32", "fontdata.c")
+    open(out, "w").write(text)
+    print("wrote win32/fontdata.c  (%d bytes of source, %d bytes of font)"
+          % (len(text), sum(p[2] for p in parts)))
+
+
+if __name__ == "__main__":
+    if "--subset" in sys.argv:
+        subset_all()
+    emit_c()

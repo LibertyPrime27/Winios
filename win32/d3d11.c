@@ -1034,6 +1034,7 @@ static void sc_Present(w32 *w) {
     int pitch = (int)w32_com_get(w, tex, TEX_PITCH);
     uint64_t px = w32_com_get(w, tex, TEX_PIXELS);
     w32_com_set(w, self, SC_FRAMES, w32_com_get(w, self, SC_FRAMES) + 1);
+    w32_note_activity();          /* a frame is not idling */
     void *ctx = 0;
     w32_present_fn fn = w32_get_present(&ctx);
     if (fn && px) fn(ctx, W32P(w, px), width, h, pitch);

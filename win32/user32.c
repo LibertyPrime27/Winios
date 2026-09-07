@@ -39,6 +39,7 @@
  * run on this emulator, rather than from memory.
  */
 #include "w32.h"
+#include "image.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -86,6 +87,7 @@ enum {
     WM_SYSKEYDOWN = 0x0104, WM_SYSKEYUP = 0x0105, WM_SYSCHAR = 0x0106,
     WM_SYSCOMMAND = 0x0112,
     WM_MOUSEFIRST = 0x0200, WM_MOUSEMOVE = 0x0200,
+    WM_HSCROLL = 0x0114, WM_VSCROLL = 0x0115,
     WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202, WM_LBUTTONDBLCLK = 0x0203,
     WM_RBUTTONDOWN = 0x0204, WM_RBUTTONUP = 0x0205, WM_RBUTTONDBLCLK = 0x0206,
     WM_MBUTTONDOWN = 0x0207, WM_MBUTTONUP = 0x0208, WM_MBUTTONDBLCLK = 0x0209,
@@ -183,9 +185,18 @@ enum { MAX_CLASSES = 64, MAX_WINDOWS = 192, MAX_MSGS = 512, GWL_SLOTS = 8 };
  * to chain to, exactly as it would on Windows. */
 typedef enum {
     CTL_NONE = 0, CTL_DIALOG, CTL_STATIC, CTL_BUTTON, CTL_EDIT,
-    CTL_LISTBOX, CTL_COMBOBOX, CTL_PROGRESS, CTL_PANE, CTL_N
+    CTL_LISTBOX, CTL_COMBOBOX, CTL_PROGRESS, CTL_PANE,
+    /* The common controls. They were registered by InitCommonControls from
+     * the beginning -- a program that cannot create one does not get as far
+     * as drawing anything -- but nothing painted them, so an installer's
+     * licence box, its component list and its tabs came up as empty holes. */
+    CTL_LISTVIEW, CTL_TREEVIEW, CTL_TAB, CTL_STATUS, CTL_TRACK,
+    CTL_TOOLBAR, CTL_LINK, CTL_HEADER, CTL_UPDOWN, CTL_N
 } ctlkind;
 enum { HPROC_BASE = 0x00030000u, HPROC_STEP = 4 };
+/* LVS_EX_CHECKBOXES. Kept in the window's exstyle because that is where
+ * LVM_SETEXTENDEDLISTVIEWSTYLE puts it and where the painter looks. */
+enum { LVS_EX_CHECKBOXES_ = 0x00000004u };
 
 /* There is no window manager here, so a window with WS_CAPTION draws its own
  * title bar -- and a title bar takes room. Keeping it *outside* the client
@@ -223,6 +234,15 @@ typedef struct {
 
     /* what it takes to draw one */
     char     text[256];         /* the window text: a caption, a label, a field */
+    /* ...and, when it does not fit in that, the whole of it.
+     *
+     * 256 bytes is plenty for a caption and a button, and nowhere near enough
+     * for the thing that actually needs the most room: a licence agreement in
+     * a read-only edit box, which is tens of kilobytes and is the first page
+     * of most installers. `text` keeps the leading part so everything that
+     * reads a caption stays simple; `big` is what gets drawn. */
+    char    *big;
+    int      biglen;
     uint64_t font;              /* WM_SETFONT, or 0 for the default */
     ctlkind  ctl;               /* non-zero: we draw it, we handle its clicks */
     uint64_t id;                /* child identifier -- the menu argument */
@@ -238,12 +258,33 @@ typedef struct {
     int      is_dialog, ending, result, default_id;
     uint64_t userdata;          /* DWL_USER */
     uint64_t subclass_ref;
+    uint64_t icon;              /* WM_SETICON, drawn in the caption */
+    /* scroll bars, for the controls that have them and the windows that ask
+     * for one with WS_VSCROLL. A licence agreement in a read-only edit box is
+     * the case that matters: without a bar there is nothing to say the text
+     * continues, and nothing to move it with. */
+    int      scroll_pos, scroll_max, scroll_page;
+    int      hscroll_pos, hscroll_max, hscroll_page;
+    int      top;               /* first visible item or line */
 } wwin;
 
 /* List boxes are rare and their contents are not: one store per list box
  * that exists, rather than a fixed array on every window. */
-enum { MAX_LISTS = 8, LIST_ITEMS = 64, LIST_TEXT = 96 };
-static struct { int used, n; char item[LIST_ITEMS][LIST_TEXT]; } g_list[MAX_LISTS];
+/* One store per list-ish control that exists. A list view's component list
+ * and a tab control's labels live here too, which is why there are more of
+ * them and more room in each than a combo box ever needed. */
+enum { MAX_LISTS = 24, LIST_ITEMS = 256, LIST_TEXT = 128 };
+static struct {
+    int  used, n;
+    char item[LIST_ITEMS][LIST_TEXT];
+    /* A list view's check boxes (LVS_EX_CHECKBOXES), which is how every
+     * installer's component page asks what to install. */
+    unsigned char checked[LIST_ITEMS];
+    /* Column widths, for a report-mode list view. Zero columns means the
+     * control is in list or icon mode and the whole row is one string. */
+    int  ncol, colw[8];
+    char colname[8][32];
+} g_list[MAX_LISTS];
 
 static wclass g_cls[MAX_CLASSES];
 static wwin   g_win[MAX_WINDOWS];
@@ -253,6 +294,12 @@ enum { HW_BASE = 0x00050000u, HW_STEP = 4 };
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static qmsg    g_q[MAX_MSGS];
 static int     g_qhead, g_qtail;        /* head == tail: empty */
+/* Which cursor the program last set. Drawn by the compositor at the end of a
+ * repaint, so a game that hides it or picks the wait cursor is believed. */
+static uint64_t g_cursor;
+/* Signalled whenever anything is queued, so GetMessage can wait for input
+ * instead of spinning on the queue or -- as it used to -- giving up on it. */
+static pthread_cond_t g_qcond = PTHREAD_COND_INITIALIZER;
 static uint8_t g_keys[256];             /* 0x80 down, 0x01 toggled */
 static uint8_t g_keys_hit[256];         /* pressed since the last GetAsyncKeyState */
 static uint32_t g_keychar[256];         /* the character the host resolved for this key, if any */
@@ -305,6 +352,7 @@ static void push(uint64_t hwnd, uint32_t msg, uint64_t wp, uint64_t lp, int x, i
     g_q[g_qtail].time = tick_ms();
     g_q[g_qtail].x = x; g_q[g_qtail].y = y;
     g_qtail = next;
+    pthread_cond_broadcast(&g_qcond);
 }
 
 static uint32_t mouse_wp(void) {
@@ -576,16 +624,21 @@ uint64_t w32_new_window(w32 *w, const char *cls, const char *text,
      * positions its controls from the client origin, so a caption painted
      * over the client area buries the first row of them.
      *
-     * A window the program draws itself gets no caption at all. Its content
-     * is its own -- a game's back buffer, most of the time -- and taking
-     * twenty-two pixels off it, or painting a bar over the top of it, would
-     * be this layer inventing chrome nobody asked for and then charging the
-     * program for it. */
-    if (p->ctl && !(style & WS_CHILD) && (style & WS_CAPTION) == WS_CAPTION) {
+     * This used to apply only to windows of a class we recognise, on the
+     * reasoning that a window the program draws itself should not have chrome
+     * invented for it. That was wrong, and an installer showed why: a Delphi
+     * or MFC program registers its own class for its main form, sets
+     * WS_CAPTION, and expects the system to draw the title bar exactly as it
+     * does for anyone else -- so the window came up with a blank blue strip
+     * and no title on it. WS_CAPTION is the program asking for a caption, and
+     * that is the whole test. A game's full-screen window does not set it. */
+    if (!(style & WS_CHILD) && (style & WS_CAPTION) == WS_CAPTION) {
         p->cyo = caption_height();
         p->ch = ah - p->cyo > 1 ? ah - p->cyo : 1;
     }
-    if (p->ctl == CTL_LISTBOX || p->ctl == CTL_COMBOBOX) {
+    if (p->ctl == CTL_LISTBOX || p->ctl == CTL_COMBOBOX ||
+        p->ctl == CTL_LISTVIEW || p->ctl == CTL_TREEVIEW ||
+        p->ctl == CTL_TAB || p->ctl == CTL_STATUS) {
         for (int i = 0; i < MAX_LISTS; i++) if (!g_list[i].used) {
             g_list[i].used = 1; g_list[i].n = 0; p->list = i; break;
         }
@@ -639,6 +692,7 @@ void w32_destroy_window(w32 *w, uint64_t hwnd) {
     for (int i = 0; i < MAX_WINDOWS; i++)
         if (g_win[i].used && (HW_BASE + (uint64_t)i * HW_STEP == hwnd || g_win[i].parent == hwnd)) {
             if (g_win[i].list >= 0) g_list[g_win[i].list].used = 0;
+            free(g_win[i].big); g_win[i].big = 0; g_win[i].biglen = 0;
             g_win[i].used = 0;
         }
     if (g_focus == hwnd) g_focus = 0;
@@ -650,16 +704,37 @@ void w32_destroy_window(w32 *w, uint64_t hwnd) {
 
 void w32_set_window_text(w32 *w, uint64_t hwnd, const char *s) {
     (void)w;
+    if (!s) s = "";
+    size_t n = strlen(s);
+    char *copy = 0;
+    if (n >= sizeof ((wwin *)0)->text) {
+        copy = (char *)malloc(n + 1);
+        if (copy) memcpy(copy, s, n + 1);
+    }
     pthread_mutex_lock(&g_lock);
     wwin *p = win_of(hwnd);
-    if (p) snprintf(p->text, sizeof p->text, "%s", s ? s : "");
+    if (p) {
+        snprintf(p->text, sizeof p->text, "%s", s);
+        free(p->big);
+        p->big = copy;
+        p->biglen = copy ? (int)n : 0;
+        p->top = 0;
+        p->scroll_pos = 0;
+        copy = 0;
+    }
     pthread_mutex_unlock(&g_lock);
+    free(copy);
+}
+/* The whole text, or the short one when there is no long one. Callers hold
+ * g_lock; the pointer is only valid while they do. */
+static const char *win_text(const wwin *p) {
+    return p && p->big ? p->big : (p ? p->text : "");
 }
 void w32_get_window_text(w32 *w, uint64_t hwnd, char *out, size_t n) {
     (void)w;
     pthread_mutex_lock(&g_lock);
     wwin *p = win_of(hwnd);
-    snprintf(out, n, "%s", p ? p->text : "");
+    snprintf(out, n, "%s", p ? win_text(p) : "");
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -992,27 +1067,88 @@ static int take(w32 *w, uint64_t m, uint64_t filter_hwnd, uint32_t lo, uint32_t 
     return 0;
 }
 
-/* PeekMessage(msg, hwnd, min, max, flags) */
+/* PeekMessage(msg, hwnd, min, max, flags)
+ *
+ * A program that peeks, finds nothing, and peeks again is idling as fast as
+ * the CPU will let it. On a desktop that wastes a core; on a phone iOS
+ * terminates the process for it -- 80% of a CPU averaged over a minute is the
+ * documented limit, and a spin loop passes it in a minute exactly.
+ *
+ * A game's loop also peeks and finds nothing, every frame, and that one is
+ * doing real work in between and must not be slowed down. The two are told
+ * apart by whether anything happened: `w32_idle_tick` is reset whenever a
+ * frame is presented or a message is queued, so it only ever climbs while the
+ * guest is genuinely doing nothing, and a millisecond of sleep then costs
+ * nothing and saves the process.
+ */
+static int g_idle_peeks;
+void w32_note_activity(void) { g_idle_peeks = 0; }
+
 static void u_PeekMessageA(w32 *w) {
-    RET(take(w, ARG(0), ARG(1), (uint32_t)ARG(2), (uint32_t)ARG(3), ((uint32_t)ARG(4) & PM_REMOVE) != 0));
+    int got = take(w, ARG(0), ARG(1), (uint32_t)ARG(2), (uint32_t)ARG(3),
+                   ((uint32_t)ARG(4) & PM_REMOVE) != 0);
+    if (got) { g_idle_peeks = 0; RET(1); return; }
+    if (++g_idle_peeks > 64) {
+        struct timespec ts = { 0, 1000000L };      /* 1 ms */
+        nanosleep(&ts, 0);
+        if (g_idle_peeks > 1000000) g_idle_peeks = 1000;
+    }
+    RET(0);
 }
 static void u_PeekMessageW(w32 *w) { u_PeekMessageA(w); }
 
-/* GetMessage(msg, hwnd, min, max): blocks until there is one. With no other
- * thread to produce input, "blocks" would be a hang -- so an empty queue
- * means the program is waiting for something that is not coming, and it gets
- * WM_QUIT rather than a deadlock. A game's loop uses PeekMessage anyway. */
+/* How long GetMessage waits for input before deciding nobody is coming.
+ *
+ * This is the difference between a program that works and a process iOS
+ * kills, and it took a crash report to see it. GetMessage used to return
+ * WM_QUIT the moment the queue was empty, on the reasoning that there was no
+ * other thread to produce input. That was true of the command-line runner and
+ * has not been true since the app existed: an installer that reaches its
+ * first page and waits for a click has an empty queue, and telling it to quit
+ * -- or leaving its loop to spin on PeekMessage -- is either an early exit or
+ * a core held at 100% until iOS terminates the process for it.
+ *
+ * So it waits. On a device it waits for a touch, which is what Windows does.
+ * With nobody there to touch anything -- the test suite, a headless run -- it
+ * gives up after this long and returns WM_QUIT as before, so a guest still
+ * terminates rather than hanging a CI job.
+ */
+enum { GETMSG_IDLE_MS = 15000 };
+
+/* Wait for something to arrive, the guest to be asked to stop, or the patience
+ * above to run out. Returns 1 if it is worth looking at the queue again. */
+static int wait_for_message(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += GETMSG_IDLE_MS / 1000;
+    ts.tv_nsec += (long)(GETMSG_IDLE_MS % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    int rc = 0;
+    pthread_mutex_lock(&g_lock);
+    while (g_qhead == g_qtail && !g_quit) {
+        if (pthread_cond_timedwait(&g_qcond, &g_lock, &ts) != 0) break;
+    }
+    rc = g_qhead != g_qtail || g_quit;
+    pthread_mutex_unlock(&g_lock);
+    return rc;
+}
+
+/* GetMessage(msg, hwnd, min, max): blocks until there is one. */
 static void u_GetMessageA(w32 *w) {
-    if (take(w, ARG(0), ARG(1), (uint32_t)ARG(2), (uint32_t)ARG(3), 1)) {
-        uint64_t m = ARG(0);
-        uint32_t msg = (uint32_t)w32_read(w, m + (w->is32 ? 4 : 8), 4);
-        RET(msg == WM_QUIT ? 0 : 1);
-        return;
+    for (int round = 0; round < 2; round++) {
+        if (take(w, ARG(0), ARG(1), (uint32_t)ARG(2), (uint32_t)ARG(3), 1)) {
+            uint64_t m = ARG(0);
+            uint32_t msg = (uint32_t)w32_read(w, m + (w->is32 ? 4 : 8), 4);
+            RET(msg == WM_QUIT ? 0 : 1);
+            return;
+        }
+        if (round == 0 && wait_for_message()) continue;
+        break;
     }
     qmsg q; memset(&q, 0, sizeof q);
     q.msg = WM_QUIT; q.time = tick_ms();
     put_msg(w, ARG(0), &q, 0);
-    if (w->verbose) fprintf(stderr, "winrun: user32: GetMessage with an empty queue; returning WM_QUIT\n");
+    if (w->verbose) fprintf(stderr, "winrun: user32: GetMessage waited %d ms with an empty queue; returning WM_QUIT\n", GETMSG_IDLE_MS);
     RET(0);
 }
 static void u_GetMessageW(w32 *w) { u_GetMessageA(w); }
@@ -1216,12 +1352,183 @@ static void u_ShowCursor(w32 *w) {
     pthread_mutex_unlock(&g_lock);
     RET((uint64_t)(int64_t)c);
 }
-static void u_SetCursor(w32 *w) { (void)w; RET(0); }
-static void u_LoadCursorA(w32 *w) { (void)w; RET(0x9001); }
-static void u_LoadCursorW(w32 *w) { (void)w; RET(0x9001); }
-static void u_LoadIconA(w32 *w) { (void)w; RET(0x9002); }
-static void u_LoadIconW(w32 *w) { (void)w; RET(0x9002); }
-static void u_LoadImageA(w32 *w) { (void)w; RET(0x9003); }
+/* ---------------------------------------------------------- pictures
+ *
+ * These used to return a plausible handle and no pixels, which is why an
+ * installer came up with a blank banner, an empty title bar and no icons: the
+ * program asked, was told yes, and drew nothing. Everything below turns the
+ * ask into an actual decoded image (win32/image.c).
+ *
+ * The three sources are the same three Windows has. A resource id in the
+ * program's own file is by far the most common. A path, when LR_LOADFROMFILE
+ * is set -- which is how an installer shows artwork it has just unpacked. And
+ * the system's own, for the standard cursors and the message-box symbols,
+ * which are in nobody's resources and have to be drawn.
+ */
+
+/* Fetch one RT_ICON / RT_CURSOR by id, for the group directory walker. */
+typedef struct { w32 *w; uint64_t inst; int type; } res_ctx;
+static const uint8_t *fetch_icon_res(void *ctx, int id, uint32_t *size) {
+    res_ctx *c = (res_ctx *)ctx;
+    uint64_t hr = w32_find_resource(c->w, c->inst, (uint64_t)c->type, (uint64_t)id, 0);
+    if (!hr) return 0;
+    uint64_t data = w32_resource_data(c->w, hr, size);
+    return data ? (const uint8_t *)W32P(c->w, data) : 0;
+}
+
+/* An icon or cursor out of a module: RT_GROUP_ICON names the sizes, each one
+ * an RT_ICON of its own. `want` is the size the caller wants, so a 16-pixel
+ * title bar gets the 16-pixel drawing rather than a shrunk 256. */
+static uint64_t load_icon_res(w32 *w, uint64_t inst, uint64_t name, int wide,
+                              int cursor, int want) {
+    res_ctx c = { w, inst, cursor ? 1 /* RT_CURSOR */ : 3 /* RT_ICON */ };
+    uint64_t hr = w32_find_resource(w, inst, cursor ? 12 : 14, name, wide);
+    uint32_t size = 0;
+    if (hr) {
+        uint64_t data = w32_resource_data(w, hr, &size);
+        if (data) {
+            w32_image im = { 0, 0, 0 };
+            int hx = 0, hy = 0;
+            if (w32_icon_group((const uint8_t *)W32P(w, data), size, want,
+                               fetch_icon_res, &c, &im, &hx, &hy))
+                return w32_gdi_make_icon(im.w, im.h, im.px, hx, hy);
+        }
+    }
+    /* Some programs name an RT_ICON directly rather than its group. */
+    hr = w32_find_resource(w, inst, cursor ? 1 : 3, name, wide);
+    if (hr) {
+        uint64_t data = w32_resource_data(w, hr, &size);
+        w32_image im = { 0, 0, 0 };
+        if (data && w32_icon_decode((const uint8_t *)W32P(w, data), size, &im))
+            return w32_gdi_make_icon(im.w, im.h, im.px, 0, 0);
+    }
+    return 0;
+}
+
+/* The whole of a file on the virtual C:, for LR_LOADFROMFILE. */
+static uint8_t *slurp(w32 *w, const char *path, size_t *outn) {
+    char host[1024];
+    host[0] = 0;
+    w32_host_path(w, path, host, sizeof host);
+    FILE *fp = host[0] ? fopen(host, "rb") : 0;
+    if (!fp) return 0;
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return 0; }
+    long n = ftell(fp);
+    if (n <= 0 || n > 64 * 1024 * 1024) { fclose(fp); return 0; }
+    rewind(fp);
+    uint8_t *d = (uint8_t *)malloc((size_t)n);
+    if (!d) { fclose(fp); return 0; }
+    size_t got = fread(d, 1, (size_t)n, fp);
+    fclose(fp);
+    if (got != (size_t)n) { free(d); return 0; }
+    *outn = got;
+    return d;
+}
+
+/* LoadImage(hinst, name, type, cx, cy, flags). type: 0 bitmap, 1 icon,
+ * 2 cursor. LR_LOADFROMFILE is 0x10. */
+enum { IMAGE_BITMAP_ = 0, IMAGE_ICON_ = 1, IMAGE_CURSOR_ = 2, LR_LOADFROMFILE_ = 0x10 };
+
+static void load_image(w32 *w, int wide) {
+    uint64_t inst = ARG(0), name = ARG(1);
+    int type = (int)ARG(2), cx = (int)(int32_t)(uint32_t)ARG(3),
+        cy = (int)(int32_t)(uint32_t)ARG(4);
+    uint32_t flags = (uint32_t)ARG(5);
+    (void)cy;
+
+    if (flags & LR_LOADFROMFILE_) {
+        char path[512];
+        if (wide) w32_wtoa(w, name, path, sizeof path);
+        else snprintf(path, sizeof path, "%.511s", (const char *)W32P(w, name));
+        size_t n = 0;
+        uint8_t *d = slurp(w, path, &n);
+        if (!d) { RET(0); return; }
+        w32_image im = { 0, 0, 0 };
+        int hx = 0, hy = 0, ok = 0;
+        uint64_t h = 0;
+        if (type == IMAGE_BITMAP_ && n > 14 && d[0] == 'B' && d[1] == 'M') {
+            /* A .bmp file is a 14-byte file header and then the packed DIB
+             * an RT_BITMAP resource holds on its own. */
+            ok = w32_dib_decode(d + 14, n - 14, &im);
+            if (ok) h = w32_gdi_make_bitmap(im.w, im.h, im.px);
+        } else {
+            ok = w32_ico_file(d, n, cx > 0 ? cx : 0, &im, &hx, &hy);
+            if (ok) h = w32_gdi_make_icon(im.w, im.h, im.px, hx, hy);
+        }
+        free(d);
+        RET(h);
+        return;
+    }
+
+    if (type == IMAGE_BITMAP_) {
+        uint64_t hr = w32_find_resource(w, inst, 2 /* RT_BITMAP */, name, wide);
+        uint32_t size = 0;
+        if (hr) {
+            uint64_t data = w32_resource_data(w, hr, &size);
+            w32_image im = { 0, 0, 0 };
+            if (data && w32_dib_decode((const uint8_t *)W32P(w, data), size, &im)) {
+                RET(w32_gdi_make_bitmap(im.w, im.h, im.px));
+                return;
+            }
+        }
+        RET(0);
+        return;
+    }
+    uint64_t h = load_icon_res(w, inst, name, wide, type == IMAGE_CURSOR_,
+                               cx > 0 ? cx : (type == IMAGE_CURSOR_ ? 32 : 32));
+    if (!h && !inst) {
+        /* A system image: the stock cursors, and the message-box symbols. */
+        w32_image im = { 0, 0, 0 };
+        int hx = 0, hy = 0;
+        if (type == IMAGE_CURSOR_ ? w32_stock_cursor((int)name, &im, &hx, &hy)
+                                  : w32_stock_icon((int)name, cx > 0 ? cx : 32, &im))
+            h = w32_gdi_make_icon(im.w, im.h, im.px, hx, hy);
+    }
+    RET(h);
+}
+
+static void u_LoadImageA(w32 *w) { load_image(w, 0); }
+static void u_LoadImageW(w32 *w) { load_image(w, 1); }
+
+static void load_cursor(w32 *w, int wide) {
+    uint64_t inst = ARG(0), name = ARG(1);
+    uint64_t h = inst ? load_icon_res(w, inst, name, wide, 1, 32) : 0;
+    if (!h) {
+        w32_image im = { 0, 0, 0 };
+        int hx = 0, hy = 0;
+        if (w32_stock_cursor((int)name, &im, &hx, &hy))
+            h = w32_gdi_make_icon(im.w, im.h, im.px, hx, hy);
+    }
+    RET(h);
+}
+static void load_icon(w32 *w, int wide) {
+    uint64_t inst = ARG(0), name = ARG(1);
+    uint64_t h = inst ? load_icon_res(w, inst, name, wide, 0, 32) : 0;
+    if (!h) {
+        w32_image im = { 0, 0, 0 };
+        if (w32_stock_icon((int)name, 32, &im))
+            h = w32_gdi_make_icon(im.w, im.h, im.px, 0, 0);
+    }
+    RET(h);
+}
+static void u_LoadCursorA(w32 *w) { load_cursor(w, 0); }
+static void u_LoadCursorW(w32 *w) { load_cursor(w, 1); }
+static void u_LoadIconA(w32 *w) { load_icon(w, 0); }
+static void u_LoadIconW(w32 *w) { load_icon(w, 1); }
+
+/* Which cursor is showing. The pointer is drawn by the compositor at the end
+ * of a repaint (see draw_cursor), so setting one is just remembering it. */
+static void u_SetCursor(w32 *w) {
+    pthread_mutex_lock(&g_lock);
+    uint64_t old = g_cursor;
+    g_cursor = ARG(0);
+    pthread_mutex_unlock(&g_lock);
+    RET(old);
+}
+static void u_GetCursor(w32 *w) {
+    pthread_mutex_lock(&g_lock); uint64_t c = g_cursor; pthread_mutex_unlock(&g_lock);
+    RET(c);
+}
 static void u_SetCapture(w32 *w) {
     pthread_mutex_lock(&g_lock); uint64_t old = g_capture; g_capture = ARG(0); pthread_mutex_unlock(&g_lock);
     RET(old);
@@ -1394,7 +1701,9 @@ uint32_t *w32_desktop_bits(int *cx, int *cy) {
 }
 /* Called by gdi32 after it has drawn, and by anything that changes what the
  * screen should look like. */
-void w32_desktop_damaged(void) { g_surf_dirty = 1; }
+/* Something drew. That is activity, so the idle pacing above stands down --
+ * a program repainting is working, not spinning. */
+void w32_desktop_damaged(void) { g_surf_dirty = 1; w32_note_activity(); }
 
 /* Hand the surface to whoever is showing frames. Nothing happens if a 3D
  * guest owns the display: it presents its own frames and this one is not
@@ -1470,11 +1779,26 @@ uint32_t w32_sys_color(int i) { return sys_color(i); }
 static ctlkind ctl_of_class(const char *cls) {
     if (!strcasecmp(cls, "button")) return CTL_BUTTON;
     if (!strcasecmp(cls, "static")) return CTL_STATIC;
-    if (!strcasecmp(cls, "edit") || !strcasecmp(cls, "richedit") ||
-        !strcasecmp(cls, "richedit20a") || !strcasecmp(cls, "richedit20w")) return CTL_EDIT;
+    /* Every RichEdit version there has ever been -- RichEdit, RichEdit20A/W,
+     * RICHEDIT50W, RichEdit60W -- is drawn as a multi-line edit box. It is
+     * not a rich text control and the formatting is dropped, but the *text*
+     * appears, and an installer whose licence page was a blank white
+     * rectangle now shows the licence. */
+    if (!strncasecmp(cls, "richedit", 8)) return CTL_EDIT;
+    if (!strcasecmp(cls, "edit")) return CTL_EDIT;
     if (!strcasecmp(cls, "listbox")) return CTL_LISTBOX;
     if (!strcasecmp(cls, "combobox")) return CTL_COMBOBOX;
     if (!strcasecmp(cls, "msctls_progress32")) return CTL_PROGRESS;
+    if (!strcasecmp(cls, "syslistview32"))     return CTL_LISTVIEW;
+    if (!strcasecmp(cls, "systreeview32"))     return CTL_TREEVIEW;
+    if (!strcasecmp(cls, "systabcontrol32"))   return CTL_TAB;
+    if (!strcasecmp(cls, "msctls_statusbar32"))return CTL_STATUS;
+    if (!strcasecmp(cls, "msctls_trackbar32")) return CTL_TRACK;
+    if (!strcasecmp(cls, "msctls_updown32"))   return CTL_UPDOWN;
+    if (!strcasecmp(cls, "toolbarwindow32"))   return CTL_TOOLBAR;
+    if (!strcasecmp(cls, "sysheader32"))       return CTL_HEADER;
+    if (!strcasecmp(cls, "syslink"))           return CTL_LINK;
+    if (!strcasecmp(cls, "comboboxex32"))      return CTL_COMBOBOX;
     if (!strcasecmp(cls, "#32770") || !strcasecmp(cls, "dialog")) return CTL_DIALOG;
     /* The atoms a dialog template uses for the standard classes, in place of
      * a name: 0x0080 button, 0x0081 edit, 0x0082 static, 0x0083 list box,
@@ -1515,13 +1839,87 @@ static int is_extra_class(const char *cls) {
 
 /* Draw a raised or sunken bevel: two light edges and two dark ones, which is
  * the whole of the Windows Classic look and reads correctly at any size. */
+/* --- visual styles ------------------------------------------------------
+ *
+ * Windows has drawn its controls two ways since 2001. A program without a
+ * manifest gets the grey 3D bevels of Windows 95; one with a comctl32 version
+ * 6 dependency in its manifest gets the themed look -- flat fills, a thin
+ * outline, a soft gradient, a blue edge on whatever has the keyboard. Every
+ * program built in the last twenty years asks for the second, so drawing only
+ * the first is why screenshots of this looked two decades old.
+ *
+ * The theme is not read from a .msstyles file: that is a PE full of bitmaps
+ * belonging to whoever's Windows it came from, and it is not ours to ship.
+ * What is drawn here is the *shape* of the modern look -- borders, gradients
+ * and highlight colours -- which is what makes it read as current.
+ */
+static int g_themed = 1;
+int w32_themes_enabled(void) { return g_themed; }
+void w32_set_themes(int on) { g_themed = on != 0; }
+
+/* A vertical gradient. Two fills would band visibly across a button, so this
+ * is one row at a time with the interpolation done in integers -- the same
+ * arithmetic on every machine, which matters because these pixels end up in
+ * a frame checksum. */
+static void gradient_v(uint64_t hdc, int l, int t, int r, int b,
+                       uint32_t top, uint32_t bot) {
+    int h = b - t;
+    if (h <= 0 || r <= l) return;
+    if (h == 1) { w32_gdi_fill_rect(hdc, l, t, r, b, top); return; }
+    for (int y = 0; y < h; y++) {
+        unsigned rr = (((top >> 16) & 0xFF) * (h - 1 - y) + ((bot >> 16) & 0xFF) * y) / (h - 1);
+        unsigned gg = (((top >>  8) & 0xFF) * (h - 1 - y) + ((bot >>  8) & 0xFF) * y) / (h - 1);
+        unsigned bb = (((top      ) & 0xFF) * (h - 1 - y) + ((bot      ) & 0xFF) * y) / (h - 1);
+        w32_gdi_fill_rect(hdc, l, t + y, r, t + y + 1, rr << 16 | gg << 8 | bb);
+    }
+}
+
+/* A rectangle with its four corner pixels left out. Not a real rounded
+ * corner -- at these sizes a real one is a corner pixel and a lighter
+ * neighbour -- but it is the difference between a control that looks drawn
+ * for this decade and one that does not. */
+static void rounded_frame(uint64_t hdc, int l, int t, int r, int b, uint32_t c) {
+    if (r - l < 3 || b - t < 3) { w32_gdi_frame_rect(hdc, l, t, r, b, c); return; }
+    w32_gdi_fill_rect(hdc, l + 1, t, r - 1, t + 1, c);
+    w32_gdi_fill_rect(hdc, l + 1, b - 1, r - 1, b, c);
+    w32_gdi_fill_rect(hdc, l, t + 1, l + 1, b - 1, c);
+    w32_gdi_fill_rect(hdc, r - 1, t + 1, r, b - 1, c);
+}
+
+/* The 3D edge, or the themed equivalent. Every control's outline goes through
+ * here, so switching the look is one branch rather than fifty. */
 static void bevel(uint64_t hdc, int l, int t, int r, int b, int sunken) {
+    if (g_themed) {
+        /* Themed: one thin outline, darker for a sunken field than for a
+         * raised one, and no white highlight -- the highlight is what makes
+         * the old look old. */
+        rounded_frame(hdc, l, t, r, b, sunken ? 0x9A8E85u : 0xACA39Au);
+        return;
+    }
     uint32_t tl = sunken ? sys_color(COLOR_BTNSHADOW) : 0xFFFFFF;
     uint32_t br = sunken ? 0xFFFFFF : sys_color(COLOR_3DDKSHADOW);
     w32_gdi_fill_rect(hdc, l, t, r, t + 1, tl);
     w32_gdi_fill_rect(hdc, l, t, l + 1, b, tl);
     w32_gdi_fill_rect(hdc, l, b - 1, r, b, br);
     w32_gdi_fill_rect(hdc, r - 1, t, r, b, br);
+}
+
+/* The face of a push button, in whichever look is in force. `state` is 0
+ * normal, 1 pressed, 2 focused or default. */
+static void button_face(uint64_t hdc, int l, int t, int r, int b, int state) {
+    if (!g_themed) {
+        w32_gdi_fill_rect(hdc, l, t, r, b, sys_color(COLOR_BTNFACE));
+        bevel(hdc, l, t, r, b, state == 1);
+        return;
+    }
+    /* The colours are the ones the Aero button actually uses: a near-white
+     * top falling to a light grey, inverted while pressed, and a blue edge
+     * when the button is the one Enter would press. */
+    uint32_t top = state == 1 ? 0xE0E4E8u : 0xFDFEFFu;
+    uint32_t bot = state == 1 ? 0xF0F3F5u : 0xE3E9EFu;
+    gradient_v(hdc, l + 1, t + 1, r - 1, b - 1, top, bot);
+    rounded_frame(hdc, l, t, r, b, state == 2 ? 0xC08040u : 0x9A8E85u);
+    if (state == 2) rounded_frame(hdc, l + 1, t + 1, r - 1, b - 1, 0xE8C89Cu);
 }
 
 /* Text inside a rectangle, with the three alignments a control uses and
@@ -1555,9 +1953,14 @@ static int draw_text_rect(uint64_t hdc, const char *s, int len,
     /* Measure first, so DT_VCENTER and DT_CALCRECT know the height before
      * anything is drawn. Two passes over a label is nothing, and getting the
      * height from a single pass means drawing in the wrong place first. */
+    /* Room for a licence agreement. Sixty-four lines was enough for a label
+     * and a message box and nothing else -- the first page of an installer is
+     * hundreds, and the ones past the limit were silently dropped, which is
+     * both a wrong height for the scroll bar and missing text. */
+    enum { MAX_LINES = 2048 };
     int lines = 0, i = 0;
-    int starts[64], lens[64];
-    while (i < len && lines < 64) {
+    static int starts[MAX_LINES], lens[MAX_LINES];
+    while (i < len && lines < MAX_LINES) {
         int take_n = len - i, hard = 0;
         for (int k = 0; k < take_n; k++) if (s[i + k] == '\n') { take_n = k; hard = 1; break; }
         if (!(fmt & DT_SINGLELINE)) {
@@ -1614,6 +2017,86 @@ static int strip_amp(const char *in, char *out, int cap) {
     return n;
 }
 
+/* The icon to show in a window's title bar: the one it was given by
+ * WM_SETICON if any, otherwise its class's. Both are ordinary image handles
+ * now that LoadIcon returns real pixels, so the caption can just draw it. */
+static uint64_t window_icon(uint64_t hwnd) {
+    uint64_t h = 0;
+    pthread_mutex_lock(&g_lock);
+    wwin *p = win_of(hwnd);
+    if (p) {
+        h = p->icon;
+        if (!h) {
+            wclass *c = class_of(p->cls);
+            if (c) h = c->icon;
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    return h;
+}
+
+/* A check mark, drawn as two strokes rather than a glyph so it scales with
+ * the box it sits in. Shared by the check box and the list view. */
+static void draw_check(uint64_t hdc, int x, int y, int size, uint32_t colour) {
+    if (size < 5) size = 5;
+    int t = size >= 16 ? 2 : 1;
+    for (int i = 0; i < size / 3; i++)
+        w32_gdi_fill_rect(hdc, x + 2 + i, y + size / 2 + i, x + 2 + i + t,
+                          y + size / 2 + i + t, colour);
+    for (int i = 0; i < size * 2 / 3; i++)
+        w32_gdi_fill_rect(hdc, x + 2 + size / 3 + i, y + size / 2 + size / 3 - i,
+                          x + 2 + size / 3 + i + t, y + size / 2 + size / 3 - i + t, colour);
+}
+
+/* One end of a scroll bar: a raised box with a triangle in it. */
+static void arrow_box(uint64_t hdc, int x, int y, int cw, int ch, int down) {
+    w32_gdi_fill_rect(hdc, x, y, x + cw, y + ch, sys_color(COLOR_BTNFACE));
+    bevel(hdc, x, y, x + cw, y + ch, 0);
+    uint32_t k = sys_color(COLOR_BTNTEXT);
+    int cx = x + cw / 2, cy = y + ch / 2;
+    for (int i = 0; i < 4; i++) {
+        int yy = down ? cy - 2 + i : cy + 2 - i;
+        w32_gdi_fill_rect(hdc, cx - i, yy, cx + i + 1, yy + 1, k);
+    }
+}
+
+/* A SysLink's caption is HTML-ish: "read the <a href=x>licence</a> first".
+ * The markup is removed for drawing; `link_start` and `link_len` come back so
+ * a click can be tested against the part that is actually a link. */
+static int strip_link(const char *in, char *out, int cap, int *link_start, int *link_len) {
+    int n = 0, ls = -1, le = 0;
+    for (int i = 0; in[i] && n + 1 < cap; i++) {
+        if (in[i] == '<') {
+            int close = in[i + 1] == '/';
+            if (!close && ls < 0) ls = n;
+            if (close) le = n;
+            while (in[i] && in[i] != '>') i++;
+            continue;
+        }
+        out[n++] = in[i];
+    }
+    out[n] = 0;
+    if (link_start) *link_start = ls < 0 ? 0 : ls;
+    if (link_len) *link_len = ls < 0 ? n : (le > ls ? le - ls : n - ls);
+    return n;
+}
+
+/* How much text there turned out to be, told to the window by its own
+ * painter. A scroll bar cannot be drawn correctly before the text has been
+ * laid out, and laying it out is what painting does. */
+static void edit_extent(uint64_t hwnd, int over, int page, int line) {
+    pthread_mutex_lock(&g_lock);
+    wwin *p = win_of(hwnd);
+    if (p) {
+        p->scroll_max = over;
+        p->scroll_page = page;
+        p->step = line > 0 ? line : 13;
+        if (p->scroll_pos > over) p->scroll_pos = over;
+        if (p->scroll_pos < 0) p->scroll_pos = 0;
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+
 /* ---- painting one control ---------------------------------------------- */
 
 static void paint_control(w32 *w, uint64_t hwnd, wwin *snap) {
@@ -1628,25 +2111,55 @@ static void paint_control(w32 *w, uint64_t hwnd, wwin *snap) {
     w32_gdi_set_bk_mode(hdc, 1);                 /* TRANSPARENT */
     w32_gdi_set_text_color(hdc, fg);
 
+    /* The title bar, for any window that asked for one -- drawn on a device
+     * context over the *whole* window, because the client one cannot reach
+     * above its own origin, which is where the caption is.
+     *
+     * The icon goes in it if the program gave its class one, and the close
+     * box on the right, because a title bar without either reads as a
+     * placeholder rather than a window. */
+    if (snap->cyo) {
+        uint64_t wdc = w32_dc_for_window(w, hwnd, 1);
+        if (wdc) {
+            if (snap->font) w32_gdi_set_font(wdc, snap->font);
+            if (g_themed)
+                gradient_v(wdc, 0, 0, snap->w, snap->cyo, 0xF2F6FBu, 0xD3DEEBu);
+            else
+                w32_gdi_fill_rect(wdc, 0, 0, snap->w, snap->cyo, sys_color(COLOR_ACTIVECAPTION));
+            w32_gdi_set_bk_mode(wdc, 1);
+            w32_gdi_set_text_color(wdc, g_themed ? 0x3C3C3Cu : sys_color(COLOR_CAPTIONTEXT));
+            int th = w32_gdi_line_height(wdc);
+            int tx = 6;
+            uint64_t icon = window_icon(hwnd);
+            if (icon) {
+                int isz = snap->cyo - 6;
+                if (isz > 4) {
+                    w32_gdi_draw_image(wdc, icon, 4, 3, isz, isz);
+                    tx = 6 + isz + 4;
+                }
+            }
+            /* The close box. It is drawn rather than made a real button
+             * because there is no window manager here to own one, and a
+             * program that watches for WM_CLOSE gets it from the hit test. */
+            int bs = snap->cyo - 8;
+            if (bs > 6 && snap->w > bs + 12) {
+                int bx = snap->w - bs - 4, by = 4;
+                w32_gdi_fill_rect(wdc, bx, by, bx + bs, by + bs, sys_color(COLOR_BTNFACE));
+                uint32_t xk = sys_color(COLOR_BTNTEXT);
+                for (int i = 3; i < bs - 3; i++) {
+                    w32_gdi_fill_rect(wdc, bx + i, by + i, bx + i + 1, by + i + 1, xk);
+                    w32_gdi_fill_rect(wdc, bx + bs - 1 - i, by + i, bx + bs - i, by + i + 1, xk);
+                }
+            }
+            w32_gdi_text_at(wdc, tx, (snap->cyo - th) / 2, snap->text, (int)strlen(snap->text));
+            w32_gdi_frame_rect(wdc, 0, 0, snap->w, snap->h, sys_color(COLOR_3DDKSHADOW));
+            w32_dc_release(wdc);
+        }
+    }
+
     switch (snap->ctl) {
     case CTL_DIALOG:
         w32_gdi_fill_rect(hdc, 0, 0, cw, ch, sys_color(COLOR_BTNFACE));
-        if (snap->cyo) {
-            /* The title bar, on a device context over the whole window --
-             * the client one cannot reach above its own origin, which is
-             * where the caption is. */
-            uint64_t wdc = w32_dc_for_window(w, hwnd, 1);
-            if (wdc) {
-                if (snap->font) w32_gdi_set_font(wdc, snap->font);
-                w32_gdi_fill_rect(wdc, 0, 0, snap->w, snap->cyo, sys_color(COLOR_ACTIVECAPTION));
-                w32_gdi_set_bk_mode(wdc, 1);
-                w32_gdi_set_text_color(wdc, sys_color(COLOR_CAPTIONTEXT));
-                int th = w32_gdi_line_height(wdc);
-                w32_gdi_text_at(wdc, 8, (snap->cyo - th) / 2, snap->text, (int)strlen(snap->text));
-                w32_gdi_frame_rect(wdc, 0, 0, snap->w, snap->h, sys_color(COLOR_3DDKSHADOW));
-                w32_dc_release(wdc);
-            }
-        }
         break;
 
     case CTL_STATIC: {
@@ -1689,8 +2202,13 @@ static void paint_control(w32 *w, uint64_t hwnd, wwin *snap) {
             if (box > ch) box = ch;
             if (box < 8) box = 8;
             int by = (ch - box) / 2;
-            w32_gdi_fill_rect(hdc, 0, by, box, by + box, 0xFFFFFF);
-            bevel(hdc, 0, by, box, by + box, 1);
+            if (g_themed) {
+                gradient_v(hdc, 1, by + 1, box - 1, by + box - 1, 0xF6FAFDu, 0xFFFFFFu);
+                rounded_frame(hdc, 0, by, box, by + box, snap->focused ? 0xC08040u : 0x8E837Au);
+            } else {
+                w32_gdi_fill_rect(hdc, 0, by, box, by + box, 0xFFFFFF);
+                bevel(hdc, 0, by, box, by + box, 1);
+            }
             if (snap->checked) {
                 /* A tick for a check box, a dot for a radio button: the two
                  * are different controls and have to look different, because
@@ -1712,10 +2230,13 @@ static void paint_control(w32 *w, uint64_t hwnd, wwin *snap) {
             draw_text_rect(hdc, label, ln, box + box / 3 + 2, 0, cw, ch, DT_LEFT | DT_VCENTER | DT_WORDBREAK);
             break;
         }
-        /* A push button. */
-        w32_gdi_fill_rect(hdc, 0, 0, cw, ch, sys_color(COLOR_BTNFACE));
-        bevel(hdc, 0, 0, cw, ch, snap->pressed);
-        if (kind == BS_DEFPUSHBUTTON) w32_gdi_frame_rect(hdc, 0, 0, cw, ch, 0x000000);
+        /* A push button. Pressed wins over focused, because a button being
+         * held down is the more urgent thing to show. */
+        button_face(hdc, 0, 0, cw, ch,
+                    snap->pressed ? 1
+                    : (snap->focused || kind == BS_DEFPUSHBUTTON) ? 2 : 0);
+        if (!g_themed && kind == BS_DEFPUSHBUTTON)
+            w32_gdi_frame_rect(hdc, 0, 0, cw, ch, 0x000000);
         int off = snap->pressed ? 1 : 0;
         draw_text_rect(hdc, label, ln, off, off, cw + off, ch + off,
                        DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -1732,9 +2253,30 @@ static void paint_control(w32 *w, uint64_t hwnd, wwin *snap) {
             memset(stars, '*', (size_t)n); stars[n] = 0;
             draw_text_rect(hdc, stars, n, 3, 2, cw - 3, ch - 2,
                            (snap->style & ES_MULTILINE) ? DT_WORDBREAK : DT_SINGLELINE | DT_VCENTER);
+        } else if (snap->style & ES_MULTILINE) {
+            /* A multi-line box holds the whole text, which for a licence
+             * agreement is far more than fits, so it is drawn from the
+             * scroll position down and the box tells the scroll bar how much
+             * there is. Measuring the wrapped height with DT_CALCRECT and
+             * then drawing is what Windows does, and it is the only way the
+             * thumb's size can mean anything. */
+            const char *t = win_text(snap);
+            int len = (int)strlen(t);
+            int inner = cw - 6 - ((snap->style & WS_VSCROLL) ? 16 : 0);
+            if (inner < 8) inner = 8;
+            int lh = w32_gdi_line_height(hdc);
+            if (lh < 1) lh = 13;
+            int total = draw_text_rect(hdc, t, len, 3, 2, 3 + inner, ch - 2,
+                                       DT_WORDBREAK | DT_CALCRECT);
+            int shown = ch - 4;
+            /* Report the extent back, so the bar drawn below this switch and
+             * the wheel handling both work from the real numbers. */
+            edit_extent(hwnd, total > shown ? total - shown : 0, shown, lh);
+            draw_text_rect(hdc, t, len, 3, 2 - snap->scroll_pos, 3 + inner,
+                           ch - 2, DT_WORDBREAK | DT_NOCLIP);
         } else {
             draw_text_rect(hdc, snap->text, (int)strlen(snap->text), 3, 2, cw - 3, ch - 2,
-                           (snap->style & ES_MULTILINE) ? DT_WORDBREAK : DT_SINGLELINE | DT_VCENTER);
+                           DT_SINGLELINE | DT_VCENTER);
         }
         break;
 
@@ -1773,14 +2315,24 @@ static void paint_control(w32 *w, uint64_t hwnd, wwin *snap) {
     }
 
     case CTL_PROGRESS: {
-        w32_gdi_fill_rect(hdc, 0, 0, cw, ch, sys_color(COLOR_WINDOW));
+        w32_gdi_fill_rect(hdc, 0, 0, cw, ch, g_themed ? 0xF0EDEBu : sys_color(COLOR_WINDOW));
         bevel(hdc, 0, 0, cw, ch, 1);
         int span = snap->hi - snap->lo;
         int done = span > 0 ? (snap->pos - snap->lo) : 0;
         if (done < 0) done = 0;
         if (span > 0 && done > span) done = span;
         int fillw = span > 0 ? (cw - 4) * done / span : 0;
-        if (fillw > 0) w32_gdi_fill_rect(hdc, 2, 2, 2 + fillw, ch - 2, 0x00A000);
+        /* The themed bar is a green gradient with a lighter band across the
+         * top, which is the one thing about a progress bar people recognise
+         * at a glance. */
+        if (fillw > 0) {
+            if (g_themed) {
+                gradient_v(hdc, 2, 2, 2 + fillw, ch - 2, 0x36C13Au, 0x0A8A18u);
+                gradient_v(hdc, 2, 2, 2 + fillw, 2 + (ch - 4) / 3, 0x86E58Cu, 0x36C13Au);
+            } else {
+                w32_gdi_fill_rect(hdc, 2, 2, 2 + fillw, ch - 2, 0x00A000);
+            }
+        }
         break;
     }
 
@@ -1789,8 +2341,233 @@ static void paint_control(w32 *w, uint64_t hwnd, wwin *snap) {
         bevel(hdc, 0, 0, cw, ch, 1);
         break;
 
+    /* A list view. Report mode -- a header row and columns -- is what an
+     * installer's component page and a game's resolution list both use; list
+     * and icon modes fall back to one string per row, which is what those
+     * modes look like anyway at this level of detail.
+     *
+     * The check boxes are not decoration. LVS_EX_CHECKBOXES is how every
+     * installer asks which components to install, and a list of components
+     * with no way to see or change what is ticked is not usable. */
+    case CTL_LISTVIEW: {
+        w32_gdi_fill_rect(hdc, 0, 0, cw, ch, sys_color(COLOR_WINDOW));
+        bevel(hdc, 0, 0, cw, ch, 1);
+        if (snap->list < 0) break;
+        int lh = w32_gdi_line_height(hdc) + 4;
+        int y = 2;
+        int ncol = g_list[snap->list].ncol;
+        int checks = (snap->exstyle & LVS_EX_CHECKBOXES_) != 0;
+        if (ncol > 0) {
+            /* The header. Drawn as buttons, because that is what it is. */
+            int x = 2;
+            for (int c = 0; c < ncol && x < cw; c++) {
+                int cwid = g_list[snap->list].colw[c] > 0 ? g_list[snap->list].colw[c] : 100;
+                w32_gdi_fill_rect(hdc, x, y, x + cwid, y + lh, sys_color(COLOR_BTNFACE));
+                bevel(hdc, x, y, x + cwid, y + lh, 0);
+                w32_gdi_set_text_color(hdc, sys_color(COLOR_BTNTEXT));
+                w32_gdi_text_at(hdc, x + 4, y + 2, g_list[snap->list].colname[c],
+                                (int)strlen(g_list[snap->list].colname[c]));
+                x += cwid;
+            }
+            y += lh;
+        }
+        int n = g_list[snap->list].n;
+        for (int i = snap->top; i < n && y + lh <= ch - 2; i++) {
+            int sel = i == snap->sel;
+            if (sel) w32_gdi_fill_rect(hdc, 2, y, cw - 2, y + lh, sys_color(COLOR_HIGHLIGHT));
+            int x = 4;
+            if (checks) {
+                int b = lh - 6 > 8 ? lh - 6 : 8;
+                w32_gdi_fill_rect(hdc, x, y + 2, x + b, y + 2 + b, sys_color(COLOR_WINDOW));
+                bevel(hdc, x, y + 2, x + b, y + 2 + b, 1);
+                if (g_list[snap->list].checked[i])
+                    draw_check(hdc, x + 1, y + 3, b - 2, sys_color(COLOR_WINDOWTEXT));
+                x += b + 4;
+            }
+            w32_gdi_set_text_color(hdc, sel ? sys_color(COLOR_HIGHLIGHTTEXT)
+                                            : sys_color(COLOR_WINDOWTEXT));
+            /* Report mode packs a row as column texts separated by tabs --
+             * see the LVM_SETITEMTEXT handler, which builds them that way. */
+            const char *it = g_list[snap->list].item[i];
+            if (ncol > 0) {
+                int c = 0, cx2 = x;
+                const char *seg = it;
+                while (c < ncol && cx2 < cw) {
+                    const char *tab = strchr(seg, '\t');
+                    int len = tab ? (int)(tab - seg) : (int)strlen(seg);
+                    w32_gdi_text_at(hdc, cx2 + (c ? 4 : 0), y + 2, seg, len);
+                    cx2 += g_list[snap->list].colw[c] > 0 ? g_list[snap->list].colw[c] : 100;
+                    if (!tab) break;
+                    seg = tab + 1; c++;
+                }
+            } else {
+                w32_gdi_text_at(hdc, x, y + 2, it, (int)strlen(it));
+            }
+            y += lh;
+        }
+        break;
+    }
+
+    /* A tree view, drawn flat. The hierarchy is not modelled -- an item knows
+     * its text and nothing else -- so this is a list with room on the left
+     * where the expanders would be. That is enough for the two things a tree
+     * is used for here, a directory picker and a component list, to be
+     * legible rather than blank. */
+    case CTL_TREEVIEW: {
+        w32_gdi_fill_rect(hdc, 0, 0, cw, ch, sys_color(COLOR_WINDOW));
+        bevel(hdc, 0, 0, cw, ch, 1);
+        if (snap->list < 0) break;
+        int lh = w32_gdi_line_height(hdc) + 2;
+        int y = 2, n = g_list[snap->list].n;
+        for (int i = snap->top; i < n && y + lh <= ch - 2; i++) {
+            int sel = i == snap->sel;
+            if (sel) w32_gdi_fill_rect(hdc, 2, y, cw - 2, y + lh, sys_color(COLOR_HIGHLIGHT));
+            w32_gdi_set_text_color(hdc, sel ? sys_color(COLOR_HIGHLIGHTTEXT)
+                                            : sys_color(COLOR_WINDOWTEXT));
+            const char *it = g_list[snap->list].item[i];
+            w32_gdi_text_at(hdc, 16, y + 1, it, (int)strlen(it));
+            y += lh;
+        }
+        break;
+    }
+
+    /* Tabs across the top, the selected one raised and joined to the page
+     * below it. The page itself is a child window the program manages; all
+     * this owes it is the strip and a body to sit on. */
+    case CTL_TAB: {
+        w32_gdi_fill_rect(hdc, 0, 0, cw, ch, sys_color(COLOR_BTNFACE));
+        if (snap->list < 0) break;
+        int n = g_list[snap->list].n;
+        int th = w32_gdi_line_height(hdc) + 8;
+        int x = 2;
+        for (int i = 0; i < n && x < cw; i++) {
+            const char *lab = g_list[snap->list].item[i];
+            int tw2 = 0, tht = 0;
+            w32_gdi_text_extent(hdc, lab, (int)strlen(lab), &tw2, &tht);
+            int wdt = tw2 + 16;
+            int sel = i == snap->sel;
+            int ty = sel ? 0 : 2;
+            w32_gdi_fill_rect(hdc, x, ty, x + wdt, th, sys_color(COLOR_BTNFACE));
+            bevel(hdc, x, ty, x + wdt, th + 2, 0);
+            w32_gdi_set_text_color(hdc, sys_color(COLOR_BTNTEXT));
+            w32_gdi_text_at(hdc, x + 8, ty + 4, lab, (int)strlen(lab));
+            x += wdt + 1;
+        }
+        bevel(hdc, 0, th, cw, ch, 0);
+        break;
+    }
+
+    /* The status bar along the bottom. Its panes come from SB_SETTEXT, one
+     * per part, and a program that only ever sets part 0 gets one pane the
+     * width of the window -- which is what most of them do. */
+    case CTL_STATUS: {
+        w32_gdi_fill_rect(hdc, 0, 0, cw, ch, sys_color(COLOR_BTNFACE));
+        if (snap->list < 0) break;
+        int n = g_list[snap->list].n;
+        if (n < 1) n = 1;
+        int pw = cw / n;
+        w32_gdi_set_text_color(hdc, sys_color(COLOR_BTNTEXT));
+        for (int i = 0; i < n; i++) {
+            int x = i * pw;
+            bevel(hdc, x + 1, 1, x + pw - 1, ch - 1, 1);
+            if (i < g_list[snap->list].n)
+                w32_gdi_text_at(hdc, x + 5, 2, g_list[snap->list].item[i],
+                                (int)strlen(g_list[snap->list].item[i]));
+        }
+        break;
+    }
+
+    /* A slider. A game's volume and gamma live on these, so the thumb has to
+     * be somewhere a finger can find it, and it has to move when dragged --
+     * see the WM_LBUTTONDOWN handling in ctl_proc. */
+    case CTL_TRACK: {
+        w32_gdi_fill_rect(hdc, 0, 0, cw, ch, sys_color(COLOR_BTNFACE));
+        int span = snap->hi - snap->lo;
+        int vert = ch > cw;
+        int track = 4;
+        if (vert) {
+            int x = cw / 2 - track / 2;
+            w32_gdi_fill_rect(hdc, x, 4, x + track, ch - 4, sys_color(COLOR_BTNSHADOW));
+            bevel(hdc, x, 4, x + track, ch - 4, 1);
+            int pos = span > 0 ? (ch - 20) * (snap->pos - snap->lo) / span : 0;
+            w32_gdi_fill_rect(hdc, 2, 4 + pos, cw - 2, 4 + pos + 12, sys_color(COLOR_BTNFACE));
+            bevel(hdc, 2, 4 + pos, cw - 2, 4 + pos + 12, 0);
+        } else {
+            int y = ch / 2 - track / 2;
+            w32_gdi_fill_rect(hdc, 4, y, cw - 4, y + track, sys_color(COLOR_BTNSHADOW));
+            bevel(hdc, 4, y, cw - 4, y + track, 1);
+            int pos = span > 0 ? (cw - 20) * (snap->pos - snap->lo) / span : 0;
+            w32_gdi_fill_rect(hdc, 4 + pos, 2, 4 + pos + 12, ch - 2, sys_color(COLOR_BTNFACE));
+            bevel(hdc, 4 + pos, 2, 4 + pos + 12, ch - 2, 0);
+        }
+        break;
+    }
+
+    /* A SysLink is a label with <a>...</a> in it. The markup is stripped and
+     * the link part drawn the way a link is drawn, which is the entire point
+     * of the control; clicking it sends NM_CLICK to the parent. */
+    case CTL_LINK: {
+        char plain[256];
+        int pn = strip_link(snap->text, plain, sizeof plain, 0, 0);
+        w32_gdi_set_text_color(hdc, 0xCC6600);            /* COLOR_HOTLIGHT, BGR */
+        w32_gdi_text_at(hdc, 0, 0, plain, pn);
+        int tw2 = 0, tht = 0;
+        w32_gdi_text_extent(hdc, plain, pn, &tw2, &tht);
+        w32_gdi_fill_rect(hdc, 0, tht - 1, tw2, tht, 0xCC6600);
+        break;
+    }
+
+    case CTL_TOOLBAR:
+    case CTL_HEADER:
+        w32_gdi_fill_rect(hdc, 0, 0, cw, ch, sys_color(COLOR_BTNFACE));
+        w32_gdi_fill_rect(hdc, 0, ch - 1, cw, ch, sys_color(COLOR_BTNSHADOW));
+        break;
+
+    /* The two little arrows beside a field. */
+    case CTL_UPDOWN: {
+        w32_gdi_fill_rect(hdc, 0, 0, cw, ch, sys_color(COLOR_BTNFACE));
+        bevel(hdc, 0, 0, cw, ch / 2, 0);
+        bevel(hdc, 0, ch / 2, cw, ch, 0);
+        uint32_t k = sys_color(COLOR_BTNTEXT);
+        for (int i = 0; i < 3; i++) {
+            w32_gdi_fill_rect(hdc, cw / 2 - i, ch / 4 + i, cw / 2 + i + 1, ch / 4 + i + 1, k);
+            w32_gdi_fill_rect(hdc, cw / 2 - i, ch * 3 / 4 - i, cw / 2 + i + 1, ch * 3 / 4 - i + 1, k);
+        }
+        break;
+    }
+
     default:
         break;
+    }
+
+    /* Scroll bars, for anything that asked for one.
+     *
+     * This is not decoration either: a licence agreement in a read-only edit
+     * box is taller than the box, and with no bar there is nothing to say the
+     * text continues and nothing to move it with. The thumb's size is the
+     * visible fraction, which is the only part of a scroll bar people
+     * actually read. */
+    if (snap->style & WS_VSCROLL) {
+        int sbw = 16;
+        int x = cw - sbw;
+        if (x > 0) {
+            w32_gdi_fill_rect(hdc, x, 0, cw, ch, sys_color(COLOR_BTNFACE));
+            arrow_box(hdc, x, 0, sbw, sbw, 0);
+            arrow_box(hdc, x, ch - sbw, sbw, sbw, 1);
+            int span = ch - 2 * sbw;
+            if (span > 8) {
+                int total = snap->scroll_max > 0 ? snap->scroll_max : 1;
+                int page = snap->scroll_page > 0 ? snap->scroll_page : 1;
+                int th2 = span * page / (total + page);
+                if (th2 < 8) th2 = 8;
+                if (th2 > span) th2 = span;
+                int at = total > 0 ? (span - th2) * snap->scroll_pos / total : 0;
+                if (at < 0) at = 0;
+                if (at > span - th2) at = span - th2;
+                w32_gdi_fill_rect(hdc, x, sbw + at, cw, sbw + at + th2, sys_color(COLOR_BTNFACE));
+                bevel(hdc, x, sbw + at, cw, sbw + at + th2, 0);
+            }
+        }
     }
     if ((snap->style & WS_BORDER) && snap->ctl != CTL_EDIT && snap->ctl != CTL_LISTBOX)
         w32_gdi_frame_rect(hdc, 0, 0, cw, ch, sys_color(COLOR_WINDOWFRAME));
@@ -1824,6 +2601,483 @@ static void get_msg_text(w32 *w, uint64_t p, int wide, char *out, size_t n) {
     else snprintf(out, n, "%.*s", (int)n - 1, w32_str(w, p));
 }
 
+/* ---- the common controls' own messages ---------------------------------
+ *
+ * Each of these is small on its own; together they are the difference between
+ * a control that exists and one that has anything in it. They are here rather
+ * than inline in ctl_proc because that switch is long enough already.
+ */
+
+static int list_count(const wwin *snap) {
+    return snap->list >= 0 ? g_list[snap->list].n : 0;
+}
+static uint64_t list_clear(uint64_t hwnd) {
+    pthread_mutex_lock(&g_lock);
+    wwin *p = win_of(hwnd);
+    if (p && p->list >= 0) { g_list[p->list].n = 0; p->sel = -1; p->top = 0; }
+    pthread_mutex_unlock(&g_lock);
+    invalidate(hwnd);
+    return 1;
+}
+
+/* Read a string out of a guest struct field that may be char* or wchar_t*. */
+static void read_str_field(w32 *w, uint64_t ptr, int wide, char *out, size_t n) {
+    out[0] = 0;
+    if (!ptr) return;
+    if (wide) w32_wtoa(w, ptr, out, n);
+    else snprintf(out, n, "%.*s", (int)n - 1, (const char *)W32P(w, ptr));
+}
+
+/* LVCOLUMN: mask, fmt, cx, pszText, cchTextMax, iSubItem... The first three
+ * are DWORDs and the fourth is a pointer, so the text offset is 12 either
+ * way and the pointer's width is the only thing that differs. */
+static uint64_t lv_insert_column(w32 *w, uint64_t hwnd, uint64_t p_, int wide) {
+    if (!p_) return (uint64_t)-1;
+    int cx = (int)(int32_t)w32_read(w, p_ + 8, 4);
+    uint64_t txt = w32_read(w, p_ + 12, w32_ptrsize(w));
+    char name[32];
+    read_str_field(w, txt, wide, name, sizeof name);
+    int idx = -1;
+    pthread_mutex_lock(&g_lock);
+    wwin *p = win_of(hwnd);
+    if (p && p->list >= 0 && g_list[p->list].ncol < 8) {
+        idx = g_list[p->list].ncol++;
+        g_list[p->list].colw[idx] = cx > 0 ? cx : 100;
+        snprintf(g_list[p->list].colname[idx], 32, "%s", name);
+    }
+    pthread_mutex_unlock(&g_lock);
+    invalidate(hwnd);
+    return (uint64_t)(int64_t)idx;
+}
+
+/* LVITEM: mask, iItem, iSubItem, state, stateMask, pszText, ... -- five
+ * DWORDs then a pointer. */
+static uint64_t lv_insert_item(w32 *w, uint64_t hwnd, uint64_t p_, int wide) {
+    if (!p_) return (uint64_t)-1;
+    int at = (int)(int32_t)w32_read(w, p_ + 4, 4);
+    uint64_t txt = w32_read(w, p_ + 20, w32_ptrsize(w));
+    char buf[LIST_TEXT];
+    read_str_field(w, txt, wide, buf, sizeof buf);
+    int idx = -1;
+    pthread_mutex_lock(&g_lock);
+    wwin *p = win_of(hwnd);
+    if (p && p->list >= 0 && g_list[p->list].n < LIST_ITEMS) {
+        int n = g_list[p->list].n;
+        if (at < 0 || at > n) at = n;
+        for (int i = n; i > at; i--) {
+            memcpy(g_list[p->list].item[i], g_list[p->list].item[i - 1], LIST_TEXT);
+            g_list[p->list].checked[i] = g_list[p->list].checked[i - 1];
+        }
+        snprintf(g_list[p->list].item[at], LIST_TEXT, "%s", buf);
+        g_list[p->list].checked[at] = 0;
+        g_list[p->list].n = n + 1;
+        idx = at;
+    }
+    pthread_mutex_unlock(&g_lock);
+    invalidate(hwnd);
+    return (uint64_t)(int64_t)idx;
+}
+
+/* A sub-item's text. Report mode packs a row as its columns joined by tabs,
+ * which is what the painter walks back apart. */
+static uint64_t lv_set_item_text(w32 *w, uint64_t hwnd, int item, uint64_t p_, int wide) {
+    if (!p_) return 0;
+    int col = (int)(int32_t)w32_read(w, p_ + 8, 4);
+    uint64_t txt = w32_read(w, p_ + 20, w32_ptrsize(w));
+    char buf[LIST_TEXT];
+    read_str_field(w, txt, wide, buf, sizeof buf);
+    pthread_mutex_lock(&g_lock);
+    wwin *p = win_of(hwnd);
+    if (p && p->list >= 0 && item >= 0 && item < g_list[p->list].n) {
+        char row[LIST_TEXT], out[LIST_TEXT];
+        snprintf(row, sizeof row, "%s", g_list[p->list].item[item]);
+        int at = 0, c = 0, n = 0;
+        const char *seg = row;
+        out[0] = 0;
+        /* Rebuild the row, substituting the one column that changed. */
+        for (c = 0; c < 8; c++) {
+            const char *tab = strchr(seg, '\t');
+            int len = tab ? (int)(tab - seg) : (int)strlen(seg);
+            const char *src = c == col ? buf : seg;
+            int slen = c == col ? (int)strlen(buf) : len;
+            if (n && n + 1 < LIST_TEXT) out[n++] = '\t';
+            for (int i = 0; i < slen && n + 1 < LIST_TEXT; i++) out[n++] = src[i];
+            out[n] = 0;
+            if (!tab) { if (col <= c) break; seg = ""; } else seg = tab + 1;
+            if (!tab && col <= c) break;
+        }
+        (void)at;
+        snprintf(g_list[p->list].item[item], LIST_TEXT, "%s", out);
+    }
+    pthread_mutex_unlock(&g_lock);
+    invalidate(hwnd);
+    return 1;
+}
+
+/* LVIS_STATEIMAGEMASK in the top byte of the low word carries the check
+ * state: image 2 is ticked, 1 is not. That encoding is how every installer
+ * sets a component on, and reading it wrong means the ticks never move. */
+static uint64_t lv_set_state(w32 *w, uint64_t hwnd, int item, uint64_t p_) {
+    if (!p_) return 0;
+    uint32_t state = (uint32_t)w32_read(w, p_ + 12, 4);
+    uint32_t mask  = (uint32_t)w32_read(w, p_ + 16, 4);
+    pthread_mutex_lock(&g_lock);
+    wwin *p = win_of(hwnd);
+    if (p && p->list >= 0) {
+        int lo = item < 0 ? 0 : item, hi = item < 0 ? g_list[p->list].n - 1 : item;
+        for (int i = lo; i <= hi && i < g_list[p->list].n; i++) {
+            if (mask & 0xF000u) g_list[p->list].checked[i] = ((state >> 12) & 0xF) >= 2;
+            if ((mask & 1) && i == item) p->sel = (state & 1) ? i : p->sel;
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    invalidate(hwnd);
+    return 1;
+}
+static uint64_t lv_get_state(const wwin *snap, int item, uint32_t mask) {
+    if (snap->list < 0 || item < 0 || item >= g_list[snap->list].n) return 0;
+    uint32_t st = 0;
+    if (g_list[snap->list].checked[item]) st |= 0x2000u;
+    else st |= 0x1000u;
+    if (item == snap->sel) st |= 1;
+    return st & (mask ? mask : 0xFFFFFFFFu);
+}
+
+/* TVINSERTSTRUCT: hParent, hInsertAfter, then a TVITEM whose text pointer is
+ * at mask+hItem+state+stateMask -- four DWORDs in. */
+static uint64_t tv_insert(w32 *w, uint64_t hwnd, uint64_t p_, int wide) {
+    if (!p_) return 0;
+    int ps = (int)w32_ptrsize(w);
+    uint64_t item = p_ + 2u * (unsigned)ps;
+    uint64_t txt = w32_read(w, item + 4 + (unsigned)ps + 8, (unsigned)ps);
+    char buf[LIST_TEXT];
+    read_str_field(w, txt, wide, buf, sizeof buf);
+    uint64_t h = 0;
+    pthread_mutex_lock(&g_lock);
+    wwin *p = win_of(hwnd);
+    if (p && p->list >= 0 && g_list[p->list].n < LIST_ITEMS) {
+        int at = g_list[p->list].n++;
+        snprintf(g_list[p->list].item[at], LIST_TEXT, "%s", buf);
+        h = 0x00050000u + (uint64_t)at * 4;
+    }
+    pthread_mutex_unlock(&g_lock);
+    invalidate(hwnd);
+    return h;
+}
+
+/* TCITEM: mask, dwState, dwStateMask, pszText -- three DWORDs then a
+ * pointer. */
+static uint64_t tab_insert(w32 *w, uint64_t hwnd, int at, uint64_t p_, int wide) {
+    if (!p_) return (uint64_t)-1;
+    uint64_t txt = w32_read(w, p_ + 12, w32_ptrsize(w));
+    char buf[LIST_TEXT];
+    read_str_field(w, txt, wide, buf, sizeof buf);
+    int idx = -1;
+    pthread_mutex_lock(&g_lock);
+    wwin *p = win_of(hwnd);
+    if (p && p->list >= 0 && g_list[p->list].n < LIST_ITEMS) {
+        int n = g_list[p->list].n;
+        if (at < 0 || at > n) at = n;
+        for (int i = n; i > at; i--) memcpy(g_list[p->list].item[i], g_list[p->list].item[i-1], LIST_TEXT);
+        snprintf(g_list[p->list].item[at], LIST_TEXT, "%s", buf);
+        g_list[p->list].n = n + 1;
+        if (p->sel < 0) p->sel = 0;
+        idx = at;
+    }
+    pthread_mutex_unlock(&g_lock);
+    invalidate(hwnd);
+    return (uint64_t)(int64_t)idx;
+}
+
+/* SB_SETTEXT's wParam is the part index in its low byte; the rest is drawing
+ * style, which does not change what the text says. */
+static uint64_t sb_set_text(w32 *w, uint64_t hwnd, int part, uint64_t txt, int wide) {
+    char buf[LIST_TEXT];
+    read_str_field(w, txt, wide, buf, sizeof buf);
+    pthread_mutex_lock(&g_lock);
+    wwin *p = win_of(hwnd);
+    if (p && p->list >= 0 && part >= 0 && part < LIST_ITEMS) {
+        while (g_list[p->list].n <= part) g_list[p->list].item[g_list[p->list].n++][0] = 0;
+        snprintf(g_list[p->list].item[part], LIST_TEXT, "%s", buf);
+    }
+    pthread_mutex_unlock(&g_lock);
+    invalidate(hwnd);
+    return 1;
+}
+
+/* A slider's position and range. `pos` of a very negative number means "do
+ * not change it", which keeps the four TBM_ messages one function. */
+static void track_set(uint64_t hwnd, int pos, int lo, int hi) {
+    pthread_mutex_lock(&g_lock);
+    wwin *p = win_of(hwnd);
+    if (p) {
+        if (lo != -1 || hi != -1) { if (lo != -1) p->lo = lo; if (hi != -1) p->hi = hi; }
+        if (pos > -1000000000) p->pos = pos;
+        if (p->hi <= p->lo) p->hi = p->lo + 1;
+        if (p->pos < p->lo) p->pos = p->lo;
+        if (p->pos > p->hi) p->pos = p->hi;
+    }
+    pthread_mutex_unlock(&g_lock);
+    invalidate(hwnd);
+}
+
+/* Rich text, reduced to text.
+ *
+ * A licence agreement streamed in as RTF is a brace-nested control-word
+ * soup, and rendering it properly is a project of its own. Stripping it is
+ * not: drop the control words, drop the groups that exist only to carry
+ * fonts and colours, turn \par into a newline, and what is left is the
+ * sentences somebody has to read before clicking I Agree. That is the part
+ * that matters, and showing it beats showing a blank box. */
+static int rtf_to_text(const char *in, int n, char *out, int cap) {
+    int o = 0, depth = 0, skip_depth = -1;
+    for (int i = 0; i < n && o + 1 < cap; i++) {
+        char c = in[i];
+        if (c == '{') { depth++; continue; }
+        if (c == '}') { if (skip_depth >= 0 && depth <= skip_depth) skip_depth = -1; depth--; continue; }
+        if (c == '\\') {
+            int j = i + 1;
+            if (j < n && !((in[j] >= 'a' && in[j] <= 'z') || (in[j] >= 'A' && in[j] <= 'Z'))) {
+                /* An escaped literal: \{ \} \\ , or \'xx for a byte. */
+                if (in[j] == '\'' && j + 2 < n) { i = j + 2; continue; }
+                if (skip_depth < 0) out[o++] = in[j];
+                i = j;
+                continue;
+            }
+            char word[32];
+            int wn = 0;
+            while (j < n && ((in[j] >= 'a' && in[j] <= 'z') || (in[j] >= 'A' && in[j] <= 'Z'))
+                   && wn + 1 < (int)sizeof word) word[wn++] = in[j++];
+            word[wn] = 0;
+            while (j < n && (in[j] == '-' || (in[j] >= '0' && in[j] <= '9'))) j++;
+            if (j < n && in[j] == ' ') j++;
+            i = j - 1;
+            if (!strcmp(word, "par") || !strcmp(word, "line")) { if (skip_depth < 0) out[o++] = '\n'; }
+            else if (!strcmp(word, "tab")) { if (skip_depth < 0) out[o++] = '\t'; }
+            else if (!strcmp(word, "fonttbl") || !strcmp(word, "colortbl")
+                  || !strcmp(word, "stylesheet") || !strcmp(word, "info")
+                  || !strcmp(word, "generator") || !strcmp(word, "pict")) {
+                if (skip_depth < 0) skip_depth = depth;
+            }
+            continue;
+        }
+        if (c == '\r' || c == '\n') continue;          /* RTF's own line breaks are not text */
+        if (skip_depth < 0) out[o++] = c;
+    }
+    out[o] = 0;
+    return o;
+}
+
+/* EM_STREAMIN(format, EDITSTREAM*). EDITSTREAM is { cookie, error, callback }
+ * -- a pointer, a DWORD and a pointer, so the callback sits two pointers in
+ * once alignment is accounted for. The callback is
+ * DWORD (*)(DWORD_PTR cookie, BYTE *buf, LONG cb, LONG *pcb), and it is
+ * called until it reports fewer bytes than were asked for. */
+static uint64_t em_stream_in(w32 *w, uint64_t hwnd, uint32_t fmt, uint64_t es) {
+    if (!es) return 0;
+    int ps = (int)w32_ptrsize(w);
+    uint64_t cookie = w32_read(w, es, (unsigned)ps);
+    uint64_t cb = w32_read(w, es + 2u * (unsigned)ps, (unsigned)ps);
+    if (!cb) return 0;
+
+    /* Somewhere for the callback to write, and somewhere to count what it
+     * wrote -- both in guest memory, because the guest writes to them. */
+    enum { CHUNK = 4096 };
+    uint64_t buf = w32_alloc(w, CHUNK + 16, 0);
+    if (!buf) return 0;
+    uint64_t pcb = buf + CHUNK;
+
+    char *acc = (char *)malloc(64 * 1024);
+    if (!acc) return 0;
+    size_t an = 0, acap = 64 * 1024;
+    int unicode = (fmt & 0x20) != 0;
+
+    for (int guard = 0; guard < 512; guard++) {
+        w32_write(w, pcb, 4, 0);
+        uint64_t args[4] = { cookie, buf, CHUNK, pcb };
+        uint64_t rc = w32_call_guest(w, cb, 4, args);
+        int got = (int)(int32_t)w32_read(w, pcb, 4);
+        if (rc != 0 || got <= 0) break;
+        if (got > CHUNK) got = CHUNK;
+        const unsigned char *src = (const unsigned char *)W32P(w, buf);
+        if (!src) break;
+        /* UTF-16 in, ASCII out: this layer draws one byte per character. */
+        int step = unicode ? 2 : 1;
+        for (int i = 0; i + step <= got; i += step) {
+            if (an + 2 >= acap) {
+                char *bigger = (char *)realloc(acc, acap * 2);
+                if (!bigger) { got = 0; break; }
+                acc = bigger; acap *= 2;
+            }
+            unsigned ch = unicode ? (unsigned)(src[i] | src[i + 1] << 8) : src[i];
+            acc[an++] = (char)(ch < 256 ? ch : '?');
+        }
+        if (got < CHUNK) break;
+    }
+    acc[an] = 0;
+
+    /* SF_RTF is 2. Some programs say SF_TEXT and hand over RTF anyway, so the
+     * signature is trusted over the flag. */
+    char *text = acc;
+    char *plain = 0;
+    if ((fmt & 2) || (an > 5 && !strncmp(acc, "{\\rtf", 5))) {
+        plain = (char *)malloc(an + 2);
+        if (plain) { rtf_to_text(acc, (int)an, plain, (int)an + 1); text = plain; }
+    }
+
+    w32_set_window_text(w, hwnd, text);
+    free(plain);
+    free(acc);
+    invalidate(hwnd);
+    return 0;
+}
+
+/* Move a scrolling control by `lines`, and repaint if anything moved. */
+static void scroll_by(w32 *w, uint64_t hwnd, const wwin *snap, int lines) {
+    (void)w;
+    int moved = 0;
+    pthread_mutex_lock(&g_lock);
+    wwin *p = win_of(hwnd);
+    if (p) {
+        int step = p->step > 0 ? p->step : 13;
+        int was = p->ctl == CTL_LISTVIEW || p->ctl == CTL_TREEVIEW ? p->top : p->scroll_pos;
+        if (p->ctl == CTL_LISTVIEW || p->ctl == CTL_TREEVIEW) {
+            p->top += lines;
+            if (p->top < 0) p->top = 0;
+            if (p->list >= 0 && p->top > g_list[p->list].n - 1)
+                p->top = g_list[p->list].n > 0 ? g_list[p->list].n - 1 : 0;
+            moved = p->top != was;
+        } else {
+            p->scroll_pos += lines * step;
+            if (p->scroll_pos < 0) p->scroll_pos = 0;
+            if (p->scroll_pos > p->scroll_max) p->scroll_pos = p->scroll_max;
+            moved = p->scroll_pos != was;
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    (void)snap;
+    if (moved) invalidate(hwnd);
+}
+
+/* A click in the vertical scroll bar: the arrows step, the track pages. */
+static void scroll_click(w32 *w, uint64_t hwnd, const wwin *snap, int my) {
+    int sbw = 16;
+    if (my < sbw) scroll_by(w, hwnd, snap, -1);
+    else if (my > snap->ch - sbw) scroll_by(w, hwnd, snap, 1);
+    else {
+        int page = snap->scroll_page > 0 ? snap->scroll_page : snap->ch;
+        int step = snap->step > 0 ? snap->step : 13;
+        int lines = page / step;
+        if (lines < 1) lines = 1;
+        int span = snap->ch - 2 * sbw;
+        int at = span > 0 && snap->scroll_max > 0
+               ? sbw + span * snap->scroll_pos / (snap->scroll_max + page) : sbw;
+        scroll_by(w, hwnd, snap, my < at ? -lines : lines);
+    }
+}
+
+/* WM_NOTIFY, which is how a common control tells its parent something
+ * happened. NMHDR is { HWND hwndFrom; UINT_PTR idFrom; UINT code; } -- two
+ * pointer-sized fields and a DWORD, so it has to be built in guest memory at
+ * the guest's own widths. */
+static void post_notify(w32 *w, uint64_t parent, uint64_t from, uint64_t id, uint32_t code) {
+    if (!parent) return;
+    int ps = (int)w32_ptrsize(w);
+    uint64_t nm = w32_alloc(w, 64, 0);
+    if (!nm) return;
+    w32_write(w, nm, (unsigned)ps, from);
+    w32_write(w, nm + (unsigned)ps, (unsigned)ps, id);
+    w32_write(w, nm + 2u * (unsigned)ps, 4, code);
+    send_to(w, parent, WM_NOTIFY, id, nm, 1);
+}
+
+/* A click on one of the controls this file draws itself. */
+static void ctl_click(w32 *w, uint64_t hwnd, const wwin *snap, int mx, int my) {
+    pthread_mutex_lock(&g_lock);
+    g_focus = hwnd;
+    pthread_mutex_unlock(&g_lock);
+
+    switch (snap->ctl) {
+    case CTL_LISTVIEW: {
+        if (snap->list < 0) break;
+        uint64_t hdc = w32_dc_for_window(w, hwnd, 0);
+        int lh = (hdc ? w32_gdi_line_height(hdc) : 13) + 4;
+        if (hdc) w32_dc_release(hdc);
+        int y = 2 + (g_list[snap->list].ncol > 0 ? lh : 0);
+        int idx = snap->top + (my - y) / (lh > 0 ? lh : 17);
+        pthread_mutex_lock(&g_lock);
+        wwin *p = win_of(hwnd);
+        if (p && idx >= 0 && idx < g_list[snap->list].n) {
+            p->sel = idx;
+            /* Clicking the box toggles the tick; clicking the row selects.
+             * That is the distinction an installer's component page lives on. */
+            if ((snap->exstyle & LVS_EX_CHECKBOXES_) && mx < 4 + lh)
+                g_list[snap->list].checked[idx] = !g_list[snap->list].checked[idx];
+        } else idx = -1;
+        pthread_mutex_unlock(&g_lock);
+        invalidate(hwnd);
+        if (idx >= 0) post_notify(w, snap->parent, hwnd, snap->id, (uint32_t)-101);  /* LVN_ITEMCHANGED */
+        break;
+    }
+    case CTL_TREEVIEW: {
+        if (snap->list < 0) break;
+        uint64_t hdc = w32_dc_for_window(w, hwnd, 0);
+        int lh = (hdc ? w32_gdi_line_height(hdc) : 13) + 2;
+        if (hdc) w32_dc_release(hdc);
+        int idx = snap->top + (my - 2) / (lh > 0 ? lh : 15);
+        pthread_mutex_lock(&g_lock);
+        wwin *p = win_of(hwnd);
+        if (p && idx >= 0 && idx < g_list[snap->list].n) p->sel = idx; else idx = -1;
+        pthread_mutex_unlock(&g_lock);
+        invalidate(hwnd);
+        if (idx >= 0) post_notify(w, snap->parent, hwnd, snap->id, (uint32_t)-402);  /* TVN_SELCHANGED */
+        break;
+    }
+    case CTL_TAB: {
+        if (snap->list < 0) break;
+        uint64_t hdc = w32_dc_for_window(w, hwnd, 0);
+        int th = (hdc ? w32_gdi_line_height(hdc) : 13) + 8;
+        if (my > th) { if (hdc) w32_dc_release(hdc); break; }
+        int x = 2, hit = -1;
+        for (int i = 0; i < g_list[snap->list].n; i++) {
+            const char *lab = g_list[snap->list].item[i];
+            int tw2 = 0, tht = 0;
+            if (hdc) w32_gdi_text_extent(hdc, lab, (int)strlen(lab), &tw2, &tht);
+            int wdt = tw2 + 16;
+            if (mx >= x && mx < x + wdt) { hit = i; break; }
+            x += wdt + 1;
+        }
+        if (hdc) w32_dc_release(hdc);
+        if (hit < 0) break;
+        pthread_mutex_lock(&g_lock);
+        wwin *p = win_of(hwnd);
+        if (p) p->sel = hit;
+        pthread_mutex_unlock(&g_lock);
+        invalidate(hwnd);
+        post_notify(w, snap->parent, hwnd, snap->id, (uint32_t)-551);   /* TCN_SELCHANGE */
+        break;
+    }
+    case CTL_TRACK: {
+        int span = snap->hi - snap->lo;
+        if (span <= 0) break;
+        int vert = snap->ch > snap->cw;
+        int at = vert ? my - 10 : mx - 10;
+        int len = (vert ? snap->ch : snap->cw) - 20;
+        int val = len > 0 ? snap->lo + span * at / len : snap->lo;
+        track_set(hwnd, val, -1, -1);
+        /* WM_HSCROLL/WM_VSCROLL with SB_THUMBTRACK is how a program reads a
+         * slider it did not move itself. */
+        send_to(w, snap->parent, vert ? WM_VSCROLL : WM_HSCROLL,
+                (uint64_t)(5u | ((uint32_t)val << 16)), hwnd, 1);
+        break;
+    }
+    case CTL_LINK:
+        post_notify(w, snap->parent, hwnd, snap->id, (uint32_t)-2);     /* NM_CLICK */
+        break;
+    default: break;
+    }
+}
+
 static uint64_t ctl_proc(w32 *w, uint64_t hwnd, uint32_t msg, uint64_t wp, uint64_t lp, int wide) {
     pthread_mutex_lock(&g_lock);
     wwin *p = win_of(hwnd);
@@ -1831,6 +3085,98 @@ static uint64_t ctl_proc(w32 *w, uint64_t hwnd, uint32_t msg, uint64_t wp, uint6
     wwin snap = *p;
     snap.focused = (g_focus == hwnd);
     pthread_mutex_unlock(&g_lock);
+
+    /* The common-control messages. Each family is WM_USER plus an index, so
+     * the numbers collide between families -- TBM_SETPOS and SB_SETPARTS are
+     * both 0x0405 -- and they are told apart by which control is being sent
+     * to, which is why this is dispatched on `snap.ctl` before the general
+     * switch below. */
+    switch (snap.ctl) {
+    case CTL_LISTVIEW:
+        switch (msg) {
+        case 0x1004: return list_count(&snap);                       /* GETITEMCOUNT */
+        case 0x1009: return list_clear(hwnd);                        /* DELETEALLITEMS */
+        case 0x1036:                                                 /* SETEXTENDEDLISTVIEWSTYLE */
+            pthread_mutex_lock(&g_lock);
+            if ((p = win_of(hwnd))) p->exstyle |= (uint32_t)lp;
+            pthread_mutex_unlock(&g_lock);
+            invalidate(hwnd);
+            return 0;
+        case 0x101B: case 0x1061: return lv_insert_column(w, hwnd, lp, msg == 0x1061);
+        case 0x1007: case 0x104D: return lv_insert_item(w, hwnd, lp, msg == 0x104D);
+        case 0x102E: case 0x1074: return lv_set_item_text(w, hwnd, (int)wp, lp, msg == 0x1074);
+        case 0x102B: return lv_set_state(w, hwnd, (int)(int32_t)wp, lp);  /* SETITEMSTATE */
+        case 0x102C: return lv_get_state(&snap, (int)wp, (uint32_t)lp);   /* GETITEMSTATE */
+        case 0x100C:                                                 /* GETNEXTITEM */
+            return (uint64_t)(int64_t)(snap.sel >= 0 && (uint32_t)lp ? snap.sel : -1);
+        default: break;
+        }
+        break;
+    case CTL_TREEVIEW:
+        switch (msg) {
+        case 0x1105: return list_clear(hwnd);                        /* TVM_DELETEITEM(ROOT) */
+        case 0x1100: case 0x1132: return tv_insert(w, hwnd, lp, msg == 0x1132);
+        default: break;
+        }
+        break;
+    case CTL_TAB:
+        switch (msg) {
+        case 0x1304: return list_count(&snap);                       /* GETITEMCOUNT */
+        case 0x1309: return list_clear(hwnd);                        /* DELETEALLITEMS */
+        case 0x1307: case 0x133E: return tab_insert(w, hwnd, (int)wp, lp, msg == 0x133E);
+        case 0x130B: return (uint64_t)(int64_t)snap.sel;             /* GETCURSEL */
+        case 0x130C: {                                               /* SETCURSEL */
+            int old = snap.sel;
+            pthread_mutex_lock(&g_lock);
+            if ((p = win_of(hwnd))) p->sel = (int)(int32_t)wp;
+            pthread_mutex_unlock(&g_lock);
+            invalidate(hwnd);
+            return (uint64_t)(int64_t)old;
+        }
+        default: break;
+        }
+        break;
+    case CTL_STATUS:
+        switch (msg) {
+        case 0x0401: case 0x040B: return sb_set_text(w, hwnd, (int)(wp & 0xFF), lp, msg == 0x040B);
+        case 0x0404:                                                 /* SB_SETPARTS */
+            pthread_mutex_lock(&g_lock);
+            if ((p = win_of(hwnd)) && p->list >= 0 && (int)wp <= LIST_ITEMS) {
+                while (g_list[p->list].n < (int)wp) g_list[p->list].item[g_list[p->list].n++][0] = 0;
+            }
+            pthread_mutex_unlock(&g_lock);
+            invalidate(hwnd);
+            return 1;
+        default: break;
+        }
+        break;
+    case CTL_TRACK:
+        switch (msg) {
+        case 0x0400: return (uint64_t)(int64_t)snap.pos;             /* TBM_GETPOS */
+        case 0x0401: return (uint64_t)(int64_t)snap.lo;              /* TBM_GETRANGEMIN */
+        case 0x0402: return (uint64_t)(int64_t)snap.hi;              /* TBM_GETRANGEMAX */
+        case 0x0405: track_set(hwnd, (int)(int32_t)lp, -1, -1); return 0;   /* TBM_SETPOS */
+        case 0x0406: track_set(hwnd, -1000000000, (int)(int16_t)(lp & 0xFFFF),
+                               (int)(int16_t)((lp >> 16) & 0xFFFF)); return 0;
+        case 0x0407: track_set(hwnd, -1000000000, (int)(int32_t)lp, -1); return 0;
+        case 0x0408: track_set(hwnd, -1000000000, -1, (int)(int32_t)lp); return 0;
+        default: break;
+        }
+        break;
+    case CTL_EDIT:
+        /* EM_STREAMIN is how a RichEdit is filled: the program hands over a
+         * callback and this pulls the text out of it in chunks. Every Inno
+         * Setup licence page arrives this way, which is why one of them was a
+         * blank white box until now. */
+        if (msg == 0x0449) return em_stream_in(w, hwnd, (uint32_t)wp, lp);
+        if (msg == 0x0443) return 0;                    /* EM_SETBKGNDCOLOR */
+        if (msg == 0x0445) return 0;                    /* EM_SETEVENTMASK */
+        if (msg == 0x0444) return 1;                    /* EM_SETCHARFORMAT: accepted, ignored */
+        if (msg == 0x045B) return 0;                    /* EM_AUTOURLDETECT */
+        if (msg == 0x0435) return 0;                    /* EM_EXLIMITTEXT */
+        break;
+    default: break;
+    }
 
     switch (msg) {
     case WM_PAINT:
@@ -1898,8 +3244,27 @@ static uint64_t ctl_proc(w32 *w, uint64_t hwnd, uint32_t msg, uint64_t wp, uint6
             post_command(snap.parent, snap.id, LBN_SELCHANGE, hwnd);
         } else if (snap.ctl == CTL_EDIT && snap.enabled) {
             pthread_mutex_lock(&g_lock); g_focus = hwnd; pthread_mutex_unlock(&g_lock);
+        } else if (snap.enabled) {
+            int mx = (int)(int16_t)(lp & 0xFFFF), my = (int)(int16_t)((lp >> 16) & 0xFFFF);
+            ctl_click(w, hwnd, &snap, mx, my);
+        }
+        /* A click in a scroll bar, whatever the control is. Handled after the
+         * control's own hit test so a list view's rows still take clicks that
+         * are not in the bar. */
+        if (snap.style & WS_VSCROLL) {
+            int mx = (int)(int16_t)(lp & 0xFFFF), my = (int)(int16_t)((lp >> 16) & 0xFFFF);
+            if (mx >= snap.cw - 16) scroll_click(w, hwnd, &snap, my);
         }
         return 0;
+
+    /* The wheel. A licence agreement is the reason this exists: it is how
+     * anybody actually reads one, and a page with no wheel and no reachable
+     * scroll bar cannot be got to the bottom of at all. */
+    case WM_MOUSEWHEEL: {
+        int delta = (int)(int16_t)((wp >> 16) & 0xFFFF);
+        scroll_by(w, hwnd, &snap, -delta * 3 / 120);
+        return 0;
+    }
 
     case WM_LBUTTONUP:
         if (snap.ctl == CTL_BUTTON && snap.enabled) {
@@ -3662,11 +5027,52 @@ static void u_GetClassLongPtrW(w32 *w) { w32_ret64(w, 0); }
 static void u_SetClassLongPtrA(w32 *w) { w32_ret64(w, 0); }
 static void u_SetClassLongPtrW(w32 *w) { w32_ret64(w, 0); }
 
-static void u_LoadImageW(w32 *w) { (void)w; RET(0x9003); }
-static void u_LoadBitmapA(w32 *w) { (void)w; RET(0); }
-static void u_LoadBitmapW(w32 *w) { (void)w; RET(0); }
-static void u_DestroyIcon(w32 *w) { (void)w; RET(1); }
-static void u_DestroyCursor(w32 *w) { (void)w; RET(1); }
+/* LoadBitmap is LoadImage with the type fixed and no size: the old call. */
+static void u_LoadBitmapA(w32 *w) {
+    uint64_t hr = w32_find_resource(w, ARG(0), 2, ARG(1), 0);
+    uint32_t size = 0;
+    w32_image im = { 0, 0, 0 };
+    uint64_t data = hr ? w32_resource_data(w, hr, &size) : 0;
+    if (data && w32_dib_decode((const uint8_t *)W32P(w, data), size, &im))
+        RET(w32_gdi_make_bitmap(im.w, im.h, im.px));
+    else RET(0);
+}
+static void u_LoadBitmapW(w32 *w) {
+    uint64_t hr = w32_find_resource(w, ARG(0), 2, ARG(1), 1);
+    uint32_t size = 0;
+    w32_image im = { 0, 0, 0 };
+    uint64_t data = hr ? w32_resource_data(w, hr, &size) : 0;
+    if (data && w32_dib_decode((const uint8_t *)W32P(w, data), size, &im))
+        RET(w32_gdi_make_bitmap(im.w, im.h, im.px));
+    else RET(0);
+}
+static void u_DestroyIcon(w32 *w) { w32_gdi_delete_object(ARG(0)); RET(1); }
+static void u_DestroyCursor(w32 *w) { w32_gdi_delete_object(ARG(0)); RET(1); }
+
+/* DrawIconEx(hdc, x, y, hicon, cx, cy, step, brush, flags). DrawIcon is the
+ * same at the icon's own size. */
+static void u_DrawIconEx(w32 *w) {
+    w32_gdi_draw_image(ARG(0), ARG(3), (int)(int32_t)(uint32_t)ARG(1),
+                       (int)(int32_t)(uint32_t)ARG(2),
+                       (int)(int32_t)(uint32_t)ARG(4), (int)(int32_t)(uint32_t)ARG(5));
+    RET(1);
+}
+static void u_DrawIcon(w32 *w) {
+    w32_gdi_draw_image(ARG(0), ARG(3), (int)(int32_t)(uint32_t)ARG(1),
+                       (int)(int32_t)(uint32_t)ARG(2), 0, 0);
+    RET(1);
+}
+/* GetIconInfo(hicon, ICONINFO*): fIcon, xHotspot, yHotspot, then two bitmap
+ * handles. A program calls this to find out how big an icon is. */
+static void u_GetIconInfo(w32 *w) {
+    int cx = 0, cy = 0, hx = 0, hy = 0;
+    if (!ARG(1) || !w32_gdi_icon_size(ARG(0), &cx, &cy, &hx, &hy)) { RET(0); return; }
+    w32_write(w, ARG(1), 4, (uint64_t)(hx == 0 && hy == 0));
+    w32_write(w, ARG(1) + 4, 4, (uint64_t)(uint32_t)hx);
+    w32_write(w, ARG(1) + 8, 4, (uint64_t)(uint32_t)hy);
+    RET(1);
+}
+static void u_CopyImage(w32 *w) { RET(ARG(0)); }
 static void u_GetKeyboardLayout(w32 *w) { (void)w; RET(0x04090409u); }   /* en-US */
 
 /* MessageBoxIndirect takes a MSGBOXPARAMS struct instead of arguments. The
@@ -3719,7 +5125,9 @@ const w32_api w32_user32[] = {
     /* input */
     F(GetAsyncKeyState, 1), F(GetKeyState, 1), F(GetKeyboardState, 1), F(SetKeyboardState, 1),
     F(GetCursorPos, 1), F(SetCursorPos, 2), F(ShowCursor, 1), F(SetCursor, 1),
-    F(LoadCursorA, 2), F(LoadCursorW, 2), F(LoadIconA, 2), F(LoadIconW, 2), F(LoadImageA, 6),
+    F(LoadCursorA, 2), F(LoadCursorW, 2), F(LoadIconA, 2), F(LoadIconW, 2),
+    F(LoadImageA, 6), F(LoadImageW, 6), F(GetCursor, 0),
+    F(DrawIcon, 4), F(DrawIconEx, 9), F(GetIconInfo, 2), F(CopyImage, 5),
     F(SetCapture, 1), F(ReleaseCapture, 0), F(GetCapture, 0),
     F(ClipCursor, 1), F(GetClipCursor, 1),
     F(MapVirtualKeyA, 2), F(MapVirtualKeyW, 2), F(VkKeyScanA, 1), F(GetKeyNameTextA, 3),

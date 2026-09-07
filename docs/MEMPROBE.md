@@ -36,6 +36,133 @@ The probes below were the whole app for as long as there was nothing to run.
 They are one tap away under **Diagnostics**, and they are still how you tell
 "this program is broken" from "this device is broken".
 
+## Keyboard and mouse
+
+A hardware keyboard and a hardware mouse work as soon as they are connected.
+There is nothing to switch on, and Settings says outright whether either is
+attached — that line is the first thing to look at when a game is ignoring
+both, because if nothing is connected nothing below it can help.
+
+Keys arrive as `UIPress`es on the view over the frame, which is why that view
+has to be first responder and has to *stay* one: several things take it away
+and none of them give it back, and the symptom is a keyboard that worked a
+minute ago and now does nothing at all, with nothing on screen to say so. It
+is re-taken once a frame, from the same tick that uploads the frame.
+
+Each press carries two useful things, and Windows wants both: the raw HID
+usage, which becomes a virtual-key code through the table in
+`GuestInput.swift`, and `key.characters`, which is what the system's own
+keyboard layout resolved. They go across together through `w32_input_key_ch`,
+because the character is the one thing the host knows better than we could
+guess — a non-US layout types what it should, and `TranslateMessage` on the
+guest side uses that character instead of deriving one. Letters, digits,
+F1-F12, the arrows, space, enter, escape, tab, backspace, delete and the whole
+numeric keypad are mapped.
+
+Modifiers are the part that needed care. The press events on their own are not
+enough: a Shift held down before the view became first responder never
+produces a press here, and one released while an alert was up never produces a
+release — and either way the guest believes Shift is down for the rest of the
+run, which a game shows as a walk key that has stuck. Every key event also
+carries `modifierFlags`, which is the truth about right now, so every key
+event is a chance to reconcile. Caps Lock is driven from that flag alone and
+the physical key is skipped, because it is a lock rather than a hold and
+feeding in both would flip the guest's toggle bit twice.
+
+The mouse comes through GameController's `GCMouse`, which is the only iOS API
+that reports **relative** motion. That is not a preference: a pointer clamped
+to the edge of the screen stops turning the view, and every game that does
+mouselook depends on it not doing that. Buttons and the wheel come off the
+same object. While the guest has hidden its own cursor — a game saying it is
+doing mouselook and recentring the pointer with `SetCursorPos` every frame —
+the pointer is captured with `prefersPointerLocked`, so nothing of the
+system's is drawn over the game; a menu shows the cursor again and the capture
+goes with it, which is what keeps Close reachable with the mouse. iOS refuses
+the capture when the app is not full screen, and nothing depends on it having
+worked: the deltas arrive either way.
+
+Every source of motion is fed through one function, so the feel does not
+change with the hardware. `Settings.mouseSensitivity` and
+`Settings.mouseInvertY` apply to a touch drag, a trackpad and a real mouse
+alike — which is what Settings had always claimed and what nothing was
+actually doing; both were being read by nobody, so the slider moved and the
+pointer did not change. The scaling keeps the fraction of a pixel it leaves
+over rather than rounding each delta: at 0.3x a one-pixel report rounds to
+zero, and a sensitivity that low would not slow the pointer down but stop it.
+
+The on-screen WASD overlay hides itself while a keyboard is connected. It used
+to be a note in Settings asking people to go and turn it off, which was asking
+someone to do something the app can see for itself. The switch is still there,
+for keeping the keys out of the way when there is no keyboard either.
+
+## Crash reports, and why the .ips file names something else
+
+Four crash reports came off the device and between them said almost nothing
+about this app.
+
+Two were `cpu_resource_fatal`: the process killed for averaging 99% CPU over
+48 seconds against iOS's 80%-over-60-seconds limit, with the heaviest stack in
+main-thread SwiftUI and dispatch churn — log volume, not the emulator. One was
+a SIGSEGV inside StikDebug's own `LogManager`, a Combine `Published` array
+mutated from a dispatch block; that is StikDebug's bug, though a flood of log
+lines from us is what makes it fire. One was a SIGABRT in SwiftUI's RenderBox
+failing to load its Metal library, which is what running under LiveContainer
+looks like and is nobody's bug here.
+
+The lesson is the section title. Launched through LiveContainer paired with
+StikDebug, the process that dies is very often not this one, and by the time a
+report reaches a person it is filed against whichever process it was. So the
+app records its own, in its own container, immediately. Three things, and they
+answer different questions:
+
+- **A breadcrumb**, written whenever a guest starts and deleted when the run
+  comes back. It names the executable, 32- or 64-bit, whether the JIT was
+  blessed, the display size and the device. Finding one at the next launch
+  means the process did not survive that run. This is the only part that is
+  not optional, and it is the part that covers the failure that actually
+  happened: a CPU-watchdog or jetsam kill delivers no signal, runs no handler,
+  and leaves nothing else behind at all.
+- **A signal report**, when crash reporting is on in Settings: the signal, the
+  fault address and a backtrace for SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT
+  and SIGTRAP, plus an `NSSetUncaughtExceptionHandler` that catches an
+  Objective-C exception's name and reason before the runtime has unwound and
+  lost them.
+- **The system's own .ips files**, from `~/Library/Logs/CrashReporter` and the
+  container's `Library/Logs`, when they can be read at all. On a sideloaded
+  app they usually cannot, and that degrades to "none found" rather than to an
+  error — reporting on the reporting helps nobody.
+
+It is **off by default because it costs performance**, and it has no start
+button: a crash never announces itself, so either the handlers were armed
+before it happened or there is nothing afterwards to read. On the next launch
+a row in Settings says the previous run ended badly, with View, Copy and Clear
+beside it — the same row the log has, because they are the same thing to read.
+
+The handler half is C, in `tools/memprobe/Shared/crashcatch.c`, and that is
+not stylistic. A signal handler may call async-signal-safe functions and
+nothing else, and almost everything Swift does on the way to a line of text —
+allocating a String, retaining an object, taking the runtime's locks, going
+anywhere near Foundation or `os_log` — is none of those. A handler that
+allocates can deadlock against the malloc lock the faulting thread was already
+holding, and when that happens the process dies with no report at all, which
+is the exact failure the facility exists to prevent. So it writes with
+`write(2)` into a descriptor opened at arming time, formats its own integers,
+runs on an alternate signal stack so a stack overflow can still be reported,
+takes the backtrace with `backtrace()`/`backtrace_symbols_fd()`, then restores
+the default handler and re-raises so the process still dies the way it was
+going to and the system still writes its own report.
+
+### What was wrong with the log
+
+"The in-app crash log tool doesn't work" had a specific cause. `Logs.record`
+was the only thing that ever wrote to the log file, and it is called *after* a
+run returns — so a run that faulted or got the process killed before returning
+wrote nothing, and the log came up empty in exactly the case somebody had
+turned it on for. The machine block is now written when the run **starts** and
+the outcome is appended to it when the run ends. That costs one extra entry
+per run, and buys a header with no outcome under it, which names the program,
+the device, the JIT state and the resolution that died.
+
 ## Measuring the app-extension memory limit
 
 **Why this exists.** Whether 64-bit Windows games (Fallout 4) are reachable on

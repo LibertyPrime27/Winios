@@ -113,6 +113,13 @@ final class ProgramViewController: UIViewController {
             ? "running, carrying on past anything unimplemented…\n"
             : "running, stopping at the first unimplemented function…\n"
 
+        // Written down before it runs rather than after it returns. A run
+        // that faults or gets the process killed never reaches the code
+        // below, and those are the runs somebody wants a record of.
+        let label = program.name + "/" + exe.lastPathComponent
+        CrashReports.guestStarting(program: label, is32: program.is32)
+        Logs.starting(program: label)
+
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             guard let self else { return }
             var out = [CChar](repeating: 0, count: 1 << 20)
@@ -146,8 +153,8 @@ final class ProgramViewController: UIViewController {
             // The log, if it was asked for. Recorded here rather than in the
             // C layer because this is where the run report and the outcome
             // are both in hand.
-            Logs.record(program: p.name + "/" + exe.lastPathComponent,
-                        exit: rc, ms: ns / 1_000_000, report: text)
+            Logs.record(program: label, exit: rc, ms: ns / 1_000_000, report: text)
+            CrashReports.guestFinished()
 
             DispatchQueue.main.async {
                 self.program = p
@@ -164,7 +171,8 @@ final class ProgramViewController: UIViewController {
         guard let exe = ProgramStore.exeURL(program), let c = ExeBrowser.driveC else { return }
         let rel = exe.path.replacingOccurrences(of: c.path + "/", with: "")
         let vc = GuestViewController(exe: rel, root: c,
-                                     dllDir: ProgramStore.dllDirURL(program)?.path)
+                                     dllDir: ProgramStore.dllDirURL(program)?.path,
+                                     is32: program.is32)
         vc.modalPresentationStyle = .fullScreen
         present(vc, animated: true)
     }

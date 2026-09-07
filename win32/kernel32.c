@@ -491,7 +491,16 @@ static void k_GetModuleFileNameW(w32 *w) {
     RET(l);
 }
 static void k_IsDebuggerPresent(w32 *w) { RET(0); }
-static void k_OutputDebugStringA(w32 *w) { fprintf(stderr, "[dbg] %s", GSTR(ARG(0))); }
+/* OutputDebugString goes nowhere unless somebody asked to see it.
+ *
+ * A program calling this in its main loop -- and installers do -- writes a
+ * line per iteration, and on a phone each of those crosses into the system
+ * log and wakes the host app's UI. That was enough on its own to hold the
+ * main thread at 100% until iOS terminated the process, which is a strange
+ * way for a debug print to kill a game. */
+static void k_OutputDebugStringA(w32 *w) {
+    if (w->verbose) fprintf(stderr, "[dbg] %s", GSTR(ARG(0)));
+}
 static void k_GetSystemInfo(w32 *w) {
     uint64_t p = ARG(0); int psz = (int)w32_ptrsize(w);
     memset(W32P(w, p), 0, w->is32 ? 36 : 48);

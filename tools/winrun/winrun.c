@@ -398,6 +398,7 @@ static const w32_dll g_dlls[] = {
      * at all -- see win32/misc_dlls.c and win32/net_dlls.c. */
     { "imm32.dll",    { w32_imm32 },                                      0 },
     { "dwmapi.dll",   { w32_dwmapi },                                     0 },
+    { "uxtheme.dll",  { w32_uxtheme },                                    0 },
     { "avrt.dll",     { w32_avrt },                                       0 },
     { "version.dll",  { w32_version },                                    0 },
     { "rpcrt4.dll",   { w32_rpcrt4 },                                     0 },
