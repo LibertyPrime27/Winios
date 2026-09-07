@@ -145,7 +145,8 @@ final class ProgramViewController: UIViewController {
     @objc private func runFullScreen() {
         guard let exe = ProgramStore.exeURL(program), let c = ExeBrowser.driveC else { return }
         let rel = exe.path.replacingOccurrences(of: c.path + "/", with: "")
-        let vc = GuestViewController(exe: rel, root: c)
+        let vc = GuestViewController(exe: rel, root: c,
+                                     dllDir: ProgramStore.dllDirURL(program)?.path)
         vc.modalPresentationStyle = .fullScreen
         present(vc, animated: true)
     }

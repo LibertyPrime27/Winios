@@ -40,6 +40,22 @@ def zip_payload():
         z.writestr('game/game.exe', b'MZ' + b'\0' * 200)
     return buf.getvalue()
 
+def compressible_zip():
+    """A zip whose payload is far larger than the file holding it.
+
+    The point of measuring an archive's *uncompressed* total is that the
+    download's size tells you nothing about whether it will fit. The SFX
+    fixture above cannot show that -- its 8 KB PE stub dwarfs its 230-byte
+    payload -- so this one exists purely to make the difference real: 4 MB of
+    highly compressible data in a file of a few KB.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+        z.writestr('big/assets.dat', b'\0' * (4 << 20))
+        z.writestr('big/readme.txt', 'four megabytes of nothing, in a few kilobytes\n')
+    return buf.getvalue()
+
+
 print("installer-detection fixtures:")
 write('fake_inno.exe',     pe([b'TSetupLdrWindow', b'Inno Setup 6.2.0']))
 write('fake_nsis.exe',     pe([b'Nullsoft Install System v3.08',
@@ -55,3 +71,4 @@ write('fake_plain.exe',    pe([b'just a game', b'nothing to see']))
 write('fake_setupish.exe', pe([b'requireAdministrator']))
 write('not_a_pe.bin',      b'this is not a PE at all' * 40)
 write('fake_zipsfx.exe',   pe([b'sfx loader'], tail=zip_payload()))
+write('compressible.zip',  compressible_zip())

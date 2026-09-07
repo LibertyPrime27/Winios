@@ -6,8 +6,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "import.h"
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -26,16 +24,42 @@ int win_probe_run_dir(const char *exe_path, const char *dll_dir, int keep_going,
 
 /* --- importing ---
  *
- * Both modes, with the guest's own output appended to the report: when an
- * install produces nothing, the reason is in the run report and not in the
- * importer's summary. `installer` picks the mode; `keep_going` and
- * `timeout_s` only apply to installer mode. See tools/import/import.h. */
-int win_probe_import(const char *src, const char *drive_c, int installer,
-                     int keep_going, int timeout_s, wi_result *out);
+ * Flat scalars and caller-provided buffers, not the importer's own structs,
+ * and deliberately so: Swift imports a fixed-size C array as a *tuple* of
+ * that many elements, and `wi_result` carries an 8 KB report buffer. An
+ * 8192-element tuple is the sort of thing that makes the Swift type checker
+ * take minutes or give up altogether. Nothing here crosses the bridge as an
+ * aggregate, which also matches how win_probe_imports has always worked.
+ *
+ * Any out-parameter may be NULL.
+ */
 
-/* What is this file: a folder, an archive, a program, or a setup? Changes
- * nothing on disk, so the UI can ask before offering a mode. */
-wi_probe_result win_probe_look(const char *path);
+/* What kind of file is this? Changes nothing on disk, so the UI can ask
+ * before it offers a mode. Returns one of: */
+enum { WIN_LOOK_EXE = 0, WIN_LOOK_FOLDER = 1, WIN_LOOK_ARCHIVE = 2, WIN_LOOK_UNKNOWN = 3 };
+/*   is32          1, 0, or -1 when there is no single executable to ask
+ *   is_installer  whether it should be offered as an install rather than a game
+ *   family        the installer family's name ("Inno Setup", "not an installer")
+ *   note          one line saying what will happen, for the person importing */
+int win_probe_look(const char *path, int *is32, int *is_installer,
+                   char *family, size_t family_len,
+                   char *note, size_t note_len);
+
+/* Import, in one of the two modes. Returns 0 when the program is ready to
+ * run. `installer` picks the mode; `keep_going` and `timeout_s` apply only to
+ * installer mode.
+ *
+ * `detail` receives the report *and* the guest's own output -- when an install
+ * produces nothing, the reason is in the run report and the importer's summary
+ * only says that nothing appeared. `name` and `exe_rel` are the library entry;
+ * `dll_dir` is where the program's own DLLs are, for win_probe_run_dir. */
+int win_probe_import(const char *src, const char *drive_c, int installer,
+                     int keep_going, int timeout_s,
+                     char *detail, size_t detail_len,
+                     char *name, size_t name_len,
+                     char *exe_rel, size_t exe_rel_len,
+                     char *dll_dir, size_t dll_dir_len,
+                     int *is32, int *files, int *exes);
 
 /* The same, for a program we did not ship and cannot vouch for.
  *   keep_going  an unimplemented import returns 0 and the run continues, so

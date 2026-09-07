@@ -41,6 +41,16 @@ typedef int (*uz_progress)(void *ctx, const char *name, uint64_t done, uint64_t 
  * plain .zip and for a self-extracting .exe with a zip payload. */
 int uz_is_zip(const char *path);
 
+/* How much disk the archive needs once it is open, from the sizes recorded in
+ * the central directory -- so it costs a couple of reads rather than a trial
+ * extraction. Returns 0 for a file that is not a zip.
+ *
+ * This exists because the destination is a phone. Running out of space
+ * halfway through a 12 GB game leaves a broken half-install and a full disk,
+ * and the user's next move is to work out which of those to deal with first.
+ * Refusing before anything is written is a much better failure. */
+uint64_t uz_uncompressed_total(const char *path);
+
 /* Extract `zip_path` into `dest_dir`, which is created if needed.
  * Returns the number of files written, or -1 on failure with `err` filled in.
  * Directories in the archive are created; entries outside `dest_dir` after

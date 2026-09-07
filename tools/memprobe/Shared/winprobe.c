@@ -9,6 +9,11 @@
  * Swift is deliberate: both are easy to get subtly wrong across the bridge,
  * and neither is interesting enough to be worth doing twice.
  */
+/* clock_gettime is POSIX rather than C, so a strict -std=c11 build hides it.
+ * Darwin exposes it regardless, which is why the iOS build never minded --
+ * but the same omission in drivediff.c turned a pointer into an int on a
+ * 64-bit target, and a latent one is not worth keeping. */
+#define _GNU_SOURCE
 #include "winprobe.h"
 #include "winrun.h"
 #include "w32.h"
@@ -132,31 +137,75 @@ static int call_import(void *ctx) {
     return wi_import_game(a->src, a->drive_c, 0, 0, a->out);
 }
 
+/* Copy a C string into a caller's buffer, truncating rather than overrunning.
+ * Every string leaving this file goes through it. */
+static void put(char *dst, size_t n, const char *src) {
+    if (!dst || !n) return;
+    snprintf(dst, n, "%.*s", (int)n - 1, src ? src : "");
+}
+
 int win_probe_import(const char *src, const char *drive_c, int installer,
-                     int keep_going, int timeout_s, wi_result *out) {
-    if (!out) return -1;
-    import_args a = { src, drive_c, installer, keep_going, timeout_s, out };
-    char guest[128 * 1024];
-    int rc = with_capture(call_import, &a, guest, sizeof guest);
-    if (guest[0]) {
-        size_t used = strlen(out->detail);
-        size_t room = used + 80 < sizeof out->detail ? sizeof out->detail - used - 80 : 0;
+                     int keep_going, int timeout_s,
+                     char *detail, size_t detail_len,
+                     char *name, size_t name_len,
+                     char *exe_rel, size_t exe_rel_len,
+                     char *dll_dir, size_t dll_dir_len,
+                     int *is32, int *files, int *exes) {
+    /* wi_result is 11 KB, which is more than belongs on a stack shared with a
+     * guest's own frames. */
+    wi_result *r = (wi_result *)calloc(1, sizeof *r);
+    if (!r) { put(detail, detail_len, "out of memory\n"); return -1; }
+    r->is32 = -1;
+
+    import_args a = { src, drive_c, installer, keep_going, timeout_s, r };
+    char *guest = (char *)malloc(128 * 1024);
+    int rc = with_capture(call_import, &a, guest, guest ? 128 * 1024 : 0);
+
+    /* The importer's own report, then what the program printed. Both, because
+     * an install that produced nothing is explained by the second half. */
+    put(detail, detail_len, r->detail);
+    if (guest && guest[0] && detail && detail_len) {
+        size_t used = strlen(detail);
+        size_t room = used + 80 < detail_len ? detail_len - used - 80 : 0;
         if (room) {
             /* The tail, not the head. An installer prints progress and *then*
              * the run report, and the run report -- which names what it called
-             * that is not implemented -- is the part worth keeping. Cutting
-             * the front is the right way round. */
+             * that is not implemented -- is the part worth keeping. */
             size_t n = strlen(guest);
             const char *from = n > room ? guest + (n - room) : guest;
-            snprintf(out->detail + used, sizeof out->detail - used,
+            snprintf(detail + used, detail_len - used,
                      "\n---- what the program printed%s ----\n%s",
                      n > room ? " (last part)" : "", from);
         }
     }
-    return rc;
+    free(guest);
+
+    put(name, name_len, r->name);
+    put(exe_rel, exe_rel_len, r->exe_rel);
+    put(dll_dir, dll_dir_len, r->dll_dir);
+    if (is32)  *is32  = r->is32;
+    if (files) *files = r->files;
+    if (exes)  *exes  = r->exes;
+    int ok = rc == 0 && r->ok;
+    free(r);
+    return ok ? 0 : -1;
 }
 
-wi_probe_result win_probe_look(const char *path) { return wi_probe(path); }
+int win_probe_look(const char *path, int *is32, int *is_installer,
+                   char *family, size_t family_len,
+                   char *note, size_t note_len) {
+    wi_probe_result p = wi_probe(path);
+    if (is32) *is32 = p.is32;
+    if (is_installer) *is_installer = p.looks_like_installer;
+    put(family, family_len, p.setup.name);
+    put(note, note_len, p.setup.note);
+    switch (p.src) {
+    case WI_SRC_FOLDER: return WIN_LOOK_FOLDER;
+    case WI_SRC_ZIP:    return WIN_LOOK_ARCHIVE;
+    case WI_SRC_EXE:    return WIN_LOOK_EXE;
+    default:            return WIN_LOOK_UNKNOWN;
+    }
+}
 
 /* A guest driven by a recorded input script. The script is the same file the
  * shell suite uses, so the diagnostics on the device and the check in CI are

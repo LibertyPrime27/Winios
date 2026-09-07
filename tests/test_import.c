@@ -288,6 +288,99 @@ static void test_diff(const char *dir) {
     if (system(rm)) { }
 }
 
+/* ---- will it fit? ---------------------------------------------------------- */
+
+/* The estimate is the part that can be wrong; the comparison against free
+ * space is two additions. So this checks the estimate against a tree whose
+ * size the test knows exactly, and checks that an archive is measured
+ * *uncompressed* -- which is the whole point, since a zip of mostly-zero
+ * files can be a hundredth of what it unpacks to, and comparing the download
+ * size against free space would wave a game through that cannot fit. */
+static void test_space(const char *dir) {
+    char root[1024];
+    snprintf(root, sizeof root, "%s/.space_test", dir);
+    char rm[1200]; snprintf(rm, sizeof rm, "rm -rf '%s'", root);
+    if (system(rm)) { }
+
+    char p[1200];
+    snprintf(p, sizeof p, "%s/a.bin", root);          write_pe(p, 100000, 0);
+    snprintf(p, sizeof p, "%s/sub/b.bin", root);      write_pe(p, 250000, 0);
+    snprintf(p, sizeof p, "%s/sub/deep/c.bin", root); write_pe(p, 4096, 0);
+
+    /* Every check below calls first and asserts second, on its own line.
+     * Folding the call into the ok() -- `ok(f(&need) && need == n, "...", need)`
+     * -- looks tidier and is wrong: C does not order the evaluation of a
+     * call's arguments against the call, so the `need` printed in the message
+     * can be the value from before f() filled it in. That is not a
+     * hypothetical; the first version of this function did it and reported
+     * "ok ... (got 230)" while asserting the number was 920. */
+    uint64_t need = 0, have = 0;
+    int known = wi_space_needed(root, dir, &need, &have);
+    ok(known, "a folder's size can be worked out");
+    ok(need == 100000 + 250000 + 4096,
+       "and it is the sum of its files, at every depth (got %llu, want %llu)",
+       (unsigned long long)need, (unsigned long long)(100000 + 250000 + 4096));
+    ok(have > 0, "and the free space on the destination is reported");
+
+    snprintf(p, sizeof p, "%s/a.bin", root);
+    need = 0;
+    known = wi_space_needed(p, dir, &need, 0);
+    ok(known && need == 100000, "a single file is its own size (got %llu)",
+       (unsigned long long)need);
+
+    /* An archive is measured by what comes out, not by what is on disk, and
+     * this is the whole point of measuring it at all: compressible.zip holds
+     * 4 MB in about 4 KB. Checking the download's size against free space
+     * would wave through a game a thousand times too big for the device. */
+    struct stat st;
+    char zip[1024];
+    snprintf(zip, sizeof zip, "%s/compressible.zip", dir);
+    uint64_t unpacked = uz_uncompressed_total(zip);
+    uint64_t container = stat(zip, &st) == 0 ? (uint64_t)st.st_size : 0;
+    ok(unpacked >= (4u << 20), "a zip's uncompressed total is what is inside it (%llu bytes)",
+       (unsigned long long)unpacked);
+    ok(container > 0 && unpacked > container * 100,
+       "and it dwarfs the file holding it (%llu on disk, %llu unpacked)",
+       (unsigned long long)container, (unsigned long long)unpacked);
+    need = 0;
+    known = wi_space_needed(zip, dir, &need, 0);
+    ok(known && need == unpacked,
+       "so that is what an import of it is said to need (got %llu, want %llu)",
+       (unsigned long long)need, (unsigned long long)unpacked);
+
+    /* And the same through a self-extracting .exe, where the payload is found
+     * behind a PE loader. Here the stub is the bigger half, which is why the
+     * ratio above is checked against a plain zip and not against this. */
+    char sfx[1024];
+    snprintf(sfx, sizeof sfx, "%s/fake_zipsfx.exe", dir);
+    uint64_t sfx_unpacked = uz_uncompressed_total(sfx);
+    ok(sfx_unpacked > 0, "a self-extractor's payload is measurable too (%llu bytes)",
+       (unsigned long long)sfx_unpacked);
+    need = 0;
+    known = wi_space_needed(sfx, dir, &need, 0);
+    ok(known && need == sfx_unpacked, "and it is measured the same way (got %llu)",
+       (unsigned long long)need);
+
+    /* Not a zip and not a PE: the size still comes back, because a plain file
+     * is copied as it is. */
+    snprintf(p, sizeof p, "%s/not_a_pe.bin", dir);
+    uint64_t on_disk = stat(p, &st) == 0 ? (uint64_t)st.st_size : 0;
+    need = 0;
+    known = wi_space_needed(p, dir, &need, 0);
+    ok(known && need == on_disk, "a plain file too (got %llu, want %llu)",
+       (unsigned long long)need, (unsigned long long)on_disk);
+
+    /* A source that is not there is "unknown", not "zero". The caller treats
+     * unknown as permission to carry on, so answering "0 bytes needed" would
+     * be a silent yes to something that was never measured. */
+    snprintf(p, sizeof p, "%s/nothing_here_at_all", dir);
+    need = 12345;
+    known = wi_space_needed(p, dir, &need, 0);
+    ok(!known, "an unreadable source reports that it is unknown");
+
+    if (system(rm)) { }
+}
+
 /* ---- probing: which mode should be offered -------------------------------- */
 
 static void test_probe(const char *dir) {
@@ -323,6 +416,7 @@ int main(int argc, char **argv) {
     test_unzip(dir);
     test_ranking(dir);
     test_diff(dir);
+    test_space(dir);
     test_probe(dir);
     printf("\ntest_import: %s\n", fails ? "FAILED" : "all checks passed");
     return fails ? 1 : 0;

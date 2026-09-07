@@ -86,6 +86,18 @@ int wi_import_installer(const char *setup, const char *drive_c,
                         wi_runner run, int keep_going, int timeout_s,
                         wi_progress cb, void *ctx, wi_result *out);
 
+/* How many bytes an import of `src` will need on the drive, and how many are
+ * free where `drive_c` is. Either out-parameter may be NULL. Returns 0 when
+ * the size could not be worked out (an unreadable source), which the caller
+ * should treat as "go ahead" rather than "refuse" -- a wrong refusal is worse
+ * than a run that fails on a full disk.
+ *
+ * Both modes call this before writing anything. The destination is a phone:
+ * running out of space halfway through leaves a broken half-install *and* a
+ * full disk, and the person then has to work out which to deal with first. */
+int wi_space_needed(const char *src, const char *drive_c,
+                    uint64_t *needed, uint64_t *free_bytes);
+
 /* Turn a name from outside into one that is safe as a single directory
  * component: no separators, no leading dots, no trailing spaces, and never
  * empty. Exposed because it is worth testing on its own. */

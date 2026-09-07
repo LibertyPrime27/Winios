@@ -26,6 +26,7 @@ void w32_drive_init(void);
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 /* Everything appended to the report goes through this, so a full buffer
@@ -127,6 +128,64 @@ static int copy_tree(const char *src, const char *dst, copy_state *cs) {
     return rc;
 }
 
+/* --- will it fit? ----------------------------------------------------------- */
+
+/* Add up the regular files under a directory. Its own recursion rather than
+ * drivediff's walk, for the same reason copy_tree has its own: this needs to
+ * descend in step with the copy that will follow, and symlinks are skipped
+ * here exactly as they are skipped there -- otherwise the estimate and the
+ * work could disagree about what is being copied. */
+static uint64_t tree_bytes(const char *dir) {
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    uint64_t total = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char q[4096];
+        if ((size_t)snprintf(q, sizeof q, "%s/%s", dir, e->d_name) >= sizeof q) continue;
+        struct stat st;
+        if (lstat(q, &st)) continue;
+        if (S_ISLNK(st.st_mode)) continue;
+        if (S_ISDIR(st.st_mode)) total += tree_bytes(q);
+        else if (S_ISREG(st.st_mode)) total += (uint64_t)st.st_size;
+    }
+    closedir(d);
+    return total;
+}
+
+int wi_space_needed(const char *src, const char *drive_c,
+                    uint64_t *needed, uint64_t *free_bytes) {
+    if (free_bytes) {
+        *free_bytes = 0;
+        struct statvfs vfs;
+        if (drive_c && statvfs(drive_c, &vfs) == 0) {
+            uint64_t unit = vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize;
+            *free_bytes = (uint64_t)vfs.f_bavail * unit;
+        }
+    }
+    if (!needed) return 1;
+    *needed = 0;
+    if (!src) return 0;
+
+    struct stat st;
+    if (stat(src, &st)) return 0;
+    if (S_ISDIR(st.st_mode)) {
+        uint64_t t = tree_bytes(src);
+        if (!t) return 0;
+        *needed = t;
+        return 1;
+    }
+    if (uz_is_zip(src)) {
+        uint64_t t = uz_uncompressed_total(src);
+        if (!t) return 0;
+        *needed = t;
+        return 1;
+    }
+    *needed = (uint64_t)st.st_size;
+    return 1;
+}
+
 /* --- probing ---------------------------------------------------------------- */
 
 wi_probe_result wi_probe(const char *path) {
@@ -220,11 +279,33 @@ static void pick_exe(wi_result *r, const char *drive_c, const char *entry_dir) {
 
 /* --- game mode -------------------------------------------------------------- */
 
+/* Refuse an import that cannot fit, before a byte is written.
+ *
+ * The margin is 64 MB rather than zero: a drive filled to the last byte is a
+ * device that misbehaves in other ways, and an installer needs room for its
+ * own temporary unpacking on top of what it finally leaves. Returns 0 to
+ * carry on.
+ *
+ * An unknown size is not a refusal. A wrong "no" is worse than a run that
+ * fails on a full disk, because the person cannot argue with the first one. */
+static int wont_fit(const char *src, const char *drive_c, wi_result *out) {
+    uint64_t need = 0, have = 0;
+    if (!wi_space_needed(src, drive_c, &need, &have)) return 0;
+    const uint64_t margin = 64ull << 20;
+    if (!have || need + margin <= have) return 0;
+    addf(out, "Not enough room: this needs about %.1f GB and there is %.1f GB free.\n"
+              "Nothing has been copied. Free some space, or import a smaller "
+              "download.\n",
+         (double)need / 1073741824.0, (double)have / 1073741824.0);
+    return 1;
+}
+
 int wi_import_game(const char *src, const char *drive_c,
                    wi_progress cb, void *ctx, wi_result *out) {
     memset(out, 0, sizeof *out);
     out->is32 = -1;
     if (!src || !drive_c || !*drive_c) { addf(out, "no source or no C: drive\n"); return -1; }
+    if (wont_fit(src, drive_c, out)) return -1;
 
     char want[256], name[256], dest[2048];
     { char stem[256]; stem_of(src, stem, sizeof stem); wi_safe_component(stem, want, sizeof want); }
@@ -368,6 +449,12 @@ int wi_import_installer(const char *setup, const char *drive_c,
     memset(out, 0, sizeof *out);
     out->is32 = -1;
     if (!setup || !drive_c || !*drive_c || !run) { addf(out, "nothing to run\n"); return -1; }
+
+    /* An installer needs room for what it unpacks *and* what it installs, and
+     * we only know the first. Checking the installer's own size against the
+     * drive is a weak test, but it catches the case that matters -- a 4 GB
+     * setup on a phone with 2 GB free. */
+    if (wont_fit(setup, drive_c, out)) return -1;
 
     wi_probe_result p = wi_probe(setup);
     addf(out, "%s: %s\n%s\n", base_of(setup), p.setup.name, p.setup.note);

@@ -21,6 +21,11 @@ final class GuestViewController: UIViewController {
     /// Where the executable lives. nil means the guests we bundled; a library
     /// program passes the app's C: drive.
     private let root: URL?
+    /// Where the program's own DLLs are. An imported game keeps them beside
+    /// its executable, which for a deeply nested one is not the folder the
+    /// library shows -- and without this the windowed run would find them and
+    /// the full-screen run would not, which is a confusing way to fail.
+    private let dllDir: String?
     private var layerView = MetalFrameView()
     private let input = GuestInputView()
     private let keys = OnScreenKeys()
@@ -33,9 +38,10 @@ final class GuestViewController: UIViewController {
     private var started = CFAbsoluteTimeGetCurrent()
     private var output = ""
 
-    init(exe: String, root: URL? = nil) {
+    init(exe: String, root: URL? = nil, dllDir: String? = nil) {
         self.exeName = exe
         self.root = root
+        self.dllDir = dllDir
         super.init(nibName: nil, bundle: nil)
     }
     required init?(coder: NSCoder) { fatalError("not used") }
@@ -106,14 +112,21 @@ final class GuestViewController: UIViewController {
             return
         }
         let exe = dir.appendingPathComponent(exeName).path
+        let dll = dllDir ?? ""
         // Foreground band: a guest drawing frames is exactly the work this
         // app exists to do, and the efficiency cores would halve it.
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             var out = [CChar](repeating: 0, count: 4096)
             var ns: UInt64 = 0
             xc_jit_enable(1)
-            // No frame limit: it draws until Close makes Present fail.
-            let rc = exe.withCString { win_probe_run($0, nil, nil, &out, out.count, &ns, nil, nil) }
+            // No frame limit and no time limit: it draws until Close makes
+            // Present fail. The DLL directory goes with it so an imported
+            // game loads its own libraries here too.
+            let rc = exe.withCString { p in
+                dll.withCString { d in
+                    win_probe_run_dir(p, dll.isEmpty ? nil : d, 0, 0, &out, out.count, &ns)
+                }
+            }
             xc_jit_enable(0)
             let text = String(cString: out)
             DispatchQueue.main.async {

@@ -814,6 +814,24 @@ The chosen executable's own directory becomes the DLL search path (`winrun
 title that is three folders below the one the library shows, so it cannot be
 inferred from the entry and has to be carried.
 
+### Will it fit?
+
+The destination is a phone. Running out of space halfway through a 12 GB game
+leaves a broken half-install *and* a full disk, and the person then has to
+work out which of the two to deal with first — so both modes work out what an
+import needs before writing a byte, and refuse with the two numbers when it
+will not fit.
+
+An archive is measured by its **uncompressed** total, read from the central
+directory rather than by trial extraction. That is the whole reason to measure
+at all: `tests/import/compressible.zip` holds 4 MB in about 4 KB, so checking
+the download's size against free space would wave through a game a thousand
+times too big for the device.
+
+An unknown size is not a refusal. A source that cannot be measured means
+"carry on" — a wrong "no" is worse than a run that fails on a full disk,
+because the person cannot argue with the first one.
+
 ### Paths from outside are not trusted
 
 An archive can name `../../etc/passwd` or `C:\Windows\System32\x.dll`. The
@@ -877,9 +895,24 @@ will never appear. An installer that re-launches itself elevated stops here;
 one that shells out to a redistributable carries on without it, which is
 usually what you wanted.
 
+### Crossing into Swift
+
+The app calls the importer through `win_probe_import` and `win_probe_look`,
+and both take flat scalars and caller-provided buffers rather than the
+importer's own structs. That is not tidiness: **Swift imports a fixed-size C
+array as a tuple of that many elements**, and `wi_result` carries an 8 KB
+report buffer — an 8192-element tuple, which is the sort of thing that makes
+the Swift type checker take minutes or give up. Nothing crosses the bridge as
+an aggregate, and `tools/import/*.h` is deliberately absent from the bridging
+header.
+
+Worth writing down because it is invisible from the Linux side: none of the
+Swift is built by any check this container can run, so a mistake there costs a
+whole CI round trip on a macOS runner.
+
 ### Verified
 
-`test_import` is 53 checks with no guest involved: every family against a
+`test_import` is 62 checks with no guest involved: every family against a
 fixture, the flag tables (including that NSIS's `/D=` is last and unquoted),
 the path sanitiser against traversal attempts *and* against names that merely
 contain dots, a real deflate round-trip out of a self-extracting archive,

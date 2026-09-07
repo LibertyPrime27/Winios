@@ -99,6 +99,66 @@ int uz_is_zip(const char *path) {
     return at >= 0;
 }
 
+/* Walk the central directory adding up the uncompressed sizes. The same
+ * offset arithmetic as the extractor, including the self-extractor
+ * correction, because a total computed from a directory read at the wrong
+ * place would be worse than no total at all. */
+uint64_t uz_uncompressed_total(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    unsigned char *scan = (unsigned char *)malloc(EOCD_SCAN);
+    if (!scan) { fclose(f); return 0; }
+    size_t sgot = 0;
+    long eocd_at = find_eocd(f, scan, &sgot);
+    uint64_t total = 0;
+    if (eocd_at >= 0 && fseek(f, 0, SEEK_END) == 0) {
+        long scan_start = ftell(f) - (long)sgot;
+        const unsigned char *e = scan + (size_t)(eocd_at - scan_start);
+        uint64_t nent = rd16(e + 10), cd_size = rd32(e + 12), cd_off = rd32(e + 16);
+        if (nent == 0xFFFFu || cd_size == 0xFFFFFFFFu || cd_off == 0xFFFFFFFFu) {
+            if (eocd_at - scan_start >= 20 && rd32(e - 20) == SIG_Z64L) {
+                uint64_t z64 = rd64(e - 20 + 8);
+                unsigned char z[56];
+                if (!fseek(f, (long)z64, SEEK_SET) && fread(z, 1, sizeof z, f) == sizeof z
+                    && rd32(z) == SIG_Z64E) {
+                    nent = rd64(z + 32); cd_size = rd64(z + 40);
+                }
+            }
+        }
+        if (nent && cd_size && cd_size <= (256u << 20)) {
+            unsigned char *cd = (unsigned char *)malloc((size_t)cd_size);
+            if (cd) {
+                long cd_real = eocd_at - (long)cd_size;
+                if (!fseek(f, cd_real, SEEK_SET) && fread(cd, 1, (size_t)cd_size, f) == cd_size) {
+                    size_t p2 = 0;
+                    for (uint64_t i = 0; i < nent; i++) {
+                        if (p2 + 46 > cd_size || rd32(cd + p2) != SIG_CDH) break;
+                        uint64_t usize = rd32(cd + p2 + 24);
+                        uint16_t nlen = rd16(cd + p2 + 28), elen = rd16(cd + p2 + 30),
+                                 clen = rd16(cd + p2 + 32);
+                        if (usize == 0xFFFFFFFFu) {
+                            const unsigned char *ex = cd + p2 + 46 + nlen;
+                            size_t left = elen;
+                            while (left >= 4) {
+                                uint16_t id = rd16(ex), sz = rd16(ex + 2);
+                                if (4u + sz > left) break;
+                                if (id == 0x0001 && sz >= 8) { usize = rd64(ex + 4); break; }
+                                ex += 4 + sz; left -= 4u + sz;
+                            }
+                        }
+                        total += usize;
+                        p2 += 46u + nlen + elen + clen;
+                    }
+                }
+                free(cd);
+            }
+        }
+    }
+    free(scan);
+    fclose(f);
+    return total;
+}
+
 #define FAIL(...) do { if (err) snprintf(err, err_len, __VA_ARGS__); goto fail; } while (0)
 
 int uz_extract(const char *zip_path, const char *dest_dir,

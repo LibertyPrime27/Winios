@@ -70,6 +70,15 @@ final class ImportViewController: UIViewController, UIDocumentPickerDelegate {
         ])
     }
 
+    /// Append to the report. `UITextView.text` is an implicitly unwrapped
+    /// optional, and `+=` on one of those relies on the compiler unwrapping
+    /// for both the read and the write. It does -- but there is one of these
+    /// and there were four of those, so the unwrap happens here and is
+    /// explicit.
+    private func say(_ more: String) {
+        output.text = (output.text ?? "") + more
+    }
+
     private func button(_ title: String, _ action: Selector) -> UIButton {
         var c = UIButton.Configuration.bordered()
         c.title = title
@@ -110,7 +119,15 @@ final class ImportViewController: UIViewController, UIDocumentPickerDelegate {
         setBusy(true)
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let look = src.path.withCString { win_probe_look($0) }
+            var family = [CChar](repeating: 0, count: 128)
+            var note = [CChar](repeating: 0, count: 512)
+            var is32: Int32 = -1
+            var isInstaller: Int32 = 0
+            let kind = src.path.withCString {
+                win_probe_look($0, &is32, &isInstaller, &family, family.count, &note, note.count)
+            }
+            let look = Look(kind: kind, is32: is32, isInstaller: isInstaller != 0,
+                            family: String(cString: family), note: String(cString: note))
             DispatchQueue.main.async {
                 guard let self else {
                     if scoped { src.stopAccessingSecurityScopedResource() }
@@ -122,33 +139,43 @@ final class ImportViewController: UIViewController, UIDocumentPickerDelegate {
         }
     }
 
+    /// What the C side said about the file. A Swift struct rather than the C
+    /// one: the importer's structs carry fixed-size char buffers, and Swift
+    /// imports those as tuples of that many elements.
+    private struct Look {
+        let kind: Int32
+        let is32: Int32
+        let isInstaller: Bool
+        let family: String
+        let note: String
+    }
+
     /// What it looks like, and the choice. The recommended mode is first and
     /// says why; the other is offered anyway, because a detector that is
     /// certain is a detector that cannot be corrected.
-    private func offerModes(for src: URL, look: wi_probe_result, scoped: Bool) {
-        let family = String(cString: look.setup.name)
-        let note = String(cString: look.setup.note)
+    private func offerModes(for src: URL, look: Look, scoped: Bool) {
         let kindWord: String
-        switch look.src {
-        case WI_SRC_FOLDER: kindWord = "a folder"
-        case WI_SRC_ZIP:    kindWord = "an archive"
-        case WI_SRC_EXE:    kindWord = "a Windows program"
-        default:            kindWord = "something we cannot read"
+        switch look.kind {
+        case Int32(WIN_LOOK_FOLDER):  kindWord = "a folder"
+        case Int32(WIN_LOOK_ARCHIVE): kindWord = "an archive"
+        case Int32(WIN_LOOK_EXE):     kindWord = "a Windows program"
+        default:                      kindWord = "something we cannot read"
         }
         let bits = look.is32 == 1 ? "32-bit" : look.is32 == 0 ? "64-bit" : "unknown bitness"
 
         var text = "\(src.lastPathComponent)\n\n"
         text += "This is \(kindWord) (\(bits)).\n"
-        text += "Identified as: \(family)\n\(note)\n"
+        text += "Identified as: \(look.family)\n\(look.note)\n"
         output.text = text
 
-        if look.src == WI_SRC_UNKNOWN {
-            output.text += "\nThere is nothing here that can be imported.\n"
+        if look.kind == Int32(WIN_LOOK_UNKNOWN) {
+            say("\nThere is nothing here that can be imported.\n")
             if scoped { src.stopAccessingSecurityScopedResource() }
             return
         }
 
-        let installerFirst = look.looks_like_installer
+        let installerFirst = look.isInstaller
+        let family = look.family
         let a = UIAlertController(
             title: installerFirst ? "This looks like an installer" : "This looks like a game",
             message: installerFirst
@@ -177,33 +204,42 @@ final class ImportViewController: UIViewController, UIDocumentPickerDelegate {
 
     private func run(src: URL, installer: Bool, scoped: Bool) {
         guard let drive = ExeBrowser.driveC else {
-            output.text += "\nThere is no C: drive to import into.\n"
+            say("\nThere is no C: drive to import into.\n")
             if scoped { src.stopAccessingSecurityScopedResource() }
             return
         }
         setBusy(true)
-        output.text += installer
+        say(installer
             ? "\nInstalling. This runs the setup program, so it may take a while.\n"
-            : "\nCopying.\n"
+            : "\nCopying.\n")
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             // The C side owns the whole import, including running a guest for
             // an installer, so there is one place where the order of
             // operations lives rather than two that can disagree.
-            var r = wi_result()
+            var detailBuf = [CChar](repeating: 0, count: 64 * 1024)
+            var nameBuf = [CChar](repeating: 0, count: 256)
+            var exeBuf = [CChar](repeating: 0, count: 512)
+            var dllBuf = [CChar](repeating: 0, count: 1200)
+            var is32: Int32 = -1, files: Int32 = 0, exes: Int32 = 0
             let rc = src.path.withCString { s in
                 drive.path.withCString { d in
                     // strict rather than keep-going: an install that stopped
                     // is better than one that half-happened, and the run
                     // report still names what it wanted.
-                    win_probe_import(s, d, installer ? 1 : 0, 0, 300, &r)
+                    win_probe_import(s, d, installer ? 1 : 0, 0, 300,
+                                     &detailBuf, detailBuf.count,
+                                     &nameBuf, nameBuf.count,
+                                     &exeBuf, exeBuf.count,
+                                     &dllBuf, dllBuf.count,
+                                     &is32, &files, &exes)
                 }
             }
-            let detail = Self.text(r.detail)
-            let name = Self.text(r.name)
-            let exeRel = Self.text(r.exe_rel)
-            let dllDir = Self.text(r.dll_dir)
-            let ok = rc == 0 && r.ok != 0
+            let detail = String(cString: detailBuf)
+            let name = String(cString: nameBuf)
+            let exeRel = String(cString: exeBuf)
+            let dllDir = String(cString: dllBuf)
+            let ok = rc == 0
 
             DispatchQueue.main.async {
                 if scoped { src.stopAccessingSecurityScopedResource() }
@@ -224,10 +260,10 @@ final class ImportViewController: UIViewController, UIDocumentPickerDelegate {
                     let report = String(cString: buf)
                     resolved = Self.number(before: " imports resolved", in: report)
                     missing = Self.number(after: "imports resolved, ", in: report)
-                    self.output.text += "\n---- what it needs ----\n" + report
+                    self.say("\n---- what it needs ----\n" + report)
                 }
                 self.pending = Program(name: name, exeRelative: exeRel,
-                                       is32: r.is32 == 1,
+                                       is32: is32 == 1,
                                        importsResolved: resolved, importsMissing: missing,
                                        lastExit: nil, lastRunMs: nil,
                                        dllDir: dllDir.isEmpty ? nil : dllDir,
@@ -253,16 +289,7 @@ final class ImportViewController: UIViewController, UIDocumentPickerDelegate {
         if b { spinner.startAnimating() } else { spinner.stopAnimating() }
     }
 
-    // MARK: - reading C strings out of the result
-
-    /// A fixed-size C char array arrives in Swift as a tuple, so it has to be
-    /// read through its bytes rather than indexed.
-    private static func text<T>(_ field: T) -> String {
-        withUnsafeBytes(of: field) { raw in
-            guard let base = raw.baseAddress else { return "" }
-            return String(cString: base.assumingMemoryBound(to: CChar.self))
-        }
-    }
+    // MARK: - reading the two counts back out of the import report
 
     private static func number(before marker: String, in text: String) -> Int {
         guard let r = text.range(of: marker) else { return -1 }

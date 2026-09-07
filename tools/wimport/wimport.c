@@ -11,6 +11,7 @@
 #include "unzip.h"
 #include "winrun.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,7 +43,8 @@ static int usage(void) {
         "  install <setup> <drive_c> [-k] [-t s]\n"
         "                                     run a setup program silently and keep what it makes\n"
         "  unzip   <archive> <dir>            just extract (works on a self-extracting .exe)\n"
-        "  exes    <dir> [name]               rank the executables in a folder\n");
+        "  exes    <dir> [name]               rank the executables in a folder\n"
+        "  space   <src> <drive_c>            how much room an import would need\n");
     return 2;
 }
 
@@ -76,6 +78,16 @@ int main(int argc, char **argv) {
             printf("  %2d. %-46s %5d  %s  %s\n", i + 1, e[i].rel, e[i].score,
                    e[i].is32 == 1 ? "32" : e[i].is32 == 0 ? "64" : "??", e[i].why);
         return n ? 0 : 1;
+    }
+
+    if (!strcmp(cmd, "space")) {
+        if (argc < 4) return usage();
+        uint64_t need = 0, have = 0;
+        int known = wi_space_needed(argv[2], argv[3], &need, &have);
+        printf("%s\n  needs: %s%.2f GB\n  free:  %.2f GB on %s\n", argv[2],
+               known ? "" : "(unknown) ", (double)need / 1073741824.0,
+               (double)have / 1073741824.0, argv[3]);
+        return 0;
     }
 
     if (!strcmp(cmd, "unzip")) {
