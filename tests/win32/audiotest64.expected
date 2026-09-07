@@ -1,0 +1,27 @@
+64-bit
+
+DirectSoundCreate8: ok
+SetCooperativeLevel: ok
+GetCaps: ok, primary buffers 1
+CreateSoundBuffer(1 s): ok
+buffer GetCaps: ok, 176400 bytes
+GetFormat: 44100 Hz, 2 channels, 16 bits
+Lock(0, 1024): ok, 1024 + 0 bytes
+what was written is what is there: yes
+Lock across the end: ok, 512 + 512 bytes (want 512 + 512), second pointer given
+status before Play: 0
+Play: ok
+status while playing: 0x5 (1 = playing, 4 = looping)
+cursor moved about right in 100 ms (wanted roughly 17640 bytes)
+write cursor leads the play cursor: yes
+Stop: ok
+status after Stop: 0
+QueryInterface(IDirectSound3DBuffer): ok, a different object
+  SetPosition on it: ok
+
+XInput:
+  XInputGetState(0): 0 (0 = a pad is there, 1167 = none)
+  XInputGetState(1): 1167 (want 1167: only one pad)
+  GetCapabilities: 0, type 1 subtype 1
+  SetState (rumble): 0
+  buttons 0x1010, left stick 32767,32767, right stick 0,32767, triggers 255/0

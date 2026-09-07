@@ -403,6 +403,10 @@ final class ProbeViewController: UIViewController {
             // code alone would pass on a run that received nothing.
             ("inputtest64.exe", ["6"], 0, "inputtest64"),
             ("inputtest32.exe", ["6"], 0, "inputtest32"),
+            // Audio that initialises and a gamepad the keyboard stands in
+            // for. Also script-driven, so the keys reach XInput.
+            ("audiotest64.exe", [], 0, "audiotest64"),
+            ("audiotest32.exe", [], 0, "audiotest32"),
         ]
         let cases = single.map { s in all.filter { $0.0 == s } } ?? all
 
@@ -427,8 +431,9 @@ final class ProbeViewController: UIViewController {
             let a2 = args.count > 1 ? strdup(args[1]) : nil
             xc_jit_enable(1)
             let rc: Int32
-            if name.hasPrefix("inputtest") {
-                let script = dir.appendingPathComponent("inputtest.script").path
+            if name.hasPrefix("inputtest") || name.hasPrefix("audiotest") {
+                let script = dir.appendingPathComponent(
+                    name.hasPrefix("audiotest") ? "audiotest.script" : "inputtest.script").path
                 rc = exe.withCString { p in
                     script.withCString { sp in
                         win_probe_run_script(p, sp, a1, &out, out.count, &ns)

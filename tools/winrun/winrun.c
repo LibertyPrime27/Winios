@@ -20,6 +20,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <dirent.h>
 #include <unistd.h>
@@ -350,6 +351,14 @@ static const w32_dll g_dlls[] = {
     { "ntdll.dll",    w32_ntdll,    w32_seh_ntdll,    0 },
     { "user32.dll",   w32_user32,   0,                0 },
     { "winmm.dll",    w32_winmm,    0,                0 },
+    { "dsound.dll",   w32_dsound,   0,                0 },
+    /* Every XInput version games link against, all the same implementation:
+     * the DLL name changed five times and the eight functions did not. */
+    { "xinput1_4.dll", w32_xinput,  0,                0 },
+    { "xinput1_3.dll", w32_xinput,  0,                0 },
+    { "xinput1_2.dll", w32_xinput,  0,                0 },
+    { "xinput1_1.dll", w32_xinput,  0,                0 },
+    { "xinput9_1_0.dll", w32_xinput, 0,               0 },
     { "d3d9.dll",     w32_d3d9,     0,                0 },
     { "advapi32.dll", w32_advapi32, 0,                0 },
 };
@@ -787,6 +796,8 @@ static void winrun_reset(void) {
     w32_registry_reset();
     w32_seh_reset();
     w32_input_reset();
+    w32_dsound_reset();
+    w32_xinput_reset();
     g_nscript = 0; g_frame = 0;
     if (g_hook_on) { w32_set_present(g_next_present, g_next_present_ctx); g_hook_on = 0; }
     g_next_present = 0; g_next_present_ctx = 0;
@@ -914,6 +925,214 @@ static void present_ppm(void *ctx, const void *pixels, int width, int height, in
 static int cmp_missing(const void *a, const void *b) {
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
+int winrun_main(int argc, char **argv);      /* -survey runs one per binary */
+
+/* -survey <dir>: what a whole folder of Windows programs would need.
+ *
+ * `-imports` answers that for one binary. This answers it for a library, and
+ * the difference matters: the question a compatibility layer has to keep
+ * asking is not "what does this program need" but "what would unblock the
+ * most programs", and one hand-written fixture cannot answer that. Point this
+ * at a folder of real games and the ranking falls out of their own import
+ * tables.
+ *
+ * Three outputs, because they answer three different questions:
+ *
+ *   - every missing function, ranked by how many binaries import it. That is
+ *     the build order.
+ *   - the same totalled by DLL, so a whole subsystem's cost and reach are
+ *     visible together ("dsound.dll: six functions, twenty-three binaries").
+ *   - the binaries closest to running, fewest-missing first. That is the
+ *     shortest path to something that works, which is not always the same as
+ *     the most-wanted function.
+ *
+ * Each binary is loaded in its own fully reset run -- the same path `-imports`
+ * takes -- so a corrupt or packed file spoils its own line and nothing else.
+ */
+enum { SV_MAX_NAMES = 8192, SV_MAX_FILES = 4096 };
+typedef struct { char name[128]; int files; } sv_name;      /* "dll!Function", how many want it */
+typedef struct { char path[256]; int bits, resolved, missing, dotnet, failed; } sv_file;
+static sv_name g_sv_name[SV_MAX_NAMES];
+static int g_sv_nnames;
+static sv_file g_sv_file[SV_MAX_FILES];
+static int g_sv_nfiles;
+static int g_surveying;                 /* deliberately not cleared by winrun_reset */
+
+static void sv_note(const char *dll_bang_name) {
+    for (int i = 0; i < g_sv_nnames; i++)
+        if (!strcmp(g_sv_name[i].name, dll_bang_name)) { g_sv_name[i].files++; return; }
+    if (g_sv_nnames >= SV_MAX_NAMES) return;
+    snprintf(g_sv_name[g_sv_nnames].name, sizeof g_sv_name[0].name, "%s", dll_bang_name);
+    g_sv_name[g_sv_nnames].files = 1;
+    g_sv_nnames++;
+}
+
+/* One binary's imports, folded into the totals. Called instead of printing. */
+static void sv_collect(w32 *w) {
+    if (g_sv_nfiles >= SV_MAX_FILES) return;
+    int me = g_sv_nfiles++;
+    snprintf(g_sv_file[me].path, sizeof g_sv_file[0].path, "%s", w->exe_path ? w->exe_path : "?");
+    g_sv_file[me].bits = w->is32 ? 32 : 64;
+    int dlls = 0, mscoree = 0;
+    for (int i = 0; i < w->nstubs; i++) {
+        if (w->stubs[i].api) { g_sv_file[me].resolved++; continue; }
+        const char *full = w->stubs[i].missing;
+        if (!full || !strchr(full, '!')) continue;
+        g_sv_file[me].missing++;
+        sv_note(full);
+    }
+    /* A managed binary imports one function from mscoree and nothing else --
+     * worth naming, because "1 missing" would otherwise read as nearly ready
+     * when in fact it needs a whole other runtime. */
+    for (int i = 0; i < w->nstubs; i++) {
+        const char *full = w->stubs[i].missing;
+        if (!full) continue;
+        dlls++;
+        if (!strncasecmp(full, "mscoree.dll!", 12)) mscoree = 1;
+    }
+    if (mscoree && dlls <= 2) g_sv_file[me].dotnet = 1;
+}
+
+static int sv_cmp_name(const void *a, const void *b) {
+    const sv_name *x = a, *y = b;
+    if (y->files != x->files) return y->files - x->files;
+    return strcmp(x->name, y->name);
+}
+static int sv_cmp_close(const void *a, const void *b) {
+    const sv_file *x = a, *y = b;
+    if (x->failed != y->failed) return x->failed - y->failed;      /* readable ones first */
+    if (x->missing != y->missing) return x->missing - y->missing;
+    return strcmp(x->path, y->path);
+}
+
+static const char *sv_base(const char *p) {
+    const char *s = strrchr(p, '/');
+    return s ? s + 1 : p;
+}
+
+static int sv_is_pe_name(const char *n) {
+    size_t l = strlen(n);
+    if (l < 5) return 0;
+    return !strcasecmp(n + l - 4, ".exe") || !strcasecmp(n + l - 4, ".dll");
+}
+
+/* Recursive walk. Depth-limited because a games folder can be deep and a
+ * symlink loop should not turn a survey into a hang. */
+static void sv_walk(const char *dir, int depth, char **files, int *nfiles, int max) {
+    if (depth > 8 || *nfiles >= max) return;
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) && *nfiles < max) {
+        if (e->d_name[0] == '.') continue;
+        char path[1024];
+        snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+        struct stat st;
+        if (stat(path, &st)) continue;
+        if (S_ISDIR(st.st_mode)) sv_walk(path, depth + 1, files, nfiles, max);
+        else if (S_ISREG(st.st_mode) && sv_is_pe_name(e->d_name)) files[(*nfiles)++] = strdup(path);
+    }
+    closedir(d);
+}
+
+static int survey(const char *root) {
+    enum { MAX_SV_WALK = SV_MAX_FILES };
+    char **files = calloc(MAX_SV_WALK, sizeof *files);
+    if (!files) return 2;
+    int n = 0;
+    struct stat st;
+    if (!stat(root, &st) && S_ISREG(st.st_mode)) files[n++] = strdup(root);
+    else sv_walk(root, 0, files, &n, MAX_SV_WALK);
+    if (!n) { fprintf(stderr, "winrun: -survey: no .exe or .dll found under %s\n", root); free(files); return 2; }
+
+    g_sv_nnames = 0; g_sv_nfiles = 0;
+    g_surveying = 1;
+    printf("surveying %d binaries under %s\n\n", n, root);
+    for (int i = 0; i < n; i++) {
+        char *av[4] = { (char *)"winrun", (char *)"-imports", files[i], 0 };
+        int before = g_sv_nfiles;
+        int rc = winrun_main(3, av);
+        if (g_sv_nfiles == before && g_sv_nfiles < SV_MAX_FILES) {
+            /* it could not be loaded at all: still a data point, and the one
+             * most likely to mean "packed" or "not a PE we understand" */
+            int me = g_sv_nfiles++;
+            memset(&g_sv_file[me], 0, sizeof g_sv_file[me]);
+            snprintf(g_sv_file[me].path, sizeof g_sv_file[0].path, "%s", files[i]);
+            g_sv_file[me].failed = 1;
+            (void)rc;
+        }
+        const char *b = sv_base(files[i]);
+        sv_file *f = &g_sv_file[g_sv_nfiles - 1];
+        if (f->failed)      printf("  %-44.44s  %s\n", b, "could not be read as a PE");
+        else if (f->dotnet) printf("  %-44.44s  %d-bit  .NET: needs a managed runtime\n", b, f->bits);
+        else if (!f->missing) printf("  %-44.44s  %d-bit  every import resolves\n", b, f->bits);
+        else                printf("  %-44.44s  %d-bit  %d resolved, %d missing\n", b, f->bits,
+                                   f->resolved, f->missing);
+    }
+    g_surveying = 0;
+
+    /* --- the build order --- */
+    qsort(g_sv_name, (size_t)g_sv_nnames, sizeof g_sv_name[0], sv_cmp_name);
+    int complete = 0, dotnet = 0, unreadable = 0;
+    for (int i = 0; i < g_sv_nfiles; i++) {
+        if (g_sv_file[i].failed) unreadable++;
+        else if (g_sv_file[i].dotnet) dotnet++;
+        else if (!g_sv_file[i].missing) complete++;
+    }
+    printf("\n%d binaries: %d resolve every import, %d are .NET, %d unreadable\n",
+           g_sv_nfiles, complete, dotnet, unreadable);
+    printf("%d distinct missing function%s.\n", g_sv_nnames, g_sv_nnames == 1 ? "" : "s");
+    /* Said plainly, because the number above is the most over-read number this
+     * tool prints: an import table says what a program *asks for*, not
+     * whether what it gets back is right. Several of these are implemented as
+     * a value that is merely plausible. Resolving every import is the point
+     * at which a program starts, not the point at which it works. */
+    printf("\n\"Resolves every import\" means it can start, not that it works:\n"
+           "an import table says what a program asks for, not whether the\n"
+           "answer it gets is right.\n");
+
+    printf("\nwhat would unblock the most binaries:\n");
+    for (int i = 0; i < g_sv_nnames && i < 40; i++)
+        printf("  %4d x  %s\n", g_sv_name[i].files, g_sv_name[i].name);
+    if (g_sv_nnames > 40) printf("  (and %d more)\n", g_sv_nnames - 40);
+
+    /* --- by DLL: a subsystem's cost and its reach, together --- */
+    printf("\nby DLL -- functions missing, and binaries affected:\n");
+    for (int i = 0; i < g_sv_nnames; i++) {
+        const char *bang = strchr(g_sv_name[i].name, '!');
+        if (!bang) continue;
+        size_t dl = (size_t)(bang - g_sv_name[i].name);
+        int seen = 0;
+        for (int k = 0; k < i; k++)
+            if (!strncmp(g_sv_name[k].name, g_sv_name[i].name, dl) && g_sv_name[k].name[dl] == '!') seen = 1;
+        if (seen) continue;
+        int funcs = 0, worst = 0;
+        for (int k = 0; k < g_sv_nnames; k++)
+            if (!strncmp(g_sv_name[k].name, g_sv_name[i].name, dl) && g_sv_name[k].name[dl] == '!') {
+                funcs++;
+                if (g_sv_name[k].files > worst) worst = g_sv_name[k].files;
+            }
+        printf("  %-16.*s  %3d function%s missing, affecting up to %d binar%s\n",
+               (int)dl, g_sv_name[i].name, funcs, funcs == 1 ? "" : "s",
+               worst, worst == 1 ? "y" : "ies");
+    }
+
+    /* --- the shortest path to something that runs --- */
+    qsort(g_sv_file, (size_t)g_sv_nfiles, sizeof g_sv_file[0], sv_cmp_close);
+    printf("\nclosest to running, of the ones still missing something:\n");
+    int shown = 0;
+    for (int i = 0; i < g_sv_nfiles && shown < 15; i++) {
+        if (g_sv_file[i].failed || g_sv_file[i].dotnet || !g_sv_file[i].missing) continue;
+        printf("  %-44.44s  %d-bit  %d missing\n", sv_base(g_sv_file[i].path),
+               g_sv_file[i].bits, g_sv_file[i].missing);
+        shown++;
+    }
+    if (!shown) printf("  (none: everything readable here resolves already)\n");
+    for (int i = 0; i < n; i++) free(files[i]);
+    free(files);
+    return 0;
+}
+
 static void report_imports(w32 *w) {
     printf("%s: %d-bit\n", w->exe_path, w->is32 ? 32 : 64);
     printf("\nmodules loaded:\n");
@@ -1019,6 +1238,7 @@ int winrun_main(int argc, char **argv) {
         if (!strcmp(argv[ai], "-v")) w->verbose++;
         else if (!strcmp(argv[ai], "-vv")) w->verbose += 2;
         else if (!strcmp(argv[ai], "-imports")) w->imports_only = 1;
+        else if (!strcmp(argv[ai], "-survey") && ai + 1 < argc) return survey(argv[ai + 1]);
         else if (!strcmp(argv[ai], "-input") && ai + 1 < argc) { if (script_load(argv[++ai])) return 2; }
         else if (!strcmp(argv[ai], "-k")) w->keep_going = 1;
         else if (!strcmp(argv[ai], "-t") && ai + 1 < argc) { w->deadline_ns = now_ns_host() + (uint64_t)atoll(argv[ai + 1]) * 1000000000ull; ai++; }
@@ -1028,10 +1248,12 @@ int winrun_main(int argc, char **argv) {
             snprintf(dir, sizeof dir, "%s%s", argv[ai + 1], argv[ai + 1][strlen(argv[ai + 1]) - 1] == '/' ? "" : "/");
             w->dll_dir = dir; ai++;
         }
-        else { fprintf(stderr, "usage: winrun [-v] [-imports] [-k] [-t seconds] [-C drive_c] [-L dlldir] program.exe [args...]\n"); return 2; }
+        else { fprintf(stderr, "usage: winrun [-v] [-imports] [-survey dir] [-k] [-t seconds]\n"
+                          "              [-C drive_c] [-L dlldir] [-input script] program.exe [args...]\n"); return 2; }
         ai++;
     }
-    if (ai >= argc) { fprintf(stderr, "usage: winrun [-v] [-imports] [-k] [-t seconds] [-C drive_c] [-L dlldir] program.exe [args...]\n"); return 2; }
+    if (ai >= argc) { fprintf(stderr, "usage: winrun [-v] [-imports] [-survey dir] [-k] [-t seconds]\n"
+                                      "              [-C drive_c] [-L dlldir] [-input script] program.exe [args...]\n"); return 2; }
     w->exe_path = argv[ai];
 
     /* bitness decides the memory model, so peek at the header first */
@@ -1071,7 +1293,10 @@ int winrun_main(int argc, char **argv) {
      * preferred base (0x140000000) or a PE32 one (0x400000) */
     process_init(w, argc - ai, argv + ai);
     if (w32_load_pe(w, argv[ai])) return 2;
-    if (w->imports_only) { report_imports(w); return 0; }
+    if (w->imports_only) {
+        if (g_surveying) sv_collect(w); else report_imports(w);
+        return 0;
+    }
     w32_write(w, w->peb + (w->is32 ? 0x08 : 0x10), w->is32 ? 4 : 8, w->image_base);   /* PEB.ImageBaseAddress */
     /* the initial thread: TEB in gs (x64) / fs (x86), stack, entry point */
     xc_cpu *c = w->c;

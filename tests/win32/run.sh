@@ -100,5 +100,12 @@ unset XCORE_JIT
 # recording of the tester's reflexes is not a test.
 check inputtest64.exe 0 6 -- -input inputtest.script
 check inputtest32.exe 0 6 -- -input inputtest.script
+# Audio and a gamepad. Nothing makes a sound and no controller is attached --
+# what is checked is that a game's audio init succeeds (many abort when it
+# fails), that a sound buffer is memory the guest can write and read back,
+# that the play cursor advances at the rate the format implies, and that the
+# keyboard reaches XInput.
+check audiotest64.exe 0 -- -input audiotest.script
+check audiotest32.exe 0 -- -input audiotest.script
 rm -f /tmp/winrun_err.$$
 exit $fail

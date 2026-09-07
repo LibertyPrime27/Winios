@@ -1,0 +1,9 @@
+# The keyboard standing in for a gamepad: XInput should report these as
+# stick deflection and buttons. Nothing is aimed at a frame, because this
+# guest presents nothing -- events with no frame arrive before it starts.
+key down 87       # W  -> left stick up
+key down 68       # D  -> left stick right
+key down 38       # Up arrow -> right stick up
+key down 32       # Space -> A
+key down 13       # Enter -> Start
+key down 90       # Z -> left trigger

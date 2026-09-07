@@ -224,6 +224,8 @@ extern const w32_api w32_msvcrt[];
 extern const w32_api w32_ntdll[];
 extern const w32_api w32_user32[];
 extern const w32_api w32_winmm[];
+extern const w32_api w32_dsound[];
+extern const w32_api w32_xinput[];
 extern const w32_api w32_d3d9[];
 extern const w32_api w32_advapi32[];
 
@@ -263,6 +265,25 @@ int  w32_has_window(void);                         /* has the guest made one yet
  * virtual cursor should get out of the way. */
 int  w32_cursor_visible(void);
 void w32_cursor_pos(int *x, int *y);
+/* Is this virtual key held? So xinput.c can let a keyboard stand in for a
+ * gamepad without a second copy of the key state. */
+int  w32_key_down(int vk);
+
+/* xinput.c: a gamepad, from the host.
+ *
+ * `present` is 0 when nothing is attached, which is not the same as a pad
+ * reading zeros -- a game uses the difference to decide whether to show
+ * controller prompts at all. Passing NULL to w32_pad_state goes back to
+ * letting the keyboard stand in. */
+typedef struct {
+    uint16_t buttons;          /* XINPUT_GAMEPAD_* */
+    uint8_t  lt, rt;           /* triggers, 0..255 */
+    int16_t  lx, ly, rx, ry;   /* sticks, -32768..32767, y up */
+    int      present;
+} w32_pad;
+void w32_pad_state(const w32_pad *p);
+void w32_xinput_reset(void);
+void w32_dsound_reset(void);
 
 /* d3d9.c: where a presented frame goes. NULL simply drops it, which is what
  * the headless test and CI want; the iOS app sets it to a Metal blit. */

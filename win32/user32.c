@@ -909,6 +909,16 @@ int w32_cursor_visible(void) {
     pthread_mutex_lock(&g_lock); int v = g_cursor_shown; pthread_mutex_unlock(&g_lock);
     return v;
 }
+/* For xinput.c, so a keyboard can stand in for a gamepad without a second
+ * copy of this array. */
+int w32_key_down(int vk) {
+    if (vk < 0 || vk > 255) return 0;
+    pthread_mutex_lock(&g_lock);
+    int d = (g_keys[vk] & 0x80) != 0;
+    pthread_mutex_unlock(&g_lock);
+    return d;
+}
+
 void w32_cursor_pos(int *x, int *y) {
     pthread_mutex_lock(&g_lock);
     if (x) *x = g_mx;

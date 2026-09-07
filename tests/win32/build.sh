@@ -38,6 +38,8 @@ for a in 32 64; do
     $CC -O2 -s -o faulttest$a.exe faulttest.c
     # a window, a message pump, a keyboard and a mouse
     $CC -O2 -s -o inputtest$a.exe inputtest.c -ld3d9 -luser32
+    # audio that initialises, and a gamepad the keyboard can stand in for
+    $CC -O2 -s -o audiotest$a.exe audiotest.c -ldsound -lxinput -lole32
 done
 
 # Not run by the suite: it calls things we do not implement, on purpose.

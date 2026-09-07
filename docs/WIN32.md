@@ -191,15 +191,15 @@ compiled code for pages that become writable.
 
 ## Verified
 
-`tests/win32/run.sh` runs thirty-eight checks over fifteen programs and
+`tests/win32/run.sh` runs forty checks over sixteen programs and
 compares stdout and exit code with recordings: the three-import `hello`, the
 full mingw-w64 CRT program (`crt.c`: TLS callbacks, `__getmainargs`,
 `_initterm`, malloc/free, `sqrt`, `printf`, `snprintf`, exit code), the n-body
 benchmark, the loader test `dlltest`, the four Direct3D 9 programs `d3dtest`,
 `d3dframe`, `d3dloop` and `d3ddraw`, the file-layer tests `pathtest` and
 `filetest`, the registry test `regtest`, the exception tests `sehtest` and
-`faulttest`, and the window-and-input test `inputtest` — each as PE32 and
-PE32+. Three of them are run more than once:
+`faulttest`, the window-and-input test `inputtest`, and the audio and gamepad
+test `audiotest` — each as PE32 and PE32+. Three of them are run more than once:
 `regtest` twice per bitness because what it tests is what survives between two
 runs, and `faulttest` both with the dynarec and without it, because "the same
 either way" is the property that matters there.
@@ -522,6 +522,112 @@ a run that received nothing.
 
 The script is also how to reproduce an input bug: the script *is* the repro.
 
+## Audio that initialises, and a gamepad
+
+Neither of these makes a sound or needs a controller plugged in, and both are
+still worth having, for the same reason: the thing they prevent is a game
+*refusing to start*.
+
+`dsound.dll` exists because a great many games do not degrade to silence when
+audio init fails — they abort. `DirectSoundCreate8` returning an error is the
+end of the program, so "no audio" and "no audio subsystem" are very different
+amounts of broken, and this is the second one.
+
+A sound buffer really is guest memory of the size asked for, and `Lock` hands
+back a pointer into it. That matters more than it sounds: a game writes its
+mixed audio there and then reads its own *play cursor* to decide how much more
+to write. So the cursor advances at the rate the buffer's format implies, from
+a clock, and a program waiting to be told "you may write the next 4 KB" is told
+so on time. Get that wrong and a game that would have been merely silent
+instead hangs in its audio thread. `Lock` also returns two pointers when the
+region crosses the end of the circular buffer, because a program handed only
+the first writes past the end.
+
+What is missing is only the last step — handing those bytes to CoreAudio. The
+buffer contents are correct by the time `Play` is called, so that is a consumer,
+not a redesign.
+
+`QueryInterface` on a buffer is real here, unlike the shared one COM objects
+use by default. A game asks a buffer for `IDirectSound3DBuffer` and then calls
+`SetPosition`, which is slot 17 there and `GetFrequency` on the buffer —
+returning the same object would be a call into a differently shaped vtable. The
+IID is matched in full rather than by its first word: a loose compare guarding
+the one thing worth being strict about would be perverse.
+
+### Vtable slots come from the header now
+
+    sh tools/gen/vtables.sh > win32/vtables_gen.h
+
+A COM interface is an array of function pointers and the *order* is the ABI.
+One slot out does not fail to compile and does not fail a test that never calls
+it — it calls whatever is next in the table, which is how the missing
+`IDirect3DDevice9::CreateDepthStencilSurface` first showed up as "unimplemented
+slot 57". So the slot numbers are generated from mingw-w64's own headers as
+named constants and the tables index by name: a table with the wrong *name* in
+a slot cannot compile, and a missing slot leaves an obvious hole.
+
+### XInput
+
+Eight functions, and the cheapest breadth on the list: every game from about
+2006 onwards reads a controller through XInput, and unlike DirectInput there is
+no COM, no enumeration and no data formats — a struct of buttons and axes,
+polled. All five DLL names games link against (`xinput1_1` through `1_4`,
+`xinput9_1_0`) resolve to the same implementation, because the name changed five
+times and the functions did not. Ordinal 100, `XInputGetStateEx`, is there too:
+undocumented, and imported by ordinal by a fair number of games that want the
+Guide button.
+
+It reports a connected pad and feeds it from the same key state `user32.c`
+keeps, so a real keyboard and the on-screen keys both drive it. That is not a
+stopgap — on a tablet the keyboard *is* the controller for a lot of people, and
+a game that only reads XInput would otherwise be unplayable however good the
+touch controls were. `w32_pad_state()` lets the host substitute a real
+controller's values, and `present` distinguishes "nothing attached" from "a pad
+reading zeros", which is what a game uses to decide whether to show controller
+prompts at all.
+
+The packet number changes only when the state does. A game polling at its frame
+rate uses it to skip work: one that always changes makes every frame look like
+new input, and one that never changes makes a game ignore real input entirely.
+
+`audiotest` checks all of it — that every call succeeds, that what was written
+to a buffer is what is there, that a lock across the end comes back in two
+pieces, that the cursor moves at roughly the format's rate (a wide window: it
+is a clock, not a real-time guarantee), and that injected keys arrive as stick
+deflection and buttons.
+
+## Surveying a library, not a fixture
+
+    winrun -survey <dir>
+
+`-imports` answers "what does this program need" for one binary. This answers
+it for a whole folder, and the difference is the difference between a fixture
+and a roadmap: the question a compatibility layer has to keep asking is not
+what one program needs but *what would unblock the most programs*, and one
+hand-written test guest cannot answer that.
+
+Three outputs, because they answer three different questions:
+
+- every missing function, ranked by how many binaries import it — the build
+  order;
+- the same totalled by DLL, so a subsystem's cost and its reach are visible
+  together ("dsound.dll: six functions, twenty-three binaries");
+- the binaries closest to running, fewest-missing first — the shortest path to
+  something that works, which is not always the same as the most-wanted
+  function.
+
+Each binary is loaded in its own fully reset run, the same path `-imports`
+takes, so a corrupt or packed file spoils its own line and nothing else. It also
+names the two cases that would otherwise read as "nearly ready": a managed
+binary, which imports one function from `mscoree` and needs a whole other
+runtime, and a file that could not be read as a PE at all.
+
+One caveat the tool prints itself, because it is the most over-read number it
+produces: **"resolves every import" means a program can start, not that it
+works.** An import table says what a program asks for, not whether the answer
+it gets back is right, and several of these are implemented as a value that is
+merely plausible.
+
 ## What a program needs that we do not have
 
     winrun -imports program.exe
@@ -602,10 +708,12 @@ the app.
 ## What is deliberately not here yet
 
 Threads (`CreateThread`/`_beginthreadex` report failure) — which is the last
-thing `gamelike32.exe` asks for that is not here. Audio. DirectInput, which is
-what Fallout 3 and New Vegas actually read the keyboard and mouse through; it
-sits on the state `user32.c` already keeps, so it is a layer rather than a
-subsystem. 64-bit `__except` (the 32-bit frame list is implemented; the x64
+thing `gamelike32.exe` asks for that is not here, and the largest single
+compatibility gap: nearly every game after 2000 starts one. Audio that actually
+reaches a speaker (it initialises, and a buffer's contents are right by the time
+`Play` is called — CoreAudio is the missing consumer). DirectInput, which is
+what Fallout 3 and New Vegas read the keyboard and mouse through; it sits on the
+state `user32.c` already keeps, so it is a layer rather than a subsystem. 64-bit `__except` (the 32-bit frame list is implemented; the x64
 table-driven mechanism is not — see the end of `win32/seh.c`). GDI beyond the
 stubs a message loop needs, and any window decoration: a window here is its own
 client area, which is what a fullscreen game wants and not what a windowed
