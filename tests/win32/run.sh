@@ -27,6 +27,18 @@ checkx() {  # name expected_file expected_rc args...
         "$winrun" -v "./$name" "$@" 2>&1 >/dev/null | tail -24 | sed 's/^/  | /'
     else echo "ok   $name"; fi
 }
+# Only the exit code and one line of output. These runs end in the crash
+# report, which prints registers and addresses that differ between the
+# interpreter and the dynarec by design -- recording it would be recording
+# the machine, not the behaviour.
+checkrc() {  # name expected_rc must_contain args...
+    name=$1; erc=$2; want=$3; shift 3
+    got=$("$winrun" "./$name" "$@" 2>/tmp/winrun_err.$$); rc=$?
+    if [ "$rc" -ne "$erc" ] || ! printf '%s\n' "$got" | grep -qF "$want"; then
+        echo "FAIL $name $* (rc=$rc, want $erc; looking for \"$want\")"
+        printf '%s\n' "$got" | head -8; cat /tmp/winrun_err.$$; fail=1
+    else echo "ok   $name $* (ended with $erc)"; fi
+}
 check hello64.exe 7 a b
 check hello32.exe 7 a b
 check crt64.exe 3
@@ -54,5 +66,27 @@ checkx regtest32.exe regtest_write32.expected 0 write
 checkx regtest32.exe regtest_read32.expected  0 read
 checkx regtest64.exe regtest_write64.expected 0 write
 checkx regtest64.exe regtest_read64.expected  0 read
+# Structured exception handling. Software exceptions -- RaiseException, and so
+# every 32-bit MSVC C++ throw -- work the same through the interpreter and the
+# dynarec, because they arrive through a stub with the registers spilled.
+check sehtest64.exe 0
+check sehtest32.exe 0
+checkrc sehtest64.exe 129 "an unhandled exception" die
+checkrc sehtest32.exe 129 "an unhandled exception" die
+# Faults are the other half. A fault inside a compiled block is recovered
+# through the recovery stub that block carries (core/src/jit/jit.c), so these
+# run the same way as everything else -- and are then run again with the JIT
+# off, because "the same either way" is the property that matters and it is
+# only proved by checking both.
+check faulttest64.exe 0
+check faulttest32.exe 0
+checkrc faulttest64.exe 129 "an unhandled exception" die
+checkrc faulttest32.exe 129 "an unhandled exception" die
+XCORE_JIT=0; export XCORE_JIT
+check faulttest64.exe 0
+check faulttest32.exe 0
+checkrc faulttest64.exe 129 "an unhandled exception" die
+checkrc faulttest32.exe 129 "an unhandled exception" die
+unset XCORE_JIT
 rm -f /tmp/winrun_err.$$
 exit $fail

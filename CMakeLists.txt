@@ -41,6 +41,10 @@ add_test(NAME selftest COMMAND test_selftest)
 # --- AArch64 encoder sanity: emits one of everything; bytes are checked by
 # hand against the system disassembler (see the file) -----------------------
 # JIT vs interpreter on every difftest case (passes trivially where there is no JIT)
+add_executable(test_faultdiff tests/test_faultdiff.c)
+target_link_libraries(test_faultdiff PRIVATE xcore)
+target_include_directories(test_faultdiff PRIVATE tests)
+add_test(NAME faultdiff COMMAND test_faultdiff)
 add_executable(test_jitdiff tests/test_jitdiff.c)
 target_link_libraries(test_jitdiff PRIVATE xcore)
 target_include_directories(test_jitdiff PRIVATE tests)
@@ -75,7 +79,7 @@ endif()
 if(NOT WIN32)
     # The same sources twice: once as the command-line tool, once as a library
     # the device build links (tools/memprobe) so an iPad can run a .exe.
-    add_library(winrun_lib STATIC tools/winrun/winrun.c win32/pe.c win32/kernel32.c win32/msvcrt.c win32/com.c win32/d3d9.c win32/raster.c win32/stdcall_args.c win32/advapi32.c)
+    add_library(winrun_lib STATIC tools/winrun/winrun.c win32/pe.c win32/kernel32.c win32/msvcrt.c win32/com.c win32/d3d9.c win32/raster.c win32/stdcall_args.c win32/advapi32.c win32/seh.c)
     target_link_libraries(winrun_lib PUBLIC xcore)
     if(NOT APPLE)
         target_link_libraries(winrun_lib PUBLIC m)
@@ -85,7 +89,7 @@ if(NOT WIN32)
     set_property(TARGET winrun_lib PROPERTY C_STANDARD 11)
     target_compile_options(winrun_lib PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
-    add_executable(winrun tools/winrun/winrun.c win32/pe.c win32/kernel32.c win32/msvcrt.c win32/com.c win32/d3d9.c win32/raster.c win32/stdcall_args.c win32/advapi32.c)
+    add_executable(winrun tools/winrun/winrun.c win32/pe.c win32/kernel32.c win32/msvcrt.c win32/com.c win32/d3d9.c win32/raster.c win32/stdcall_args.c win32/advapi32.c win32/seh.c)
     target_link_libraries(winrun PRIVATE xcore m)
     target_include_directories(winrun PRIVATE win32)
     set_property(TARGET winrun PROPERTY C_STANDARD 11)

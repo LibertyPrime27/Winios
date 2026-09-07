@@ -12,12 +12,15 @@
 #include "../../win32/w32.h"
 
 #include <errno.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/mman.h>
 #include <time.h>
+#include <ucontext.h>
 #include <dirent.h>
 #include <unistd.h>
 
@@ -27,6 +30,12 @@
 static w32 g_w;
 static xc_mem g_mem;
 static xc_cpu g_cpu;
+
+/* Where the run loop resumes when the signal handler turns a host SIGSEGV
+ * back into a guest fault. Defined here because both the run loop and the
+ * handler need it, and they are far apart. See on_crash. */
+static sigjmp_buf g_fault_jmp;
+static volatile int g_fault_armed;
 
 /* ------------------------------------------------------------- memory */
 
@@ -319,12 +328,14 @@ void w32_handle_close(w32 *w, uint64_t h) {
 /* --------------------------------------------------------------- stubs */
 
 static const w32_dll g_dlls[] = {
-    { "kernel32.dll", w32_kernel32, 0 },
-    { "msvcrt.dll",   w32_msvcrt,   0 },
-    { "ntdll.dll",    w32_ntdll,    0 },
-    { "user32.dll",   w32_user32,   0 },
-    { "d3d9.dll",     w32_d3d9,     0 },
-    { "advapi32.dll", w32_advapi32, 0 },
+    /* name, exports, a second table of exports (SEH lives in its own file
+     * but belongs to these two DLLs), module handle */
+    { "kernel32.dll", w32_kernel32, w32_seh_kernel32, 0 },
+    { "msvcrt.dll",   w32_msvcrt,   0,                0 },
+    { "ntdll.dll",    w32_ntdll,    w32_seh_ntdll,    0 },
+    { "user32.dll",   w32_user32,   0,                0 },
+    { "d3d9.dll",     w32_d3d9,     0,                0 },
+    { "advapi32.dll", w32_advapi32, 0,                0 },
 };
 enum { NDLLS = sizeof g_dlls / sizeof g_dlls[0], STUB_RETURN = 0, STUB_EXIT = 1, STUB_FIRST = 2 };
 
@@ -366,10 +377,13 @@ uint64_t w32_stub_for(w32 *w, const char *dll, const char *name) {
         for (int i = STUB_FIRST; i < w->nstubs; i++)
             if (w->stubs[i].dll == &g_dlls[d] && w->stubs[i].api && !strcmp(w->stubs[i].api->name, name))
                 return w->stubs[i].api->data_size ? w->data_exports[i] : stub_addr(w, i);
-        for (const w32_api *a = g_dlls[d].apis; a->name; a++) if (!strcmp(a->name, name)) {
-            int i = stub_new(w, &g_dlls[d], a, 0);
-            if (a->data_size) { w->data_exports[i] = w32_heap_alloc(w, (uint64_t)a->data_size); return w->data_exports[i]; }
-            return stub_addr(w, i);
+        for (int t = 0; t < 2; t++) {
+            const w32_api *tab = t ? g_dlls[d].apis2 : g_dlls[d].apis;
+            for (const w32_api *a = tab; a && a->name; a++) if (!strcmp(a->name, name)) {
+                int i = stub_new(w, &g_dlls[d], a, 0);
+                if (a->data_size) { w->data_exports[i] = w32_heap_alloc(w, (uint64_t)a->data_size); return w->data_exports[i]; }
+                return stub_addr(w, i);
+            }
         }
     }
     /* unknown: a stub that reports the name when (if) it is called */
@@ -449,6 +463,10 @@ static void dispatch(w32 *w, int i) {
     uint64_t rsp = c->gpr[XC_RSP];
     a->fn(w);
     if (w->exited) return;
+    /* An implementation that set rip and rsp itself -- RaiseException handing
+     * control to a handler, NtContinue restoring a context -- has already
+     * decided where the guest goes next. Returning for it would undo that. */
+    if (w->redirected) { w->redirected = 0; return; }
     /* return to the caller: pop the return address (and the arguments for stdcall on x86) */
     if (w->is32) {
         c->rip = w32_read(w, rsp, 4);
@@ -481,7 +499,14 @@ static int run_loop(w32 *w) {
             w->stop_reason = "ran past its time limit";
             w32_exit(w, 124); return 0;
         }
-        xc_stop st = xc_run(c, 1u << 20);
+        xc_stop st;
+        if (sigsetjmp(g_fault_jmp, 1) == 0) {
+            g_fault_armed = 1;
+            st = xc_run(c, 1u << 20);
+            g_fault_armed = 0;
+        } else {
+            st = XC_STOP_FAULT;                 /* on_crash recovered a guest access */
+        }
         if (st == XC_STOP_STEPS) continue;
         if (st == XC_STOP_BREAKPOINT) {
             uint64_t at = c->rip - 1;
@@ -494,10 +519,33 @@ static int run_loop(w32 *w) {
             fprintf(stderr, "winrun: int3 in guest code at %#llx\n", (unsigned long long)at);
             w32_exit(w, 128 + 5); return 0;
         }
+        /* A fault or an illegal instruction is not the end of the run: it is
+         * an exception, and the guest may well have a handler for it. Only if
+         * nothing takes it does the run stop -- which is what Windows does. */
+        /* Deliberately only XC_STOP_FAULT. An undefined instruction is
+         * ambiguous here -- it is either the guest's own UD2 or an opcode we
+         * have not implemented -- and handing our own gap to the guest's
+         * handler would hide it. A stop that names the instruction is worth
+         * more than an exception that is probably a lie. */
+        if (st == XC_STOP_FAULT) {
+            uint64_t at = c->rip, addr = c->fault_addr;
+            xc_stop kind = st;
+            c->stop = XC_STOP_NONE;
+            if (w32_fault_to_exception(w)) continue;
+            if (w->exited) return 0;
+            uint64_t ea = 0; uint32_t code = w32_last_exception(&ea);
+            w->stop_reason = "an unhandled exception";
+            char dis[128]; xc_disasm(c, at, dis, sizeof dis);
+            fprintf(stderr, "winrun: unhandled %s (%#x) at rip=%#llx  [%s]",
+                    w32_exception_name(code), code, (unsigned long long)at, dis);
+            if (kind == XC_STOP_FAULT && c->fault_kind == XC_FAULT_MEM)
+                fprintf(stderr, "  fault_addr=%#llx", (unsigned long long)addr);
+            fprintf(stderr, "\n");
+            w32_exit(w, 129); return 0;
+        }
         w->stop_reason = xc_stop_name(st);
         char dis[128]; xc_disasm(c, c->rip, dis, sizeof dis);
         fprintf(stderr, "winrun: stopped: %s at rip=%#llx  [%s]", xc_stop_name(st), (unsigned long long)c->rip, dis);
-        if (st == XC_STOP_FAULT) fprintf(stderr, "  fault_addr=%#llx", (unsigned long long)c->fault_addr);
         fprintf(stderr, "\n");
         w32_exit(w, 125); return 0;
     }
@@ -602,21 +650,110 @@ static void process_init(w32 *w, int argc, char **argv) {
 #include <execinfo.h>
 #define HAVE_BACKTRACE 1
 #endif
+/* Where the host was when the signal arrived. Needed to tell a guest access
+ * to an unmapped guest page -- which the interpreter can turn into a guest
+ * exception -- from the same access made by compiled code, where the guest's
+ * registers are in host registers and no honest CONTEXT can be built. Returns
+ * 0 where the layout is unknown, and 0 means "assume the worst". */
+static uint64_t *host_pc_slot(void *uctx) {
+#if defined(__APPLE__) && defined(__aarch64__)
+    return (uint64_t *)&((ucontext_t *)uctx)->uc_mcontext->__ss.__pc;
+#elif defined(__linux__) && defined(__aarch64__)
+    return (uint64_t *)&((ucontext_t *)uctx)->uc_mcontext.pc;
+#else
+    (void)uctx; return 0;                       /* only ARM64 has compiled code */
+#endif
+}
+
+static uint64_t host_pc_of(void *uctx) {
+#if defined(__APPLE__) && defined(__aarch64__)
+    return (uint64_t)((ucontext_t *)uctx)->uc_mcontext->__ss.__pc;
+#elif defined(__APPLE__) && defined(__x86_64__)
+    return (uint64_t)((ucontext_t *)uctx)->uc_mcontext->__ss.__rip;
+#elif defined(__linux__) && defined(__aarch64__)
+    return (uint64_t)((ucontext_t *)uctx)->uc_mcontext.pc;
+#elif defined(__linux__) && defined(__x86_64__)
+    return (uint64_t)((ucontext_t *)uctx)->uc_mcontext.gregs[REG_RIP];
+#else
+    (void)uctx; return 0;
+#endif
+}
+
+/* A 32-bit guest's arena is one 4 GB PROT_NONE reservation with the pages it
+ * has actually claimed mapped over it, so a guest dereference of a null or
+ * stray pointer is a *host* SIGSEGV rather than something the memory model
+ * reports. Windows would raise an access violation there and the guest may
+ * have a handler for it, so the interpreter's faults come back here.
+ *
+ * Longjmp out of a signal handler is safe in exactly this case: the signal is
+ * synchronous, we land back in the run loop on the same thread, and the
+ * interpreter holds no allocation or lock across an instruction. It is only
+ * done when the fault address is inside the guest's own arena -- a fault
+ * anywhere else is a bug in this runtime, and recovering from it would hide
+ * the bug -- and only when the faulting code was not a compiled block, whose
+ * register state cannot be reconstructed yet. */
 static void on_crash(int sig, siginfo_t *si, void *uctx) {
-    (void)uctx;
     xc_cpu *c = g_w.c;
     uint64_t lo = 0, hi = 0; int have = xc_jit_code_range(&lo, &hi);
     uint64_t fault = (uint64_t)(uintptr_t)si->si_addr;
+    uint64_t pc = host_pc_of(uctx);
+    int in_arena = g_w.is32 && g_w.base &&
+                   fault >= (uint64_t)(uintptr_t)g_w.base &&
+                   fault < (uint64_t)(uintptr_t)g_w.base + (1ull << 32);
+    int in_jit = have && pc >= lo && pc < hi;
+    /* A guest address: what the guest was reaching for, if this was a guest
+     * access at all. The arena makes that unambiguous for a 32-bit guest; a
+     * 64-bit guest is identity-mapped, so the address is already the guest's. */
+    uint64_t gaddr = g_w.is32 ? fault - (uint64_t)(uintptr_t)g_w.base : fault;
+
+    /* Inside a compiled block the guest's registers are in host registers, so
+     * nothing can leave from here -- the compiled code has to write them back
+     * itself, and it carries a recovery stub for exactly this instruction.
+     * Move the PC there and return: the stub spills, sets the guest RIP and
+     * exits through the dispatcher, and xc_run returns XC_STOP_FAULT.
+     *
+     * The exact-PC match is also what makes this safe to do at all. It is not
+     * a guess about where the fault came from: the PC either is one of the
+     * ldr/str instructions the compiler emitted for a guest access, or it is
+     * not, and a fault anywhere else in the runtime stays a crash. That is a
+     * stronger test than "the address looks like guest memory", so it needs
+     * no help from the arena and works for both bitnesses. */
+    if (g_fault_armed && in_jit && pc && c) {
+        uint64_t grip = 0;
+        void *stub = xc_jit_fault_stub(pc, &grip);
+        uint64_t *pcp = host_pc_slot(uctx);
+        if (stub && pcp) {
+            c->stop = XC_STOP_FAULT;
+            c->fault_kind = XC_FAULT_MEM;
+            c->fault_addr = gaddr;
+            c->rip = grip;                      /* the stub only spills; the RIP is ours to set */
+            *pcp = (uint64_t)(uintptr_t)stub;
+            return;
+        }
+    }
+    /* The interpreter's own accesses. Here the cpu struct is already the
+     * truth at an instruction boundary, so longjmp out to the run loop. Only
+     * for a 32-bit guest, whose arena makes "this was the guest reaching for
+     * memory it does not have" a fact rather than a hope -- a fault outside
+     * it is a bug in this runtime, and recovering from one would hide it. */
+    if (g_fault_armed && in_arena && !in_jit && pc && c) {
+        c->stop = XC_STOP_FAULT;
+        c->fault_kind = XC_FAULT_MEM;
+        c->fault_addr = gaddr;
+        g_fault_armed = 0;
+        siglongjmp(g_fault_jmp, 1);
+    }
     char buf[768];
     int n = snprintf(buf, sizeof buf,
-        "winrun: host %s at address %#llx; guest rip=%#llx rsp=%#llx (%d-bit, %s); fault %s the JIT code region%s\n"
+        "winrun: host %s at address %#llx; guest rip=%#llx rsp=%#llx (%d-bit, %s); host pc %s a compiled block%s\n"
         "winrun: state: image %#llx+%#x entry %#llx stubs %#llx teb %#llx peb %#llx stack %#llx..%#llx heap %#llx depth %d exited %d\n",
         sig == SIGSEGV ? "SIGSEGV" : "SIGBUS", (unsigned long long)fault,
         (unsigned long long)(c ? c->rip : 0), (unsigned long long)(c ? c->gpr[XC_RSP] : 0), g_w.is32 ? 32 : 64,
         xc_jit_enabled() ? "jit" : "interpreter",
-        have && fault >= lo && fault < hi ? "inside" : "outside",
-        g_w.is32 && fault >= (uint64_t)(uintptr_t)g_w.base && fault < (uint64_t)(uintptr_t)g_w.base + (1ull << 32)
-            ? " -- inside the 4 GB arena (unmapped guest page)" : "",
+        in_jit ? "inside" : "outside",
+        in_jit ? " -- in compiled code, with no recovery stub for this instruction"
+                 " (see core/src/jit/jit.c)"
+               : in_arena ? " -- inside the 4 GB arena (unmapped guest page)" : "",
         (unsigned long long)g_w.image_base, (unsigned)g_w.image_size, (unsigned long long)g_w.entry,
         (unsigned long long)g_w.stub_base, (unsigned long long)g_w.teb, (unsigned long long)g_w.peb,
         (unsigned long long)g_w.stack_limit, (unsigned long long)g_w.stack_base, (unsigned long long)g_w.heap_cur,
@@ -651,6 +788,7 @@ static void winrun_reset(void) {
     g_stop_request = 0;
     w32_reset_statics();
     w32_registry_reset();
+    w32_seh_reset();
     w32_com_reset();
     w32_d3d9_reset();
     xc_cache_flush();

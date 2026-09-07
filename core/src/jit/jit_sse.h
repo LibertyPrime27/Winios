@@ -50,6 +50,7 @@ static int xsrc(jc *j, const xop *op, int vt, int bits) {
     if (op->type != XOP_MEM) { j->failed = 1; return vt; }
     int w = emit_ea(j, op, T4);
     emit_bounds(j, bits / 8);
+    fault_site(j);
     a64_fldst_reg(&j->a, bits == 128 ? 2 : bits == 64 ? 1 : 0, 1, vt, R_BASE, T4, w ? 2 : 3);
     return vt;
 }
@@ -60,6 +61,7 @@ static void xdst(jc *j, const xop *op, int vs, int bits) {
     if (op->type != XOP_MEM) { j->failed = 1; return; }
     int w = emit_ea(j, op, T4);
     emit_bounds(j, bits / 8);
+    fault_site(j);
     a64_fldst_reg(&j->a, bits == 128 ? 2 : bits == 64 ? 1 : 0, 0, vs, R_BASE, T4, w ? 2 : 3);
 }
 

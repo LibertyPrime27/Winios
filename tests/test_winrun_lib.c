@@ -65,6 +65,38 @@ static int test_registry(const char *dir) {
     return bad;
 }
 
+/* Faults, through the interpreter. Software exceptions run in the table above
+ * with everything else because they work either way; turning a *fault* into a
+ * guest exception needs the register state at the faulting instruction, which
+ * a compiled block only has at its boundaries (the end of win32/seh.c says
+ * what that will take). So the JIT comes off for these two and goes back on
+ * after, which also checks that toggling it mid-process works -- the app does
+ * exactly that between probes. */
+static int test_faults(const char *dir) {
+    int was = xc_jit_enabled();
+    xc_jit_enable(0);
+    int bad = 0;
+    static const struct { const char *exe; const char *arg; int rc; } F[] = {
+        { "faulttest32.exe", 0,      0   }, { "faulttest64.exe", 0,      0   },
+        { "faulttest32.exe", "die",  129 }, { "faulttest64.exe", "die",  129 },
+    };
+    for (int i = 0; i < 4; i++) {
+        char path[512];
+        snprintf(path, sizeof path, "%s/%s", dir, F[i].exe);
+        char *av[3] = { (char *)"winrun", path, (char *)F[i].arg };
+        fflush(stdout);
+        int rc = winrun_main(F[i].arg ? 3 : 2, av);
+        fflush(stdout);
+        if (rc != F[i].rc) {
+            printf("FAIL %s %s exited %d, want %d\n", F[i].exe, F[i].arg ? F[i].arg : "", rc, F[i].rc);
+            bad++;
+        }
+    }
+    xc_jit_enable(was);
+    if (!bad) printf("ok   faulttest: a fault became a guest exception, and an unhandled one ended the run\n");
+    return bad;
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : "tests/win32";
     /* C:\ for pathtest, and a check that the setting survives winrun_reset --
@@ -83,6 +115,7 @@ int main(int argc, char **argv) {
         { "pathtest64.exe", 0 }, { "pathtest32.exe", 0 },
         { "d3ddraw64.exe", 0 },  { "d3ddraw32.exe", 0 },
         { "filetest64.exe", 0 }, { "filetest32.exe", 0 },
+        { "sehtest64.exe", 0 },  { "sehtest32.exe", 0 },
     };
     const int n = (int)(sizeof G / sizeof G[0]);
     int bad = 0;
@@ -110,6 +143,7 @@ int main(int argc, char **argv) {
     }
     bad += test_device_lost(dir);
     bad += test_registry(dir);
+    bad += test_faults(dir);
     printf("test_winrun_lib: %d runs, %d failed\n", 2 * n, bad);
     return bad != 0;
 }

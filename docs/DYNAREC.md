@@ -193,9 +193,41 @@ is the arena base and the `uxtw` is the `base + zext32(addr)` of the memory
 model, at zero cost; for a 64-bit guest x25 is 0 and the same form is the
 identity mapping. When a 32-bit arena is smaller than 4 GB (a memory-constrained
 configuration, or a test), every access carries a bounds check that faults the
-way the interpreter does; a full-size arena needs none. An access to an
-unmapped page *inside* the arena is a host fault today; a signal handler that
-turns it into a guest fault is the runtime's job later.
+way the interpreter does; a full-size arena needs none.
+
+An access to an unmapped page is a host fault, and each one is recoverable.
+The problem it poses is that guest registers live in host registers here and
+are written back only at block boundaries, so a fault in the middle of a block
+has no consistent guest state to report — and a state built from the last
+block exit would be quietly, plausibly wrong, which is worse than failing.
+
+Reconstructing it in C would mean a second implementation of everything
+`spill()` knows — which host register holds which guest register, the x87
+renaming, the tag word, the pending FPSR fold — kept in step with the first by
+hand. So the generated code does it. Every guest access gets an out-of-line
+**recovery stub** carrying exactly the spill sequence for that point in the
+block; the runtime's signal handler looks the faulting host PC up in a side
+table, moves the PC to the stub and returns, and the stub writes the registers
+back and leaves through the dispatcher, so `xc_run` returns `XC_STOP_FAULT`
+with the state the faulting instruction had.
+
+The lookup is an exact match on the host PC, which is what makes it safe: the
+PC either is one of the load/store instructions emitted for a guest access, or
+it is not, and a fault anywhere else stays a crash. Nothing is added to the
+fast path — the cost is code size, +15% to +22% of generated code in the
+programs measured, and only in blocks that touch memory. The guest RIP is kept
+in the side table rather than baked into the stub, so a stub is a pure function
+of the spill state and every access in a block with the same registers live
+shares one.
+
+`test_faultdiff` holds it to what x86 says rather than to what the interpreter
+happens to do: a faulting instruction has no effect, so the architectural state
+at a fault is the state after the instruction before it — which the interpreter
+can produce with a step budget one short, without faulting at all. It caught a
+real bug on its first run: the compiler drops a flag computation nothing in the
+block reads, which is sound until a fault hands control to a handler the
+liveness pass never saw. An instruction that can fault is now a reader of the
+flags.
 
 ## Self-modifying code
 
@@ -205,7 +237,7 @@ the block, and the next lookup decodes and compiles afresh.
 
 ## Verification
 
-Three layers, from cheapest to most authoritative:
+Four layers, from cheapest to most authoritative:
 
 1. **Golden vectors.** The on-device self-test replays every recorded silicon
    post-state through the JIT (`xc_run`) as well as the interpreter. 2388
@@ -224,6 +256,15 @@ Three layers, from cheapest to most authoritative:
    the precision or rounding mode), runs each through the interpreter and the
    JIT, and requires identical final states (x87 status masked only for DE).
    67 000 runs, 0 differences. Runs under qemu in CI and natively on the
+   Apple-silicon job.
+2c. **State at a fault, against x86** (`tests/test_faultdiff.c`). Thirty-two
+   sequences that end in a faulting access, each with as much state as
+   possible held in host registers first. The oracle is not the interpreter's
+   behaviour but x86's rule that a faulting instruction has no effect, so the
+   state at the fault is the state after the instruction before it — which the
+   interpreter produces with a step budget one short, never touching the bad
+   page. Every register, XMM, flag, x87 register, the tag word, the reported
+   RIP and guest memory must match. Runs under qemu in CI and natively on the
    Apple-silicon job.
 3. **Apple silicon.** The macOS CI job runs the self-test natively; MemProbe
    runs it on the iPad and iPhone inside a debugger-blessed arena
@@ -323,7 +364,7 @@ every case. Real numbers come from the devices.
 2. **Indirect branch prediction.** RET and `jmp reg` still go through the
    dispatcher's hash lookup; an inline cache keyed by target address would
    cover most of them.
-3. **Faults.** Map host SIGSEGV/SIGBUS inside guest code to guest faults with
-   the interpreter's `XC_STOP_FAULT` semantics.
-4. **A code cache on disk**, keyed by the block's bytes, so later launches
+3. **A code cache on disk**, keyed by the block's bytes, so later launches
    start compiled (see `CPU-CORE.md`, "Could we just compile it instead").
+
+Faults used to be third on this list. They are done — see **Memory** above.

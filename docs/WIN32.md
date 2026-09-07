@@ -191,14 +191,17 @@ compiled code for pages that become writable.
 
 ## Verified
 
-`tests/win32/run.sh` runs twenty-four checks over twelve programs and compares
-stdout and exit code with recordings: the three-import `hello`, the full
-mingw-w64 CRT program (`crt.c`: TLS callbacks, `__getmainargs`, `_initterm`,
-malloc/free, `sqrt`, `printf`, `snprintf`, exit code), the n-body benchmark,
-the loader test `dlltest`, the four Direct3D 9 programs `d3dtest`, `d3dframe`,
-`d3dloop` and `d3ddraw`, the file-layer tests `pathtest` and `filetest`, and
-the registry test `regtest` — each as PE32 and PE32+, and `regtest` twice over
-in each bitness because what it is testing is what survives between two runs.
+`tests/win32/run.sh` runs thirty-six checks over fourteen programs and
+compares stdout and exit code with recordings: the three-import `hello`, the
+full mingw-w64 CRT program (`crt.c`: TLS callbacks, `__getmainargs`,
+`_initterm`, malloc/free, `sqrt`, `printf`, `snprintf`, exit code), the n-body
+benchmark, the loader test `dlltest`, the four Direct3D 9 programs `d3dtest`,
+`d3dframe`, `d3dloop` and `d3ddraw`, the file-layer tests `pathtest` and
+`filetest`, the registry test `regtest`, and the exception tests `sehtest` and
+`faulttest` — each as PE32 and PE32+. Three of them are run more than once:
+`regtest` twice per bitness because what it tests is what survives between two
+runs, and `faulttest` both with the dynarec and without it, because "the same
+either way" is the property that matters there.
 
 `d3dtest` calls Direct3D 9 the way a game starts up — `Direct3DCreate9`,
 `GetAdapterIdentifier`, `CreateDevice`, `Clear`, `Present`, then
@@ -329,6 +332,93 @@ the store reached the disk. The device build runs the same pair, and because
 every run begins by throwing the whole in-memory store away, a value the second
 run can see came back off disk and nowhere else.
 
+## Structured exception handling
+
+On 32-bit Windows this is a linked list on the stack. `__try` pushes an
+eight-byte record — next pointer, handler address — and stores its address at
+`fs:[0]`; `__except` pops it. When something faults, the kernel walks that list
+from `fs:[0]` outward, calling each handler with a description of what happened
+and a copy of the register state, and the first one that says "I will deal with
+this" gets control. All of it lives in memory the guest owns, so implementing it
+is a matter of walking the guest's own list and calling the guest's own
+functions.
+
+It matters more than it looks. 32-bit MSVC compiles C++ `throw` into
+`RaiseException(0xE06D7363)` and catches it through this same chain, so a game
+built with MSVC has this on its critical path without containing a single
+`__try`. It is also how a program survives its own bad pointer, which is why
+code that works on Windows dies without it.
+
+`win32/seh.c` has the dispatcher, `RaiseException`, `RtlUnwind`,
+`SetUnhandledExceptionFilter`, the vectored handlers, `RtlCaptureContext`,
+`NtContinue` and `IsBadReadPtr`. What a handler is handed has to be laid out
+exactly right or it reads the wrong fields: `EXCEPTION_RECORD` (80 bytes on
+x86, 152 on x64) and `CONTEXT` (716 / 1232). Those offsets were read out of
+mingw-w64's headers with `offsetof`, by a program compiled for Windows and run
+on this emulator — a pleasant way to get them from the source of truth rather
+than from memory.
+
+Two details callers depend on and stubs usually get wrong: the search order is
+vectored handlers, then the frame list, then the unhandled filter; and a
+handler returning `ExceptionContinueExecution` gets the whole `CONTEXT` copied
+back, not just the fields we expect it to have touched — a handler that repairs
+one register and resumes has to actually resume with that register repaired.
+
+`RtlUnwind` is what makes `__except` work rather than just the search: it pops
+the list down to the target frame, giving every handler it passes a chance to
+run its `__finally` blocks (`EXCEPTION_UNWINDING`), then returns to the caller,
+which jumps into its own handler body.
+
+### Faults, and where the guest's registers were
+
+A CPU fault becomes the exception Windows would have raised for it: an access
+violation with the address in `ExceptionInformation[1]`, a divide error, a
+stack overflow when the address is just past the end of the guest stack.
+
+The interesting part is that this works from dynarec-compiled code, where it
+has no right to. The compiler keeps guest registers in host registers and
+writes them back at block boundaries, so a fault in the middle of a block has
+no consistent guest state to report — and a `CONTEXT` built from the last
+block exit would be quietly, plausibly wrong, which is worse than failing.
+
+Reconstructing the state in C would mean a second implementation of everything
+the compiler's spill knows — which host register holds which guest register,
+the x87 renaming, the tag word, the pending FPSR fold — kept in step with the
+first by hand, in the one place where a disagreement is hardest to notice. So
+the generated code does it instead. Every guest memory access gets an
+out-of-line *recovery stub* carrying exactly the spill sequence for that point
+in the block; a host `SIGSEGV` at one of those instructions is turned into a
+jump to its stub, which writes the registers back and leaves through the
+dispatcher. `xc_run` returns with a cpu struct as consistent as if the block
+had ended there.
+
+The lookup is an exact match on the host PC, and that is what makes it safe to
+do at all. It is not a guess about where a fault came from: the PC either is
+one of the load/store instructions the compiler emitted for a guest access, or
+it is not, and a fault anywhere else stays a crash with a report. Nothing is
+added to the fast path — the cost is code size, about 15–20% more generated
+code in the programs measured, and only in blocks that touch memory.
+
+`tests/test_faultdiff.c` is what holds this honest. x86 says a faulting
+instruction has no effect — including a faulting `push`, which leaves the stack
+pointer alone — so the architectural state at a fault is exactly the state
+after the instruction before it. That is the oracle, and the interpreter can
+produce it without faulting: run it with a step budget one short of the
+faulting instruction and compare every register, every XMM, the flags, the
+whole x87 stack and tag word, the reported RIP and guest memory against what
+recovery reports. Thirty-two sequences (generated from real assembly by
+`tools/gen/faultcases.sh`, each carrying its own disassembly) put as much state
+in host registers as possible first: dirty GPRs, dirty XMMs, a loaded x87
+stack, a stack pointer the lowering has already moved, a register cache a
+callout has just invalidated.
+
+Stating it as a claim about x86 rather than as agreement between two
+implementations is the point — two implementations can be wrong together. It
+caught a real one immediately: the dynarec drops a flag computation nothing in
+the block reads, which is sound right up until a fault hands control to a
+handler the liveness pass never saw. An instruction that can fault is now a
+reader of the flags.
+
 ## What a program needs that we do not have
 
     winrun -imports program.exe
@@ -410,12 +500,12 @@ the app.
 
 ## What is deliberately not here yet
 
-Threads (`CreateThread`/`_beginthreadex` report failure), structured
-exception handling (a guest fault ends the run rather than reaching the
-guest's own handler, so MSVC code faults where real Windows would not), audio,
-and everything user32/gdi32 beyond `MessageBoxA` — which means no window and no
-message pump, and so no installer either. Drawing reaches the screen but goes
-through the reference rasterizer rather than Metal.
+Threads (`CreateThread`/`_beginthreadex` report failure), audio, 64-bit
+`__except` (the 32-bit frame list is implemented; the x64 table-driven
+mechanism is not — see the end of `win32/seh.c`), and everything
+user32/gdi32 beyond `MessageBoxA` — which means no window and no message pump,
+and so no installer either. Drawing reaches the screen but goes through the
+reference rasterizer rather than Metal.
 
 Within the loader specifically: `DLL_PROCESS_DETACH` is never sent (nothing is
 ever unloaded and the process exits without unwinding), `DLL_THREAD_ATTACH`

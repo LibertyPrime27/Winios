@@ -1,0 +1,11 @@
+32-bit
+
+access violation, repaired by the handler:
+  fixer: code 0xc0000005, 2 parameters, read at 0
+  fixer: context has eip set: yes, eax 0, ecx 0x2000
+read through a repaired pointer: 0x5a5a (want 0x5a5a)
+
+integer divide by zero, repaired by the handler:
+  fixer: code 0xc0000094, 0 parameters
+  fixer: context has eip set: yes, eax 0xa, ecx 0
+divide with a repaired divisor: 5 (want 5)

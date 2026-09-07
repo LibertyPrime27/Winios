@@ -50,6 +50,15 @@ typedef enum {
     XC_STOP_FAULT,        /* memory outside the guest arena, #DE, etc. */
 } xc_stop;
 
+/* Which kind of fault, when stop == XC_STOP_FAULT. A runtime that turns a
+ * fault into a guest exception needs to know: an access violation and a
+ * divide error are different exception codes to Windows, and nothing else in
+ * the stop reason distinguishes them. */
+typedef enum {
+    XC_FAULT_MEM = 0,     /* access outside the guest's memory; fault_addr is the address */
+    XC_FAULT_DIVIDE,      /* #DE: divide by zero or a quotient that does not fit */
+} xc_fault;
+
 typedef struct xc_mem {
     xc_mode  mode;
     uint8_t *base;        /* arena base for 32-bit; unused for identity */
@@ -97,6 +106,7 @@ typedef struct xc_cpu {
 
     /* Diagnostics for the last stop. */
     xc_stop  stop;
+    xc_fault fault_kind;       /* meaningful when stop == XC_STOP_FAULT */
     uint64_t fault_addr;
     int      syscall_vector;   /* 0x80 for INT 80, -1 for SYSCALL */
     char     last_insn[64];    /* disassembly, when the formatter is built in */
@@ -138,6 +148,18 @@ void xc_cache_stats(uint64_t *hits, uint64_t *builds, uint64_t *flushes, uint64_
 /* Dynarec (ARM64 hosts). xc_run uses it when available and enabled; set
  * XCORE_JIT=0 in the environment to force the interpreter. */
 int  xc_jit_available(void);
+
+/* A host SIGSEGV inside compiled code: the *recovery stub* for that exact
+ * host PC, or NULL if the PC is not a guest memory access the compiler
+ * emitted -- and, through `guest_rip`, which guest instruction it was.
+ *
+ * A runtime that turns guest faults into guest exceptions sets cpu->stop,
+ * fault_kind, fault_addr and rip (to `guest_rip`), then moves the signal
+ * context's PC here and returns. The stub writes the guest registers back and
+ * leaves through the dispatcher, so xc_run returns XC_STOP_FAULT with a
+ * consistent cpu struct. See core/src/jit/jit.c. */
+void *xc_jit_fault_stub(uint64_t host_pc, uint64_t *guest_rip);
+uint64_t xc_jit_fault_sites(void);      /* how many are registered, for diagnostics */
 void xc_jit_enable(int on);
 /* iOS: supply dual-mapped code memory (written at rw, executed at rx) that
  * the debugger has blessed; without it the JIT reports unavailable there. */

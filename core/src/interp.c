@@ -213,18 +213,40 @@ typedef struct {
     xc_stop stop;
 } ctx;
 
+/* One access, by size. The size is a constant in each arm, so the compiler
+ * emits a single load or store instead of a call into memcpy with a runtime
+ * length -- which is what the old code did on every guest access. memcpy
+ * rather than a cast because a guest address need not be aligned, and x86
+ * permits that where the host may not.
+ *
+ * It also matters for faults: a plain store is attributable to the
+ * instruction that made it, where a fault inside a library memcpy is not
+ * always -- which is the difference between a guest access violation the
+ * runtime can hand to the guest and an unexplained crash. */
 static int mem_read(ctx *x, uint64_t ga, int bits, uint64_t *out) {
     void *p = xc_mem_ptr(x->c->mem, ga, (size_t)bits / 8);
-    if (!p) { x->stop = XC_STOP_FAULT; x->c->fault_addr = ga; return 0; }
-    uint64_t v = 0;
-    memcpy(&v, p, (size_t)bits / 8);          /* little-endian host assumed */
+    if (!p) { x->stop = XC_STOP_FAULT; x->c->fault_kind = XC_FAULT_MEM; x->c->fault_addr = ga; return 0; }
+    uint64_t v = 0;                           /* little-endian host assumed */
+    switch (bits) {
+    case 8:  { uint8_t t;  memcpy(&t, p, 1); v = t; break; }
+    case 16: { uint16_t t; memcpy(&t, p, 2); v = t; break; }
+    case 32: { uint32_t t; memcpy(&t, p, 4); v = t; break; }
+    case 64: memcpy(&v, p, 8); break;
+    default: memcpy(&v, p, (size_t)bits / 8); break;
+    }
     *out = v;
     return 1;
 }
 static int mem_write(ctx *x, uint64_t ga, int bits, uint64_t v) {
     void *p = xc_mem_ptr(x->c->mem, ga, (size_t)bits / 8);
-    if (!p) { x->stop = XC_STOP_FAULT; x->c->fault_addr = ga; return 0; }
-    memcpy(p, &v, (size_t)bits / 8);
+    if (!p) { x->stop = XC_STOP_FAULT; x->c->fault_kind = XC_FAULT_MEM; x->c->fault_addr = ga; return 0; }
+    switch (bits) {
+    case 8:  { uint8_t t = (uint8_t)v;   memcpy(p, &t, 1); break; }
+    case 16: { uint16_t t = (uint16_t)v; memcpy(p, &t, 2); break; }
+    case 32: { uint32_t t = (uint32_t)v; memcpy(p, &t, 4); break; }
+    case 64: memcpy(p, &v, 8); break;
+    default: memcpy(p, &v, (size_t)bits / 8); break;
+    }
     return 1;
 }
 
@@ -498,7 +520,7 @@ static int do_div(ctx *x, int signed_) {
     int bits = x->ops[0].size;
     uint64_t d; if (!op_read(x, 0, &d)) return 0;
     d = mask_bits(d, bits);
-    if (d == 0) { x->stop = XC_STOP_FAULT; return 0; }              /* #DE */
+    if (d == 0) { x->stop = XC_STOP_FAULT; x->c->fault_kind = XC_FAULT_DIVIDE; return 0; }   /* #DE */
     uint64_t lo, hi;
     if (bits == 8) { lo = x->c->gpr[XC_RAX] & 0xFF; hi = (x->c->gpr[XC_RAX] >> 8) & 0xFF; }
     else { lo = mask_bits(x->c->gpr[XC_RAX], bits); hi = mask_bits(x->c->gpr[XC_RDX], bits); }
@@ -507,12 +529,12 @@ static int do_div(ctx *x, int signed_) {
         __int128 n = ((__int128)(int64_t)sext(hi, bits) << bits) | lo;
         __int128 dv = (int64_t)sext(d, bits);
         __int128 qq = n / dv, rr = n % dv;
-        if (qq != (__int128)(int64_t)sext((uint64_t)qq, bits)) { x->stop = XC_STOP_FAULT; return 0; }
+        if (qq != (__int128)(int64_t)sext((uint64_t)qq, bits)) { x->stop = XC_STOP_FAULT; x->c->fault_kind = XC_FAULT_DIVIDE; return 0; }
         q = mask_bits((uint64_t)qq, bits); r = mask_bits((uint64_t)rr, bits);
     } else {
         unsigned __int128 n = ((unsigned __int128)hi << bits) | lo;
         unsigned __int128 qq = n / d, rr = n % d;
-        if (qq >> bits) { x->stop = XC_STOP_FAULT; return 0; }
+        if (qq >> bits) { x->stop = XC_STOP_FAULT; x->c->fault_kind = XC_FAULT_DIVIDE; return 0; }
         q = (uint64_t)qq; r = (uint64_t)rr;
     }
     if (bits == 8) x->c->gpr[XC_RAX] = (x->c->gpr[XC_RAX] & ~0xFFFFull) | (r << 8) | q;
@@ -1186,7 +1208,7 @@ static void do_aaa_aas(xc_cpu *c, int sub) {
 }
 static int do_aam(ctx *x) {
     uint64_t base; op_read(x, 0, &base); base &= 0xFF;
-    if (base == 0) { x->stop = XC_STOP_FAULT; return 0; }                 /* #DE */
+    if (base == 0) { x->stop = XC_STOP_FAULT; x->c->fault_kind = XC_FAULT_DIVIDE; return 0; }   /* #DE */
     uint64_t al = x->c->gpr[XC_RAX] & 0xFF;
     uint64_t ax = ((al / base) << 8) | (al % base);
     reg_write(x->c, ZYDIS_REGISTER_AX, ax);
@@ -1302,7 +1324,7 @@ int xc_decode_at(xc_cpu *c, uint64_t rip, ZydisDecodedInstruction *in, ZydisDeco
         src = (const uint8_t *)xc_mem_ptr(c->mem, rip, avail);
         if (src) break;
     }
-    if (!src) { c->stop = XC_STOP_FAULT; c->fault_addr = rip; return 0; }
+    if (!src) { c->stop = XC_STOP_FAULT; c->fault_kind = XC_FAULT_MEM; c->fault_addr = rip; return 0; }
     memcpy(buf, src, avail);
     if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(c->mode == XC_MODE_64 ? &dec64 : &dec32, buf, avail, in, ops))) {
         c->stop = XC_STOP_DECODE; return 0;

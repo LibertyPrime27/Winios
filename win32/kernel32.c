@@ -400,8 +400,6 @@ static void k_GetModuleFileNameW(w32 *w) {
 }
 static void k_IsDebuggerPresent(w32 *w) { RET(0); }
 static void k_OutputDebugStringA(w32 *w) { fprintf(stderr, "[dbg] %s", GSTR(ARG(0))); }
-static void k_SetUnhandledExceptionFilter(w32 *w) { RET(0); }
-static void k_UnhandledExceptionFilter(w32 *w) { RET(1); }
 static void k_GetSystemInfo(w32 *w) {
     uint64_t p = ARG(0); int psz = (int)w32_ptrsize(w);
     memset(W32P(w, p), 0, w->is32 ? 36 : 48);
@@ -760,12 +758,10 @@ static void k_WaitForSingleObject(w32 *w) { RET(0); }
 static void k_ReleaseMutex(w32 *w) { RET(1); }
 static void k_GetProcessAffinityMask(w32 *w) { w32_write(w, ARG(1), (int)w32_ptrsize(w), 0xF); w32_write(w, ARG(2), (int)w32_ptrsize(w), 0xF); RET(1); }
 static void k_SetErrorMode(w32 *w) { RET(0); }
-static void k_RtlCaptureContext(w32 *w) { memset(W32P(w, ARG(0)), 0, w->is32 ? 716 : 1232); }
 static void k_RtlPcToFileHeader(w32 *w) { w32_write(w, ARG(1), (int)w32_ptrsize(w), w->image_base); RET(w->image_base); }
 static void k_RtlLookupFunctionEntry(w32 *w) { RET(0); }
 static void k_RtlVirtualUnwind(w32 *w) { RET(0); }
 static void k_RtlUnwindEx(w32 *w) { fprintf(stderr, "winrun: RtlUnwindEx: exception unwinding is not supported\n"); w32_exit(w, 129); }
-static void k_RaiseException(w32 *w) { fprintf(stderr, "winrun: RaiseException(%#x)\n", (unsigned)ARG(0)); w32_exit(w, 129); }
 static void k_InterlockedIncrement(w32 *w) { uint64_t p = ARG(0); uint32_t v = (uint32_t)w32_read(w, p, 4) + 1; w32_write(w, p, 4, v); RET(v); }
 static void k_InterlockedDecrement(w32 *w) { uint64_t p = ARG(0); uint32_t v = (uint32_t)w32_read(w, p, 4) - 1; w32_write(w, p, 4, v); RET(v); }
 static void k_InterlockedExchange(w32 *w) { uint64_t p = ARG(0); uint32_t old = (uint32_t)w32_read(w, p, 4); w32_write(w, p, 4, ARG(1)); RET(old); }
@@ -798,7 +794,7 @@ const w32_api w32_kernel32[] = {
     FN(GetEnvironmentStrings, 0, k_GetEnvironmentStringsA), F(GetEnvironmentVariableA, 3), F(GetEnvironmentVariableW, 3),
     F(GetModuleHandleA, 1), F(GetModuleHandleW, 1), F(GetModuleHandleExW, 3), F(LoadLibraryA, 1), F(LoadLibraryW, 1), F(LoadLibraryExA, 3), F(LoadLibraryExW, 3),
     F(FreeLibrary, 1), F(GetProcAddress, 2), F(GetModuleFileNameA, 3), F(GetModuleFileNameW, 3),
-    F(IsDebuggerPresent, 0), F(OutputDebugStringA, 1), F(SetUnhandledExceptionFilter, 1), F(UnhandledExceptionFilter, 1),
+    F(IsDebuggerPresent, 0), F(OutputDebugStringA, 1),
     F(GetSystemInfo, 1), F(GetNativeSystemInfo, 1), F(GetVersion, 0), F(GetVersionExA, 1), F(GetVersionExW, 1),
     F(Sleep, 1), F(GetTickCount, 0), F(GetTickCount64, 0), F(QueryPerformanceCounter, 1), F(QueryPerformanceFrequency, 1),
     F(GetSystemTimeAsFileTime, 1), F(GetSystemTimePreciseAsFileTime, 1), F(GetLocalTime, 1), F(GetSystemTime, 1), F(GetTimeZoneInformation, 1),
@@ -823,7 +819,11 @@ const w32_api w32_kernel32[] = {
     F(GetFileAttributesA, 1), F(DeleteFileA, 1), F(GetCurrentDirectoryA, 2), F(SetCurrentDirectoryA, 1), F(GetTempPathA, 2), F(GetFullPathNameA, 4), F(FormatMessageA, 7),
     F(GetThreadPriority, 1), F(SetThreadPriority, 2), F(GetExitCodeProcess, 2), F(CreateEventA, 4), F(CreateEventW, 4), F(CreateMutexA, 3), F(SetEvent, 1), F(ResetEvent, 1),
     F(WaitForSingleObject, 2), F(ReleaseMutex, 1), F(GetProcessAffinityMask, 3), F(SetErrorMode, 1),
-    F(RtlCaptureContext, 1), F(RtlPcToFileHeader, 2), F(RtlLookupFunctionEntry, 3), F(RtlVirtualUnwind, 8), F(RtlUnwindEx, 6), F(RaiseException, 4),
+    /* RaiseException, RtlCaptureContext, RtlUnwind, the vectored handlers and
+     * the unhandled filter are in win32/seh.c, which kernel32 pulls in as its
+     * second table. What is left here is the 64-bit table-driven unwinder,
+     * which is not implemented. */
+    F(RtlPcToFileHeader, 2), F(RtlLookupFunctionEntry, 3), F(RtlVirtualUnwind, 8), F(RtlUnwindEx, 6),
     F(InterlockedIncrement, 1), F(InterlockedDecrement, 1), F(InterlockedExchange, 2), F(InterlockedCompareExchange, 3),
     F(EncodePointer, 1), F(DecodePointer, 1), F(InitializeSListHead, 1), F(SetHandleCount, 1), F(GetLogicalDrives, 0), F(GetDriveTypeA, 1),
     F(GetComputerNameA, 2), F(GetUserNameA, 2), F(lstrlenA, 1), F(lstrlenW, 1), F(lstrcpyA, 2), F(lstrcmpiA, 2),

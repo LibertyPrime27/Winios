@@ -392,6 +392,12 @@ final class ProbeViewController: UIViewController {
             ("regtest32.exe", ["read"], 0, "regtest_read32"),
             ("regtest64.exe", ["write"], 0, "regtest_write64"),
             ("regtest64.exe", ["read"], 0, "regtest_read64"),
+            // Structured exception handling. faulttest is the one that is
+            // really device-specific: it faults inside a compiled block and
+            // needs the recovery stub, the signal redirect and the guest
+            // handler to work on real silicon, under a real signal.
+            ("sehtest64.exe", [], 0, "sehtest64"),     ("sehtest32.exe", [], 0, "sehtest32"),
+            ("faulttest64.exe", [], 0, "faulttest64"), ("faulttest32.exe", [], 0, "faulttest32"),
         ]
         let cases = single.map { s in all.filter { $0.0 == s } } ?? all
 

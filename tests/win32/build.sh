@@ -33,6 +33,9 @@ for a in 32 64; do
     # archives and how it finds out where it was installed
     $CC -O2 -s -o filetest$a.exe filetest.c
     $CC -O2 -s -o regtest$a.exe  regtest.c -ladvapi32
+    # structured exception handling: the dispatch, and faults
+    $CC -O2 -s -o sehtest$a.exe   sehtest.c
+    $CC -O2 -s -o faulttest$a.exe faulttest.c
 done
 
 # Not run by the suite: it calls things we do not implement, on purpose.

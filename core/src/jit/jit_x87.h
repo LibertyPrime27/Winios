@@ -263,12 +263,13 @@ static int x87_mem_src(jc *j, const xop *op, int integer, int vt) {
     int w = emit_ea(j, op, T4);
     emit_bounds(j, op->size / 8);
     if (!integer) {
-        if (op->size == 64) { a64_fldst_reg(&j->a, 1, 1, vt, R_BASE, T4, w ? 2 : 3); return vt; }
-        if (op->size == 32) { a64_fldst_reg(&j->a, 0, 1, vt, R_BASE, T4, w ? 2 : 3); a64_fcvt_sd(&j->a, vt, vt); return vt; }
+        if (op->size == 64) { fault_site(j); a64_fldst_reg(&j->a, 1, 1, vt, R_BASE, T4, w ? 2 : 3); return vt; }
+        if (op->size == 32) { fault_site(j); a64_fldst_reg(&j->a, 0, 1, vt, R_BASE, T4, w ? 2 : 3); a64_fcvt_sd(&j->a, vt, vt); return vt; }
         j->failed = 1; return vt;
     }
     if (op->size == 64) {
-        a64_ldr_reg(&j->a, 3, T0, R_BASE, T4, w ? 2 : 3);
+        fault_site(j);
+    a64_ldr_reg(&j->a, 3, T0, R_BASE, T4, w ? 2 : 3);
         a64_scvtf(&j->a, 1, 1, vt, T0);
         a64_fcvtzs(&j->a, 1, 1, T1, vt);
         a64_cmp(&j->a, 1, T0, T1);
@@ -278,6 +279,7 @@ static int x87_mem_src(jc *j, const xop *op, int integer, int vt) {
         j->nz = NZ_NONE;
         return vt;
     }
+    fault_site(j);
     a64_ldrs_reg(&j->a, op->size == 32 ? 2 : 1, 1, T0, R_BASE, T4, w ? 2 : 3);
     a64_scvtf(&j->a, 1, 1, vt, T0);
     return vt;
@@ -470,8 +472,8 @@ static void emit_x87_inner(jc *j) {
             if (ops[0].size == 80) break;
             int w = emit_ea(j, &ops[0], T4);
             emit_bounds(j, ops[0].size / 8);
-            if (ops[0].size == 64) a64_fldst_reg(&j->a, 1, 0, s, R_BASE, T4, w ? 2 : 3);
-            else { x87_unit(j); x87_float_range_guard(j, s); a64_fcvt_ds(&j->a, FT0, s); a64_fldst_reg(&j->a, 0, 0, FT0, R_BASE, T4, w ? 2 : 3); j->x87_ixc = 1; }
+            if (ops[0].size == 64) { fault_site(j); a64_fldst_reg(&j->a, 1, 0, s, R_BASE, T4, w ? 2 : 3); }
+            else { x87_unit(j); x87_float_range_guard(j, s); a64_fcvt_ds(&j->a, FT0, s); fault_site(j); a64_fldst_reg(&j->a, 0, 0, FT0, R_BASE, T4, w ? 2 : 3); j->x87_ixc = 1; }
         } else {
             int i = st_of(&ops[0]);
             int d = fset(j, i);
@@ -507,6 +509,7 @@ static void emit_x87_inner(jc *j) {
         }
         int w = emit_ea(j, &ops[0], T4);
         emit_bounds(j, bits / 8);
+        fault_site(j);
         a64_str_reg(&j->a, ldst_size(bits), T0, R_BASE, T4, w ? 2 : 3);
         uint32_t done = a64_here(&j->a); a64_b(&j->a, 0);
         a64_patch_bcond(&j->a, nan, a64_here(&j->a)); a64_patch_bcond(&j->a, bad, a64_here(&j->a));

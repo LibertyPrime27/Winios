@@ -1,0 +1,19 @@
+64-bit
+
+the frame list is a 32-bit mechanism; skipping the chain test
+
+a vectored handler runs before the frame list:
+  vectored: saw 0xe000abcd before any frame handler
+  unhandled filter: 0xe000abcd reached the end of the chain
+back after the vectored handler declined and the filter continued
+
+nothing takes it:
+  unhandled filter: 0xe0009999 reached the end of the chain
+RaiseException returned after the filter continued execution
+
+IsBadReadPtr(NULL, 4): 1 (want 1)
+IsBadReadPtr(&g_valid, 4): 0 (want 0)
+IsBadReadPtr(&g_valid, 0): 0 (want 0)
+
+handlers ran in this order: 4 5 5
+  (2 inner, 3 outer, 4 vectored, 5 unhandled filter)

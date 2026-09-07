@@ -32,14 +32,20 @@
  * Guest addresses go through x25, the arena base: `ldr w0, [x25, w1, uxtw]`
  * is the 32-bit guest's base + zext32(addr) at no extra cost, and with x25 =
  * 0 the same form is the 64-bit guest's identity mapping. A guest access to
- * unmapped memory is a host fault today; the signal-to-guest-fault bridge is
- * the runtime's job later.
+ * unmapped memory is a host fault, and each one carries an out-of-line
+ * recovery stub so the runtime can turn it back into a guest fault with the
+ * register state the faulting instruction had -- see "turning a host fault
+ * into a guest one" below.
  *
  * Verification
  * ------------
  * The self-test replays the golden vectors through this path, so the JIT is
  * held to the same silicon recordings as the interpreter; the block cache's
- * byte check makes self-modifying code safe here too.
+ * byte check makes self-modifying code safe here too. test_jitdiff compares
+ * final state against the interpreter over the whole differential suite, and
+ * test_faultdiff does the same for state at a fault -- against what x86 says
+ * it should be, rather than against the interpreter, since a faulting
+ * instruction has no effect and that pins the answer exactly.
  *
  * Host: AArch64 only. On other hosts xc_jit_available() is 0 and xc_run
  * uses the interpreter.
@@ -209,7 +215,32 @@ static link_rec *g_links;
 static int g_chain = -1;
 #endif
 
-void xc_jit_code_reset(void) { g_code_used = 0; g_nlinks = 0; }
+/* Recovery stubs: see "turning a host fault into a guest one" below. */
+typedef struct { uint64_t at, stub, rip; } faultsite;   /* the access, its recovery stub, the guest instruction */
+enum { MAX_FAULT_SITES = 16384, MAX_BLOCK_SITES = 384 };
+static faultsite g_fsite[MAX_FAULT_SITES];
+static int g_nfsite;
+
+void xc_jit_code_reset(void) { g_code_used = 0; g_nlinks = 0; g_nfsite = 0; }
+
+/* The recovery stub for a host PC, or NULL if that PC is not a guest memory
+ * access this compiler emitted. An exact match is required and is what makes
+ * the answer trustworthy: the PC either is one of the recorded ldr/str
+ * instructions or it is something else entirely, and there is no third case
+ * to guess about. */
+void *xc_jit_fault_stub(uint64_t host_pc, uint64_t *guest_rip) {
+    int lo = 0, hi = g_nfsite - 1;
+    while (lo <= hi) {
+        int m = (lo + hi) / 2;
+        if (g_fsite[m].at == host_pc) {
+            if (guest_rip) *guest_rip = g_fsite[m].rip;
+            return (void *)(uintptr_t)g_fsite[m].stub;
+        }
+        if (g_fsite[m].at < host_pc) lo = m + 1; else hi = m - 1;
+    }
+    return 0;
+}
+uint64_t xc_jit_fault_sites(void) { return (uint64_t)g_nfsite; }
 
 #if XC_JIT_HOST
 void xc_jit_unlink(block *b) {
@@ -374,7 +405,7 @@ static int jit_cc(xc_cpu *c, int cc) {
 }
 static int jit_cf(xc_cpu *c) { xc_flags_sync(c); return (int)(c->rflags & 1); }
 /* A guest address outside a bounded arena: report it as the interpreter would. */
-static void jit_fault(xc_cpu *c, uint64_t addr, uint64_t rip) { c->stop = XC_STOP_FAULT; c->fault_addr = addr; c->rip = rip; }
+static void jit_fault(xc_cpu *c, uint64_t addr, uint64_t rip) { c->stop = XC_STOP_FAULT; c->fault_kind = XC_FAULT_MEM; c->fault_addr = addr; c->rip = rip; }
 static void jit_sync(xc_cpu *c) { xc_flags_sync(c); }
 
 /* --------------------------------------------------------- the compiler */
@@ -476,6 +507,105 @@ static void flush(jc *j) { spill(j); j->dirty = 0; j->xdirty = 0; x87_flushed(j)
  * the prologue would only make the cold path and the link stubs longer. */
 static void invalidate(jc *j) { j->loaded = j->dirty = 0; j->xloaded = j->xdirty = 0; j->invalidated = 1; x87_invalidate(j); }
 
+/* ---------------------------------------- turning a host fault into a guest one
+ *
+ * A 32-bit guest's arena is a 4 GB reservation with only the pages the guest
+ * has claimed mapped over it, so a guest dereference of a stray pointer is a
+ * *host* SIGSEGV, at the very ldr/str this compiler emitted for it. To hand
+ * that to the guest as an access violation the runtime needs the guest's
+ * register state at that instruction -- and at that instruction the state is
+ * in host registers, written back to the cpu struct only at block boundaries.
+ *
+ * Reconstructing it in C would mean a second implementation of everything
+ * spill() knows -- which host register holds which guest register, the x87
+ * renaming, the tag word, the pending FPSR fold -- kept in step with the
+ * first by hand, in the one place where a disagreement is hardest to notice.
+ *
+ * So the generated code does it. Every guest memory access gets an
+ * out-of-line *recovery stub* holding exactly the spill sequence for that
+ * point in the block, and the signal handler moves the host PC to the stub
+ * and returns. The stub writes every live register back and leaves through
+ * the dispatcher, which returns XC_STOP_FAULT with a cpu struct as consistent
+ * as if the block had ended there -- so the runtime can raise a guest
+ * exception, and a handler that repairs a register and resumes lands back in
+ * a freshly compiled block.
+ *
+ * The guest RIP is not baked into the stub: the handler already writes
+ * cpu->stop and the fault address, and the side table can hand it the RIP as
+ * well. That leaves the stub a pure function of the spill state, so every
+ * access in a block that has the same registers live shares one -- which in
+ * a straight-line block is a handful of stubs rather than one per access.
+ *
+ * Nothing is added to the fast path. The cost is code size, in blocks that
+ * touch memory.
+ */
+/* Per-block, during compilation: where each access is and the whole compile
+ * state at that point, so the stub can be emitted afterwards by the same
+ * emitters that would have run there. */
+typedef struct {
+    uint32_t off;               /* word offset of the faulting instruction */
+    uint32_t stub_off;          /* word offset of its recovery stub */
+    uint64_t rip;               /* the guest instruction to report and resume at */
+    int rsp_fix, rsp_sf;        /* undo a stack adjustment the lowering made early (push) */
+    jc snap;                    /* compile state at the access; `a` is zeroed so states compare */
+} psite;
+static psite g_psite[MAX_BLOCK_SITES];
+static int g_npsite;
+
+/* Called immediately before emitting a guest memory access.
+ *
+ * `rsp_fix` exists for push: the lowering decrements the guest SP and then
+ * stores, but x86 reports a faulting push with the SP it had before the
+ * instruction, so the stub adds it back. Every other access leaves the guest
+ * registers exactly as they were before the instruction, which is what makes
+ * resuming at `rip` correct. */
+static void fault_site_fix(jc *j, int rsp_fix, int rsp_sf) {
+    if (j->probe || g_npsite >= MAX_BLOCK_SITES) return;
+    psite *p = &g_psite[g_npsite++];
+    p->off = a64_here(&j->a);
+    p->rip = j->d ? j->d->rip : 0;
+    p->rsp_fix = rsp_fix; p->rsp_sf = rsp_sf;
+    p->snap = *j;
+    memset(&p->snap.a, 0, sizeof p->snap.a);        /* the buffer is not part of the state */
+}
+static void fault_site(jc *j) { fault_site_fix(j, 0, 0); }
+
+/* After the block body: one stub per distinct spill state. */
+static void emit_fault_stubs(jc *j) {
+    if (j->probe || !g_npsite) return;
+    jc after = *j;                                  /* state at the end of the body */
+    for (int i = 0; i < g_npsite; i++) {
+        psite *p = &g_psite[i];
+        int share = -1;
+        for (int k = 0; k < i && share < 0; k++)
+            if (g_psite[k].rsp_fix == p->rsp_fix && g_psite[k].rsp_sf == p->rsp_sf &&
+                !memcmp(&g_psite[k].snap, &p->snap, sizeof(jc)))
+                share = k;
+        if (share >= 0) { p->stub_off = g_psite[share].stub_off; continue; }
+        p->stub_off = a64_here(&j->a);
+        a64 keep = j->a;
+        *j = p->snap; j->a = keep;                  /* emit as if we were back at the access */
+        if (p->rsp_fix) a64_add_imm(&j->a, p->rsp_sf, HREG[XC_RSP], HREG[XC_RSP], (uint32_t)p->rsp_fix);
+        spill(j);
+        a64_br(&j->a, R_DISP);
+        keep = j->a; *j = after; j->a = keep;
+    }
+}
+
+/* Register the block's sites once it has compiled without overflowing. Blocks
+ * are emitted forward through one bump-allocated arena, so appending keeps
+ * the table sorted by host address and the lookup is a binary search. */
+static void register_fault_sites(const jc *j) {
+    if (j->probe) return;
+    uint64_t base = (uint64_t)(uintptr_t)RX(j->a.buf);
+    for (int i = 0; i < g_npsite && g_nfsite < MAX_FAULT_SITES; i++) {
+        g_fsite[g_nfsite].at = base + 4u * g_psite[i].off;
+        g_fsite[g_nfsite].stub = base + 4u * g_psite[i].stub_off;
+        g_fsite[g_nfsite].rip = g_psite[i].rip;
+        g_nfsite++;
+    }
+}
+
 /* Address of a memory operand into `rd`. Returns 1 if the address is a
  * 32-bit quantity (use uxtw addressing), 0 if 64-bit. */
 static int emit_ea(jc *j, const xop *op, int rd) {
@@ -550,6 +680,7 @@ static int ld_op(jc *j, const xop *op, int rd, int sext) {
         int w = emit_ea(j, op, T4);
         int opt = w ? 2 : 3;
         emit_bounds(j, bits / 8);
+        fault_site(j);
         if (sext && bits < 64) a64_ldrs_reg(&j->a, ldst_size(bits), 1, rd, R_BASE, T4, opt);
         else a64_ldr_reg(&j->a, ldst_size(bits), rd, R_BASE, T4, opt);
         return rd;
@@ -579,6 +710,7 @@ static void st_op(jc *j, const xop *op, int rs) {
     if (op->type == XOP_MEM) {
         int w = emit_ea(j, op, T4);
         emit_bounds(j, bits / 8);
+        fault_site(j);
         a64_str_reg(&j->a, ldst_size(bits), rs, R_BASE, T4, w ? 2 : 3);
         return;
     }
@@ -940,18 +1072,33 @@ static void emit_push_reg(jc *j, int rval) {         /* rval holds a stack-width
     a64_sub_imm(&j->a, sf, rsp, rsp, sw / 8);
     gdirty(j, XC_RSP);
     if (j->bound) { a64_mov_reg(&j->a, 1, T4, rsp); emit_bounds(j, sw / 8); }
+    fault_site_fix(j, sw / 8, sf);              /* the SP is already down; x86 reports the old one */
     a64_str_reg(&j->a, sf ? 3 : 2, rval, R_BASE, rsp, sf ? 3 : 2);
 }
 static void emit_pop_to(jc *j, int rd) {
     int sw = j->d->in.stack_width, sf = sw == 64;
     int rsp = greg(j, XC_RSP);
     if (j->bound) { a64_mov_reg(&j->a, 1, T4, rsp); emit_bounds(j, sw / 8); }
+    fault_site(j);
     a64_ldr_reg(&j->a, sf ? 3 : 2, rd, R_BASE, rsp, sf ? 3 : 2);
     a64_add_imm(&j->a, sf, rsp, rsp, sw / 8);
     gdirty(j, XC_RSP);
 }
 
 /* ------------------------------------------------------- per instruction */
+
+/* Can this instruction touch guest memory, and so fault?
+ *
+ * Asked of every operand rather than of the mnemonic, because Zydis decodes
+ * the implicit ones too: the stack slot a push writes and a call pushes its
+ * return address into are memory operands here, so there is no list of
+ * special cases to keep up to date. LEA is the one instruction with a memory
+ * operand it never accesses. */
+static int insn_can_fault(const ZydisDecodedInstruction *in, const xop *ops) {
+    if (in->mnemonic == ZYDIS_MNEMONIC_LEA) return 0;
+    for (int k = 0; k < in->operand_count; k++) if (ops[k].type == XOP_MEM) return 1;
+    return 0;
+}
 
 /* Which flag bits an instruction reads / writes, for the liveness pass. */
 enum { FW_ALL = 1, FW_PART = 2, FR = 4 };
@@ -1190,6 +1337,14 @@ static void *compile(xc_cpu *c, block *b) {
         live[i] = (uint8_t)l;
         int u = flag_use(&insns[i].in, xc_cache_ops(&insns[i]));
         if (u & FR) l = 1; else if (u & FW_ALL) l = 0;
+        /* An instruction that can fault reads the flags too. A fault leaves
+         * the block for a guest exception handler, which is entitled to the
+         * architectural flags -- and those are the ones the *previous*
+         * instruction left, because a faulting instruction has no effect.
+         * Without this, a flag computation that nothing in the block reads
+         * gets dropped, and a handler is handed flags the program never had.
+         * Caught by test_faultdiff, which is what it is for. */
+        if (insn_can_fault(&insns[i].in, xc_cache_ops(&insns[i]))) l = 1;
     }
 
     code_write_begin();
@@ -1217,6 +1372,7 @@ static void *compile(xc_cpu *c, block *b) {
         j.bound = (c->mode == XC_MODE_32 && c->mem->size < (1ull << 32)) ? c->mem->size : 0;
         j.probe = pass == 0;
 
+        g_npsite = 0;
         emit_reg_loads(&j.a, livein);            /* nothing on the probe pass */
         warm = a64_here(&j.a);                   /* chained predecessors enter here */
         j.loaded = (uint16_t)livein; j.xloaded = (uint16_t)(livein >> 16);
@@ -1244,10 +1400,14 @@ static void *compile(xc_cpu *c, block *b) {
         /* fell off the end (block ended at a decode failure or MAX_BLOCK): continue sequentially */
         if (!j.ended) { const dinsn *last = &insns[b->count - 1]; emit_exit_imm(&j, last->rip + last->in.length); }
 
+        /* after the body, and after its exit: the stubs never fall through */
+        emit_fault_stubs(&j);
+
         if (j.a.overflow) { code_write_end(j.a.buf, 0, RX(j.a.buf)); return 0; }
         if (pass == 0) livein = j.lazy;   /* pass 1 preloads them, so its own lazy set is empty */
         bytes = (size_t)j.a.n * 4;
     }
+    register_fault_sites(&j);
     void *rx = RX(j.a.buf);
     code_write_end(j.a.buf, bytes, rx);
     if (getenv("XCORE_JIT_DUMP")) {          /* raw code for `objdump -D -b binary -m aarch64` */

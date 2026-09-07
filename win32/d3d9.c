@@ -497,10 +497,10 @@ static const w32_api d3d9_methods[17] = {
     [16] = { "CreateDevice",                 7, 0, i_CreateDevice,                0 },
 };
 
-static w32_com_class cls_d3d9    = { "IDirect3D9",        d3d9_methods,    17,  TAG_D3D9,    0, {0,0,0} };
-static w32_com_class cls_device  = { "IDirect3DDevice9",  device_methods,  119, TAG_DEVICE,  0, {0,0,0} };
-static w32_com_class cls_surface = { "IDirect3DSurface9", surface_methods, 17,  TAG_SURFACE, 0, {0,0,0} };
-static w32_com_class cls_vbuf    = { "IDirect3DVertexBuffer9", vbuf_methods, 14, TAG_VERTEXBUFFER, 0, {0,0,0} };
+static w32_com_class cls_d3d9    = { "IDirect3D9",        d3d9_methods,    17,  TAG_D3D9,    0, {0} };
+static w32_com_class cls_device  = { "IDirect3DDevice9",  device_methods,  119, TAG_DEVICE,  0, {0} };
+static w32_com_class cls_surface = { "IDirect3DSurface9", surface_methods, 17,  TAG_SURFACE, 0, {0} };
+static w32_com_class cls_vbuf    = { "IDirect3DVertexBuffer9", vbuf_methods, 14, TAG_VERTEXBUFFER, 0, {0} };
 
 /* --------------------------------------------------------- the export */
 

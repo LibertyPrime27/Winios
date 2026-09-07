@@ -49,10 +49,16 @@ jobs:
         run: |
           sudo apt-get install -y --no-install-recommends qemu-user gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
           cmake -S . -B build-a64 -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64-linux.cmake -DCMAKE_BUILD_TYPE=Release -DWINIOS_D12MT=OFF
-          cmake --build build-a64 -j"$(nproc)" --target test_selftest test_jitdiff test_bench test_winrun_lib xrun winrun
+          cmake --build build-a64 -j"$(nproc)" --target test_selftest test_jitdiff test_faultdiff test_bench test_winrun_lib xrun winrun
           Q="qemu-aarch64 -L /usr/aarch64-linux-gnu"
           $Q build-a64/test_selftest
           $Q build-a64/test_jitdiff 24
+          # what a fault inside a compiled block reports, against what x86
+          # says it should report. Needs the host to deliver a guest fault as
+          # a signal it can attribute to the faulting instruction, which
+          # qemu-user does now that the interpreter's accesses are plain
+          # loads and stores rather than calls into memcpy.
+          $Q build-a64/test_faultdiff 24
           $Q build-a64/test_bench 50000
           $Q build-a64/test_winrun_lib tests/win32
           printf '#!/bin/sh\nexec %s %s/build-a64/winrun "$@"\n' "$Q" "$PWD" > /tmp/winrun-q && chmod +x /tmp/winrun-q
@@ -147,7 +153,7 @@ jobs:
         run: |
           set +e
           cmake -S . -B build-mac -DCMAKE_BUILD_TYPE=Release -DWINIOS_D12MT=OFF 2>&1 | tail -3
-          cmake --build build-mac -j3 --target test_selftest test_arena32 test_jitdiff test_bench test_winrun_lib winrun 2>&1 | grep -E "error|warning: |Built target" | head -20
+          cmake --build build-mac -j3 --target test_selftest test_arena32 test_jitdiff test_faultdiff test_bench test_winrun_lib winrun 2>&1 | grep -E "error|warning: |Built target" | head -20
           uname -m; sysctl -n machdep.cpu.brand_string || true; echo "page size $(getconf PAGESIZE)"
           # GitHub keeps at most 10 notice annotations per step, so the run page
           # gets one line per suite; the full outputs go to the job summary
@@ -159,6 +165,11 @@ jobs:
           out3=$(./build-mac/test_arena32 2>&1); rc3=$?
           out4=$(./build-mac/test_jitdiff 100 2>&1); rc4=$?
           echo "$out4" | tail -1 | while IFS= read -r l; do echo "::notice::jitdiff: ${l}"; done
+          # real hardware, real signals: what a fault inside a compiled block
+          # reports, against what x86 says it should report
+          out8=$(./build-mac/test_faultdiff 100 2>&1); rc8=$?
+          echo "$out8" | tail -1 | while IFS= read -r l; do echo "::notice::faultdiff: ${l}"; done
+          echo "$out8" | grep -E '^  \[' | head -8 | while IFS= read -r l; do echo "::error::faultdiff: ${l}"; done
           out6=$(./build-mac/test_bench 200000 2>&1); rc6=$?
           echo "$out6" | grep -E "interp|x87" | head -4 | while IFS= read -r l; do echo "::notice::bench: ${l}"; done
           out5=$(sh tests/win32/run.sh build-mac/winrun tests/win32 2>&1); rc5=$?
@@ -166,10 +177,10 @@ jobs:
           echo "$out5" | grep -E '^FAIL|winrun: host SIG' | head -8 | while IFS= read -r l; do echo "::error::win32: ${l}"; done
           out7=$(./build-mac/test_winrun_lib tests/win32 2>&1); rc7=$?
           echo "$out7" | tail -1 | while IFS= read -r l; do echo "::notice::winrun-lib: ${l}"; done
-          echo "rc jit=$rc interp=$rc2 arena=$rc3 jitdiff=$rc4 win32=$rc5 bench=$rc6 winrunlib=$rc7"
+          echo "rc jit=$rc interp=$rc2 arena=$rc3 jitdiff=$rc4 faultdiff=$rc8 win32=$rc5 bench=$rc6 winrunlib=$rc7"
           {
             echo "## Apple silicon ($(uname -m), $(getconf PAGESIZE)-byte pages)"
-            echo "rc: jit=$rc interp=$rc2 arena=$rc3 jitdiff=$rc4 win32=$rc5"
+            echo "rc: jit=$rc interp=$rc2 arena=$rc3 jitdiff=$rc4 faultdiff=$rc8 win32=$rc5"
             echo; echo "### test_selftest (jit)"; echo '```'; echo "$out" | tail -30; echo '```'
             echo "### test_selftest (interpreter)"; echo '```'; echo "$out2" | tail -3; echo '```'
             echo "### test_arena32"; echo '```'; echo "$out3" | tail -5; echo '```'
@@ -178,7 +189,7 @@ jobs:
             echo "### winrun as a library (repeat runs)"; echo '```'; echo "$out7" | tail -5; echo '```'
             echo "### Win32 guests"; echo '```'; echo "$out5" | tail -80; echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          [ $rc -eq 0 ] && [ $rc2 -eq 0 ] && [ $rc3 -eq 0 ] && [ $rc4 -eq 0 ] && [ $rc5 -eq 0 ] && [ $rc6 -eq 0 ] && [ $rc7 -eq 0 ]
+          [ $rc -eq 0 ] && [ $rc2 -eq 0 ] && [ $rc3 -eq 0 ] && [ $rc4 -eq 0 ] && [ $rc5 -eq 0 ] && [ $rc6 -eq 0 ] && [ $rc7 -eq 0 ] && [ $rc8 -eq 0 ]
 
       - name: Install XcodeGen
         run: brew install xcodegen

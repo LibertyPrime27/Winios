@@ -43,6 +43,8 @@ typedef struct {
 typedef struct {
     const char    *name;         /* "kernel32.dll" */
     const w32_api *apis;         /* terminated by name == NULL */
+    const w32_api *apis2;        /* a second table, or NULL: one DLL's exports
+                                  * may be implemented in more than one file */
     uint64_t       hmodule;      /* fake module base */
 } w32_dll;
 
@@ -131,6 +133,8 @@ struct w32 {
 
     /* run state */
     int       exited, exit_code;
+    int       redirected;        /* a host implementation set rip/rsp itself:
+                                  * the stub dispatcher must not return for it */
     int       depth;
     uint64_t  atexit_fns[64]; int natexit;
 
@@ -197,11 +201,25 @@ void     w32_com_reset(void);                               /* a new process: fo
 void     w32_com_QueryInterface(w32 *w);                    /* IUnknown, shared by every interface */
 void     w32_com_AddRef(w32 *w);
 void     w32_com_Release(w32 *w);
+
+/* structured exception handling (seh.c) */
+void     w32_context_save(w32 *w, uint64_t ctx);            /* CPU -> guest CONTEXT */
+void     w32_context_load(w32 *w, uint64_t ctx);            /* guest CONTEXT -> CPU */
+/* Raise an exception in the guest. 1 if a handler took it and the CPU is set
+ * up to carry on, 0 if nothing did -- then the caller ends the run. */
+int      w32_raise(w32 *w, uint32_t code, uint32_t flags, uint64_t exc_addr,
+                   int nparams, const uint64_t *params);
+int      w32_fault_to_exception(w32 *w);                    /* a CPU fault, as the exception Windows would raise */
+const char *w32_exception_name(uint32_t code);
+uint32_t w32_last_exception(uint64_t *addr);                /* what ended the run, for the report */
+void     w32_seh_reset(void);
 /* one int3 stub bound to `api`, or a named "not implemented" stub when it is NULL */
 uint64_t w32_stub_alloc(w32 *w, const w32_dll *dll, const w32_api *api, char *missing);
 
 /* the DLLs */
 extern const w32_api w32_kernel32[];
+extern const w32_api w32_seh_kernel32[];
+extern const w32_api w32_seh_ntdll[];
 extern const w32_api w32_msvcrt[];
 extern const w32_api w32_ntdll[];
 extern const w32_api w32_user32[];
