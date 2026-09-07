@@ -9,11 +9,9 @@ import UniformTypeIdentifiers
 /// — a virtual C: — because a security-scoped URL from the Files app is not
 /// something a PE loader can keep hold of.
 ///
-/// The first thing shown is never the program's output. It is the **import
-/// report**: what the executable needs and what nothing here can satisfy. For
-/// anything real that list will be long, and it is the useful answer — "this
-/// cannot run yet, and here is exactly what is missing" beats a crash every
-/// time, and the list is the work queue.
+/// This only copies and reports where things landed. What to do next — the
+/// import report, or a run — is the caller's decision, so the picking is not
+/// entangled with what the library happens to want today.
 final class ExeBrowser: NSObject, UIDocumentPickerDelegate {
 
     static let shared = ExeBrowser()
@@ -62,7 +60,9 @@ final class ExeBrowser: NSObject, UIDocumentPickerDelegate {
             return
         }
 
-        // A folder: find the executables inside it and report on each.
+        // A folder: find the executables inside it. The first one is offered
+        // as the thing to run; a program with several is rare and the library
+        // entry can be pointed at a different one later.
         var exes: [URL] = []
         if isDir.boolValue {
             let all = (try? fm.contentsOfDirectory(at: target, includingPropertiesForKeys: nil)) ?? []
@@ -75,18 +75,9 @@ final class ExeBrowser: NSObject, UIDocumentPickerDelegate {
             exes = [target]
         }
 
-        DispatchQueue.global(qos: .userInitiated).async {
-            var text = "copied to the app's C: drive: \(target.lastPathComponent)\n"
-            if isDir.boolValue { text += "\(exes.count) executable(s) inside\n" }
-            for exe in exes.prefix(8) {
-                var buf = [CChar](repeating: 0, count: 65536)
-                _ = exe.path.withCString { win_probe_imports($0, &buf, buf.count) }
-                text += "\n" + String(repeating: "─", count: 40) + "\n"
-                text += String(cString: buf)
-            }
-            if exes.count > 8 { text += "\n(\(exes.count - 8) more not examined)\n" }
-            DispatchQueue.main.async { self.onReport?(text, exes.first) }
-        }
+        var text = "copied to C:\\ as \(target.lastPathComponent)"
+        if isDir.boolValue { text += " — \(exes.count) executable(s) inside" }
+        onReport?(text, exes.first)
     }
 
     func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {

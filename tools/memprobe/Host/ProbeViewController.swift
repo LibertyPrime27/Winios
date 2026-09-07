@@ -44,7 +44,7 @@ final class ProbeViewController: UIViewController {
         // C:\ for anything the user opens: the app's own storage, so a program
         // copied in from Files can open its data with the paths it shipped with.
         if let c = ExeBrowser.driveC { c.path.withCString { w32_set_drive_c($0) } }
-        title = "winios probes · \(DeviceInfo.modelIdentifier)"
+        title = "Diagnostics · \(DeviceInfo.modelIdentifier)"
         view.backgroundColor = .systemBackground
 
         results.isEditable = false
@@ -69,9 +69,7 @@ final class ProbeViewController: UIViewController {
             button("8 · Run a Windows program full screen (live frames)", #selector(runGuest)),
             button("4 · JIT: attach StikDebug, then execute in a blessed arena", #selector(attachJIT)),
             button("9 · JIT arena: try a bigger one next launch", #selector(stepArena)),
-            row([("Open an .exe…", #selector(openExe)), ("Run it", #selector(runPicked))]),
-            row([("Stop the running program", #selector(stopGuest)), ("Copy report", #selector(copyReport))]),
-            row([("Reset results", #selector(resetAll))]),
+            row([("Copy report", #selector(copyReport)), ("Reset results", #selector(resetAll))]),
             frameView,
             results,
         ])
@@ -138,7 +136,7 @@ final class ProbeViewController: UIViewController {
             body()
             DispatchQueue.main.async {
                 self.running = false
-                self.title = "winios probes · \(DeviceInfo.modelIdentifier)"
+                self.title = "Diagnostics · \(DeviceInfo.modelIdentifier)"
                 self.refresh()
             }
         }
@@ -187,52 +185,6 @@ final class ProbeViewController: UIViewController {
         vc.modalPresentationStyle = .fullScreen
         present(vc, animated: true)
     }
-    /// The user's own executable, rather than one we shipped. What comes back
-    /// first is the import report -- what it needs and what is missing --
-    /// because for anything real that is the answer, and the list is the work
-    /// queue. Running it is a second, separate decision.
-    private var pickedExe: URL?
-    @objc private func openExe() {
-        guard !running else { return }
-        ExeBrowser.shared.pick(from: self) { [weak self] report, exe in
-            guard let self else { return }
-            self.pickedExe = exe
-            self.winLine = report
-            self.refresh()
-        }
-    }
-    /// Stop whatever is running. Safe to tap when nothing is: the flag is
-    /// cleared at the start of every run.
-    @objc private func stopGuest() {
-        win_probe_request_stop()
-        title = "stopping…"
-    }
-
-    /// Run whatever was picked. It may well not get far -- that is what the
-    /// import report was for -- so the output is captured either way.
-    @objc private func runPicked() {
-        guard let exe = pickedExe else {
-            winLine = "nothing picked yet — use \"Open an .exe…\" first"
-            refresh(); return
-        }
-        work("picked exe") {
-            if let arena = self.ensureArena() { _ = self.handArenaToXcore(arena) }
-            var out = [CChar](repeating: 0, count: 262144)
-            var ns: UInt64 = 0
-            xc_jit_enable(1)
-            // keep_going: one run names everything it needed, not just the
-            // first thing it tripped on. 120 s so a runaway cannot wedge the
-            // app -- Stop ends it sooner.
-            let rc = exe.path.withCString { win_probe_run_ex($0, 1, 120, &out, out.count, &ns) }
-            xc_jit_enable(0)
-            var text = "\(exe.lastPathComponent) exited \(rc) after \(ns / 1_000_000) ms\n\n"
-            text += String(cString: out)
-            if rc == 127 { text += "\n(127: it called something we cannot even return from — see the report)\n" }
-            if rc == 124 { text += "\n(124: stopped by the time limit or the Stop button)\n" }
-            DispatchQueue.main.async { self.winLine = text; self.refresh() }
-        }
-    }
-
     @objc private func clearFrame() {
         frameImage = nil
         DispatchQueue.main.async { self.frameView.image = nil; self.frameView.isHidden = true }

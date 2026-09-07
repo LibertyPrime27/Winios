@@ -18,6 +18,9 @@ import QuartzCore
 final class GuestViewController: UIViewController {
 
     private let exeName: String
+    /// Where the executable lives. nil means the guests we bundled; a library
+    /// program passes the app's C: drive.
+    private let root: URL?
     private var layerView = MetalFrameView()
     private let hud = UILabel()
     private var link: CADisplayLink?
@@ -28,8 +31,9 @@ final class GuestViewController: UIViewController {
     private var started = CFAbsoluteTimeGetCurrent()
     private var output = ""
 
-    init(exe: String) {
+    init(exe: String, root: URL? = nil) {
         self.exeName = exe
+        self.root = root
         super.init(nibName: nil, bundle: nil)
     }
     required init?(coder: NSCoder) { fatalError("not used") }
@@ -77,7 +81,7 @@ final class GuestViewController: UIViewController {
         l.add(to: .main, forMode: .common)
         link = l
 
-        guard let dir = Bundle.main.resourceURL?.appendingPathComponent("win32") else {
+        guard let dir = root ?? Bundle.main.resourceURL?.appendingPathComponent("win32") else {
             hud.text = "guests not bundled"
             return
         }

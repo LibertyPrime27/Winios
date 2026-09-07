@@ -1,4 +1,39 @@
-# MemProbe — measuring the app-extension memory limit
+# MemProbe — the app, and the probes underneath it
+
+## The app
+
+The front door is a **library** of Windows programs on the device. `+` adds one
+— a folder for anything real, since a program is rarely a single file — and
+copies it into the app's own storage, which is the guest's `C:` drive. A
+security-scoped URL from the Files app is not something a PE loader can hold
+on to, so it has to be copied rather than referenced.
+
+Every row says what is known before it is tapped: bitness, and how many of the
+program's imports nothing here can satisfy. For anything real that second
+number is large, and saying so up front is more use than letting someone tap
+Run and watch it stop.
+
+A program has two ways to run, and the difference is the point:
+
+- **Run** carries on past functions we have not implemented — each logs itself
+  and returns zero — so one run names *everything* the program wanted. That is
+  how to find out what to build next. It is not a way to run something for
+  real: zero is failure for most of the Win32 API but success for some, so a
+  program in this mode can wander somewhere real Windows would never have let
+  it go.
+- **Run strictly** stops at the first missing function, which is the honest
+  answer to "does this work yet".
+
+Either way the output ends with the run report, and it is kept — whoever reads
+it is usually not whoever tapped the button. **Full screen** is for a program
+that draws: its frames as they arrive, with a Stop that ends it by making
+`Present` fail rather than reaching into running guest code.
+
+The probes below were the whole app for as long as there was nothing to run.
+They are one tap away under **Diagnostics**, and they are still how you tell
+"this program is broken" from "this device is broken".
+
+## Measuring the app-extension memory limit
 
 **Why this exists.** Whether 64-bit Windows games (Fallout 4) are reachable on
 iOS comes down to one unmeasured number: how much resident memory an iOS app
@@ -246,17 +281,6 @@ to see the GPU result again.
   happens may be a fatal SIGTRAP and otherwise the finding is lost. **Reset
   results** clears the in-flight attempt but keeps what the ladder has learnt —
   those are facts about the device, not results.
-- **Open an .exe… / Run it** — a Windows program the user chose, rather than one
-  we shipped. A folder can be picked as well as a single file, because a game is
-  never one file, and everything is copied into the app's own storage — a
-  virtual `C:` — since a security-scoped URL from the Files app is not something
-  a PE loader can hold on to.
-
-  What comes back first is never the program's output: it is the **import
-  report**, what the executable needs and what nothing here can satisfy. For
-  anything real that list will be long, and it is the useful answer. "This
-  cannot run yet, and here is exactly what is missing" beats a crash, and the
-  list is the work queue. **Run it** is a separate, second decision.
 - **6 · Memory ladder** — the ladder on its own.
 
   A note on what the numbers are measured on: every probe runs at
