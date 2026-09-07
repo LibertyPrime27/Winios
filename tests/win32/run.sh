@@ -4,6 +4,8 @@
 # checked by hand / against the Linux build of the same source).
 #   run.sh <winrun> <dir>
 winrun=$(cd "$(dirname "$1")" && pwd)/$(basename "$1"); cd "$2" || exit 2; fail=0
+# C:\ for the guests that use absolute paths. Everything else ignores it.
+WINRUN_DRIVE_C=$PWD/cdrive; export WINRUN_DRIVE_C
 check() {   # name expected_rc args...
     name=$1; erc=$2; shift 2
     got=$("$winrun" "./$name" "$@" 2>/tmp/winrun_err.$$); rc=$?
@@ -30,6 +32,8 @@ check d3dframe64.exe 0
 check d3dframe32.exe 0
 check d3dloop64.exe 0 12
 check d3dloop32.exe 0 12
+check pathtest64.exe 0
+check pathtest32.exe 0
 check d3ddraw64.exe 0
 check d3ddraw32.exe 0
 rm -f /tmp/winrun_err.$$

@@ -203,6 +203,11 @@ void w32_raster_triangle(void *target, int width, int height, int pitch,
                          const float *xy1, uint32_t c1,
                          const float *xy2, uint32_t c2);
 
+/* kernel32.c: where C:\ is on the host. NULL or "" keeps the command-line
+ * behaviour (absolute guest paths become relative); the app sets it to its own
+ * storage so a program copied in from Files finds its data. */
+void w32_set_drive_c(const char *path);
+
 /* msvcrt.c: drop every cached guest address, so a second process can start
  * in the same host process (see winrun_main). */
 void w32_reset_statics(void);

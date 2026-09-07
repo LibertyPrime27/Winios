@@ -645,15 +645,16 @@ int winrun_main(int argc, char **argv) {
         if (!strcmp(argv[ai], "-v")) w->verbose++;
         else if (!strcmp(argv[ai], "-vv")) w->verbose += 2;
         else if (!strcmp(argv[ai], "-imports")) w->imports_only = 1;
+        else if (!strcmp(argv[ai], "-C") && ai + 1 < argc) { w32_set_drive_c(argv[ai + 1]); ai++; }
         else if (!strcmp(argv[ai], "-L") && ai + 1 < argc) {       /* extra directory to find guest DLLs in */
             static char dir[512];
             snprintf(dir, sizeof dir, "%s%s", argv[ai + 1], argv[ai + 1][strlen(argv[ai + 1]) - 1] == '/' ? "" : "/");
             w->dll_dir = dir; ai++;
         }
-        else { fprintf(stderr, "usage: winrun [-v] [-imports] [-L dlldir] program.exe [args...]\n"); return 2; }
+        else { fprintf(stderr, "usage: winrun [-v] [-imports] [-C drive_c] [-L dlldir] program.exe [args...]\n"); return 2; }
         ai++;
     }
-    if (ai >= argc) { fprintf(stderr, "usage: winrun [-v] [-imports] [-L dlldir] program.exe [args...]\n"); return 2; }
+    if (ai >= argc) { fprintf(stderr, "usage: winrun [-v] [-imports] [-C drive_c] [-L dlldir] program.exe [args...]\n"); return 2; }
     w->exe_path = argv[ai];
 
     /* bitness decides the memory model, so peek at the header first */
@@ -677,6 +678,7 @@ int winrun_main(int argc, char **argv) {
         xc_mem_init_identity(w->mem);
         xc_cpu_init(w->c, XC_MODE_64, w->mem);
     }
+    { const char *c = getenv("WINRUN_DRIVE_C"); if (c && *c) w32_set_drive_c(c); }
     stubs_init(w);
     { const char *ppm = getenv("WINRUN_PRESENT_PPM"); if (ppm) w32_set_present(present_ppm, (void *)ppm); }
     /* TEB/PEB/stack/heap first (TLS callbacks need them); they come from the

@@ -246,6 +246,17 @@ to see the GPU result again.
   happens may be a fatal SIGTRAP and otherwise the finding is lost. **Reset
   results** clears the in-flight attempt but keeps what the ladder has learnt —
   those are facts about the device, not results.
+- **Open an .exe… / Run it** — a Windows program the user chose, rather than one
+  we shipped. A folder can be picked as well as a single file, because a game is
+  never one file, and everything is copied into the app's own storage — a
+  virtual `C:` — since a security-scoped URL from the Files app is not something
+  a PE loader can hold on to.
+
+  What comes back first is never the program's output: it is the **import
+  report**, what the executable needs and what nothing here can satisfy. For
+  anything real that list will be long, and it is the useful answer. "This
+  cannot run yet, and here is exactly what is missing" beats a crash, and the
+  list is the work queue. **Run it** is a separate, second decision.
 - **6 · Memory ladder** — the ladder on its own.
 
   A note on what the numbers are measured on: every probe runs at

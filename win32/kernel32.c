@@ -33,19 +33,54 @@ static uint64_t filetime_now(void) {
 static uint64_t ticks_ms(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000; }
 static uint64_t ticks_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
 
-/* Windows path -> host path: strip a drive letter, flip the slashes. Paths
- * under C:\xcore\ are the guest's own directory (where the .exe lives). */
+/* Where C:\ is. The app points this at its own storage, so a game copied in
+ * from Files can open its data the way it expects to. Empty (the command-line
+ * tool's default) keeps the older behaviour, which the test suite relies on. */
+static char g_drive_c[1024];
+void w32_set_drive_c(const char *path) { snprintf(g_drive_c, sizeof g_drive_c, "%s", path ? path : ""); }
+
+/* The directory the executable lives in, which is also the guest's working
+ * directory: a Windows program is normally started in its own install folder
+ * and opens "data\\x.bsa" expecting that. */
+/* A path is a path, not an essay: bounding each half explicitly is what lets
+ * the compiler see that joining them cannot overrun the caller's buffer, and
+ * truncating an absurd path is the right behaviour anyway. */
+#define P_DIR  1000
+#define P_REST 2000
+static void exe_dir(w32 *w, char *out, size_t n) {
+    const char *slash = w->exe_path ? strrchr(w->exe_path, '/') : 0;
+    if (slash) snprintf(out, n, "%.*s", (int)(slash - w->exe_path) > P_DIR ? P_DIR : (int)(slash - w->exe_path), w->exe_path);
+    else snprintf(out, n, ".");
+}
+
+/* Windows path -> host path: flip the slashes, then decide what the root is.
+ *
+ *   C:\xcore\...   the executable's own directory (what winrun has always
+ *                  reported as its location, so the guests' recorded output
+ *                  keeps working)
+ *   C:\...         under the drive root when one is set, else relative --
+ *                  a real program's absolute paths have to land somewhere
+ *   anything else  relative to the executable's directory, because that is
+ *                  where a Windows program is started
+ */
 static void host_path(w32 *w, const char *win, char *out, size_t n) {
     char tmp[4096]; size_t i = 0;
     const char *p = win;
-    if (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':') p += 2;
+    int had_drive = ((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':';
+    if (had_drive) p += 2;
     for (; *p && i + 1 < sizeof tmp; p++) tmp[i++] = *p == '\\' ? '/' : *p;
     tmp[i] = 0;
-    if (!strncasecmp(tmp, "/xcore/", 7)) {
-        const char *slash = strrchr(w->exe_path, '/');
-        if (slash) snprintf(out, n, "%.*s/%s", (int)(slash - w->exe_path), w->exe_path, tmp + 7);
-        else snprintf(out, n, "%s", tmp + 7);
-    } else snprintf(out, n, "%s", tmp[0] == '/' && win[1] == ':' ? tmp + 1 : tmp);   /* absolute Windows paths become relative */
+
+    char dir[2048];
+    if (!strncasecmp(tmp, "/xcore/", 7)) { exe_dir(w, dir, sizeof dir); snprintf(out, n, "%.*s/%.*s", P_DIR, dir, P_REST, tmp + 7); return; }
+    if (had_drive) {
+        if (g_drive_c[0]) snprintf(out, n, "%.*s/%.*s", P_DIR, g_drive_c, P_REST, tmp[0] == '/' ? tmp + 1 : tmp);
+        else snprintf(out, n, "%.*s", P_REST, tmp[0] == '/' ? tmp + 1 : tmp);
+        return;
+    }
+    if (tmp[0] == '/') { snprintf(out, n, "%.*s", P_REST, tmp); return; }   /* already a host path */
+    exe_dir(w, dir, sizeof dir);
+    snprintf(out, n, "%.*s/%.*s", P_DIR, dir, P_REST, tmp);
 }
 
 /* ---- process ---- */

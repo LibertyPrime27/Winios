@@ -78,6 +78,38 @@ static uint64_t now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+/* stdout is a file for the duration, because winrun writes its report there
+ * and an iOS app's stdout goes nowhere anyone can see. Same trick as
+ * win_probe_run; factored out so both use one copy of the descriptor juggling. */
+static int run_capture(int argc, char **argv, char *out, size_t out_len) {
+    const char *tmpdir = getenv("TMPDIR");
+    char tmp[1024];
+    snprintf(tmp, sizeof tmp, "%swinprobe.%d.out", tmpdir && *tmpdir ? tmpdir : "/tmp/", (int)getpid());
+
+    fflush(stdout);
+    int saved = dup(STDOUT_FILENO);
+    int fd = open(tmp, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0) { dup2(fd, STDOUT_FILENO); close(fd); }
+
+    int rc = winrun_main(argc, argv);
+
+    fflush(stdout);
+    if (saved >= 0) { dup2(saved, STDOUT_FILENO); close(saved); }
+
+    if (out && out_len) {
+        out[0] = 0;
+        FILE *f = fopen(tmp, "rb");
+        if (f) { size_t got = fread(out, 1, out_len - 1, f); out[got] = 0; fclose(f); }
+    }
+    remove(tmp);
+    return rc;
+}
+
+int win_probe_imports(const char *exe_path, char *out, size_t out_len) {
+    char *argv[3] = { (char *)"winrun", (char *)"-imports", (char *)exe_path };
+    return run_capture(3, argv, out, out_len);
+}
+
 int win_probe_run(const char *exe_path, const char *arg1, const char *arg2,
                   char *out, size_t out_len, uint64_t *ns, uint64_t *x87_native,
                   uint64_t *x87_callout) {

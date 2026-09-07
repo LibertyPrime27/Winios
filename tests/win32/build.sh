@@ -28,6 +28,7 @@ for a in 32 64; do
     $CC -O2 -s -o d3dframe$a.exe d3dframe.c -ld3d9
     $CC -O2 -s -o d3dloop$a.exe  d3dloop.c  -ld3d9
     $CC -O2 -s -o d3ddraw$a.exe  d3ddraw.c  -ld3d9
+    $CC -O2 -s -o pathtest$a.exe pathtest.c
 done
 
 # Not run by the suite: it calls things we do not implement, on purpose.

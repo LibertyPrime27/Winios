@@ -40,6 +40,10 @@ static int test_device_lost(const char *dir) {
 
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : "tests/win32";
+    /* C:\ for pathtest, and a check that the setting survives winrun_reset --
+     * the app sets it once at startup and every later run has to still see it. */
+    char drive[600]; snprintf(drive, sizeof drive, "%s/cdrive", dir);
+    w32_set_drive_c(drive);
     /* name, expected exit code */
     static const struct { const char *exe; int rc; } G[] = {
         { "hello64.exe", 7 }, { "hello32.exe", 7 },
@@ -49,6 +53,7 @@ int main(int argc, char **argv) {
         { "d3dtest64.exe", 0 },  { "d3dtest32.exe", 0 },
         { "d3dframe64.exe", 0 }, { "d3dframe32.exe", 0 },
         { "d3dloop64.exe", 0 },  { "d3dloop32.exe", 0 },
+        { "pathtest64.exe", 0 }, { "pathtest32.exe", 0 },
         { "d3ddraw64.exe", 0 },  { "d3ddraw32.exe", 0 },
     };
     const int n = (int)(sizeof G / sizeof G[0]);

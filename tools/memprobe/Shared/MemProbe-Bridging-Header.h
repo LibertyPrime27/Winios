@@ -6,3 +6,4 @@
 #import "../Host/ExtensionLauncher.h"
 #import "winprobe.h"
 #import "xcore/bench.h"
+#import "w32.h"

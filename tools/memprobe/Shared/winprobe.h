@@ -16,6 +16,12 @@ int win_probe_run(const char *exe_path, const char *arg1, const char *arg2,
                   char *out, size_t out_len, uint64_t *ns, uint64_t *x87_native,
                   uint64_t *x87_callout);
 
+/* Load an executable, resolve its imports, and report which ones nothing here
+ * can satisfy -- without running it. This is how the app answers "can this
+ * program run, and if not, what is missing?" for an arbitrary .exe the user
+ * picked, which is the only honest first question. */
+int win_probe_imports(const char *exe_path, char *out, size_t out_len);
+
 /* The last frame the guest presented through d3d9, as X8R8G8B8 rows (B,G,R,X
  * in memory), owned here and valid until the next win_probe_run. NULL if the
  * guest presented nothing. Only safe once the run has finished. */

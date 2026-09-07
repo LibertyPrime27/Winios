@@ -191,7 +191,7 @@ compiled code for pages that become writable.
 
 ## Verified
 
-`tests/win32/run.sh` runs sixteen executables and compares stdout and exit code
+`tests/win32/run.sh` runs eighteen executables and compares stdout and exit code
 with recordings: the three-import `hello`, the full mingw-w64 CRT program
 (`crt.c`: TLS callbacks, `__getmainargs`, `_initterm`, malloc/free, `sqrt`,
 `printf`, `snprintf`, exit code), the n-body benchmark, the loader test
@@ -241,6 +241,27 @@ which is what `winrun` and a real MSVC CRT both set; Fallout 3 and New Vegas
 are 32-bit MSVC programs that do their scalar float on the x87 stack, so this
 is the path they run on. `_controlfp`/`_control87` are implemented on the
 guest's real FCW/MXCSR so the CRT actually reaches that mode.
+
+## Where a guest's files are
+
+A Windows program opens `C:\...` for what it installed and a bare relative name
+for what sits beside its executable, and both have to land somewhere real or a
+game cannot find its own data.
+
+- `C:\...` resolves under a **drive root** the host chooses — the app points it
+  at its own storage, `winrun` takes `-C dir` or `WINRUN_DRIVE_C`. With no root
+  set (the command-line default) an absolute path falls back to being relative,
+  which is what the older behaviour was.
+- A relative path resolves against **the executable's own directory**, because
+  that is the working directory a Windows program is started in. Not the host
+  process's cwd, which on iOS points nowhere useful.
+- `C:\xcore\...` is still the executable's directory, because that is the
+  location `GetModuleFileName` has always reported and the recorded guest
+  output depends on it.
+
+`pathtest.exe` locks all three down, including a path that is deliberately not
+there — "not found" is a result too, and a file layer that cheerfully opens
+anything would pass a weaker test.
 
 ## What a program needs that we do not have
 

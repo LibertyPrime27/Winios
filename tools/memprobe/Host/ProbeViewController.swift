@@ -41,6 +41,9 @@ final class ProbeViewController: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        // C:\ for anything the user opens: the app's own storage, so a program
+        // copied in from Files can open its data with the paths it shipped with.
+        if let c = ExeBrowser.driveC { c.path.withCString { w32_set_drive_c($0) } }
         title = "winios probes · \(DeviceInfo.modelIdentifier)"
         view.backgroundColor = .systemBackground
 
@@ -66,6 +69,7 @@ final class ProbeViewController: UIViewController {
             button("8 · Run a Windows program full screen (live frames)", #selector(runGuest)),
             button("4 · JIT: attach StikDebug, then execute in a blessed arena", #selector(attachJIT)),
             button("9 · JIT arena: try a bigger one next launch", #selector(stepArena)),
+            row([("Open an .exe…", #selector(openExe)), ("Run it", #selector(runPicked))]),
             row([("Copy report", #selector(copyReport)), ("Reset results", #selector(resetAll))]),
             frameView,
             results,
@@ -182,6 +186,41 @@ final class ProbeViewController: UIViewController {
         vc.modalPresentationStyle = .fullScreen
         present(vc, animated: true)
     }
+    /// The user's own executable, rather than one we shipped. What comes back
+    /// first is the import report -- what it needs and what is missing --
+    /// because for anything real that is the answer, and the list is the work
+    /// queue. Running it is a second, separate decision.
+    private var pickedExe: URL?
+    @objc private func openExe() {
+        guard !running else { return }
+        ExeBrowser.shared.pick(from: self) { [weak self] report, exe in
+            guard let self else { return }
+            self.pickedExe = exe
+            self.winLine = report
+            self.refresh()
+        }
+    }
+    /// Run whatever was picked. It may well not get far -- that is what the
+    /// import report was for -- so the output is captured either way.
+    @objc private func runPicked() {
+        guard let exe = pickedExe else {
+            winLine = "nothing picked yet — use \"Open an .exe…\" first"
+            refresh(); return
+        }
+        work("picked exe") {
+            if let arena = self.ensureArena() { _ = self.handArenaToXcore(arena) }
+            var out = [CChar](repeating: 0, count: 65536)
+            var ns: UInt64 = 0
+            xc_jit_enable(1)
+            let rc = exe.path.withCString { win_probe_run($0, nil, nil, &out, out.count, &ns, nil, nil) }
+            xc_jit_enable(0)
+            var text = "\(exe.lastPathComponent) exited \(rc) after \(ns / 1_000_000) ms\n\n"
+            text += String(cString: out)
+            if rc == 127 { text += "\n(exit 127 is an unimplemented import being called — the line above names it)\n" }
+            DispatchQueue.main.async { self.winLine = text; self.refresh() }
+        }
+    }
+
     @objc private func clearFrame() {
         frameImage = nil
         DispatchQueue.main.async { self.frameView.image = nil; self.frameView.isHidden = true }
