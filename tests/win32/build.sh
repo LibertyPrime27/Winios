@@ -29,3 +29,8 @@ for a in 32 64; do
     $CC -O2 -s -o d3dloop$a.exe  d3dloop.c  -ld3d9
     $CC -O2 -s -o d3ddraw$a.exe  d3ddraw.c  -ld3d9
 done
+
+# Not run by the suite: it calls things we do not implement, on purpose.
+# `winrun -imports tests/win32/gamelike32.exe` names them, and that list is
+# the work between here and a real game.
+i686-w64-mingw32-gcc -O2 -s -o gamelike32.exe gamelike.c -luser32 -lgdi32 -ladvapi32 -lwinmm

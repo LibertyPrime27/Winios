@@ -242,6 +242,38 @@ are 32-bit MSVC programs that do their scalar float on the x87 stack, so this
 is the path they run on. `_controlfp`/`_control87` are implemented on the
 guest's real FCW/MXCSR so the CRT actually reaches that mode.
 
+## What a program needs that we do not have
+
+    winrun -imports program.exe
+
+Loads the image, resolves every import, and prints the ones nothing could
+satisfy — without running an instruction. Each unresolved import already
+becomes a stub carrying its own name, so the list falls out of the loader for
+free, and it turns "what should we build next" from a guess into a list taken
+from the binary. Pointed at a real game, it *is* the roadmap.
+
+`tests/win32/gamelike32.exe` is a fixture for it: a program that does what a
+game does in its first few seconds — makes a window and pumps messages, starts
+a thread, takes a lock, reads the registry, walks a directory, memory-maps a
+file, times a frame, queries the display. It is deliberately not in the test
+suite, because it cannot run yet. What it reports today:
+
+    59 imports resolved, 17 missing
+      advapi32.dll (1)   RegOpenKeyExA
+      kernel32.dll (6)   CreateThread, CreateFileMappingA, MapViewOfFile,
+                         FindFirstFileA, FindNextFileA, FindClose
+      user32.dll   (9)   RegisterClassA, CreateWindowExA, ShowWindow,
+                         PeekMessageA, TranslateMessage, DispatchMessageA,
+                         DefWindowProcA, GetSystemMetrics, EnumDisplaySettingsA
+      winmm.dll    (1)   timeGetTime
+
+Worth reading closely, because it corrects the obvious assumption. "No threads"
+is not quite right: `EnterCriticalSection`, `CreateEventA`, `SetEvent`,
+`InterlockedIncrement`, `WaitForSingleObject`, `QueryPerformanceCounter` and
+`CreateFileA` all resolve already — only `CreateThread` itself is absent. The
+window and its message pump are the larger hole, and file enumeration and
+memory-mapped files are what a game reaches for to load its archives.
+
 ## What is deliberately not here yet
 
 Threads (`CreateThread`/`_beginthreadex` report failure), structured

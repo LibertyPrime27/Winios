@@ -588,6 +588,53 @@ static void present_ppm(void *ctx, const void *pixels, int width, int height, in
     fprintf(stderr, "winrun: presented frame -> %s (%dx%d)\n", path, width, height);
 }
 
+/* What does this program need that we do not have?
+ *
+ * Every import that no host implementation and no guest DLL could satisfy
+ * became a stub carrying its own name (w32_stub_for). Loading an executable
+ * therefore produces the exact list of what is missing, before running a
+ * single instruction -- which turns "what should we build next" from a guess
+ * into a list taken from the binary itself. `winrun -imports game.exe` on a
+ * real game is the roadmap.
+ *
+ * Grouped by DLL, because that is the shape the work has: a DLL we have none
+ * of is a decision (write it, or stub it out), a DLL we have most of is an
+ * afternoon.
+ */
+static int cmp_missing(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+static void report_imports(w32 *w) {
+    printf("%s: %d-bit\n", w->exe_path, w->is32 ? 32 : 64);
+    printf("\nmodules loaded:\n");
+    for (int i = 0; i < w->nmods; i++)
+        printf("  %-28s %s\n", w->mods[i].name,
+               w->mods[i].is_exe ? "(the executable)" : "guest DLL, loaded and resolved");
+
+    const char *miss[W32_MAX_STUBS];
+    int n = 0, resolved = 0;
+    for (int i = 0; i < w->nstubs; i++) {
+        if (w->stubs[i].api) resolved++;
+        else if (w->stubs[i].missing && strchr(w->stubs[i].missing, '!')) miss[n++] = w->stubs[i].missing;
+    }
+    qsort(miss, (size_t)n, sizeof miss[0], cmp_missing);
+
+    printf("\n%d imports resolved, %d missing\n", resolved, n);
+    if (!n) { printf("\nnothing is missing: this program can be run.\n"); return; }
+
+    printf("\nmissing, by DLL:\n");
+    int i = 0;
+    while (i < n) {
+        const char *bang = strchr(miss[i], '!');
+        size_t dlen = (size_t)(bang - miss[i]);
+        int j = i;
+        while (j < n && !strncmp(miss[j], miss[i], dlen) && miss[j][dlen] == '!') j++;
+        printf("\n  %.*s  (%d missing)\n", (int)dlen, miss[i], j - i);
+        for (int k = i; k < j; k++) printf("      %s\n", miss[k] + dlen + 1);
+        i = j;
+    }
+}
+
 int winrun_main(int argc, char **argv) {
     winrun_reset();
     w32 *w = &g_w;
@@ -597,15 +644,16 @@ int winrun_main(int argc, char **argv) {
     while (ai < argc && argv[ai][0] == '-') {
         if (!strcmp(argv[ai], "-v")) w->verbose++;
         else if (!strcmp(argv[ai], "-vv")) w->verbose += 2;
+        else if (!strcmp(argv[ai], "-imports")) w->imports_only = 1;
         else if (!strcmp(argv[ai], "-L") && ai + 1 < argc) {       /* extra directory to find guest DLLs in */
             static char dir[512];
             snprintf(dir, sizeof dir, "%s%s", argv[ai + 1], argv[ai + 1][strlen(argv[ai + 1]) - 1] == '/' ? "" : "/");
             w->dll_dir = dir; ai++;
         }
-        else { fprintf(stderr, "usage: winrun [-v] [-L dlldir] program.exe [args...]\n"); return 2; }
+        else { fprintf(stderr, "usage: winrun [-v] [-imports] [-L dlldir] program.exe [args...]\n"); return 2; }
         ai++;
     }
-    if (ai >= argc) { fprintf(stderr, "usage: winrun [-v] [-L dlldir] program.exe [args...]\n"); return 2; }
+    if (ai >= argc) { fprintf(stderr, "usage: winrun [-v] [-imports] [-L dlldir] program.exe [args...]\n"); return 2; }
     w->exe_path = argv[ai];
 
     /* bitness decides the memory model, so peek at the header first */
@@ -636,6 +684,7 @@ int winrun_main(int argc, char **argv) {
      * preferred base (0x140000000) or a PE32 one (0x400000) */
     process_init(w, argc - ai, argv + ai);
     if (w32_load_pe(w, argv[ai])) return 2;
+    if (w->imports_only) { report_imports(w); return 0; }
     w32_write(w, w->peb + (w->is32 ? 0x08 : 0x10), w->is32 ? 4 : 8, w->image_base);   /* PEB.ImageBaseAddress */
     /* the initial thread: TEB in gs (x64) / fs (x86), stack, entry point */
     xc_cpu *c = w->c;

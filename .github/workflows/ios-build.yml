@@ -37,6 +37,10 @@ jobs:
           # the Win32 suite again as a 16 KB-page host would run it (Apple silicon
           # maps in 16 KB pages; the runtime widens guest ranges to host pages)
           WINRUN_HOST_PAGE=16384 sh tests/win32/run.sh build-host/winrun tests/win32
+          # informational: what a game-shaped program still needs. Shrinks as
+          # the Win32 layer grows, so it doubles as a progress meter.
+          echo "::notice::$(build-host/winrun -imports tests/win32/gamelike32.exe | grep 'imports resolved')"
+          build-host/winrun -imports tests/win32/gamelike32.exe | sed 's/^/  /'
 
       # The dynarec only runs on ARM64. The Linux runner is x86, so it runs an
       # aarch64 cross-build under qemu-user: the golden vectors through the JIT,

@@ -108,6 +108,7 @@ struct w32 {
     w32_module mods[W32_MAX_MODULES];
     int        nmods, nloaded;
     const char *dll_dir;         /* extra directory to search for guest DLLs (-L) */
+    int        imports_only;     /* -imports: load, report what is missing, do not run */
     w32_handle handles[W32_MAX_HANDLES];
     uint32_t  last_error;
 
