@@ -16,11 +16,16 @@ settings:
     # xcore and Zydis are built by CMake (see CI) into build-xcore-ios/.
     HEADER_SEARCH_PATHS: $(SRCROOT)/Shared $(SRCROOT)/../../core/include $(SRCROOT)/../../win32 $(SRCROOT)/../../tools/winrun $(SRCROOT)/../../tools/import
     LIBRARY_SEARCH_PATHS: $(SRCROOT)/../../build-xcore-ios $(SRCROOT)/../../build-xcore-ios/core $(SRCROOT)/../../build-xcore-ios/core/zydis $(SRCROOT)/../../build-xcore-ios/core/zydis/zycore
-    # winrun_lib is the PE loader + kernel32/msvcrt: it lets the app run a real
-    # Windows .exe. It must precede xcore, which it calls into.
-    # import_lib is the importer: a zip reader, installer detection, a drive
-    # diff. It calls winrun_lib (to run a setup program) so it comes first.
-    OTHER_LDFLAGS: -limport_lib -lwinrun_lib -lxcore_golden -lxcore -lsoftfloat -lZydis -lZycore -lz
+    # The emulator core, which both targets need: the extension runs the
+    # memory ladder and the JIT probes.
+    #
+    # winrun_lib and import_lib are NOT here. They belong to the app alone --
+    # the extension exists to measure memory in a second process and does not
+    # run guests, which is why it excludes winprobe.c. Putting them in the
+    # shared settings made the extension link against libraries it has no use
+    # for, and the first time one of them was missing it was the *extension*
+    # that failed, which points at the wrong target entirely.
+    OTHER_LDFLAGS: -lxcore_golden -lxcore -lsoftfloat -lZydis -lZycore
     # Unsigned by design -- signing happens locally with Sideloadly.
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"
@@ -50,6 +55,14 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: winios.app
+        # winrun_lib is the PE loader + kernel32/msvcrt: it lets the app run a
+        # real Windows .exe, and must precede xcore, which it calls into.
+        # import_lib is the importer (a zip reader, installer detection, a
+        # drive diff); it calls winrun_lib to run a setup program, so it comes
+        # first. -lz is zlib from the SDK, for the zip reader's inflate.
+        # $(inherited) keeps the core libraries from the shared settings, and
+        # they have to come after these.
+        OTHER_LDFLAGS: -limport_lib -lwinrun_lib $(inherited) -lz
     dependencies:
       - target: winiosProbe
         embed: true

@@ -160,9 +160,17 @@ jobs:
             -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
             -DCMAKE_BUILD_TYPE=Release -DWINIOS_D12MT=OFF 2>&1 | tee -a ios-cc.log
-          cmake --build build-xcore-ios --target xcore_golden winrun_lib -j3 2>&1 | tee -a ios-cc.log
+          cmake --build build-xcore-ios --target xcore_golden winrun_lib import_lib -j3 2>&1 | tee -a ios-cc.log
           echo "--- static libs produced ---"
           find build-xcore-ios -name '*.a' | sed 's/^/  /'
+          # Every library project.yml names in OTHER_LDFLAGS has to exist by
+          # now, or the Xcode link fails with "library not found" -- which is
+          # a confusing way to be told that a CMake target was left out of the
+          # line above. Checked here, where the message can say so.
+          for lib in xcore xcore_golden softfloat winrun_lib import_lib; do
+            find build-xcore-ios -name "lib$lib.a" | grep -q . \
+              || { echo "::error::lib$lib.a was not built: add $lib to the cmake --build target list"; exit 1; }
+          done
 
       # Apple silicon: the dynarec natively, against the silicon recordings.
       - name: Dynarec on Apple silicon (golden replay)

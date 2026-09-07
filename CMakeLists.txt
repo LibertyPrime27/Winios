@@ -12,6 +12,19 @@ project(winios C CXX)
 # skipped and everything else builds as before.
 find_package(ZLIB)
 
+# Which zlib to link, if any. Every Apple SDK ships libz, but the iOS
+# toolchain does not always let find_package see it -- and a silent "not
+# found" there means the importer is skipped, which surfaces much later as
+# `ld: library 'import_lib' not found` in the Xcode build. So on Apple, fall
+# back to linking it by name rather than dropping the importer.
+set(WINIOS_ZLIB "")
+if(ZLIB_FOUND)
+    set(WINIOS_ZLIB ZLIB::ZLIB)
+elseif(APPLE)
+    set(WINIOS_ZLIB z)
+    message(STATUS "zlib not found by find_package, but this is Apple: linking -lz from the SDK")
+endif()
+
 enable_testing()
 
 add_subdirectory(core)
@@ -110,7 +123,7 @@ if(NOT WIN32)
     target_compile_options(winrun PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
     # --- the importer: bringing a program in from outside ---------------------
-    if(ZLIB_FOUND)
+    if(WINIOS_ZLIB)
         # Its own library so the app links the same code the CLI tests, and so the
         # parts that have nothing to do with the emulator (a zip reader, installer
         # detection, a drive diff) can be tested without starting a guest.
@@ -118,7 +131,7 @@ if(NOT WIN32)
             tools/import/setupkind.c tools/import/unzip.c
             tools/import/drivediff.c tools/import/import.c)
         target_include_directories(import_lib PUBLIC tools/import)
-        target_link_libraries(import_lib PUBLIC ZLIB::ZLIB)
+        target_link_libraries(import_lib PUBLIC ${WINIOS_ZLIB})
         set_property(TARGET import_lib PROPERTY C_STANDARD 11)
         target_compile_options(import_lib PRIVATE -Wall -Wextra)
 
@@ -143,7 +156,10 @@ if(NOT WIN32)
             $<TARGET_FILE:wimport> ${CMAKE_CURRENT_SOURCE_DIR}/tests/win32)
     else()
         message(STATUS "zlib not found for this target: skipping the importer "
-                       "(tools/import, wimport). Everything else is unaffected.")
+                       "(tools/import, wimport). Everything else is unaffected. "
+                       "If this is an iOS or macOS build, something is wrong -- "
+                       "the SDK has libz and the Apple fallback above should "
+                       "have caught it.")
     endif()
 
     # Several guests back to back in one process -- what the device build does
