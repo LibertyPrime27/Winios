@@ -934,6 +934,7 @@ static void winrun_reset(void) {
     g_next_present = 0; g_next_present_ctx = 0;
     w32_com_reset();
     w32_d3d9_reset();
+    w32_d3d11_reset();
     xc_cache_flush();
 }
 
@@ -1273,23 +1274,10 @@ static int survey(const char *root) {
  *
  * The thumbnail is the person's answer. A checksum that changes tells you
  * something moved; a picture tells you what. It is worth the twenty lines.
+ *
+ * The checksum itself is w32_frame_crc32 (win32/d3d9.c), so the device
+ * diagnostics compute it with the same code rather than a second copy.
  */
-static uint32_t crc32_of(const void *data, size_t n) {
-    static uint32_t tab[256];
-    static int ready;
-    if (!ready) {
-        for (uint32_t i = 0; i < 256; i++) {
-            uint32_t c = i;
-            for (int k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
-            tab[i] = c;
-        }
-        ready = 1;
-    }
-    const uint8_t *p = data;
-    uint32_t c = 0xFFFFFFFFu;
-    for (size_t i = 0; i < n; i++) c = tab[(c ^ p[i]) & 0xFF] ^ (c >> 8);
-    return c ^ 0xFFFFFFFFu;
-}
 
 /* Frames as the app would receive them, not as the surface happens to look
  * at exit. The difference matters: by the time a program returns from its
@@ -1321,7 +1309,7 @@ static void dump_frame(w32 *w) {
     const uint32_t *bits = g_last_frame;
     if (!bits || cx <= 0 || cy <= 0) { printf("\nscreen: nothing drawn\n"); return; }
     printf("\nscreen %dx%d %d frames crc %08x\n", cx, cy, g_frames,
-           crc32_of(bits, (size_t)cx * cy * 4));
+           w32_frame_crc32(bits, (size_t)cx * cy * 4));
 
     /* The full image, when someone wants to look at it rather than at a
      * checksum. PPM because it is six lines of code and every viewer opens

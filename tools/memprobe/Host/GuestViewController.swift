@@ -12,9 +12,11 @@ import QuartzCore
 /// guest reports honest: it is the rate the emulator managed, not the rate the
 /// screen refreshed at.
 ///
-/// The pixels are still drawn by the guest's own x86 code on the dynarec, so
-/// what Metal does here is upload and scale. When DrawPrimitive is wired to
-/// d12mt, this is the layer the GPU will render into instead.
+/// The pixels are still computed on the CPU -- by the guest's own x86 code on
+/// the dynarec, and, for a game that draws through Direct3D 9 or 11, by the
+/// integer rasterizers in win32/raster.c and win32/d3d11_raster.c. What Metal
+/// does here is upload and scale. When those draw calls are wired to d12mt,
+/// this is the layer the GPU will render into instead.
 final class GuestViewController: UIViewController {
 
     private let exeName: String

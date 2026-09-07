@@ -202,8 +202,8 @@ each rung's work took, so its duty cycle stays under 50% even in the foreground.
 ## The buttons
 
 **▶ Run everything in order** is the one button: bless the arena, CPU vectors,
-benchmark, GPU, the Windows guests, the Direct3D 9 frames, then the memory
-ladder — and finally arm the next arena size if the ceiling is still unknown.
+benchmark, GPU, the Windows guests, the Direct3D 9 frames, the Direct3D 11
+frames, then the memory ladder — and finally arm the next arena size if the ceiling is still unknown.
 
 The order is not cosmetic. The arena is blessed **first**, explicitly, so every
 later step runs with executable memory rather than blessing it as a side effect
@@ -250,6 +250,24 @@ to see the GPU result again.
   and because that rasterizer is integer by construction, its checksum has to
   match the one recorded on an x86 runner and under qemu. Checking it here is
   what proves that on real hardware. **Clear frame** hides the image again.
+- **10 · D3D11 frame** — `d11test`, in both bitnesses, at a fixed 320x200. It
+  builds DXBC containers by hand, creates a device, a swap chain, a render
+  target, a texture and its view, vertex, index and constant buffers, an input
+  layout and the state objects, then draws an indexed textured quad and a
+  Gouraud strip — every call of it through a COM vtable in guest memory, which
+  is also what checks that the twelve vtables have the slot counts D3D11 says
+  they have. The report gives three answers separately: it ran, its own checks
+  passed, and the frame checksum is `311139ad`. Fixed at 320x200 whatever the
+  display setting says, because a recorded checksum belongs to a resolution;
+  the screen size the app had set is put back afterwards.
+
+  The number is the point. The rasterizer behind it has no floating point in
+  it, so `311139ad` on the phone means Apple silicon computed the same pixels
+  as an x86 runner and a qemu aarch64 run — and a different number means
+  something is wrong, not that something rounded. What the picture does *not*
+  prove is that a game will look right: the shaders are not executed (the
+  pipeline is interpreted from their signatures), there is no depth buffer,
+  and interpolation is affine. See `docs/WIN32.md`.
 
   The device, the back buffer and `Present` are real; the GPU is not in this
   path yet. Metal only uploads and scales what the guest and the rasterizer

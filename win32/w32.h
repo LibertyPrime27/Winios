@@ -351,7 +351,39 @@ extern const w32_api w32_propsys[];
 extern const w32_api w32_ws2_32[];
 extern const w32_api w32_wininet[];
 const char *w32_ws2_ordinal_name(int ordinal);
-/* d3d11.c: not an implementation -- see the file */
+/* --- Direct3D 11 -----------------------------------------------------------
+ *
+ * The rasterizer d3d11.c draws through, in d3d11_raster.c. Integer
+ * arithmetic throughout, so a frame is the same on every machine.
+ */
+typedef struct {
+    uint32_t *pixels;
+    int w, h, pitch_px;                 /* pitch in pixels, not bytes */
+    int clip_x, clip_y, clip_w, clip_h; /* the viewport */
+} d3d11_target;
+
+typedef struct {
+    const uint32_t *pixels;
+    int w, h, pitch_px;
+} d3d11_texture;
+
+/* A vertex after the fixed-function interpretation of the vertex stage: a
+ * position already in pixels, a texture coordinate, and a colour. */
+typedef struct {
+    float x, y, z, w;
+    float u, v;
+    uint32_t color;                     /* 0xAARRGGBB */
+} d3d11_vertex;
+
+enum { D3D11_BLEND_NONE_ = 0, D3D11_BLEND_OVER_ = 1, D3D11_BLEND_ADD_ = 2 };
+
+void w32_d3d11_triangle(const d3d11_target *t, const d3d11_vertex *v0,
+                        const d3d11_vertex *v1, const d3d11_vertex *v2,
+                        const d3d11_texture *tex, int wrap, int blend_mode);
+void w32_d3d11_clear(const d3d11_target *t, uint32_t argb);
+void w32_d3d11_reset(void);
+
+/* d3d11.c: see the file for what is and is not implemented */
 extern const w32_api w32_d3d11[];
 extern const w32_api w32_d3d10[];
 extern const w32_api w32_d3d12[];
@@ -491,10 +523,15 @@ void w32_dsound_reset(void);
 typedef void (*w32_present_fn)(void *ctx, const void *pixels, int width, int height, int pitch);
 void w32_set_present(w32_present_fn fn, void *ctx);
 w32_present_fn w32_get_present(void **ctx);        /* so a second consumer can chain */
+/* The checksum of one presented frame. Shared so that winrun's -frame, the
+ * qemu run and the device diagnostics are all comparing the same arithmetic
+ * over the same bytes -- see d3d9.c. */
+uint32_t w32_frame_crc32(const void *data, size_t n);
 /* Ask a guest that is presenting frames to stop: Present and
  * TestCooperativeLevel start returning D3DERR_DEVICELOST, which a game
  * already knows how to exit on. */
 void w32_d3d9_device_lost(int on);
+int  w32_d3d9_lost(void);          /* d3d11's Present asks the same flag */
 void w32_d3d9_reset(void);
 
 /* raster.c: the reference rasterizer d3d9 draws through when no GPU backend

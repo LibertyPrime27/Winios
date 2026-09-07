@@ -207,17 +207,21 @@ int main(void) {
         ok(joyGetPos(0, &ji) == JOYERR_UNPLUGGED, "joyGetPos: nothing plugged in");
     }
 
-    /* ---- and Direct3D 11, which is the one that is genuinely missing ---- */
+    /* ---- Direct3D 11, which used to be the one that was missing ---------
+     *
+     * This block asserted that D3D11CreateDevice *failed*, and said that if
+     * it ever started succeeding this test should be what notices. It did,
+     * and it was. The draw path is covered properly by d11test.c; what is
+     * checked here is only that a game asking for a device gets one. */
     {
         ID3D11Device *dev = NULL;
         ID3D11DeviceContext *ctx = NULL;
         D3D_FEATURE_LEVEL got = (D3D_FEATURE_LEVEL)0;
         HRESULT hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
                                        NULL, 0, D3D11_SDK_VERSION, &dev, &got, &ctx);
-        ok(FAILED(hr), "D3D11CreateDevice fails -- Direct3D 11 is not implemented");
-        ok(hr == DXGI_ERROR_UNSUPPORTED,
-           "and fails with 'no device here can do that', which a game handles");
-        ok(dev == NULL && ctx == NULL, "and hands back nothing to use");
+        ok(SUCCEEDED(hr), "D3D11CreateDevice succeeds");
+        ok(dev != NULL && ctx != NULL, "and hands back a device and a context");
+        ok(got == D3D_FEATURE_LEVEL_11_0, "at feature level 11_0");
     }
 
     printf("%d checks, %d failures\n", checks, failures);

@@ -307,6 +307,44 @@ const void *win_probe_frame(int *width, int *height, int *pitch) {
     return g_fw && g_fh ? g_frame : 0;
 }
 
+uint32_t win_probe_frame_crc(void) {
+    uint32_t c = 0;
+    pthread_mutex_lock(&g_lock);
+    /* Over width*4 bytes per row rather than the whole pitch: padding at the
+     * end of a row is not part of the picture, and winrun checksums a tightly
+     * packed surface. Including it would make the two disagree for a reason
+     * that is not about any pixel. */
+    if (g_frame && g_fw > 0 && g_fh > 0) {
+        if (g_fpitch == g_fw * 4) {
+            c = w32_frame_crc32(g_frame, (size_t)g_fw * g_fh * 4);
+        } else {
+            /* Rows are not contiguous. Pack them and checksum that, so the
+             * answer is the picture and not the allocation. */
+            size_t n = (size_t)g_fw * g_fh * 4;
+            uint8_t *packed = malloc(n);
+            if (packed) {
+                for (int y = 0; y < g_fh; y++)
+                    memcpy(packed + (size_t)y * g_fw * 4,
+                           g_frame + (size_t)y * g_fpitch, (size_t)g_fw * 4);
+                c = w32_frame_crc32(packed, n);
+                free(packed);
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    return c;
+}
+
+int win_probe_run_at(const char *exe_path, int cx, int cy,
+                     char *out, size_t out_len, uint64_t *ns) {
+    int ox = 0, oy = 0;
+    w32_screen_size(&ox, &oy);
+    w32_set_screen_size(cx, cy);
+    int rc = win_probe_run_dir(exe_path, 0, 0, 0, out, out_len, ns);
+    if (ox > 0 && oy > 0) w32_set_screen_size(ox, oy);
+    return rc;
+}
+
 static uint64_t now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);

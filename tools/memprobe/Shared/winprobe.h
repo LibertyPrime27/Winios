@@ -114,6 +114,27 @@ int win_probe_imports(const char *exe_path, char *out, size_t out_len);
  * guest presented nothing. Only safe once the run has finished. */
 const void *win_probe_frame(int *width, int *height, int *pitch);
 
+/* The checksum of that frame, computed by w32_frame_crc32 -- the same code
+ * winrun's `-frame` uses. Returns 0 when nothing was presented.
+ *
+ * Every pixel on the way here was integer arithmetic, so this number is a
+ * claim about the device: it has to equal the one an x86 runner and a qemu
+ * aarch64 run produce for the same guest at the same size, and if it does
+ * not, the rasterizer is doing something different on Apple silicon. That is
+ * worth being able to check on the phone itself rather than only in CI. */
+uint32_t win_probe_frame_crc(void);
+
+/* Run a guest with the screen set to a particular size, then put the screen
+ * back the way the app had it.
+ *
+ * A recorded checksum belongs to a resolution -- 320x200 is what the suite
+ * records -- and the app tells guests the screen is whatever Settings says,
+ * so a diagnostic that compared against a recording without fixing the size
+ * would fail on every device where someone had changed that setting, for a
+ * reason that had nothing to do with the device. */
+int win_probe_run_at(const char *exe_path, int cx, int cy,
+                     char *out, size_t out_len, uint64_t *ns);
+
 /* --- watching a guest that is still running ---
  *
  * A guest drawing frames runs on its own thread inside win_probe_run, while

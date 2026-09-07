@@ -4,6 +4,10 @@
 # checked by hand / against the Linux build of the same source).
 #   run.sh <winrun> <dir>
 winrun=$(cd "$(dirname "$1")" && pwd)/$(basename "$1"); cd "$2" || exit 2; fail=0
+# When winrun was cross-compiled -- the aarch64 build, which is the one that
+# matches the device -- it cannot be exec'd here, so CMake passes the
+# emulator to put in front of it. Empty for a native build.
+emu=${WINIOS_EMULATOR:-}
 # C:\ for the guests that use absolute paths. Everything else ignores it.
 WINRUN_DRIVE_C=$PWD/cdrive; export WINRUN_DRIVE_C
 # The registry persists on purpose, so start every suite run from nothing --
@@ -24,23 +28,33 @@ checkx() {  # name expected_file expected_rc [guest args...] [-- winrun flags...
         if [ "$t" = "--" ]; then seen=1; continue; fi
         if [ $seen -eq 1 ]; then wargs="$wargs $t"; else gargs="$gargs $t"; fi
     done
-    got=$("$winrun" $wargs "./$name" $gargs 2>/tmp/winrun_err.$$); rc=$?
+    got=$($emu "$winrun" $wargs "./$name" $gargs 2>/tmp/winrun_err.$$); rc=$?
     exp=$(cat "$expf")
     if [ "$got" != "$exp" ] || [ "$rc" -ne "$erc" ]; then
         echo "FAIL $name (rc=$rc, want $erc)"; echo "--- expected"; echo "$exp"; echo "--- got"; echo "$got"; cat /tmp/winrun_err.$$; fail=1
         # diagnostics: is it the JIT? what does -v say?
-        got2=$(XCORE_JIT=0 "$winrun" $wargs "./$name" $gargs 2>/dev/null); rc2=$?
+        got2=$(XCORE_JIT=0 $emu "$winrun" $wargs "./$name" $gargs 2>/dev/null); rc2=$?
         [ "$got2" = "$exp" ] && [ "$rc2" -eq "$erc" ] && echo "  (passes with XCORE_JIT=0: JIT-specific)" || echo "  (also fails with XCORE_JIT=0, rc=$rc2)"
-        "$winrun" $wargs -v "./$name" $gargs 2>&1 >/dev/null | tail -24 | sed 's/^/  | /'
+        $emu "$winrun" $wargs -v "./$name" $gargs 2>&1 >/dev/null | tail -24 | sed 's/^/  | /'
     else echo "ok   $name"; fi
 }
 # Only the exit code and one line of output. These runs end in the crash
 # report, which prints registers and addresses that differ between the
 # interpreter and the dynarec by design -- recording it would be recording
 # the machine, not the behaviour.
+# What a guest drew, by checksum. The frame is the one that was *presented*,
+# so this covers the whole path from the draw call to the display -- and the
+# arithmetic behind it is integer, so the number is the same in both
+# bitnesses and on every machine.
+checkframe() {  # name WxH expected_crc
+    name=$1; size=$2; want=$3
+    got=$($emu "$winrun" -frame -screen "$size" "./$name" 2>/dev/null | sed -n 's/^screen .* crc \([0-9a-f]*\)$/\1/p')
+    if [ "$got" = "$want" ]; then echo "ok   $name drew the expected frame ($want)"
+    else echo "FAIL $name drew $got, want $want"; fail=1; fi
+}
 checkrc() {  # name expected_rc must_contain args...
     name=$1; erc=$2; want=$3; shift 3
-    got=$("$winrun" "./$name" "$@" 2>/tmp/winrun_err.$$); rc=$?
+    got=$($emu "$winrun" "./$name" "$@" 2>/tmp/winrun_err.$$); rc=$?
     if [ "$rc" -ne "$erc" ] || ! printf '%s\n' "$got" | grep -qF "$want"; then
         echo "FAIL $name $* (rc=$rc, want $erc; looking for \"$want\")"
         printf '%s\n' "$got" | head -8; cat /tmp/winrun_err.$$; fail=1
@@ -100,6 +114,29 @@ unset XCORE_JIT
 # recording of the tester's reflexes is not a test.
 check inputtest64.exe 0 6 -- -input inputtest.script
 check inputtest32.exe 0 6 -- -input inputtest.script
+# Direct3D 11, which is what a game made in the last decade draws through.
+#
+# The whole path: a device and a swap chain, a vertex buffer, a texture, an
+# input layout, shaders, state objects, an indexed draw and a strip, Map,
+# UpdateSubresource, QueryInterface for the DXGI side, and Present. The
+# shader blobs are DXBC containers built by hand in the guest -- a real
+# header and real signature chunks, laid out as the compiler emits them --
+# because there is no HLSL compiler here and a synthetic container the
+# parser reads correctly is a parser that reads a real one.
+#
+# What it drew is checked by looking: the frame checksum covers every pixel,
+# so a triangle in the wrong place, a texture sampled with its coordinates
+# swapped, or a colour that failed to modulate all change it. The arithmetic
+# is integer throughout, so that number is the same in both bitnesses and on
+# every machine -- which is the only reason asserting it means anything.
+#
+# By checksum rather than by whole output: the run ends with a report -- the
+# shaders were not executed and it says so -- and a report carries a
+# register dump whose addresses move with the allocator.
+checkrc d11test64.exe 0 "0 failures"
+checkrc d11test32.exe 0 "0 failures"
+checkframe d11test64.exe 320x200 311139ad
+checkframe d11test32.exe 320x200 311139ad
 # Everything a modern game engine links against.
 #
 # A GameMaker game resolved 232 imports and was missing 114, across nineteen
@@ -133,11 +170,11 @@ checkrc enginedeps32.exe 0 "0 failures"
 # that returned zero from a pointer-returning function faulted on the first
 # one, which is what this exists to stop happening again.
 for b in 64 32; do
-    rcs=$("$winrun" "./keepgoing$b.exe" >/dev/null 2>&1; echo $?)
+    rcs=$($emu "$winrun" "./keepgoing$b.exe" >/dev/null 2>&1; echo $?)
     if [ "$rcs" = "127" ]; then echo "ok   keepgoing$b.exe stops at the first missing function"
     else echo "FAIL keepgoing$b.exe without -k exited $rcs, want 127"; fail=1; fi
 
-    outk=$("$winrun" -k "./keepgoing$b.exe" 2>&1); rck=$?
+    outk=$($emu "$winrun" -k "./keepgoing$b.exe" 2>&1); rck=$?
     missing=$(printf '%s\n' "$outk" | grep -c 'user32.dll!\(SwitchDesktop\|LockWorkStation\|CreateDesktopW\)')
     if [ "$rck" = "0" ] && [ "$missing" = "3" ] && printf '%s\n' "$outk" | grep -q '0 failures'; then
         echo "ok   keepgoing$b.exe -k names all three and the guest survives the answers"

@@ -23,6 +23,8 @@ for a in 32 64; do
     $CC -O2 -s -DSUBDLL=\"sub$a.dll\" -DLATEDLL=\"late$a.dll\" \
         -o dlltest$a.exe dlltest.c -L. -l:libmid$a.a -l:libsub$a.a
     rm -f dlllate$a.def libsub$a.a libmid$a.a
+    # Direct3D 11: the whole draw path, with hand-built shader containers.
+    $CC -O2 -s -o d11test$a.exe d11test.c -ld3d11 -ldxgi -luuid -lgdi32 -luser32
     # Everything a modern game engine links against, called once each.
     $CC -O2 -s -o enginedeps$a.exe enginedeps.c -ladvapi32 -lcomdlg32 -ldwmapi \
         -limm32 -liphlpapi -lrpcrt4 -lwininet -lws2_32 -lwinmm -ld3d11 -luser32 -lgdi32

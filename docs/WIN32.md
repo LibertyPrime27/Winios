@@ -144,6 +144,84 @@ back buffer becomes a Metal render target instead of memory the CPU writes, is
 the next step. The rasterizer stays as the reference the GPU path is checked
 against, and as the fallback where no GPU path is available.
 
+## d3d11.dll and dxgi.dll
+
+Everything from 2009 onward asks for Direct3D 11, so `d3d11.c` is the same
+mechanism again at the scale D3D11 actually has: twenty object types, twelve
+vtables, and 115 methods on `ID3D11DeviceContext` alone. `D3D11CreateDevice`
+and `D3D11CreateDeviceAndSwapChain` return a device, an immediate context and
+a swap chain whose back buffer is the screen surface; `CreateDXGIFactory`
+returns a factory, and the device's `QueryInterface` hands back `IDXGIDevice`
+and `IDXGIDevice1` so the usual `device -> IDXGIDevice -> adapter -> factory`
+walk a game does at startup completes.
+
+**Every slot count is checked by the compiler.** With 115 methods in one
+interface, a table one short is not something anyone finds by reading it — the
+call goes to the neighbouring method and the program fails later, somewhere
+else. So the counts were taken mechanically out of `d3d11.h` and `dxgi.h` by
+parsing the `typedef struct IXxxVtbl` blocks, and each table carries a
+`_Static_assert` on its length:
+
+```c
+_Static_assert(NM(device_methods)  == 43,  "ID3D11Device has 43 methods");
+_Static_assert(NM(context_methods) == 115, "ID3D11DeviceContext has 115 methods");
+```
+
+That is not hypothetical tidiness. `CheckFeatureSupport` was missing from the
+device table, which put `GetFeatureLevel` where `GetCreationFlags` should have
+been; the assert is what makes the next such omission a build error instead of
+a bug report. The same pass found `ID3D11Query` needing nine slots rather than
+seven.
+
+**Structure sizes are measured, not derived.** `GetDesc` calls write into a
+struct on the caller's stack, and a struct ending in pointer-sized members is
+a different size in each bitness. Clearing 320 bytes into a 292-byte
+`DXGI_ADAPTER_DESC` smashed the caller's frame and faulted much later with
+`rsp = 0xfffffffc` — after every check in the test had already passed. The
+sizes now in the file (`292`/`304` for the adapter description, `60`/`72` for
+the swap-chain description) came from compiling a mingw `sizeof`/`offsetof`
+probe and running it under `winrun` in both bitnesses, which is the only way
+to get them right rather than plausible.
+
+### What the pipeline does, and what it does not
+
+**The shaders are not executed.** `CreateVertexShader` and `CreatePixelShader`
+are handed DXBC containers, and `dxbc.c` parses the container — the chunk
+directory, and the `ISGN`/`OSGN`/`ISG1`/`OSG1` signature chunks — to learn
+each stage's inputs and outputs by semantic. The draw path is then
+*interpreted* from those signatures: the vertex stage transforms `POSITION` by
+the 4x4 matrix in constant buffer 0 and passes `TEXCOORD` and `COLOR` through,
+and the pixel stage samples texture 0 and modulates by the interpolated
+colour. That covers what a sprite, a UI layer or a textured quad needs, and it
+is wrong for anything whose look comes out of its own shader arithmetic. Each
+shader says so once, through `note_shader_not_run`, rather than silently.
+
+Two more limits worth stating plainly: there is **no depth buffer** (a
+depth-stencil view is accepted and ignored, so a scene that relies on z
+ordering draws in submission order), and interpolation is **affine rather than
+perspective-correct** (a large triangle seen edge-on has its texture visibly
+skewed). Neither is hidden behind a "not supported" that would stop a game
+starting; both change what you see.
+
+The vertex path is real, though. `CreateInputLayout` keeps the element array,
+including `D3D11_APPEND_ALIGNED_ELEMENT`, and `fetch_semantic` walks it to
+find a semantic and index in a bound vertex buffer; `read_attr` decodes the
+DXGI formats a game actually uses for vertex data, including 16-bit floats and
+both byte orders of 8-bit colour. `Draw`, `DrawIndexed`, `DrawInstanced` and
+`DrawIndexedInstanced` assemble lists and strips (with the odd-triangle winding
+swap), the last vertex is bounds-checked against the buffer's size, and
+`Map`/`Unmap` and `UpdateSubresource` write into buffers that live in guest
+memory just as D3D9's do.
+
+The pixels come from `d3d11_raster.c`, built the same way as `raster.c` and
+for the same reason: 28.4 fixed point for coordinates, 16.16 for texture
+coordinates, integer edge functions for the barycentric weights. `d11test.exe`
+— which builds its DXBC containers by hand, creates the whole object graph and
+draws an indexed textured quad and a Gouraud strip — presents a frame whose
+checksum is `311139ad` at 320x200 on an x86 runner, under qemu on aarch64, and
+in both bitnesses. Being the same number in all of those is the only reason a
+checksum is worth recording at all.
+
 ## Both bitnesses, one implementation
 
 A PE32 image gets the 4 GB arena (guest address = base + zext32), a PE32+

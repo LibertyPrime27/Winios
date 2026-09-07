@@ -5,9 +5,11 @@
 # compare xrun against the native run -- the CI oracle for the arena model.
 #   run.sh <xrun> <guest dir>
 xrun=$(cd "$(dirname "$1")" && pwd)/$(basename "$1"); cd "$2" || exit 2; fail=0
+# See tests/win32/run.sh: the emulator for a cross-built xrun, empty natively.
+emu=${WINIOS_EMULATOR:-}
 for g in hello libc_hello hello32 nbody; do
     exp=$(cat "$g.expected")
-    got=$("$xrun" "./$g" 2>/tmp/xrun_err.$$) ; rc=$?
+    got=$($emu "$xrun" "./$g" 2>/tmp/xrun_err.$$) ; rc=$?
     if [ "$got" != "$exp" ] || [ $rc -ne 0 ]; then
         echo "FAIL $g (rc=$rc)"; echo "--- expected"; echo "$exp"; echo "--- got"; echo "$got"; cat /tmp/xrun_err.$$; fail=1
     else echo "ok   $g"; fi
@@ -15,7 +17,7 @@ done
 tmp=$(mktemp -d)
 if gcc -m32 -static -O2 -o "$tmp/lh32" libc_hello.c 2>/dev/null; then
     exp=$("$tmp/lh32" x y); rc1=$?
-    got=$("$xrun" "$tmp/lh32" x y 2>/tmp/xrun_err.$$); rc2=$?
+    got=$($emu "$xrun" "$tmp/lh32" x y 2>/tmp/xrun_err.$$); rc2=$?
     if [ "$got" != "$exp" ] || [ $rc1 -ne $rc2 ]; then
         echo "FAIL libc_hello (i386 glibc static) rc native=$rc1 xrun=$rc2"; echo "$got"; cat /tmp/xrun_err.$$; fail=1
     else echo "ok   libc_hello (i386 glibc static, built here)"; fi

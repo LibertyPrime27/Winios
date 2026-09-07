@@ -47,6 +47,32 @@ void w32_set_present(w32_present_fn fn, void *ctx) { g_present = fn; g_present_c
  * from whoever is drawing it. */
 w32_present_fn w32_get_present(void **ctx) { if (ctx) *ctx = g_present_ctx; return g_present; }
 
+/* The checksum of a frame, in one place.
+ *
+ * Every pixel that reaches this hook was computed with integer arithmetic --
+ * the rasterizers in raster.c and d3d11_raster.c have no float in them by
+ * construction -- so the same guest drawing the same thing has to produce the
+ * same 32 bits on an x86 runner, under qemu on aarch64, and on a phone. That
+ * is only a useful claim if all three compute the checksum the same way, so
+ * winrun's `-frame` and the on-device diagnostics both call this rather than
+ * each keeping a CRC32 of their own. (Plain CRC-32, the zlib polynomial.) */
+uint32_t w32_frame_crc32(const void *data, size_t n) {
+    static uint32_t tab[256];
+    static int ready;
+    if (!ready) {
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            tab[i] = c;
+        }
+        ready = 1;
+    }
+    const uint8_t *p = (const uint8_t *)data;
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++) c = tab[(c ^ p[i]) & 0xFF] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+
 /* How the host asks a guest that is drawing frames to stop: Present starts
  * returning D3DERR_DEVICELOST. A game already has to handle that -- it is
  * what a real driver returns when the display mode changes or the machine
@@ -54,6 +80,10 @@ w32_present_fn w32_get_present(void **ctx) { if (ctx) *ctx = g_present_ctx; retu
  * without the host reaching into a running guest. */
 static volatile int g_lost;
 void w32_d3d9_device_lost(int on) { g_lost = on ? 1 : 0; }
+/* The same signal, read by d3d11's Present. "The window went away, stop
+ * drawing" is one fact about the display, not one per graphics API, so both
+ * ask the same flag rather than each keeping its own and one being stale. */
+int w32_d3d9_lost(void) { return g_lost; }
 
 /* object fields (64-bit slots after the header) */
 enum { D3D_NDEV = 0 };                                        /* IDirect3D9 */

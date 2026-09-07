@@ -22,7 +22,8 @@ import os
 final class ProbeViewController: UIViewController {
 
     private let results = UITextView()
-    /// The last frame a guest presented through d3d9. Hidden until there is one.
+    /// The last frame a guest presented -- through d3d9 or d3d11, whichever
+    /// probe ran. Hidden until there is one.
     private let frameView = UIImageView()
     private var frameImage: UIImage?
     private let store = UserDefaults.standard
@@ -32,6 +33,7 @@ final class ProbeViewController: UIViewController {
     private var jitLine: String { get { store.string(forKey: "jit") ?? "not run" } set { store.set(newValue, forKey: "jit") } }
     private var winLine: String { get { store.string(forKey: "win") ?? "not run" } set { store.set(newValue, forKey: "win") } }
     private var d3dLine: String { get { store.string(forKey: "d3d") ?? "not run" } set { store.set(newValue, forKey: "d3d") } }
+    private var d11Line: String { get { store.string(forKey: "d11") ?? "not run" } set { store.set(newValue, forKey: "d11") } }
     private var running = false
     private var jitAttachPending = false
     /// False while the app is not frontmost. Probe work pauses on it: iOS kills
@@ -84,7 +86,8 @@ final class ProbeViewController: UIViewController {
             row([("1 · CPU vectors", #selector(runCPU)), ("2 · Benchmark", #selector(runBench))]),
             row([("3 · GPU (D3D9/11/12)", #selector(runGPU)), ("5 · Windows .exe", #selector(runWindows))]),
             row([("x87 fast path", #selector(runX87)), ("7 · D3D9 frame", #selector(runFrame))]),
-            row([("6 · Memory ladder", #selector(runLadder)), ("Clear frame", #selector(clearFrame))]),
+            row([("10 · D3D11 frame", #selector(runD11)), ("Clear frame", #selector(clearFrame))]),
+            button("6 · Memory ladder", #selector(runLadder)),
             button("8 · Run a Windows program full screen (live frames)", #selector(runGuest)),
             button("4 · JIT: attach StikDebug, then execute in a blessed arena", #selector(attachJIT)),
             button("9 · JIT arena: try a bigger one next launch", #selector(stepArena)),
@@ -213,6 +216,7 @@ final class ProbeViewController: UIViewController {
             self.gpuProbe()
             self.windowsProbe(single: nil)
             self.frameProbe()
+            self.d11Probe()
             Ladder.climb(host: "app", paused: { !self.isActive })
             self.armNextArena()
         }
@@ -224,6 +228,7 @@ final class ProbeViewController: UIViewController {
     @objc private func runWindows() { work("Windows guests") { self.windowsProbe(single: nil) } }
     @objc private func runX87()  { work("x87")         { self.windowsProbe(single: "nbody32.exe") } }
     @objc private func runFrame() { work("frame")      { self.frameProbe() } }
+    @objc private func runD11()   { work("d3d11")      { self.d11Probe() } }
     /// The app rather than the probe: a guest drawing frames in a loop, full
     /// screen, presented through Metal as fast as the emulator manages.
     @objc private func runGuest() {
@@ -381,6 +386,109 @@ final class ProbeViewController: UIViewController {
         }
     }
 
+    /// Eight hex digits, zero-padded. Written out rather than String(format:)
+    /// so the two checksums in the report line up under each other whatever
+    /// the value is.
+    private func hex8(_ v: UInt32) -> String {
+        let s = String(v, radix: 16)
+        return String(repeating: "0", count: max(0, 8 - s.count)) + s
+    }
+
+    /// Direct3D 11 on this device, the same way: run it, look at it, check the
+    /// number.
+    ///
+    /// d11test builds DXBC shader containers by hand, creates a device, a
+    /// swap chain, a render target, a texture and its view, vertex, index and
+    /// constant buffers, an input layout and the state objects, then draws an
+    /// indexed textured quad and a Gouraud strip and presents. Every one of
+    /// those calls goes through a COM vtable built in guest memory, so this is
+    /// also what checks that the twelve vtables have the slot counts D3D11
+    /// says they have -- a wrong count sends a call to the neighbouring method
+    /// and the failure surfaces somewhere else entirely.
+    ///
+    /// Both bitnesses, because they are different code paths through the same
+    /// object model -- a struct that ends in pointers is a different size in
+    /// each, and getting that wrong writes past a caller's stack frame.
+    ///
+    /// The checksum is fixed at 320x200 regardless of the display setting,
+    /// because a recording belongs to a resolution. Being able to compare it
+    /// on the phone with the value an x86 runner and a qemu aarch64 run
+    /// produce is the whole point: the rasterizer has no float in it, so if
+    /// Apple silicon disagrees, something is wrong and it is not rounding.
+    ///
+    /// What this does NOT claim: the shaders are not executed. The pipeline is
+    /// interpreted from their input and output signatures -- the vertex stage
+    /// transforms POSITION by the first constant buffer's matrix and passes
+    /// TEXCOORD and COLOR through, and the pixel stage samples texture 0 and
+    /// modulates by the vertex colour. There is no depth buffer, and
+    /// interpolation is affine rather than perspective-correct. A game whose
+    /// look depends on its own shader arithmetic will draw, and will not draw
+    /// what it does on Windows.
+    private func d11Probe() {
+        DispatchQueue.main.async { self.d11Line = "running…"; self.refresh() }
+        guard let dir = Bundle.main.resourceURL?.appendingPathComponent("win32") else {
+            DispatchQueue.main.async { self.d11Line = "guests not bundled"; self.refresh() }
+            return
+        }
+        if let arena = ensureArena() { _ = handArenaToXcore(arena) }
+
+        // The value tests/win32/run.sh records for both bitnesses. Written
+        // here rather than read from the guest, because a checksum compared
+        // against whatever the run produced is not a check.
+        let want: UInt32 = 0x3111_39ad
+        var text = ""
+        var failed = 0
+        for name in ["d11test64.exe", "d11test32.exe"] {
+            let exe = dir.appendingPathComponent(name).path
+            var out = [CChar](repeating: 0, count: 8192)
+            var ns: UInt64 = 0
+            xc_jit_enable(1)
+            let rc = exe.withCString { win_probe_run_at($0, 320, 200, &out, out.count, &ns) }
+            xc_jit_enable(0)
+            let got = String(cString: out)
+            let crc = win_probe_frame_crc()
+            // Three separate claims, reported separately: it ran, its own
+            // checks passed, and it drew the right picture. Collapsing them
+            // into one PASS/FAIL is what makes a diagnostic useless when it
+            // finally fails.
+            let ran = rc == 0
+            let selfOK = got.contains("0 failures")
+            let drew = crc == want
+            if !(ran && selfOK && drew) { failed += 1 }
+            text += "\(ran && selfOK && drew ? "PASS" : "FAIL")  \(name)  exit \(rc), \(ns / 1_000_000) ms\n"
+            text += "    its own checks: \(selfOK ? "0 failures" : "reported failures")\n"
+            text += "    frame 320x200 crc \(hex8(crc)) (want \(hex8(want)))"
+                  + (drew ? "\n" : "  <- DIFFERENT\n")
+            if !selfOK {
+                text += got.split(separator: "\n").map { "    " + $0 }.joined(separator: "\n") + "\n"
+            }
+
+            var w: Int32 = 0, h: Int32 = 0, pitch: Int32 = 0
+            if rc == 0, let px = win_probe_frame(&w, &h, &pitch), w > 0, h > 0 {
+                let data = Data(bytes: px, count: Int(h) * Int(pitch))
+                let info: CGBitmapInfo = [.byteOrder32Little,
+                                          CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue)]
+                if let provider = CGDataProvider(data: data as CFData),
+                   let cg = CGImage(width: Int(w), height: Int(h), bitsPerComponent: 8, bitsPerPixel: 32,
+                                    bytesPerRow: Int(pitch), space: CGColorSpaceCreateDeviceRGB(),
+                                    bitmapInfo: info, provider: provider, decode: nil,
+                                    shouldInterpolate: false, intent: .defaultIntent) {
+                    frameImage = UIImage(cgImage: cg)
+                }
+            }
+        }
+        let head = failed == 0
+            ? "Direct3D 11 on this device: both bitnesses drew the recorded frame\n"
+            : "Direct3D 11 on this device: \(failed) of 2 did NOT match\n"
+        let img = frameImage
+        DispatchQueue.main.async {
+            self.frameView.image = img
+            self.frameView.isHidden = img == nil
+            self.d11Line = head + text
+            self.refresh()
+        }
+    }
+
     /// Windows executables built with mingw-w64, bundled as resources: the PE
     /// loader, DLL loading, the host-implemented kernel32/msvcrt/d3d9, and the
     /// dynarec, end to end on the device. `single` runs just one of them (the
@@ -531,7 +639,7 @@ final class ProbeViewController: UIViewController {
     @objc private func resetAll() {
         ResultStore.reset()
         markerPath.withCString { jit_probe_reset($0) }
-        ["cpu", "bench", "gpu", "jit", "win", "d3d"].forEach { store.removeObject(forKey: $0) }
+        ["cpu", "bench", "gpu", "jit", "win", "d3d", "d11"].forEach { store.removeObject(forKey: $0) }
         // arenaGoodKB/arenaBadKB are findings about this device, not results:
         // they survive a reset. Only the in-flight attempt is cleared.
         arenaPendingKB = 0
@@ -826,6 +934,10 @@ final class ProbeViewController: UIViewController {
 
         7 · DIRECT3D 9 (COM vtables in guest memory, vertex buffers, DrawPrimitive)
         \(d3dLine)
+
+        10 · DIRECT3D 11 (device, swap chain, input layout, DXBC signatures,
+             indexed and strip draws through the integer rasterizer)
+        \(d11Line)
 
         6 · MEMORY, app process (stops 256 MB short of the kill on purpose;
             pauses while the app is in the background)

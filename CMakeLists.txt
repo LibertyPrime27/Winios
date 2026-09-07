@@ -27,6 +27,13 @@ endif()
 
 enable_testing()
 
+# Running a cross-built binary. ctest applies CMAKE_CROSSCOMPILING_EMULATOR to
+# a test that *is* an executable target, but two of these tests are shell
+# scripts that exec the runner themselves, so the emulator has to reach them
+# as an environment variable instead. Joined with spaces because a CMake list
+# is semicolons and a shell command line is not.
+string(REPLACE ";" " " WINIOS_EMULATOR "${CMAKE_CROSSCOMPILING_EMULATOR}")
+
 add_subdirectory(core)
 
 # --- GPU: Direct3D 12 -> Metal compiler (own repo, vendored as a submodule) ---
@@ -97,6 +104,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set_property(TARGET xrun PROPERTY C_STANDARD 11)
     target_compile_options(xrun PRIVATE -Wall -Wextra -Wno-unused-parameter)
     add_test(NAME guest_hello COMMAND ${CMAKE_COMMAND} -E env
+        "WINIOS_EMULATOR=${WINIOS_EMULATOR}"
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/guest/run.sh $<TARGET_FILE:xrun> ${CMAKE_CURRENT_SOURCE_DIR}/tests/guest)
 endif()
 
@@ -116,7 +124,8 @@ if(NOT WIN32)
         win32/advapi32.c win32/seh.c win32/thread.c
         win32/user32.c win32/gdi32.c win32/gdifont.c win32/comctl32.c
         win32/dsound.c win32/xinput.c win32/shell32.c win32/ole32.c
-        win32/misc_dlls.c win32/net_dlls.c win32/d3d11.c)
+        win32/misc_dlls.c win32/net_dlls.c
+        win32/d3d11.c win32/d3d11_raster.c win32/dxbc.c)
 
     add_library(winrun_lib STATIC ${WINRUN_SOURCES})
     target_link_libraries(winrun_lib PUBLIC xcore)
@@ -166,6 +175,27 @@ if(NOT WIN32)
         add_test(NAME import_installer COMMAND ${CMAKE_COMMAND} -E env
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/import/install.sh
             $<TARGET_FILE:wimport> ${CMAKE_CURRENT_SOURCE_DIR}/tests/win32)
+
+        # --- the app's own entry points ----------------------------------
+        #
+        # winprobe.c is the layer the iOS app calls: capture the guest's
+        # stdout, hand back the frame, drive an import. Until now nothing
+        # outside Xcode compiled it, and the comment at the top of that file
+        # records what that costs -- a POSIX declaration that Darwin happened
+        # to expose was missing, and the identical omission in a sibling file
+        # silently truncated a pointer on a 64-bit target. Building it here
+        # means a mistake in the app's own C surfaces on a Linux runner
+        # instead of in an Xcode build nobody is watching.
+        #
+        # And it is worth *running*, not only compiling: the checksum a phone
+        # reports for a frame comes from this path, so checking it here is
+        # what makes the number on the phone comparable to the number in CI.
+        add_executable(test_winprobe tests/test_winprobe.c tools/memprobe/Shared/winprobe.c)
+        target_link_libraries(test_winprobe PRIVATE import_lib winrun_lib)
+        target_include_directories(test_winprobe PRIVATE tools/memprobe/Shared)
+        set_property(TARGET test_winprobe PROPERTY C_STANDARD 11)
+        target_compile_options(test_winprobe PRIVATE -Wall -Wextra -Wno-unused-parameter)
+        add_test(NAME winprobe COMMAND test_winprobe ${CMAKE_CURRENT_SOURCE_DIR}/tests/win32)
     else()
         message(STATUS "zlib not found for this target: skipping the importer "
                        "(tools/import, wimport). Everything else is unaffected. "
@@ -181,5 +211,6 @@ if(NOT WIN32)
     target_link_libraries(test_winrun_lib PRIVATE winrun_lib)
     add_test(NAME winrun_lib COMMAND test_winrun_lib ${CMAKE_CURRENT_SOURCE_DIR}/tests/win32)
     add_test(NAME win32_guests COMMAND ${CMAKE_COMMAND} -E env
+        "WINIOS_EMULATOR=${WINIOS_EMULATOR}"
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/win32/run.sh $<TARGET_FILE:winrun> ${CMAKE_CURRENT_SOURCE_DIR}/tests/win32)
 endif()
