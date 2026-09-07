@@ -222,6 +222,7 @@ int main(int argc, char **argv) {
         { "d3dloop64.exe", 0 },  { "d3dloop32.exe", 0 },
         { "pathtest64.exe", 0 }, { "pathtest32.exe", 0 },
         { "d3ddraw64.exe", 0 },  { "d3ddraw32.exe", 0 },
+        { "d3dtex64.exe", 0 },   { "d3dtex32.exe", 0 },
         { "filetest64.exe", 0 }, { "filetest32.exe", 0 },
         { "sehtest64.exe", 0 },  { "sehtest32.exe", 0 },
         { "audiotest64.exe", 0 }, { "audiotest32.exe", 0 },

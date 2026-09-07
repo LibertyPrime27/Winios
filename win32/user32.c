@@ -58,6 +58,8 @@
  * rasterizer, which is why the app can set it. */
 static int g_screen_w = 1280, g_screen_h = 720;
 
+static void screen_size_changed(void);    /* defined with the pointer state it moves */
+
 void w32_set_screen_size(int cx, int cy) {
     /* Bounded rather than trusted: a game that is told the screen is 8 pixels
      * wide does something unhelpful, and one told it is 32768 wide tries to
@@ -65,6 +67,13 @@ void w32_set_screen_size(int cx, int cy) {
     if (cx >= 320 && cy >= 200 && cx <= 7680 && cy <= 4320) {
         g_screen_w = cx;
         g_screen_h = cy;
+        /* The pointer has to end up on the display this call just made. It
+         * starts in the middle of one nobody has chosen yet -- winrun resets
+         * the input state before it reads `-screen`, and the app sets the
+         * size after it has started a guest -- so left alone it sits off the
+         * right-hand edge, where GetCursorPos reports a point outside every
+         * window and nothing draws it at all. */
+        screen_size_changed();
     }
 }
 void w32_screen_size(int *cx, int *cy) {
@@ -210,6 +219,15 @@ static int caption_height(void) {
     int h = w32_points_to_pixels(9) + 8;
     return h < 18 ? 18 : h;
 }
+/* A menu bar sits under the caption and takes room out of the client area for
+ * exactly the reason the caption does: a window's contents are positioned
+ * from the client origin, and a bar drawn over the client area covers the
+ * first row of whatever is in it. Shallower than the caption because a bar is
+ * text with a little air and nothing else in it. */
+static int menu_bar_height(void) {
+    int h = w32_points_to_pixels(9) + 6;
+    return h < 16 ? 16 : h;
+}
 
 typedef struct {
     int      used;
@@ -286,6 +304,54 @@ static struct {
     char colname[8][32];
 } g_list[MAX_LISTS];
 
+/* Menus, on the same principle as the list store above: one entry per menu
+ * that exists, a fixed array of them, and a handle that is an index in
+ * disguise. A menu bar and each of its popups are separate menus -- that is
+ * how Windows models them and how a resource stores them -- so a program with
+ * a File/Edit/View/Help bar owns five of these before any submenu.
+ *
+ * Until now these were handles with nothing behind them: distinct numbers,
+ * an honest item count of zero, and nothing drawn. That is survivable for an
+ * installer, which has no menu and only asks for its system menu so it can
+ * grey out Close, and not survivable for a game with a menu bar -- the bar
+ * simply was not there. */
+enum { MAX_MENUS = 48, MENU_ITEMS = 64, MENU_TEXT = 64 };
+typedef struct {
+    char     text[MENU_TEXT];
+    uint32_t id;                /* the WM_COMMAND identifier */
+    uint32_t flags;             /* MF_*, as the program or the resource gave them */
+    uint64_t sub;               /* a popup menu, for MF_POPUP */
+} mitem;
+typedef struct { int used, n; mitem it[MENU_ITEMS]; } wmenu;
+static wmenu g_menu[MAX_MENUS];
+enum { MENU_BASE = 0x000C0000u, MENU_STEP = 4 };
+
+/* Menu item flags. MF_END is the resource format's "last item at this level"
+ * and shares its value with MF_HILITE, which is why the parser strips it
+ * before the flags are kept. */
+enum {
+    MF_STRING = 0x0000, MF_ENABLED = 0x0000, MF_UNCHECKED = 0x0000,
+    MF_GRAYED = 0x0001, MF_DISABLED = 0x0002, MF_BITMAP = 0x0004,
+    MF_CHECKED = 0x0008, MF_POPUP = 0x0010, MF_MENUBARBREAK = 0x0020,
+    MF_MENUBREAK = 0x0040, MF_HILITE = 0x0080, MF_OWNERDRAW = 0x0100,
+    MF_SEPARATOR = 0x0800, MF_BYCOMMAND = 0x0000, MF_BYPOSITION = 0x0400,
+    MF_END = 0x0080,
+};
+/* TrackPopupMenu's flags. Only the two that change what happens are read:
+ * where the menu is placed relative to the point, and whether the chosen
+ * command comes back as the return value instead of as a WM_COMMAND. */
+enum {
+    TPM_CENTERALIGN = 0x0004, TPM_RIGHTALIGN = 0x0008,
+    TPM_VCENTERALIGN = 0x0010, TPM_BOTTOMALIGN = 0x0020,
+    TPM_RETURNCMD = 0x0100,
+};
+/* MENUITEMINFO's fMask bits. */
+enum {
+    MIIM_STATE = 0x01, MIIM_ID = 0x02, MIIM_SUBMENU = 0x04, MIIM_CHECKMARKS = 0x08,
+    MIIM_TYPE = 0x10, MIIM_DATA = 0x20, MIIM_STRING = 0x40, MIIM_BITMAP = 0x80,
+    MIIM_FTYPE = 0x100,
+};
+
 static wclass g_cls[MAX_CLASSES];
 static wwin   g_win[MAX_WINDOWS];
 enum { HW_BASE = 0x00050000u, HW_STEP = 4 };
@@ -297,6 +363,15 @@ static int     g_qhead, g_qtail;        /* head == tail: empty */
 /* Which cursor the program last set. Drawn by the compositor at the end of a
  * repaint, so a game that hides it or picks the wait cursor is believed. */
 static uint64_t g_cursor;
+/* Has anything ever been drawn into the screen surface?
+ *
+ * Moving the pointer changes the finished frame without anything having
+ * painted, so it has to be able to ask for one to be presented. But only for
+ * a surface that is actually the picture: a Direct3D guest presents its own
+ * frames and never touches this one, and presenting an empty desktop between
+ * its frames would both flicker and -- because a presented frame is what an
+ * input script counts as a frame -- move every scripted event. */
+static int g_surf_live;
 /* Signalled whenever anything is queued, so GetMessage can wait for input
  * instead of spinning on the queue or -- as it used to -- giving up on it. */
 static pthread_cond_t g_qcond = PTHREAD_COND_INITIALIZER;
@@ -304,6 +379,7 @@ static uint8_t g_keys[256];             /* 0x80 down, 0x01 toggled */
 static uint8_t g_keys_hit[256];         /* pressed since the last GetAsyncKeyState */
 static uint32_t g_keychar[256];         /* the character the host resolved for this key, if any */
 static int32_t g_mx, g_my;              /* pointer, in client pixels */
+static int     g_mouse_moved;           /* has anything put the pointer somewhere? */
 static int32_t g_rel_dx, g_rel_dy;      /* relative motion not yet consumed */
 static uint32_t g_buttons;              /* bit 0 left, 1 right, 2 middle */
 static int32_t g_wheel;
@@ -312,6 +388,83 @@ static uint64_t g_focus;                /* the window input goes to */
 static uint64_t g_capture;
 static int     g_cursor_shown = 1;
 static int     g_cursor_count;          /* ShowCursor's counter */
+
+/* The menu that is open, if any.
+ *
+ * A menu is not a window here. It is drawn as an overlay over the finished
+ * frame -- above every window, because that is where a menu is -- and while
+ * it is up it takes the mouse and the keyboard away from the windows
+ * underneath. That second half is what makes a click past an open menu close
+ * the menu instead of pressing whatever it landed on.
+ *
+ * Levels, because a submenu does not replace the popup it came from: both
+ * stay on screen, which is the entire visual grammar of a cascading menu. */
+enum { MENU_DEPTH = 4 };
+static struct {
+    int      n;                     /* popups on screen; 0 means no menu is open */
+    uint64_t owner;                 /* the window a chosen command is posted to */
+    uint64_t barwnd;                /* whose menu bar is dropped, 0 for a context menu */
+    int      baritem;               /* which bar item, -1 for a context menu */
+    struct { uint64_t menu; int x, y, w, h, hot; } lv[MENU_DEPTH];
+    int      tracking;              /* TrackPopupMenu is running its own message loop */
+    uint32_t tflags;                /* its TPM_* flags */
+    int      chosen;                /* what that loop will return; -1 until something is */
+} g_pop;
+
+/* --- the menu store ------------------------------------------------------
+ *
+ * A menu handle is an index into g_menu wearing a disguise, exactly as a
+ * window handle is an index into g_win. Callers hold g_lock.
+ */
+static wmenu *menu_of(uint64_t h) {
+    if (h < MENU_BASE) return 0;
+    uint64_t i = (h - MENU_BASE) / MENU_STEP;
+    if ((h - MENU_BASE) % MENU_STEP || i >= MAX_MENUS || !g_menu[i].used) return 0;
+    return &g_menu[i];
+}
+static uint64_t menu_new(void) {
+    for (int i = 0; i < MAX_MENUS; i++) if (!g_menu[i].used) {
+        memset(&g_menu[i], 0, sizeof g_menu[i]);
+        g_menu[i].used = 1;
+        return MENU_BASE + (uint64_t)i * MENU_STEP;
+    }
+    fprintf(stderr, "winrun: user32: out of menus\n");
+    return 0;
+}
+/* A copy to draw or measure from. Nothing that touches gdi32 may hold g_lock
+ * -- gdi32 takes it again to reach the screen surface, and the mutex is not
+ * recursive -- so every painter works from one of these instead. */
+static int menu_snapshot(uint64_t h, wmenu *out) {
+    pthread_mutex_lock(&g_lock);
+    wmenu *m = menu_of(h);
+    if (m) *out = *m;
+    pthread_mutex_unlock(&g_lock);
+    return m != 0;
+}
+
+/* MF_BYPOSITION or MF_BYCOMMAND: which one a call means is a flag in it, and
+ * getting it backwards is the classic way a menu call silently does nothing.
+ * By command it descends into submenus, because EnableMenuItem(hMenuBar,
+ * ID_FILE_OPEN, MF_GRAYED) is addressed to the bar and means an item three
+ * levels down. Caller holds the lock. */
+static mitem *menu_find(uint64_t h, uint32_t which, uint32_t flags, int depth) {
+    wmenu *m = menu_of(h);
+    if (!m || depth > 8) return 0;
+    /* Unsigned throughout: a caller that passes a command id where a position
+     * was expected hands over a number in the billions, and comparing that as
+     * a signed int makes it look like a small position. */
+    if (flags & MF_BYPOSITION)
+        return which < (uint32_t)m->n ? &m->it[which] : 0;
+    for (int i = 0; i < m->n; i++)
+        if (!(m->it[i].flags & (MF_POPUP | MF_SEPARATOR)) && m->it[i].id == which)
+            return &m->it[i];
+    for (int i = 0; i < m->n; i++)
+        if (m->it[i].flags & MF_POPUP) {
+            mitem *r = menu_find(m->it[i].sub, which, flags, depth + 1);
+            if (r) return r;
+        }
+    return 0;
+}
 
 static uint32_t tick_ms(void) {
     struct timespec ts;
@@ -330,12 +483,16 @@ void w32_input_reset(void) {
     memset(g_keys_hit, 0, sizeof g_keys_hit);
     memset(g_keychar, 0, sizeof g_keychar);
     g_mx = SCREEN_W / 2; g_my = SCREEN_H / 2;
+    g_mouse_moved = 0;
     g_rel_dx = g_rel_dy = 0;
     g_buttons = 0; g_wheel = 0;
     g_quit = 0; g_quit_code = 0;
     g_focus = 0; g_capture = 0;
     g_cursor_shown = 1; g_cursor_count = 0;
+    g_cursor = 0; g_surf_live = 0;
     memset(g_list, 0, sizeof g_list);
+    memset(g_menu, 0, sizeof g_menu);
+    memset(&g_pop, 0, sizeof g_pop);
     ui_reset_tables();
     pthread_mutex_unlock(&g_lock);
 }
@@ -365,6 +522,27 @@ static uint32_t mouse_wp(void) {
     return k;
 }
 static uint64_t xy_lp(int x, int y) { return ((uint64_t)(uint16_t)y << 16) | (uint16_t)x; }
+
+/* Put the pointer back on the display, wherever the display has got to.
+ *
+ * A pointer nobody has touched is still where the reset put it -- the middle
+ * of the screen -- and it belongs in the middle of the new one rather than
+ * wherever the old middle happens to fall. Once something has moved it, its
+ * position is a fact about the session and is only clamped back inside. */
+static void screen_size_changed(void) {
+    pthread_mutex_lock(&g_lock);
+    if (!g_mouse_moved) { g_mx = SCREEN_W / 2; g_my = SCREEN_H / 2; }
+    if (g_mx < 0) g_mx = 0;
+    if (g_my < 0) g_my = 0;
+    if (g_mx >= SCREEN_W) g_mx = SCREEN_W - 1;
+    if (g_my >= SCREEN_H) g_my = SCREEN_H - 1;
+    pthread_mutex_unlock(&g_lock);
+}
+
+/* The pointer moved, changed shape, or was hidden. Nothing painted, but the
+ * frame the pointer is composited into is different -- so ask for it to be
+ * presented again, and only if that surface is the one on the display. */
+static void cursor_damaged(void) { if (g_surf_live) w32_desktop_damaged(); }
 
 /* --- the host side of input ---------------------------------------------
  *
@@ -421,9 +599,10 @@ void w32_input_char(uint32_t ch) {
 void w32_input_mouse_move(int x, int y) {
     pthread_mutex_lock(&g_lock);
     g_rel_dx += x - g_mx; g_rel_dy += y - g_my;
-    g_mx = x; g_my = y;
+    g_mx = x; g_my = y; g_mouse_moved = 1;
     push(0, WM_MOUSEMOVE, mouse_wp(), xy_lp(x, y), x, y);
     pthread_mutex_unlock(&g_lock);
+    cursor_damaged();
 }
 
 /* Relative motion with no pointer to move: a trackpad or mouse in the
@@ -434,13 +613,14 @@ void w32_input_mouse_move(int x, int y) {
 void w32_input_mouse_delta(int dx, int dy) {
     pthread_mutex_lock(&g_lock);
     g_rel_dx += dx; g_rel_dy += dy;
-    g_mx += dx; g_my += dy;
+    g_mx += dx; g_my += dy; g_mouse_moved = 1;
     if (g_mx < 0) g_mx = 0;
     if (g_mx >= SCREEN_W) g_mx = SCREEN_W - 1;
     if (g_my < 0) g_my = 0;
     if (g_my >= SCREEN_H) g_my = SCREEN_H - 1;
     push(0, WM_MOUSEMOVE, mouse_wp(), xy_lp(g_mx, g_my), g_mx, g_my);
     pthread_mutex_unlock(&g_lock);
+    cursor_damaged();
 }
 
 void w32_input_mouse_button(int button, int down) {
@@ -498,6 +678,35 @@ static wwin *win_of(uint64_t hwnd) {
     return &g_win[i];
 }
 static uint64_t hwnd_of(const wwin *p) { return HW_BASE + (uint64_t)(p - g_win) * HW_STEP; }
+
+/* CreateWindowEx's ninth argument is an HMENU for a top-level window and a
+ * child identifier for a child, and both land in the same field. So the test
+ * for "does this window have a menu bar" is not whether the field is set but
+ * whether what is in it names a menu with anything in it -- an empty menu
+ * gets no bar, which is also what Windows draws. Caller holds the lock. */
+static uint64_t menu_of_window(const wwin *p) {
+    if (!p || (p->style & WS_CHILD)) return 0;
+    wmenu *m = menu_of(p->menu);
+    return m && m->n ? p->menu : 0;
+}
+static uint64_t window_menu(uint64_t hwnd) {
+    pthread_mutex_lock(&g_lock);
+    uint64_t h = menu_of_window(win_of(hwnd));
+    pthread_mutex_unlock(&g_lock);
+    return h;
+}
+/* Work out where the client area starts and how tall it is, given whatever
+ * chrome this window is currently showing. SetMenu can arrive long after the
+ * window was made, and a bar that appeared without the client area shrinking
+ * would be drawn straight over the top row of the contents. Caller holds the
+ * lock; `wh` is the window height. */
+static void apply_chrome(wwin *p) {
+    int cyo = 0;
+    if (!(p->style & WS_CHILD) && (p->style & WS_CAPTION) == WS_CAPTION) cyo = caption_height();
+    if (menu_of_window(p)) cyo += menu_bar_height();
+    p->cyo = cyo;
+    p->ch = p->h - cyo > 1 ? p->h - cyo : 1;
+}
 
 static wclass *class_of(const char *name) {
     for (int i = 0; i < MAX_CLASSES; i++)
@@ -573,6 +782,20 @@ static uint64_t dlg_default_proc(w32 *w, uint64_t hwnd, uint32_t msg, uint64_t w
 static void paint_control(w32 *w, uint64_t hwnd, wwin *snap);
 static uint64_t window_at(int x, int y);
 static void surface_present(void);
+/* The menu bar takes room out of the client area the way the caption does,
+ * so how deep it is has to be known where a window is sized as well as where
+ * one is drawn. */
+static int menu_bar_height(void);
+static uint64_t window_menu(uint64_t hwnd);         /* the bar this window shows, or 0 */
+/* Whether an open menu wanted this message. Everything that dispatches input
+ * asks first: a menu on screen is modal over the windows under it. */
+static int menu_input(w32 *w, uint32_t msg, uint64_t wp, int sx, int sy);
+static int is_key_msg(uint32_t msg);
+/* The open menu and the mouse pointer, put into the frame on its way to the
+ * display and taken out again immediately afterwards. Defined with the menu
+ * painters, because that is what they draw with. */
+static void overlay_compose(void);
+static void overlay_restore(void);
 
 uint64_t w32_new_window(w32 *w, const char *cls, const char *text,
                         uint32_t style, uint32_t exstyle,
@@ -631,11 +854,13 @@ uint64_t w32_new_window(w32 *w, const char *cls, const char *text,
      * WS_CAPTION, and expects the system to draw the title bar exactly as it
      * does for anyone else -- so the window came up with a blank blue strip
      * and no title on it. WS_CAPTION is the program asking for a caption, and
-     * that is the whole test. A game's full-screen window does not set it. */
-    if (!(style & WS_CHILD) && (style & WS_CAPTION) == WS_CAPTION) {
-        p->cyo = caption_height();
-        p->ch = ah - p->cyo > 1 ? ah - p->cyo : 1;
-    }
+     * that is the whole test. A game's full-screen window does not set it.
+     *
+     * A menu bar is the same argument again, and apply_chrome does both: the
+     * HMENU passed to CreateWindowEx is in `menu` by now, so a window created
+     * with its menu already built gets the room taken out here rather than
+     * having to be resized when the first bar item is drawn. */
+    apply_chrome(p);
     if (p->ctl == CTL_LISTBOX || p->ctl == CTL_COMBOBOX ||
         p->ctl == CTL_LISTVIEW || p->ctl == CTL_TREEVIEW ||
         p->ctl == CTL_TAB || p->ctl == CTL_STATUS) {
@@ -1193,6 +1418,15 @@ static void dispatch_message(w32 *w, int wide) {
     uint32_t msg = (uint32_t)w32_read(w, m + (w->is32 ? 4 : 8), 4);
     uint64_t wp  = w32_read(w, m + (w->is32 ? 8 : 16), ps);
     uint64_t lp  = w32_read(w, m + (w->is32 ? 12 : 24), ps);
+    /* An open menu comes first, because it is modal over the windows beneath
+     * it: the click that dismisses a menu must not also press whatever it
+     * landed on, and the arrow keys belong to the menu rather than to the
+     * game behind it. lParam is still in screen coordinates here, which is
+     * what a menu is positioned in. */
+    if ((msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) || is_key_msg(msg)) {
+        int sx = (int)(int16_t)(lp & 0xFFFF), sy = (int)(int16_t)((lp >> 16) & 0xFFFF);
+        if (menu_input(w, msg, wp, sx, sy)) { surface_present(); RET(0); return; }
+    }
     /* A message with no window goes to whatever is under the pointer for
      * mouse input and to the focus window otherwise, which is what makes a
      * click on a button reach the button. */
@@ -1265,7 +1499,19 @@ static void u_DefWindowProcA(w32 *w) {
         pthread_mutex_lock(&g_lock);
         wwin *p = win_of(hwnd);
         wwin snap;
-        int have = p && p->ctl;
+        /* ...or a window of the program's own class that has a menu bar. A
+         * program that builds a File/Edit/Help bar is a windowed application
+         * and the bar is ours to draw, so it needs painting even though the
+         * inside of the window is not ours; paint_control draws nothing for
+         * CTL_NONE beyond the chrome, so this cannot land on the client area.
+         *
+         * A caption alone deliberately does not qualify. A game's window is
+         * routinely WS_OVERLAPPEDWINDOW and then presents Direct3D frames
+         * over the top of it, and painting a title bar into the desktop
+         * surface for that window would put an empty desktop on the display
+         * every time the pointer moved -- the surface and the game's frames
+         * go to the same place, and only one of them is the picture. */
+        int have = p && (p->ctl || menu_of_window(p));
         if (have) { snap = *p; snap.focused = (g_focus == hwnd); }
         pthread_mutex_unlock(&g_lock);
         if (have) paint_control(w, hwnd, &snap);
@@ -1341,7 +1587,9 @@ static void u_GetCursorPos(w32 *w) {
 static void u_SetCursorPos(w32 *w) {
     pthread_mutex_lock(&g_lock);
     g_mx = (int32_t)(uint32_t)ARG(0); g_my = (int32_t)(uint32_t)ARG(1);
+    g_mouse_moved = 1;
     pthread_mutex_unlock(&g_lock);
+    cursor_damaged();
     RET(1);
 }
 static void u_ShowCursor(w32 *w) {
@@ -1350,6 +1598,7 @@ static void u_ShowCursor(w32 *w) {
     g_cursor_shown = g_cursor_count >= 0;
     int c = g_cursor_count;
     pthread_mutex_unlock(&g_lock);
+    cursor_damaged();
     RET((uint64_t)(int64_t)c);
 }
 /* ---------------------------------------------------------- pictures
@@ -1522,7 +1771,9 @@ static void u_SetCursor(w32 *w) {
     pthread_mutex_lock(&g_lock);
     uint64_t old = g_cursor;
     g_cursor = ARG(0);
+    int changed = old != g_cursor;
     pthread_mutex_unlock(&g_lock);
+    if (changed) cursor_damaged();
     RET(old);
 }
 static void u_GetCursor(w32 *w) {
@@ -1703,7 +1954,7 @@ uint32_t *w32_desktop_bits(int *cx, int *cy) {
  * screen should look like. */
 /* Something drew. That is activity, so the idle pacing above stands down --
  * a program repainting is working, not spinning. */
-void w32_desktop_damaged(void) { g_surf_dirty = 1; w32_note_activity(); }
+void w32_desktop_damaged(void) { g_surf_dirty = 1; g_surf_live = 1; w32_note_activity(); }
 
 /* Hand the surface to whoever is showing frames. Nothing happens if a 3D
  * guest owns the display: it presents its own frames and this one is not
@@ -1717,7 +1968,15 @@ static void surface_present(void) {
     uint32_t *b = surface_get(&cx, &cy);
     g_surf_dirty = 0;
     pthread_mutex_unlock(&g_lock);
+    /* An open menu and the mouse pointer go in here and come straight back
+     * out: they are above every window, so they cannot be painted before the
+     * windows are, and they must not still be in the surface when the next
+     * window paints into it. The callback has the pixels by the time it
+     * returns -- it writes a .ppm or fills a texture -- so undoing this
+     * immediately is safe and is what keeps the pointer from smearing. */
+    overlay_compose();
     if (fn && b) fn(ctx, b, cx, cy, cx * 4);
+    overlay_restore();
 }
 /* For a test, and for the probe: the frame as it stands. */
 const uint32_t *w32_desktop_peek(int *cx, int *cy) { return w32_desktop_bits(cx, cy); }
@@ -2097,7 +2356,417 @@ static void edit_extent(uint64_t hwnd, int over, int page, int line) {
     pthread_mutex_unlock(&g_lock);
 }
 
+/* ---- menus, drawn -------------------------------------------------------
+ *
+ * Two shapes, and they share their measuring: a bar across the top of a
+ * window, and a popup dropped below one of its items or put wherever
+ * TrackPopupMenu was told to put it. Both are laid out here and nowhere else,
+ * because a hit test that measures items differently from the painter is a
+ * menu where clicking one item runs another -- and that failure looks like a
+ * bug in the program rather than in this file.
+ */
+enum { MENU_PAD = 3, MENU_SEP_H = 7, MENU_MIN_W = 80 };
+/* The pale blue a themed menu highlights with, as a COLORREF -- which is
+ * 0x00BBGGRR, so this is RGB(204, 232, 255) written the way GDI takes it and
+ * not the other way round. Getting that backwards is a highlight that comes
+ * out peach, which is exactly what the first version of this did. */
+enum { MENU_HILITE = 0xFFE8CCu };
+
+static int menu_item_h(const mitem *it, int lh) {
+    return (it->flags & MF_SEPARATOR) ? MENU_SEP_H : lh + 6;
+}
+
+/* Where each bar item sits, left to right. */
+static int bar_layout(uint64_t hdc, const wmenu *m, int *xs, int *ws) {
+    int x = 2;
+    for (int i = 0; i < m->n; i++) {
+        char lab[MENU_TEXT];
+        int ln = strip_amp(m->it[i].text, lab, sizeof lab);
+        int tw = 0, th = 0;
+        if (ln) w32_gdi_text_extent(hdc, lab, ln, &tw, &th);
+        xs[i] = x;
+        ws[i] = tw + 16;
+        x += ws[i];
+    }
+    return m->n;
+}
+
+/* An item's caption is two strings, not one: "Save\tCtrl+S" is a name and the
+ * shortcut it is drawn beside, right-aligned in its own column. Splitting
+ * them here rather than at each of the two places that need it keeps the
+ * measuring and the drawing agreeing about how wide an item is. */
+static int menu_split(const mitem *it, char *lab, int cap, char *acc, int acap) {
+    char all[MENU_TEXT];
+    int n = strip_amp(it->text, all, sizeof all);
+    acc[0] = 0;
+    for (int i = 0; i < n; i++)
+        if (all[i] == '\t') {
+            all[i] = 0;
+            snprintf(acc, (size_t)acap, "%s", all + i + 1);
+            n = i;
+            break;
+        }
+    snprintf(lab, (size_t)cap, "%s", all);
+    return n;
+}
+
+/* How big a popup has to be to hold what is in it. The left gutter is the
+ * check-mark column: reserving it whether or not anything in the menu is
+ * checked is what stops the text jumping sideways the first time something
+ * is ticked. */
+static void popup_measure(uint64_t hdc, const wmenu *m, int lh, int *pw, int *ph) {
+    int wid = 0, accw = 0, h = MENU_PAD * 2;
+    for (int i = 0; i < m->n; i++) {
+        char lab[MENU_TEXT], acc[MENU_TEXT];
+        int ln = menu_split(&m->it[i], lab, sizeof lab, acc, sizeof acc);
+        int tw = 0, th = 0;
+        if (ln) w32_gdi_text_extent(hdc, lab, ln, &tw, &th);
+        if (m->it[i].flags & MF_POPUP) tw += lh;
+        if (tw > wid) wid = tw;
+        if (acc[0]) {
+            int aw = 0;
+            w32_gdi_text_extent(hdc, acc, (int)strlen(acc), &aw, &th);
+            if (aw > accw) accw = aw;
+        }
+        h += menu_item_h(&m->it[i], lh);
+    }
+    int w = lh + 6 + wid + (accw ? accw + 16 : 0) + 16;
+    *pw = w < MENU_MIN_W ? MENU_MIN_W : w;
+    *ph = h;
+}
+
+/* Which item a point inside a popup is over, or -1. Separators and greyed
+ * items are still reported: the highlight has to move over them the way the
+ * pointer does, and refusing them is the picker's job, not the hit test's. */
+static int popup_item_at(const wmenu *m, int lh, int ry) {
+    int y = MENU_PAD;
+    for (int i = 0; i < m->n; i++) {
+        int h = menu_item_h(&m->it[i], lh);
+        if (ry >= y && ry < y + h) return i;
+        y += h;
+    }
+    return -1;
+}
+/* The top of one item within its popup, which is where a submenu drops from. */
+static int popup_item_top(const wmenu *m, int lh, int idx) {
+    int y = MENU_PAD;
+    for (int i = 0; i < idx && i < m->n; i++) y += menu_item_h(&m->it[i], lh);
+    return y;
+}
+
+/* A small right-pointing triangle: the mark that says an item opens another
+ * menu rather than doing something. Tall on its left edge and a point on its
+ * right, which is the way round that means "there is more over here". */
+static void submenu_arrow(uint64_t hdc, int x, int y, int size, uint32_t colour) {
+    int half = size / 2;
+    if (half < 2) half = 2;
+    for (int i = 0; i <= half; i++)
+        w32_gdi_fill_rect(hdc, x + i, y + i, x + i + 1, y + 2 * half - i, colour);
+}
+
+/* The bar, drawn into a device context over the whole window. `hot` is the
+ * item whose popup is open, or -1. */
+static void paint_menu_bar(uint64_t hdc, const wmenu *m, int top, int width, int height, int hot) {
+    if (g_themed) gradient_v(hdc, 0, top, width, top + height, 0xF7F7F7u, 0xEDEDEDu);
+    else w32_gdi_fill_rect(hdc, 0, top, width, top + height, sys_color(COLOR_MENU));
+    w32_gdi_fill_rect(hdc, 0, top + height - 1, width, top + height, 0xC8C8C8u);
+    int xs[MENU_ITEMS], ws[MENU_ITEMS];
+    int n = bar_layout(hdc, m, xs, ws);
+    int th = w32_gdi_line_height(hdc);
+    for (int i = 0; i < n; i++) {
+        char lab[MENU_TEXT];
+        int ln = strip_amp(m->it[i].text, lab, sizeof lab);
+        int greyed = (m->it[i].flags & (MF_GRAYED | MF_DISABLED)) != 0;
+        if (i == hot) {
+            /* The open item is drawn as a continuation of the popup below it,
+             * which is what tells you which one you opened. */
+            if (g_themed) w32_gdi_fill_rect(hdc, xs[i], top + 1, xs[i] + ws[i], top + height, MENU_HILITE);
+            else w32_gdi_fill_rect(hdc, xs[i], top + 1, xs[i] + ws[i], top + height, sys_color(COLOR_HIGHLIGHT));
+        }
+        w32_gdi_set_text_color(hdc, greyed ? sys_color(COLOR_GRAYTEXT)
+                               : (i == hot && !g_themed) ? sys_color(COLOR_HIGHLIGHTTEXT)
+                               : sys_color(COLOR_MENUTEXT));
+        w32_gdi_text_at(hdc, xs[i] + 8, top + (height - th) / 2, lab, ln);
+    }
+}
+
+/* One popup, drawn straight onto the screen surface at an absolute position:
+ * a menu is above every window, so it does not go through a window's DC. */
+static void paint_popup(uint64_t hdc, const wmenu *m, int x, int y, int pw, int ph, int lh, int hot) {
+    if (g_themed) {
+        w32_gdi_fill_rect(hdc, x, y, x + pw, y + ph, 0xF7F7F7u);
+        w32_gdi_frame_rect(hdc, x, y, x + pw, y + ph, 0xA0A0A0u);
+    } else {
+        w32_gdi_fill_rect(hdc, x, y, x + pw, y + ph, sys_color(COLOR_MENU));
+        bevel(hdc, x, y, x + pw, y + ph, 0);
+    }
+    int gut = lh + 6;
+    int iy = y + MENU_PAD;
+    for (int i = 0; i < m->n; i++) {
+        const mitem *it = &m->it[i];
+        int h = menu_item_h(it, lh);
+        if (it->flags & MF_SEPARATOR) {
+            w32_gdi_fill_rect(hdc, x + gut, iy + h / 2, x + pw - 4, iy + h / 2 + 1, 0xC0C0C0u);
+            iy += h;
+            continue;
+        }
+        int greyed = (it->flags & (MF_GRAYED | MF_DISABLED)) != 0;
+        if (i == hot && !greyed) {
+            if (g_themed) w32_gdi_fill_rect(hdc, x + 2, iy, x + pw - 2, iy + h, MENU_HILITE);
+            else w32_gdi_fill_rect(hdc, x + 2, iy, x + pw - 2, iy + h, sys_color(COLOR_HIGHLIGHT));
+        }
+        uint32_t fg = greyed ? sys_color(COLOR_GRAYTEXT)
+                    : (i == hot && !g_themed) ? sys_color(COLOR_HIGHLIGHTTEXT)
+                    : sys_color(COLOR_MENUTEXT);
+        if (it->flags & MF_CHECKED)
+            draw_check(hdc, x + 4, iy + (h - lh) / 2, lh, fg);
+        char lab[MENU_TEXT], acc[MENU_TEXT];
+        int ln = menu_split(it, lab, sizeof lab, acc, sizeof acc);
+        w32_gdi_set_text_color(hdc, fg);
+        w32_gdi_text_at(hdc, x + gut, iy + (h - lh) / 2, lab, ln);
+        if (acc[0]) {
+            int aw = 0, ah = 0;
+            w32_gdi_text_extent(hdc, acc, (int)strlen(acc), &aw, &ah);
+            w32_gdi_text_at(hdc, x + pw - 12 - aw, iy + (h - lh) / 2, acc, (int)strlen(acc));
+        }
+        if (it->flags & MF_POPUP)
+            submenu_arrow(hdc, x + pw - 12, iy + (h - lh) / 2 + 2, lh - 4, fg);
+        iy += h;
+    }
+}
+
+/* ---- the overlay: what is drawn on top of every window -------------------
+ *
+ * An open menu and the mouse pointer are both above every window and inside
+ * nobody's client area, so neither can go through a window's device context:
+ * the next thing to paint would draw straight over them. They are composited
+ * into the surface just before it is handed to the display and lifted out
+ * again the moment it has been, so the surface a window paints into only ever
+ * holds what the windows drew.
+ *
+ * Leaving them in and repainting what was underneath when they move is the
+ * other way, and it is the way a compositor with a backing store per window
+ * would do it. There is one shared surface here and no backing store, so
+ * "repaint what was under the pointer" means asking every window that
+ * overlaps it to paint itself again -- a guest callback for every pixel of
+ * mouse travel. Saving the pixels and putting them back costs one
+ * rectangle-sized copy and cannot leave a trail at all.
+ */
+typedef struct { uint32_t *px; size_t cap; int x, y, w, h, sw, sh; } saveunder;
+static saveunder g_save_menu, g_save_cur;
+
+/* The surface is reached through w32_desktop_bits, which takes g_lock, so
+ * neither of these may be called with it held. */
+static void save_under(saveunder *s, int x, int y, int w, int h) {
+    s->w = 0;
+    int sw = 0, sh = 0;
+    uint32_t *b = w32_desktop_bits(&sw, &sh);
+    if (!b) return;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > sw) w = sw - x;
+    if (y + h > sh) h = sh - y;
+    if (w <= 0 || h <= 0) return;
+    size_t need = (size_t)w * (size_t)h;
+    if (need > s->cap) {
+        uint32_t *n = realloc(s->px, need * sizeof *n);
+        if (!n) return;
+        s->px = n; s->cap = need;
+    }
+    for (int j = 0; j < h; j++)
+        memcpy(s->px + (size_t)j * w, b + (size_t)(y + j) * sw + x, (size_t)w * 4);
+    s->x = x; s->y = y; s->w = w; s->h = h; s->sw = sw; s->sh = sh;
+}
+static void restore_under(saveunder *s) {
+    if (s->w <= 0 || !s->px) { s->w = 0; return; }
+    int sw = 0, sh = 0;
+    uint32_t *b = w32_desktop_bits(&sw, &sh);
+    /* A screen-size change between the save and the restore reallocates the
+     * surface, and putting old pixels back at old coordinates would be
+     * scribbling on a stranger. */
+    if (b && sw == s->sw && sh == s->sh)
+        for (int j = 0; j < s->h; j++)
+            memcpy(b + (size_t)(s->y + j) * sw + s->x, s->px + (size_t)j * s->w, (size_t)s->w * 4);
+    s->w = 0;
+}
+
+/* The arrow to draw when the program has never set a cursor. Made once and
+ * kept: it is drawn by image.c rather than decoded from anybody's resources,
+ * and a program that destroys its own LoadCursor handle must not be able to
+ * take the system's pointer with it. */
+static uint64_t stock_arrow(void) {
+    static uint64_t arrow;
+    if (!arrow) {
+        w32_image im = { 0, 0, 0 };
+        int hx = 0, hy = 0;
+        if (w32_stock_cursor(32512 /* IDC_ARROW */, &im, &hx, &hy))
+            arrow = w32_gdi_make_icon(im.w, im.h, im.px, hx, hy);
+    }
+    return arrow;
+}
+
+/* The mouse pointer.
+ *
+ * Drawn at the cursor position less its hot spot, because the hot spot is the
+ * pixel the coordinates refer to -- an arrow's tip, a cross-hair's centre --
+ * and ignoring it puts the picture a dozen pixels away from what is being
+ * clicked.
+ *
+ * ShowCursor's counter is honoured, and that is not a nicety: a game that
+ * hides the pointer is saying it will draw its own, and drawing this one as
+ * well gives it two.
+ *
+ * This is one half of a decision and the iOS app holds the other. The app
+ * draws its own pointer overlay on top of the frame, for touch: a finger
+ * covers what it is aiming at, so there has to be something on screen that
+ * says where the tap will land. That one and this one must never both be
+ * visible -- two arrows a few pixels apart are worse than none, because
+ * neither is obviously the real one. This is the pointer a program *sets*
+ * and a mouse moves; the app's is the pointer a finger drags. The app asks
+ * w32_cursor_visible() before drawing its own, and when a real mouse or
+ * trackpad is attached it must leave the drawing to this. */
+static void draw_cursor(void) {
+    pthread_mutex_lock(&g_lock);
+    int shown = g_cursor_shown, x = g_mx, y = g_my;
+    uint64_t cur = g_cursor;
+    pthread_mutex_unlock(&g_lock);
+    if (!shown) return;
+    int cx = 0, cy = 0, hx = 0, hy = 0;
+    /* A handle the program has since destroyed measures as nothing, and
+     * "no pointer at all" is a worse answer than the system arrow. */
+    if (!cur || !w32_gdi_icon_size(cur, &cx, &cy, &hx, &hy)) {
+        cur = stock_arrow();
+        if (!cur || !w32_gdi_icon_size(cur, &cx, &cy, &hx, &hy)) return;
+    }
+    save_under(&g_save_cur, x - hx, y - hy, cx, cy);
+    uint64_t hdc = w32_dc_for_window(0, 0, 1);
+    if (!hdc) return;
+    w32_gdi_draw_image(hdc, cur, x - hx, y - hy, cx, cy);
+    w32_dc_release(hdc);
+}
+
+static void overlay_compose(void) {
+    /* The menu first and the pointer last, because the pointer is over
+     * everything -- including the menu it is choosing from. */
+    struct { uint64_t menu; int x, y, w, h, hot; } lv[MENU_DEPTH];
+    int n, lx = 0, ty = 0, rx = 0, by = 0;
+    pthread_mutex_lock(&g_lock);
+    n = g_pop.n > MENU_DEPTH ? MENU_DEPTH : g_pop.n;
+    for (int i = 0; i < n; i++) {
+        lv[i].menu = g_pop.lv[i].menu;
+        lv[i].x = g_pop.lv[i].x; lv[i].y = g_pop.lv[i].y;
+        lv[i].w = g_pop.lv[i].w; lv[i].h = g_pop.lv[i].h;
+        lv[i].hot = g_pop.lv[i].hot;
+        if (!i) { lx = lv[i].x; ty = lv[i].y; rx = lx + lv[i].w; by = ty + lv[i].h; }
+        else {
+            if (lv[i].x < lx) lx = lv[i].x;
+            if (lv[i].y < ty) ty = lv[i].y;
+            if (lv[i].x + lv[i].w > rx) rx = lv[i].x + lv[i].w;
+            if (lv[i].y + lv[i].h > by) by = lv[i].y + lv[i].h;
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    if (n > 0) {
+        /* One saved rectangle for all the levels together. A cascade is
+         * contiguous by construction, so their union is barely bigger than
+         * the popups themselves. */
+        save_under(&g_save_menu, lx, ty, rx - lx, by - ty);
+        uint64_t hdc = w32_dc_for_window(0, 0, 1);
+        if (hdc) {
+            w32_gdi_set_bk_mode(hdc, 1);
+            int lh = w32_gdi_line_height(hdc);
+            if (lh < 1) lh = 13;
+            for (int i = 0; i < n; i++) {
+                wmenu m;
+                if (menu_snapshot(lv[i].menu, &m))
+                    paint_popup(hdc, &m, lv[i].x, lv[i].y, lv[i].w, lv[i].h, lh, lv[i].hot);
+            }
+            w32_dc_release(hdc);
+        }
+    }
+    draw_cursor();
+}
+
+/* Reverse order: the pointer was saved after the menu was drawn, so its
+ * saved pixels are the menu's and have to go back first. */
+static void overlay_restore(void) {
+    restore_under(&g_save_cur);
+    restore_under(&g_save_menu);
+}
+
 /* ---- painting one control ---------------------------------------------- */
+
+/* The window frame: the title bar, its icon and close box, the menu bar, and
+ * the border. Drawn for every top-level window that asked for one, whatever
+ * its class.
+ *
+ * It lives out here rather than inside paint_control because paint_control is
+ * only reached for a window this file draws the *inside* of. A program that
+ * registers its own class -- a Delphi form, an MFC frame, most installers --
+ * paints its own client area and expects the system to paint the frame around
+ * it, exactly as Windows does. Leaving it to paint_control is why one of them
+ * came up with a blank blue strip where its title should have been. */
+static void paint_chrome(w32 *w, uint64_t hwnd, wwin *snap) {
+    if (snap->cyo) {
+        uint64_t wdc = w32_dc_for_window(w, hwnd, 1);
+        if (wdc) {
+            /* cyo is the caption and the menu bar together, so how much of it
+             * belongs to which has to be worked out again here rather than
+             * assumed -- a window with a bar and no caption has one and not
+             * the other, and drawing the title gradient over the whole of cyo
+             * would put the bar inside the title bar. */
+            int cap_h = (!(snap->style & WS_CHILD) && (snap->style & WS_CAPTION) == WS_CAPTION)
+                        ? caption_height() : 0;
+            if (cap_h > snap->cyo) cap_h = snap->cyo;
+            if (snap->font) w32_gdi_set_font(wdc, snap->font);
+            w32_gdi_set_bk_mode(wdc, 1);
+            if (cap_h) {
+                if (g_themed)
+                    gradient_v(wdc, 0, 0, snap->w, cap_h, 0xF2F6FBu, 0xD3DEEBu);
+                else
+                    w32_gdi_fill_rect(wdc, 0, 0, snap->w, cap_h, sys_color(COLOR_ACTIVECAPTION));
+                w32_gdi_set_text_color(wdc, g_themed ? 0x3C3C3Cu : sys_color(COLOR_CAPTIONTEXT));
+                int th = w32_gdi_line_height(wdc);
+                int tx = 6;
+                uint64_t icon = window_icon(hwnd);
+                if (icon) {
+                    int isz = cap_h - 6;
+                    if (isz > 4) {
+                        w32_gdi_draw_image(wdc, icon, 4, 3, isz, isz);
+                        tx = 6 + isz + 4;
+                    }
+                }
+                /* The close box. It is drawn rather than made a real button
+                 * because there is no window manager here to own one, and a
+                 * program that watches for WM_CLOSE gets it from the hit test. */
+                int bs = cap_h - 8;
+                if (bs > 6 && snap->w > bs + 12) {
+                    int bx = snap->w - bs - 4, by = 4;
+                    w32_gdi_fill_rect(wdc, bx, by, bx + bs, by + bs, sys_color(COLOR_BTNFACE));
+                    uint32_t xk = sys_color(COLOR_BTNTEXT);
+                    for (int i = 3; i < bs - 3; i++) {
+                        w32_gdi_fill_rect(wdc, bx + i, by + i, bx + i + 1, by + i + 1, xk);
+                        w32_gdi_fill_rect(wdc, bx + bs - 1 - i, by + i, bx + bs - i, by + i + 1, xk);
+                    }
+                }
+                w32_gdi_text_at(wdc, tx, (cap_h - th) / 2, snap->text, (int)strlen(snap->text));
+            }
+            /* The menu bar fills whatever of cyo the caption did not. */
+            if (snap->cyo > cap_h) {
+                wmenu m;
+                if (menu_snapshot(snap->menu, &m)) {
+                    int hot = -1;
+                    pthread_mutex_lock(&g_lock);
+                    if (g_pop.n && g_pop.barwnd == hwnd) hot = g_pop.baritem;
+                    pthread_mutex_unlock(&g_lock);
+                    paint_menu_bar(wdc, &m, cap_h, snap->w, snap->cyo - cap_h, hot);
+                }
+            }
+            w32_gdi_frame_rect(wdc, 0, 0, snap->w, snap->h, sys_color(COLOR_3DDKSHADOW));
+            w32_dc_release(wdc);
+        }
+    }
+}
 
 static void paint_control(w32 *w, uint64_t hwnd, wwin *snap) {
     int cw = snap->cw, ch = snap->ch;
@@ -2118,44 +2787,6 @@ static void paint_control(w32 *w, uint64_t hwnd, wwin *snap) {
      * The icon goes in it if the program gave its class one, and the close
      * box on the right, because a title bar without either reads as a
      * placeholder rather than a window. */
-    if (snap->cyo) {
-        uint64_t wdc = w32_dc_for_window(w, hwnd, 1);
-        if (wdc) {
-            if (snap->font) w32_gdi_set_font(wdc, snap->font);
-            if (g_themed)
-                gradient_v(wdc, 0, 0, snap->w, snap->cyo, 0xF2F6FBu, 0xD3DEEBu);
-            else
-                w32_gdi_fill_rect(wdc, 0, 0, snap->w, snap->cyo, sys_color(COLOR_ACTIVECAPTION));
-            w32_gdi_set_bk_mode(wdc, 1);
-            w32_gdi_set_text_color(wdc, g_themed ? 0x3C3C3Cu : sys_color(COLOR_CAPTIONTEXT));
-            int th = w32_gdi_line_height(wdc);
-            int tx = 6;
-            uint64_t icon = window_icon(hwnd);
-            if (icon) {
-                int isz = snap->cyo - 6;
-                if (isz > 4) {
-                    w32_gdi_draw_image(wdc, icon, 4, 3, isz, isz);
-                    tx = 6 + isz + 4;
-                }
-            }
-            /* The close box. It is drawn rather than made a real button
-             * because there is no window manager here to own one, and a
-             * program that watches for WM_CLOSE gets it from the hit test. */
-            int bs = snap->cyo - 8;
-            if (bs > 6 && snap->w > bs + 12) {
-                int bx = snap->w - bs - 4, by = 4;
-                w32_gdi_fill_rect(wdc, bx, by, bx + bs, by + bs, sys_color(COLOR_BTNFACE));
-                uint32_t xk = sys_color(COLOR_BTNTEXT);
-                for (int i = 3; i < bs - 3; i++) {
-                    w32_gdi_fill_rect(wdc, bx + i, by + i, bx + i + 1, by + i + 1, xk);
-                    w32_gdi_fill_rect(wdc, bx + bs - 1 - i, by + i, bx + bs - i, by + i + 1, xk);
-                }
-            }
-            w32_gdi_text_at(wdc, tx, (snap->cyo - th) / 2, snap->text, (int)strlen(snap->text));
-            w32_gdi_frame_rect(wdc, 0, 0, snap->w, snap->h, sys_color(COLOR_3DDKSHADOW));
-            w32_dc_release(wdc);
-        }
-    }
 
     switch (snap->ctl) {
     case CTL_DIALOG:
@@ -2573,7 +3204,7 @@ static void paint_control(w32 *w, uint64_t hwnd, wwin *snap) {
         w32_gdi_frame_rect(hdc, 0, 0, cw, ch, sys_color(COLOR_WINDOWFRAME));
     /* Where the keyboard is. Without this, Tab moves something invisible and
      * Enter presses a button the person cannot see they have selected. */
-    if (snap->focused && snap->ctl != CTL_DIALOG && snap->ctl != CTL_STATIC) {
+    if (snap->focused && snap->ctl && snap->ctl != CTL_DIALOG && snap->ctl != CTL_STATIC) {
         int in = snap->ctl == CTL_BUTTON ? 3 : 1;
         for (int x = in; x < cw - in; x += 2) {
             w32_gdi_fill_rect(hdc, x, in, x + 1, in + 1, sys_color(COLOR_BTNTEXT));
@@ -3487,6 +4118,24 @@ static uint64_t send_to(w32 *w, uint64_t hwnd, uint32_t msg, uint64_t wp, uint64
  * only the modal loop, or a dialog whose procedure ignores WM_PAINT never
  * gets a background and appears as a hole. */
 static uint64_t deliver(w32 *w, uint64_t hwnd, uint32_t msg, uint64_t wp, uint64_t lp, int wide) {
+    /* The frame, before the window paints its inside.
+     *
+     * Here rather than in paint_control because paint_control is only reached
+     * for a window this file draws the inside of; a program with its own
+     * window class paints its own client area and expects the system to paint
+     * the frame around it, and doing that only for the classes we recognise
+     * is why an installer's title bar came up blank. Here rather than only in
+     * repaint_area because most repaints arrive as a queued WM_PAINT and
+     * never go through the compositor at all. */
+    if (msg == WM_PAINT) {
+        pthread_mutex_lock(&g_lock);
+        wwin *cp = win_of(hwnd);
+        wwin snap;
+        int chrome = cp && cp->visible && cp->cyo > 0 && !(cp->style & WS_CHILD);
+        if (chrome) snap = *cp;
+        pthread_mutex_unlock(&g_lock);
+        if (chrome) paint_chrome(w, hwnd, &snap);
+    }
     uint64_t r = send_to(w, hwnd, msg, wp, lp, wide);
     pthread_mutex_lock(&g_lock);
     wwin *p = win_of(hwnd);
@@ -4101,6 +4750,10 @@ static int run_modal(w32 *w, uint64_t dlg) {
             w32_host_idle();
             continue;
         }
+        /* A menu open over a modal dialog takes the input, the same way it
+         * does in the program's own loop. */
+        if ((q.msg >= WM_MOUSEFIRST && q.msg <= WM_MOUSELAST) || is_key_msg(q.msg))
+            if (menu_input(w, q.msg, q.wparam, q.x, q.y)) { surface_present(); continue; }
         uint64_t target = q.hwnd;
         if (!target) {
             pthread_mutex_lock(&g_lock);
@@ -4658,41 +5311,1072 @@ static void u_GetPropW(w32 *w)    { get_prop(w, 1, 0); }
 static void u_RemovePropA(w32 *w) { get_prop(w, 0, 1); }
 static void u_RemovePropW(w32 *w) { get_prop(w, 1, 1); }
 
-/* Menus. Nothing draws one, and a dialog-based installer has none -- but it
- * asks for its system menu so it can grey out Close, and a call that fails
- * there can send it down an error path over a cosmetic detail. Handles are
- * distinct and the counts are honest: zero items, because there are none. */
-enum { MENU_BASE = 0x000C0000u };
-static uint64_t g_next_menu = MENU_BASE;
-static void u_CreateMenu(w32 *w)      { (void)w; RET(g_next_menu += 4); }
-static void u_CreatePopupMenu(w32 *w) { (void)w; RET(g_next_menu += 4); }
-static void u_DestroyMenu(w32 *w)     { (void)w; RET(1); }
-static void u_GetSystemMenu(w32 *w)   { (void)w; RET(ARG(1) ? 0 : MENU_BASE); }
+/* --- menus ---------------------------------------------------------------
+ *
+ * A menu used to be a handle with nothing behind it: CreateMenu returned a
+ * distinct number, AppendMenu said yes, GetMenuItemCount honestly said zero,
+ * and nothing was drawn or clickable. That is enough for an installer, which
+ * has no menu bar and asks for its system menu only so it can grey out Close.
+ * It is not enough for a program whose File/Options/Help bar is how anything
+ * is reached: the bar simply was not there, and a right-click did nothing.
+ *
+ * The store is above, beside the list store, for the same reason: one entry
+ * per menu that exists. What follows is the four separable parts -- building
+ * a menu, loading one from a resource, putting one on screen, and taking the
+ * clicks.
+ */
+
+/* ---- building one ------------------------------------------------------- */
+
+static void menu_item_set(mitem *it, uint32_t flags, uint64_t idnew, const char *text) {
+    memset(it, 0, sizeof *it);
+    it->flags = flags & ~(uint32_t)MF_BYPOSITION;
+    if (flags & MF_POPUP) it->sub = idnew;
+    it->id = (uint32_t)idnew;
+    snprintf(it->text, MENU_TEXT, "%s", text ? text : "");
+}
+
+/* Read the lpNewItem argument the menu calls share. It is a string only some
+ * of the time: with MF_BITMAP it is a bitmap handle and with MF_OWNERDRAW it
+ * is the program's own pointer, and reading either as text is how a menu call
+ * turns into a fault. */
+static void menu_arg_text(w32 *w, uint32_t flags, uint64_t p, int wide, char *out, size_t n) {
+    out[0] = 0;
+    if (!p || (flags & (MF_BITMAP | MF_OWNERDRAW | MF_SEPARATOR))) return;
+    if (wide) w32_wtoa(w, p, out, n);
+    else snprintf(out, n, "%.*s", (int)n - 1, w32_str(w, p));
+}
+
+/* Append, insert or replace: the three differ only in where the item lands,
+ * so they are one function with a mode rather than three that drift apart.
+ * `mode` is 0 append, 1 insert before `which`, 2 replace `which`. */
+static uint64_t menu_put(w32 *w, uint64_t hmenu, uint32_t which, uint32_t flags,
+                         uint64_t idnew, uint64_t textp, int wide, int mode) {
+    char text[MENU_TEXT];
+    menu_arg_text(w, flags, textp, wide, text, sizeof text);
+    pthread_mutex_lock(&g_lock);
+    wmenu *m = menu_of(hmenu);
+    int ok = 0;
+    if (m) {
+        int at = m->n;
+        if (mode) {
+            mitem *f = menu_find(hmenu, which, flags, 0);
+            /* Only an item of *this* menu can be positioned against; a
+             * command that lives in a submenu is found but is not ours to
+             * insert beside, and Windows appends in that case too. */
+            at = (f >= m->it && f < m->it + m->n) ? (int)(f - m->it) : m->n;
+        }
+        if (mode == 2) {
+            if (at < m->n) { menu_item_set(&m->it[at], flags, idnew, text); ok = 1; }
+        } else if (m->n < MENU_ITEMS) {
+            for (int i = m->n; i > at; i--) m->it[i] = m->it[i - 1];
+            menu_item_set(&m->it[at], flags, idnew, text);
+            m->n++;
+            ok = 1;
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    return ok ? 1 : 0;
+}
+
+/* ---- a menu out of a resource ------------------------------------------- */
+
+/* The RT_MENU format, which has two versions exactly as RT_DIALOG does.
+ *
+ * Version 0 is a header of two words followed by items: a flags word, then
+ * an id word for anything that is not a popup, then a NUL-terminated UTF-16
+ * string; 0x0010 marks a popup, whose own items follow it inline, and 0x0080
+ * marks the last item at a level. Version 1 -- MENUEX, which is what a
+ * resource compiler emits the moment the script uses anything added after
+ * Windows 95 -- is the same tree with wider fields and DWORD alignment.
+ *
+ * Both are here for the same reason both dialog templates are: a program
+ * built this century usually carries the second, and reading only the first
+ * would mean a menu bar that appears for old programs and not for new ones. */
+static int menu_parse_res(w32 *w, tcur *c, uint64_t base, uint64_t hmenu, int ex, int depth) {
+    if (depth > MENU_DEPTH + 2) return 0;
+    for (;;) {
+        if (c->at + 2 > c->end) return 0;
+        uint32_t flags = 0, id = 0;
+        int popup = 0, last = 0;
+        if (ex) {
+            uint32_t type = t32(c), state = t32(c);
+            id = t32(c);
+            uint16_t res = t16(c);
+            popup = (res & 0x01) != 0;
+            last  = (res & 0x80) != 0;
+            /* MFT_SEPARATOR, MFS_CHECKED and MFS_GRAYED happen to have the
+             * same values as their MF_ counterparts, which is the one piece
+             * of luck in this format. */
+            flags = (type & (uint32_t)MF_SEPARATOR) | (state & (uint32_t)(MF_CHECKED | MF_GRAYED | MF_DISABLED));
+        } else {
+            uint16_t f = t16(c);
+            last = (f & MF_END) != 0;
+            flags = f & ~(uint32_t)MF_END;
+            popup = (flags & MF_POPUP) != 0;
+            if (!popup) id = t16(c);
+        }
+        char text[MENU_TEXT];
+        size_t i = 0;
+        while (c->at + 2 <= c->end) {
+            uint16_t ch = (uint16_t)w32_read(c->w, c->at, 2);
+            c->at += 2;
+            if (!ch) break;
+            if (i + 1 < sizeof text) text[i++] = ch < 128 ? (char)ch : '?';
+        }
+        text[i] = 0;
+        if (ex) {
+            /* The fields after the text are DWORD aligned, and the alignment
+             * is against the start of the resource rather than against
+             * whatever address the image happened to be mapped at. */
+            talign(c, base);
+            if (popup) c->at += 4;        /* the submenu's help id, which nothing here uses */
+        }
+        if (popup) {
+            uint64_t sub = 0;
+            pthread_mutex_lock(&g_lock);
+            sub = menu_new();
+            pthread_mutex_unlock(&g_lock);
+            if (!sub) return 0;
+            if (!menu_parse_res(w, c, base, sub, ex, depth + 1)) return 0;
+            pthread_mutex_lock(&g_lock);
+            wmenu *m = menu_of(hmenu);
+            if (m && m->n < MENU_ITEMS) menu_item_set(&m->it[m->n++], flags | MF_POPUP, sub, text);
+            pthread_mutex_unlock(&g_lock);
+        } else {
+            pthread_mutex_lock(&g_lock);
+            wmenu *m = menu_of(hmenu);
+            if (m && m->n < MENU_ITEMS)
+                menu_item_set(&m->it[m->n++], flags | (text[0] ? 0u : (uint32_t)MF_SEPARATOR), id, text);
+            pthread_mutex_unlock(&g_lock);
+        }
+        if (last) return 1;
+    }
+}
+
+static uint64_t load_menu(w32 *w, uint64_t inst, uint64_t name, int wide) {
+    uint32_t size = 0;
+    uint64_t hr = w32_find_resource(w, inst, 4 /* RT_MENU */, name, wide);
+    if (!hr) return 0;
+    uint64_t data = w32_resource_data(w, hr, &size);
+    if (!data) return 0;
+    tcur c = { w, data, data + (size ? size : 0x10000) };
+    uint16_t version = t16(&c);
+    uint16_t off = t16(&c);
+    c.at = data + 4 + off;                /* both versions say where the items begin */
+    uint64_t h;
+    pthread_mutex_lock(&g_lock);
+    h = menu_new();
+    pthread_mutex_unlock(&g_lock);
+    if (!h) return 0;
+    if (!menu_parse_res(w, &c, data, h, version == 1, 0)) {
+        pthread_mutex_lock(&g_lock);
+        wmenu *m = menu_of(h);
+        if (m) m->used = 0;
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    return h;
+}
+
+/* ---- putting one on screen ---------------------------------------------- */
+
+/* Menus are laid out in the shell font, not in whatever font the window
+ * underneath happens to be using, so the line height comes from a bare screen
+ * device context. */
+static int menu_line_h(void) {
+    uint64_t hdc = w32_dc_for_window(0, 0, 1);
+    int lh = hdc ? w32_gdi_line_height(hdc) : 13;
+    if (hdc) w32_dc_release(hdc);
+    return lh < 1 ? 13 : lh;
+}
+
+/* Which item of this window's bar is at a screen point, or -1. The bar is
+ * measured here through the same bar_layout the painter uses, because a hit
+ * test that measures differently is a menu where clicking File opens Edit. */
+static int bar_item_at(uint64_t hwnd, int sx, int sy) {
+    uint64_t bar = window_menu(hwnd);
+    if (!bar) return -1;
+    wwin snap;
+    pthread_mutex_lock(&g_lock);
+    wwin *p = win_of(hwnd);
+    if (!p || !p->visible) { pthread_mutex_unlock(&g_lock); return -1; }
+    snap = *p;
+    pthread_mutex_unlock(&g_lock);
+    int cap_h = (!(snap.style & WS_CHILD) && (snap.style & WS_CAPTION) == WS_CAPTION)
+                ? caption_height() : 0;
+    int bh = menu_bar_height();
+    if (sy < snap.y + cap_h || sy >= snap.y + cap_h + bh) return -1;
+    if (sx < snap.x || sx >= snap.x + snap.w) return -1;
+    wmenu m;
+    if (!menu_snapshot(bar, &m)) return -1;
+    uint64_t hdc = w32_dc_for_window(0, hwnd, 1);
+    if (!hdc) return -1;
+    int xs[MENU_ITEMS], ws[MENU_ITEMS];
+    int n = bar_layout(hdc, &m, xs, ws);
+    w32_dc_release(hdc);
+    for (int i = 0; i < n; i++)
+        if (sx - snap.x >= xs[i] && sx - snap.x < xs[i] + ws[i]) return i;
+    return -1;
+}
+
+/* The topmost window whose bar is under this point, the way window_at picks
+ * a window. */
+static uint64_t bar_window_at(int sx, int sy, int *item) {
+    for (int i = MAX_WINDOWS - 1; i >= 0; i--) {
+        pthread_mutex_lock(&g_lock);
+        uint64_t h = (g_win[i].used && g_win[i].visible) ? HW_BASE + (uint64_t)i * HW_STEP : 0;
+        pthread_mutex_unlock(&g_lock);
+        if (!h) continue;
+        int it = bar_item_at(h, sx, sy);
+        if (it >= 0) { *item = it; return h; }
+    }
+    return 0;
+}
+
+/* Drop a popup at a level. The corner is nudged back onto the display if the
+ * menu would run off it -- a submenu near the right edge is flipped to the
+ * left of its parent, which is what makes a deep menu tree usable at all
+ * rather than half off the screen. */
+static int menu_push_level(int level, uint64_t hmenu, int x, int y, int flip_from) {
+    wmenu m;
+    if (level < 0 || level >= MENU_DEPTH) return 0;
+    if (!menu_snapshot(hmenu, &m) || !m.n) return 0;
+    uint64_t hdc = w32_dc_for_window(0, 0, 1);
+    if (!hdc) return 0;
+    int lh = w32_gdi_line_height(hdc);
+    if (lh < 1) lh = 13;
+    int pw = 0, ph = 0;
+    popup_measure(hdc, &m, lh, &pw, &ph);
+    w32_dc_release(hdc);
+    int sw = 0, sh = 0;
+    w32_screen_size(&sw, &sh);
+    if (x + pw > sw) x = flip_from >= 0 ? flip_from - pw : sw - pw;
+    if (x < 0) x = 0;
+    if (y + ph > sh) y = sh - ph;
+    if (y < 0) y = 0;
+    pthread_mutex_lock(&g_lock);
+    g_pop.lv[level].menu = hmenu;
+    g_pop.lv[level].x = x; g_pop.lv[level].y = y;
+    g_pop.lv[level].w = pw; g_pop.lv[level].h = ph;
+    g_pop.lv[level].hot = -1;
+    g_pop.n = level + 1;
+    pthread_mutex_unlock(&g_lock);
+    w32_desktop_damaged();
+    return 1;
+}
+
+static void menu_close(void) {
+    pthread_mutex_lock(&g_lock);
+    uint64_t bw = g_pop.barwnd;
+    g_pop.n = 0; g_pop.barwnd = 0; g_pop.baritem = -1;
+    pthread_mutex_unlock(&g_lock);
+    w32_desktop_damaged();
+    /* The bar keeps a highlight on whichever item was open, so it has to be
+     * drawn again once nothing is. */
+    if (bw) invalidate(bw);
+}
+
+/* Something was chosen. A menu command reaches the owner as WM_COMMAND with
+ * the notification code zero, which is exactly how a program tells a menu
+ * apart from a button (BN_CLICKED is zero too, but a menu's lParam is NULL
+ * where a button's is the control). TrackPopupMenu with TPM_RETURNCMD wants
+ * the number back instead, and posts nothing. */
+static void menu_choose(uint32_t id) {
+    pthread_mutex_lock(&g_lock);
+    uint64_t owner = g_pop.owner, bw = g_pop.barwnd;
+    int track = g_pop.tracking;
+    uint32_t tf = g_pop.tflags;
+    if (track) g_pop.chosen = (int)id;
+    g_pop.n = 0; g_pop.barwnd = 0; g_pop.baritem = -1;
+    pthread_mutex_unlock(&g_lock);
+    w32_desktop_damaged();
+    if (bw) invalidate(bw);
+    if (!track || !(tf & TPM_RETURNCMD)) post_command(owner, id, 0, 0);
+}
+
+/* Open a bar item's popup, directly below the item. Opened from the keyboard
+ * it starts with its first choosable item highlighted, because a keyboard
+ * menu with nothing selected is one where Enter does nothing; opened with the
+ * mouse it starts with nothing, because the pointer has not landed on
+ * anything yet. */
+static void menu_open_bar_kb(uint64_t hwnd, int item, int kb) {
+    uint64_t bar = window_menu(hwnd);
+    if (!bar) return;
+    wmenu m;
+    if (!menu_snapshot(bar, &m) || item < 0 || item >= m.n) return;
+    wwin snap;
+    pthread_mutex_lock(&g_lock);
+    wwin *p = win_of(hwnd);
+    if (!p) { pthread_mutex_unlock(&g_lock); return; }
+    snap = *p;
+    pthread_mutex_unlock(&g_lock);
+    if (m.it[item].flags & (MF_GRAYED | MF_DISABLED)) return;
+    /* A bar item is normally a popup, but nothing stops one being a plain
+     * command -- a "Help" that opens no menu at all -- and that is a
+     * WM_COMMAND and not a menu to drop. */
+    if (!(m.it[item].flags & MF_POPUP)) {
+        menu_close();
+        post_command(hwnd, m.it[item].id, 0, 0);
+        return;
+    }
+    uint64_t hdc = w32_dc_for_window(0, hwnd, 1);
+    if (!hdc) return;
+    int xs[MENU_ITEMS], ws[MENU_ITEMS];
+    bar_layout(hdc, &m, xs, ws);
+    w32_dc_release(hdc);
+    int cap_h = (!(snap.style & WS_CHILD) && (snap.style & WS_CAPTION) == WS_CAPTION)
+                ? caption_height() : 0;
+    pthread_mutex_lock(&g_lock);
+    g_pop.owner = hwnd; g_pop.barwnd = hwnd; g_pop.baritem = item;
+    g_pop.n = 0;
+    pthread_mutex_unlock(&g_lock);
+    if (!menu_push_level(0, m.it[item].sub, snap.x + xs[item],
+                         snap.y + cap_h + menu_bar_height(), -1)) {
+        menu_close();
+        return;
+    }
+    if (kb) {
+        wmenu sm;
+        if (menu_snapshot(m.it[item].sub, &sm)) {
+            for (int i = 0; i < sm.n; i++)
+                if (!(sm.it[i].flags & (MF_SEPARATOR | MF_GRAYED | MF_DISABLED))) {
+                    pthread_mutex_lock(&g_lock);
+                    if (g_pop.n) g_pop.lv[0].hot = i;
+                    pthread_mutex_unlock(&g_lock);
+                    break;
+                }
+        }
+    }
+    invalidate(hwnd);
+}
+static void menu_open_bar(uint64_t hwnd, int item) { menu_open_bar_kb(hwnd, item, 0); }
+
+/* Which open level a screen point is in, and which of its items. */
+static int popup_hit(int sx, int sy, int *item) {
+    struct { uint64_t menu; int x, y, w, h; } lv[MENU_DEPTH];
+    int n;
+    pthread_mutex_lock(&g_lock);
+    n = g_pop.n > MENU_DEPTH ? MENU_DEPTH : g_pop.n;
+    for (int i = 0; i < n; i++) {
+        lv[i].menu = g_pop.lv[i].menu;
+        lv[i].x = g_pop.lv[i].x; lv[i].y = g_pop.lv[i].y;
+        lv[i].w = g_pop.lv[i].w; lv[i].h = g_pop.lv[i].h;
+    }
+    pthread_mutex_unlock(&g_lock);
+    int lh = menu_line_h();
+    for (int i = n - 1; i >= 0; i--) {
+        if (sx < lv[i].x || sx >= lv[i].x + lv[i].w) continue;
+        if (sy < lv[i].y || sy >= lv[i].y + lv[i].h) continue;
+        wmenu m;
+        if (!menu_snapshot(lv[i].menu, &m)) return -1;
+        *item = popup_item_at(&m, lh, sy - lv[i].y);
+        return i;
+    }
+    return -1;
+}
+
+/* An item that opens another menu opens it as soon as the highlight reaches
+ * it, which is how a cascade behaves and why it needs no second click. */
+static void menu_follow(int level, int item) {
+    uint64_t hm;
+    int px, py, pw;
+    pthread_mutex_lock(&g_lock);
+    if (level < 0 || level >= g_pop.n) { pthread_mutex_unlock(&g_lock); return; }
+    hm = g_pop.lv[level].menu;
+    px = g_pop.lv[level].x; py = g_pop.lv[level].y; pw = g_pop.lv[level].w;
+    pthread_mutex_unlock(&g_lock);
+    wmenu m;
+    if (!menu_snapshot(hm, &m) || item < 0 || item >= m.n) return;
+    if (!(m.it[item].flags & MF_POPUP)) return;
+    if (m.it[item].flags & (MF_GRAYED | MF_DISABLED)) return;
+    int lh = menu_line_h();
+    menu_push_level(level + 1, m.it[item].sub, px + pw - 3,
+                    py + popup_item_top(&m, lh, item) - MENU_PAD, px);
+}
+
+static void menu_hover(int sx, int sy) {
+    int item = -1;
+    int lvl = popup_hit(sx, sy, &item);
+    if (lvl < 0) {
+        /* Sliding along the bar with a menu down moves to the next one,
+         * which is the only way a bar is usable with a mouse held. */
+        uint64_t bw;
+        int cur;
+        pthread_mutex_lock(&g_lock);
+        bw = g_pop.barwnd; cur = g_pop.baritem;
+        pthread_mutex_unlock(&g_lock);
+        if (bw) {
+            int bi = bar_item_at(bw, sx, sy);
+            if (bi >= 0 && bi != cur) menu_open_bar(bw, bi);
+        }
+        return;
+    }
+    pthread_mutex_lock(&g_lock);
+    /* Leaving a submenu closes it: the levels below the one the pointer is
+     * in are no longer what is being pointed at. */
+    if (g_pop.n > lvl + 1) g_pop.n = lvl + 1;
+    int changed = g_pop.lv[lvl].hot != item;
+    g_pop.lv[lvl].hot = item;
+    pthread_mutex_unlock(&g_lock);
+    if (changed) w32_desktop_damaged();
+    menu_follow(lvl, item);
+}
+
+static void menu_activate(int level, int item) {
+    uint64_t hm;
+    pthread_mutex_lock(&g_lock);
+    if (level < 0 || level >= g_pop.n) { pthread_mutex_unlock(&g_lock); return; }
+    hm = g_pop.lv[level].menu;
+    g_pop.lv[level].hot = item;
+    pthread_mutex_unlock(&g_lock);
+    wmenu m;
+    if (!menu_snapshot(hm, &m) || item < 0 || item >= m.n) return;
+    const mitem *it = &m.it[item];
+    if (it->flags & (MF_SEPARATOR | MF_GRAYED | MF_DISABLED)) return;
+    if (it->flags & MF_POPUP) { menu_follow(level, item); return; }
+    menu_choose(it->id);
+}
+
+static void menu_click(int sx, int sy) {
+    int item = -1;
+    int lvl = popup_hit(sx, sy, &item);
+    if (lvl >= 0) { menu_activate(lvl, item); return; }
+    /* Not in a popup. On the bar it switches or closes; anywhere else it
+     * dismisses, and the click is still swallowed -- pressing the button
+     * underneath as well is the thing a menu exists to prevent. */
+    uint64_t bw;
+    int cur;
+    pthread_mutex_lock(&g_lock);
+    bw = g_pop.barwnd; cur = g_pop.baritem;
+    pthread_mutex_unlock(&g_lock);
+    if (bw) {
+        int bi = bar_item_at(bw, sx, sy);
+        if (bi >= 0) {
+            if (bi == cur) menu_close(); else menu_open_bar(bw, bi);
+            return;
+        }
+    }
+    menu_close();
+}
+
+/* Move the highlight within the deepest open popup, skipping the items that
+ * cannot be chosen -- a highlight that stops on a separator is a highlight
+ * that Enter does nothing with. */
+static void menu_arrow_move(int dir) {
+    uint64_t hm;
+    int lvl, hot;
+    pthread_mutex_lock(&g_lock);
+    lvl = g_pop.n - 1;
+    if (lvl < 0) { pthread_mutex_unlock(&g_lock); return; }
+    hm = g_pop.lv[lvl].menu;
+    hot = g_pop.lv[lvl].hot;
+    pthread_mutex_unlock(&g_lock);
+    wmenu m;
+    if (!menu_snapshot(hm, &m) || m.n <= 0) return;
+    if (hot < 0) hot = dir > 0 ? -1 : 0;
+    for (int k = 0; k < m.n; k++) {
+        hot = (hot + dir + m.n) % m.n;
+        if (!(m.it[hot].flags & (MF_SEPARATOR | MF_GRAYED | MF_DISABLED))) break;
+    }
+    pthread_mutex_lock(&g_lock);
+    if (lvl < g_pop.n) g_pop.lv[lvl].hot = hot;
+    pthread_mutex_unlock(&g_lock);
+    w32_desktop_damaged();
+}
+
+/* Sideways along the bar, which is what Left and Right do when there is
+ * nothing deeper to go into. */
+static void menu_bar_step(int dir) {
+    uint64_t bw;
+    int cur;
+    pthread_mutex_lock(&g_lock);
+    bw = g_pop.barwnd; cur = g_pop.baritem;
+    pthread_mutex_unlock(&g_lock);
+    if (!bw) return;
+    wmenu m;
+    uint64_t bar = window_menu(bw);
+    if (!bar || !menu_snapshot(bar, &m) || m.n <= 0) return;
+    menu_open_bar_kb(bw, ((cur + dir) % m.n + m.n) % m.n, 1);
+}
+
+static int is_key_msg(uint32_t msg) {
+    return msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_CHAR ||
+           msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP || msg == WM_SYSCHAR;
+}
+
+/* The whole of the menu's claim on input.
+ *
+ * With a menu open this returns 1 for every mouse and key message, because a
+ * menu is modal over the windows under it: the click that dismisses it must
+ * not also press what it landed on, and the arrow keys belong to the menu
+ * and not to the game behind it. With nothing open the only things it wants
+ * are a click in a menu bar and Alt.
+ */
+static int menu_input(w32 *w, uint32_t msg, uint64_t wp, int sx, int sy) {
+    (void)w;
+    int open;
+    pthread_mutex_lock(&g_lock);
+    open = g_pop.n > 0;
+    pthread_mutex_unlock(&g_lock);
+
+    if (!open) {
+        if (msg == WM_LBUTTONDOWN) {
+            int item = -1;
+            uint64_t hwnd = bar_window_at(sx, sy, &item);
+            if (!hwnd) return 0;
+            menu_open_bar(hwnd, item);
+            return 1;
+        }
+        /* Alt on its own opens the first bar item, the way it does on
+         * Windows. Alt with a letter is an access key, which is not here.
+         *
+         * Either message, because Alt pressed by itself is not yet a system
+         * key here -- w32_input_key marks a key as one only when Alt was
+         * already down when it arrived, so the Alt that starts the chord
+         * comes through as an ordinary WM_KEYDOWN. */
+        if ((msg == WM_SYSKEYDOWN || msg == WM_KEYDOWN) && wp == VK_MENU) {
+            uint64_t f;
+            pthread_mutex_lock(&g_lock);
+            f = g_focus;
+            pthread_mutex_unlock(&g_lock);
+            if (!f || !window_menu(f)) return 0;
+            menu_open_bar_kb(f, 0, 1);
+            return 1;
+        }
+        return 0;
+    }
+
+    if (msg == WM_MOUSEMOVE) { menu_hover(sx, sy); return 1; }
+    if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN) { menu_click(sx, sy); return 1; }
+    if (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) return 1;
+    if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) {
+        switch ((int)wp) {
+        case VK_ESCAPE: {
+            int n;
+            pthread_mutex_lock(&g_lock);
+            n = g_pop.n;
+            if (n > 1) g_pop.n = n - 1;
+            pthread_mutex_unlock(&g_lock);
+            if (n > 1) w32_desktop_damaged(); else menu_close();
+            return 1;
+        }
+        case VK_DOWN:  menu_arrow_move(1); return 1;
+        case VK_UP:    menu_arrow_move(-1); return 1;
+        case VK_RIGHT: {
+            int lvl, hot, deeper = 0;
+            pthread_mutex_lock(&g_lock);
+            lvl = g_pop.n - 1;
+            hot = lvl >= 0 ? g_pop.lv[lvl].hot : -1;
+            pthread_mutex_unlock(&g_lock);
+            if (hot >= 0) {
+                int before;
+                pthread_mutex_lock(&g_lock); before = g_pop.n; pthread_mutex_unlock(&g_lock);
+                menu_follow(lvl, hot);
+                pthread_mutex_lock(&g_lock); deeper = g_pop.n > before; pthread_mutex_unlock(&g_lock);
+                if (deeper) menu_arrow_move(1);
+            }
+            if (!deeper) menu_bar_step(1);
+            return 1;
+        }
+        case VK_LEFT: {
+            int n;
+            pthread_mutex_lock(&g_lock);
+            n = g_pop.n;
+            if (n > 1) g_pop.n = n - 1;
+            pthread_mutex_unlock(&g_lock);
+            if (n > 1) w32_desktop_damaged(); else menu_bar_step(-1);
+            return 1;
+        }
+        case VK_RETURN: {
+            int lvl, hot;
+            pthread_mutex_lock(&g_lock);
+            lvl = g_pop.n - 1;
+            hot = lvl >= 0 ? g_pop.lv[lvl].hot : -1;
+            pthread_mutex_unlock(&g_lock);
+            if (hot >= 0) menu_activate(lvl, hot);
+            return 1;
+        }
+        default: return 1;
+        }
+    }
+    return is_key_msg(msg) ? 1 : 0;
+}
+
+/* TrackPopupMenu's own message loop.
+ *
+ * The call does not return until something is chosen or the menu is
+ * dismissed -- that is what makes TPM_RETURNCMD possible at all -- so this is
+ * run_modal's shape again: take a message, offer it to the menu, and give
+ * anything the menu did not want to the window it was addressed to, so paints
+ * and timers still happen behind an open menu. Bounded the same way
+ * GetMessage is, because with nobody there to click anything a headless run
+ * has to end rather than wedge a CI job. */
+static int track_popup_loop(w32 *w) {
+    int idle = 0;
+    for (;;) {
+        if (w->exited) break;
+        int open, quit;
+        pthread_mutex_lock(&g_lock);
+        open = g_pop.n > 0; quit = g_quit;
+        pthread_mutex_unlock(&g_lock);
+        if (!open || quit) break;
+
+        qmsg q;
+        int have = 0;
+        pthread_mutex_lock(&g_lock);
+        if (g_qhead != g_qtail) { q = g_q[g_qhead]; g_qhead = (g_qhead + 1) % MAX_MSGS; have = 1; }
+        pthread_mutex_unlock(&g_lock);
+        if (!have) {
+            surface_present();
+            if (++idle > GETMSG_IDLE_MS) break;
+            w32_host_idle();
+            continue;
+        }
+        idle = 0;
+        int mouse = q.msg >= WM_MOUSEFIRST && q.msg <= WM_MOUSELAST;
+        if (mouse || is_key_msg(q.msg)) {
+            if (menu_input(w, q.msg, q.wparam, q.x, q.y)) { surface_present(); continue; }
+        }
+        uint64_t target = q.hwnd;
+        if (!target) {
+            pthread_mutex_lock(&g_lock);
+            target = mouse ? window_at(q.x, q.y) : g_focus;
+            pthread_mutex_unlock(&g_lock);
+        }
+        if (!target) continue;
+        uint64_t lp = q.lparam;
+        if (mouse) {
+            int wx = 0, wy = 0, ww = 0, wh = 0;
+            if (w32_window_area(target, 0, &wx, &wy, &ww, &wh)) lp = xy_lp(q.x - wx, q.y - wy);
+        }
+        deliver(w, target, q.msg, q.wparam, lp, 1);
+        surface_present();
+    }
+    int chosen;
+    pthread_mutex_lock(&g_lock);
+    chosen = g_pop.chosen;
+    g_pop.tracking = 0; g_pop.chosen = 0;
+    g_pop.n = 0; g_pop.barwnd = 0; g_pop.baritem = -1;
+    pthread_mutex_unlock(&g_lock);
+    w32_desktop_damaged();
+    surface_present();
+    return chosen;
+}
+
+/* ---- the exports -------------------------------------------------------- */
+
+static void u_CreateMenu(w32 *w) {
+    pthread_mutex_lock(&g_lock);
+    uint64_t h = menu_new();
+    pthread_mutex_unlock(&g_lock);
+    RET(h);
+}
+static void u_CreatePopupMenu(w32 *w) { u_CreateMenu(w); }
+
+/* Destroying a menu destroys the popups hanging off it, because the program
+ * holds no handle to those -- it gave them to AppendMenu and forgot them.
+ * Leaving them behind is a slow leak of the one resource here that is a fixed
+ * array, so a program that rebuilds its menu every time a document opens
+ * would eventually run out. */
+static void menu_destroy(uint64_t h, int depth) {
+    if (depth > MENU_DEPTH + 2) return;
+    wmenu *m = menu_of(h);
+    if (!m) return;
+    for (int i = 0; i < m->n; i++)
+        if (m->it[i].flags & MF_POPUP) menu_destroy(m->it[i].sub, depth + 1);
+    m->used = 0; m->n = 0;
+}
+static void u_DestroyMenu(w32 *w) {
+    uint64_t h = ARG(0);
+    pthread_mutex_lock(&g_lock);
+    /* A window still showing this menu would keep drawing a bar out of a
+     * store entry that has been handed to somebody else. */
+    for (int i = 0; i < MAX_WINDOWS; i++)
+        if (g_win[i].used && g_win[i].menu == h) { g_win[i].menu = 0; apply_chrome(&g_win[i]); }
+    menu_destroy(h, 0);
+    /* A menu that is on screen when it is destroyed has to come off it, or
+     * the input stays modal against a menu that no longer exists and there is
+     * no way left to dismiss it. */
+    for (int i = 0; i < g_pop.n; i++)
+        if (!menu_of(g_pop.lv[i].menu)) { g_pop.n = 0; g_pop.barwnd = 0; g_pop.baritem = -1; break; }
+    pthread_mutex_unlock(&g_lock);
+    w32_desktop_damaged();
+    RET(1);
+}
+
+/* One system menu, made when it is first asked for. Every caller wants the
+ * same thing from it -- EnableMenuItem(SC_CLOSE, MF_GRAYED), so the window
+ * cannot be closed while an install is running -- and there is no window
+ * manager here to obey that, but the call has to succeed and the item has to
+ * be there for it to be found. */
+static void u_GetSystemMenu(w32 *w) {
+    if (ARG(1)) { RET(0); return; }           /* bRevert: reset it, which we never customised */
+    static uint64_t sysmenu;
+    pthread_mutex_lock(&g_lock);
+    if (!menu_of(sysmenu)) {
+        sysmenu = menu_new();
+        wmenu *m = menu_of(sysmenu);
+        if (m) {
+            menu_item_set(&m->it[m->n++], MF_STRING, 0xF010, "Move");
+            menu_item_set(&m->it[m->n++], MF_STRING, 0xF000, "Size");
+            menu_item_set(&m->it[m->n++], MF_SEPARATOR, 0, "");
+            menu_item_set(&m->it[m->n++], MF_STRING, 0xF060, "Close");
+        }
+    }
+    uint64_t h = sysmenu;
+    pthread_mutex_unlock(&g_lock);
+    RET(h);
+}
+
 static void u_GetMenu(w32 *w) {
     pthread_mutex_lock(&g_lock);
     wwin *p = win_of(ARG(0));
-    uint64_t m = p ? p->menu : 0;
+    uint64_t m = p && !(p->style & WS_CHILD) ? p->menu : 0;
     pthread_mutex_unlock(&g_lock);
     RET(m);
 }
 static void u_SetMenu(w32 *w) {
+    uint64_t hwnd = ARG(0);
     pthread_mutex_lock(&g_lock);
-    wwin *p = win_of(ARG(0));
-    if (p) p->menu = ARG(1);
+    wwin *p = win_of(hwnd);
+    int ok = p != 0;
+    if (p) { p->menu = ARG(1); apply_chrome(p); }
     pthread_mutex_unlock(&g_lock);
+    /* The bar appeared or went away, so the client area moved: everything in
+     * it has to be drawn again where it now is. */
+    if (ok) invalidate(hwnd);
+    RET(ok);
+}
+static void u_DrawMenuBar(w32 *w) {
+    uint64_t hwnd = ARG(0);
+    pthread_mutex_lock(&g_lock);
+    wwin *p = win_of(hwnd);
+    if (p) apply_chrome(p);
+    pthread_mutex_unlock(&g_lock);
+    invalidate(hwnd);
     RET(1);
 }
-static void u_GetMenuItemCount(w32 *w) { (void)w; RET(0); }
-static void u_EnableMenuItem(w32 *w)   { (void)w; RET(0); }
-static void u_DeleteMenu(w32 *w)       { (void)w; RET(1); }
-static void u_AppendMenuA(w32 *w)      { (void)w; RET(1); }
-static void u_AppendMenuW(w32 *w)      { (void)w; RET(1); }
-static void u_DrawMenuBar(w32 *w)      { (void)w; RET(1); }
-/* TrackPopupMenu returns which item was chosen, and nothing was: there is no
- * menu on screen to choose from. Zero is "dismissed", which is what a person
- * pressing Escape produces and every caller handles. */
-static void u_TrackPopupMenu(w32 *w)   { (void)w; RET(0); }
-static void u_TrackPopupMenuEx(w32 *w) { (void)w; RET(0); }
+
+static void u_GetSubMenu(w32 *w) {
+    pthread_mutex_lock(&g_lock);
+    wmenu *m = menu_of(ARG(0));
+    int i = (int)(int32_t)(uint32_t)ARG(1);
+    uint64_t sub = (m && i >= 0 && i < m->n && (m->it[i].flags & MF_POPUP)) ? m->it[i].sub : 0;
+    pthread_mutex_unlock(&g_lock);
+    RET(sub);
+}
+static void u_GetMenuItemCount(w32 *w) {
+    pthread_mutex_lock(&g_lock);
+    wmenu *m = menu_of(ARG(0));
+    int n = m ? m->n : -1;
+    pthread_mutex_unlock(&g_lock);
+    RET((uint64_t)(uint32_t)n);
+}
+/* -1 for a separator or a submenu, which is what a caller walking a menu by
+ * position uses to tell those apart from a command. */
+static void u_GetMenuItemID(w32 *w) {
+    pthread_mutex_lock(&g_lock);
+    wmenu *m = menu_of(ARG(0));
+    int i = (int)(int32_t)(uint32_t)ARG(1);
+    uint32_t id = (uint32_t)-1;
+    if (m && i >= 0 && i < m->n && !(m->it[i].flags & (MF_POPUP | MF_SEPARATOR))) id = m->it[i].id;
+    pthread_mutex_unlock(&g_lock);
+    RET(id);
+}
+static void u_GetMenuState(w32 *w) {
+    pthread_mutex_lock(&g_lock);
+    mitem *it = menu_find(ARG(0), (uint32_t)ARG(1), (uint32_t)ARG(2), 0);
+    uint32_t s = (uint32_t)-1;
+    if (it) {
+        s = it->flags;
+        /* For a popup the high word is its item count, which is the only way
+         * a caller can size a submenu without a handle to it. */
+        if (it->flags & MF_POPUP) {
+            wmenu *sm = menu_of(it->sub);
+            if (sm) s |= (uint32_t)sm->n << 8;
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    RET(s);
+}
+
+static void get_menu_string(w32 *w, int wide) {
+    char text[MENU_TEXT];
+    text[0] = 0;
+    pthread_mutex_lock(&g_lock);
+    mitem *it = menu_find(ARG(0), (uint32_t)ARG(1), (uint32_t)ARG(4), 0);
+    if (it) snprintf(text, sizeof text, "%s", it->text);
+    int found = it != 0;
+    pthread_mutex_unlock(&g_lock);
+    if (!found) { RET(0); return; }
+    size_t n = strlen(text);
+    uint64_t out = ARG(2);
+    int cap = (int)(int32_t)(uint32_t)ARG(3);
+    /* A null buffer asks for the length, which is what every caller does
+     * first so it knows how much to allocate. */
+    if (!out || cap <= 0) { RET(n); return; }
+    if (n > (size_t)cap - 1) n = (size_t)cap - 1;
+    for (size_t i = 0; i < n; i++)
+        w32_write(w, out + (wide ? i * 2 : i), wide ? 2 : 1, (uint8_t)text[i]);
+    w32_write(w, out + (wide ? n * 2 : n), wide ? 2 : 1, 0);
+    RET(n);
+}
+static void u_GetMenuStringA(w32 *w) { get_menu_string(w, 0); }
+static void u_GetMenuStringW(w32 *w) { get_menu_string(w, 1); }
+
+/* Toggling a flag on one item, which CheckMenuItem and EnableMenuItem both
+ * are. Both return the item's previous state, or -1 if it is not there --
+ * and a caller that ignores the difference between "was unchecked" and "not
+ * found" is why the -1 matters. */
+static uint32_t menu_flip(uint64_t hmenu, uint32_t which, uint32_t flags, uint32_t mask) {
+    pthread_mutex_lock(&g_lock);
+    mitem *it = menu_find(hmenu, which, flags, 0);
+    uint32_t was = (uint32_t)-1;
+    if (it) {
+        was = it->flags & mask;
+        it->flags = (it->flags & ~mask) | (flags & mask);
+    }
+    pthread_mutex_unlock(&g_lock);
+    w32_desktop_damaged();
+    return was;
+}
+static void u_CheckMenuItem(w32 *w) {
+    RET(menu_flip(ARG(0), (uint32_t)ARG(1), (uint32_t)ARG(2), MF_CHECKED));
+}
+static void u_EnableMenuItem(w32 *w) {
+    RET(menu_flip(ARG(0), (uint32_t)ARG(1), (uint32_t)ARG(2), MF_GRAYED | MF_DISABLED));
+}
+/* One of a run of items is checked and the rest are cleared, which is the
+ * whole of what makes a menu radio group behave like one. */
+static void u_CheckMenuRadioItem(w32 *w) {
+    uint64_t h = ARG(0);
+    uint32_t first = (uint32_t)ARG(1), last = (uint32_t)ARG(2), pick = (uint32_t)ARG(3);
+    uint32_t flags = (uint32_t)ARG(4);
+    int ok = 0;
+    pthread_mutex_lock(&g_lock);
+    wmenu *m = menu_of(h);
+    if (m) {
+        if (flags & MF_BYPOSITION) {
+            for (uint32_t i = first; i <= last && (int)i < m->n; i++)
+                m->it[i].flags = (m->it[i].flags & ~(uint32_t)MF_CHECKED) | (i == pick ? MF_CHECKED : 0);
+        } else {
+            for (int i = 0; i < m->n; i++) {
+                uint32_t id = m->it[i].id;
+                if (id < first || id > last) continue;
+                m->it[i].flags = (m->it[i].flags & ~(uint32_t)MF_CHECKED) | (id == pick ? MF_CHECKED : 0);
+            }
+        }
+        ok = 1;
+    }
+    pthread_mutex_unlock(&g_lock);
+    w32_desktop_damaged();
+    RET(ok);
+}
+
+static void u_AppendMenuA(w32 *w) { RET(menu_put(w, ARG(0), 0, (uint32_t)ARG(1), ARG(2), ARG(3), 0, 0)); }
+static void u_AppendMenuW(w32 *w) { RET(menu_put(w, ARG(0), 0, (uint32_t)ARG(1), ARG(2), ARG(3), 1, 0)); }
+static void u_InsertMenuA(w32 *w) { RET(menu_put(w, ARG(0), (uint32_t)ARG(1), (uint32_t)ARG(2), ARG(3), ARG(4), 0, 1)); }
+static void u_InsertMenuW(w32 *w) { RET(menu_put(w, ARG(0), (uint32_t)ARG(1), (uint32_t)ARG(2), ARG(3), ARG(4), 1, 1)); }
+static void u_ModifyMenuA(w32 *w) { RET(menu_put(w, ARG(0), (uint32_t)ARG(1), (uint32_t)ARG(2), ARG(3), ARG(4), 0, 2)); }
+static void u_ModifyMenuW(w32 *w) { RET(menu_put(w, ARG(0), (uint32_t)ARG(1), (uint32_t)ARG(2), ARG(3), ARG(4), 1, 2)); }
+
+/* DeleteMenu destroys a submenu it removes; RemoveMenu leaves it alive, so
+ * the program can put it somewhere else. That is the entire difference
+ * between them and it is the reason both exist. */
+static uint64_t menu_take_out(uint64_t hmenu, uint32_t which, uint32_t flags, int destroy) {
+    pthread_mutex_lock(&g_lock);
+    wmenu *m = menu_of(hmenu);
+    mitem *it = menu_find(hmenu, which, flags, 0);
+    int ok = 0;
+    if (m && it >= m->it && it < m->it + m->n) {
+        int at = (int)(it - m->it);
+        if (destroy && (it->flags & MF_POPUP)) menu_destroy(it->sub, 0);
+        for (int i = at; i + 1 < m->n; i++) m->it[i] = m->it[i + 1];
+        m->n--;
+        ok = 1;
+    }
+    pthread_mutex_unlock(&g_lock);
+    w32_desktop_damaged();
+    return ok;
+}
+static void u_DeleteMenu(w32 *w) { RET(menu_take_out(ARG(0), (uint32_t)ARG(1), (uint32_t)ARG(2), 1)); }
+static void u_RemoveMenu(w32 *w) { RET(menu_take_out(ARG(0), (uint32_t)ARG(1), (uint32_t)ARG(2), 0)); }
+
+/* MENUITEMINFO. The offsets were read out of mingw-w64's headers with
+ * offsetof, by a program compiled for Windows and run on this emulator, the
+ * same way the window structures were: hSubMenu is pointer-sized and every
+ * field after it moves between the two bitnesses. */
+typedef struct { int mask, type, state, id, sub, data, typedata, cch; } mii_off;
+static const mii_off MII32 = { 4, 8, 12, 16, 20, 32, 36, 40 };
+static const mii_off MII64 = { 4, 8, 12, 16, 24, 48, 56, 64 };
+
+static void set_menu_item_info(w32 *w, int wide) {
+    const mii_off *o = w->is32 ? &MII32 : &MII64;
+    uint64_t p = ARG(3);
+    if (!p) { RET(0); return; }
+    uint32_t mask = (uint32_t)w32_read(w, p + o->mask, 4);
+    uint32_t type = (uint32_t)w32_read(w, p + o->type, 4);
+    uint32_t state = (uint32_t)w32_read(w, p + o->state, 4);
+    uint32_t id = (uint32_t)w32_read(w, p + o->id, 4);
+    uint64_t sub = w32_read(w, p + o->sub, w32_ptrsize(w));
+    uint64_t td = w32_read(w, p + o->typedata, w32_ptrsize(w));
+    char text[MENU_TEXT];
+    text[0] = 0;
+    if ((mask & (MIIM_STRING | MIIM_TYPE)) && td && !(type & (MF_BITMAP | MF_OWNERDRAW)))
+        menu_arg_text(w, 0, td, wide, text, sizeof text);
+    pthread_mutex_lock(&g_lock);
+    mitem *it = menu_find(ARG(0), (uint32_t)ARG(1), ARG(2) ? MF_BYPOSITION : MF_BYCOMMAND, 0);
+    int ok = it != 0;
+    if (it) {
+        if (mask & (MIIM_TYPE | MIIM_FTYPE))
+            it->flags = (it->flags & ~(uint32_t)MF_SEPARATOR) | (type & (uint32_t)MF_SEPARATOR);
+        if (mask & MIIM_STATE)
+            it->flags = (it->flags & ~(uint32_t)(MF_CHECKED | MF_GRAYED | MF_DISABLED)) |
+                        (state & (uint32_t)(MF_CHECKED | MF_GRAYED | MF_DISABLED));
+        if (mask & MIIM_ID) it->id = id;
+        if (mask & MIIM_SUBMENU) {
+            it->sub = sub;
+            it->flags = sub ? (it->flags | MF_POPUP) : (it->flags & ~(uint32_t)MF_POPUP);
+        }
+        if ((mask & (MIIM_STRING | MIIM_TYPE)) && text[0]) snprintf(it->text, MENU_TEXT, "%s", text);
+    }
+    pthread_mutex_unlock(&g_lock);
+    w32_desktop_damaged();
+    RET(ok);
+}
+static void u_SetMenuItemInfoA(w32 *w) { set_menu_item_info(w, 0); }
+static void u_SetMenuItemInfoW(w32 *w) { set_menu_item_info(w, 1); }
+
+static void get_menu_item_info(w32 *w, int wide) {
+    const mii_off *o = w->is32 ? &MII32 : &MII64;
+    uint64_t p = ARG(3);
+    if (!p) { RET(0); return; }
+    uint32_t mask = (uint32_t)w32_read(w, p + o->mask, 4);
+    char text[MENU_TEXT];
+    uint32_t flags = 0, id = 0;
+    uint64_t sub = 0;
+    pthread_mutex_lock(&g_lock);
+    mitem *it = menu_find(ARG(0), (uint32_t)ARG(1), ARG(2) ? MF_BYPOSITION : MF_BYCOMMAND, 0);
+    int ok = it != 0;
+    if (it) {
+        flags = it->flags; id = it->id; sub = it->sub;
+        snprintf(text, sizeof text, "%s", it->text);
+    } else text[0] = 0;
+    pthread_mutex_unlock(&g_lock);
+    if (!ok) { RET(0); return; }
+    if (mask & (MIIM_TYPE | MIIM_FTYPE)) w32_write(w, p + o->type, 4, flags & MF_SEPARATOR);
+    if (mask & MIIM_STATE)
+        w32_write(w, p + o->state, 4, flags & (MF_CHECKED | MF_GRAYED | MF_DISABLED));
+    if (mask & MIIM_ID) w32_write(w, p + o->id, 4, id);
+    if (mask & MIIM_SUBMENU) w32_write(w, p + o->sub, w32_ptrsize(w), sub);
+    if (mask & (MIIM_STRING | MIIM_TYPE)) {
+        uint64_t td = w32_read(w, p + o->typedata, w32_ptrsize(w));
+        uint32_t cap = (uint32_t)w32_read(w, p + o->cch, 4);
+        size_t n = strlen(text);
+        /* cch comes back as the length whether or not there was a buffer,
+         * which is how a caller asks how much room the text needs. */
+        w32_write(w, p + o->cch, 4, (uint32_t)n);
+        if (td && cap) {
+            if (n > cap - 1) n = cap - 1;
+            for (size_t i = 0; i < n; i++)
+                w32_write(w, td + (wide ? i * 2 : i), wide ? 2 : 1, (uint8_t)text[i]);
+            w32_write(w, td + (wide ? n * 2 : n), wide ? 2 : 1, 0);
+        }
+    }
+    RET(1);
+}
+static void u_GetMenuItemInfoA(w32 *w) { get_menu_item_info(w, 0); }
+static void u_GetMenuItemInfoW(w32 *w) { get_menu_item_info(w, 1); }
+
+/* InsertMenuItem is InsertMenu with the information in a structure instead of
+ * in the arguments, so it goes in through the same door: build the item, then
+ * put it where the position argument says. */
+static void insert_menu_item(w32 *w, int wide) {
+    const mii_off *o = w->is32 ? &MII32 : &MII64;
+    uint64_t p = ARG(3);
+    if (!p) { RET(0); return; }
+    uint32_t mask = (uint32_t)w32_read(w, p + o->mask, 4);
+    uint32_t type = (uint32_t)w32_read(w, p + o->type, 4);
+    uint32_t state = (uint32_t)w32_read(w, p + o->state, 4);
+    uint32_t id = (uint32_t)w32_read(w, p + o->id, 4);
+    uint64_t sub = (mask & MIIM_SUBMENU) ? w32_read(w, p + o->sub, w32_ptrsize(w)) : 0;
+    uint64_t td = w32_read(w, p + o->typedata, w32_ptrsize(w));
+    char text[MENU_TEXT];
+    text[0] = 0;
+    if (td && !(type & (MF_BITMAP | MF_OWNERDRAW))) menu_arg_text(w, 0, td, wide, text, sizeof text);
+    uint32_t flags = (type & (uint32_t)MF_SEPARATOR) |
+                     (state & (uint32_t)(MF_CHECKED | MF_GRAYED | MF_DISABLED)) |
+                     (sub ? (uint32_t)MF_POPUP : 0u);
+    uint32_t where = (uint32_t)ARG(1);
+    int bypos = ARG(2) != 0;
+    pthread_mutex_lock(&g_lock);
+    wmenu *m = menu_of(ARG(0));
+    int ok = 0;
+    if (m && m->n < MENU_ITEMS) {
+        int at = m->n;
+        if (bypos) { if (where < (uint32_t)m->n) at = (int)where; }
+        else {
+            mitem *f = menu_find(ARG(0), where, MF_BYCOMMAND, 0);
+            if (f >= m->it && f < m->it + m->n) at = (int)(f - m->it);
+        }
+        for (int i = m->n; i > at; i--) m->it[i] = m->it[i - 1];
+        menu_item_set(&m->it[at], flags, sub ? sub : id, text);
+        if (sub) m->it[at].id = id;
+        m->n++;
+        ok = 1;
+    }
+    pthread_mutex_unlock(&g_lock);
+    w32_desktop_damaged();
+    RET(ok);
+}
+static void u_InsertMenuItemA(w32 *w) { insert_menu_item(w, 0); }
+static void u_InsertMenuItemW(w32 *w) { insert_menu_item(w, 1); }
+
+static void u_LoadMenuA(w32 *w) { RET(load_menu(w, ARG(0), ARG(1), 0)); }
+static void u_LoadMenuW(w32 *w) { RET(load_menu(w, ARG(0), ARG(1), 1)); }
+
+/* TrackPopupMenu(hMenu, uFlags, x, y, nReserved, hWnd, prcRect) -- a context
+ * menu at a screen point. The alignment flags move the menu relative to that
+ * point, which matters for the one that is actually used: a menu asked for at
+ * the bottom of the screen with TPM_BOTTOMALIGN goes above the point rather
+ * than off the display. */
+static void track_popup(w32 *w, int ex) {
+    uint64_t hmenu = ARG(0);
+    uint32_t flags = (uint32_t)ARG(1);
+    int x = (int)(int32_t)(uint32_t)ARG(2), y = (int)(int32_t)(uint32_t)ARG(3);
+    uint64_t owner = ex ? ARG(4) : ARG(5);
+    wmenu m;
+    if (!menu_snapshot(hmenu, &m) || !m.n) { RET(0); return; }
+    uint64_t hdc = w32_dc_for_window(w, 0, 1);
+    if (!hdc) { RET(0); return; }
+    int lh = w32_gdi_line_height(hdc);
+    if (lh < 1) lh = 13;
+    int pw = 0, ph = 0;
+    popup_measure(hdc, &m, lh, &pw, &ph);
+    w32_dc_release(hdc);
+    if (flags & TPM_CENTERALIGN) x -= pw / 2;
+    else if (flags & TPM_RIGHTALIGN) x -= pw;
+    if (flags & TPM_VCENTERALIGN) y -= ph / 2;
+    else if (flags & TPM_BOTTOMALIGN) y -= ph;
+
+    pthread_mutex_lock(&g_lock);
+    g_pop.owner = owner; g_pop.barwnd = 0; g_pop.baritem = -1;
+    g_pop.tracking = 1; g_pop.tflags = flags; g_pop.chosen = 0;
+    g_pop.n = 0;
+    pthread_mutex_unlock(&g_lock);
+    if (!menu_push_level(0, hmenu, x, y, -1)) {
+        pthread_mutex_lock(&g_lock); g_pop.tracking = 0; pthread_mutex_unlock(&g_lock);
+        RET(0);
+        return;
+    }
+    int chosen = track_popup_loop(w);
+    /* Without TPM_RETURNCMD the command was posted and the answer is only
+     * "the menu was shown", which is what every caller of that form tests. */
+    RET((flags & TPM_RETURNCMD) ? (uint64_t)(uint32_t)chosen : 1);
+}
+static void u_TrackPopupMenu(w32 *w)   { track_popup(w, 0); }
+static void u_TrackPopupMenuEx(w32 *w) { track_popup(w, 1); }
 
 /* Hooks. A hook that is installed but never called is not a lie as long as
  * nothing depends on it firing; what a program depends on is that the
@@ -5183,9 +6867,22 @@ const w32_api w32_user32[] = {
     F(SendNotifyMessageA, 4), F(SendNotifyMessageW, 4),
     F(SetPropA, 3), F(SetPropW, 3), F(GetPropA, 2), F(GetPropW, 2),
     F(RemovePropA, 2), F(RemovePropW, 2),
+    /* Menus. Argument counts matter here and nowhere more: a stdcall callee
+     * pops its own arguments, so one of these being wrong corrupts the
+     * caller's stack somewhere far away from the call. */
     F(CreateMenu, 0), F(CreatePopupMenu, 0), F(DestroyMenu, 1), F(GetSystemMenu, 2),
-    F(GetMenu, 1), F(SetMenu, 2), F(GetMenuItemCount, 1), F(EnableMenuItem, 3),
-    F(DeleteMenu, 3), F(AppendMenuA, 4), F(AppendMenuW, 4), F(DrawMenuBar, 1),
+    F(GetMenu, 1), F(SetMenu, 2), F(GetSubMenu, 2),
+    F(GetMenuItemCount, 1), F(GetMenuItemID, 2), F(GetMenuState, 3),
+    F(GetMenuStringA, 5), F(GetMenuStringW, 5),
+    F(EnableMenuItem, 3), F(CheckMenuItem, 3), F(CheckMenuRadioItem, 5),
+    F(DeleteMenu, 3), F(RemoveMenu, 3),
+    F(AppendMenuA, 4), F(AppendMenuW, 4),
+    F(InsertMenuA, 5), F(InsertMenuW, 5),
+    F(ModifyMenuA, 5), F(ModifyMenuW, 5),
+    F(InsertMenuItemA, 4), F(InsertMenuItemW, 4),
+    F(SetMenuItemInfoA, 4), F(SetMenuItemInfoW, 4),
+    F(GetMenuItemInfoA, 4), F(GetMenuItemInfoW, 4),
+    F(LoadMenuA, 2), F(LoadMenuW, 2), F(DrawMenuBar, 1),
     F(TrackPopupMenu, 7), F(TrackPopupMenuEx, 6),
     F(SetWindowsHookExA, 4), F(SetWindowsHookExW, 4),
     F(UnhookWindowsHookEx, 1), F(CallNextHookEx, 4),

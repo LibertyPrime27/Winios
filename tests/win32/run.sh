@@ -46,9 +46,14 @@ checkx() {  # name expected_file expected_rc [guest args...] [-- winrun flags...
 # so this covers the whole path from the draw call to the display -- and the
 # arithmetic behind it is integer, so the number is the same in both
 # bitnesses and on every machine.
-checkframe() {  # name WxH expected_crc
+# `size` of "own" means the guest picks its own back buffer size and the
+# display is left alone -- a Direct3D guest that asks for a 256x144 device is
+# not asking for a 256x144 *display*, and telling winrun the screen is that
+# small is refused as not being a size a display can be.
+checkframe() {  # name WxH|own expected_crc
     name=$1; size=$2; want=$3
-    got=$($emu "$winrun" -frame -screen "$size" "./$name" 2>/dev/null | sed -n 's/^screen .* crc \([0-9a-f]*\)$/\1/p')
+    if [ "$size" = own ]; then scr=""; else scr="-screen $size"; fi
+    got=$($emu "$winrun" -frame $scr "./$name" 2>/dev/null | sed -n 's/^screen .* crc \([0-9a-f]*\)$/\1/p')
     if [ "$got" = "$want" ]; then echo "ok   $name drew the expected frame ($want)"
     else echo "FAIL $name drew $got, want $want"; fail=1; fi
 }
@@ -78,6 +83,16 @@ check pathtest64.exe 0
 check pathtest32.exe 0
 check d3ddraw64.exe 0
 check d3ddraw32.exe 0
+# The sprite path: a texture created, filled through LockRect, bound, and
+# drawn as a textured quad -- with colour modulation, alpha blending, the
+# transform pipeline and an indexed draw out of real buffers. This is what a
+# 2D game does every frame, and until CreateTexture existed it stopped the
+# run dead. The frame is checked by checksum because every step of it is
+# integer arithmetic, so the number has to be the same in both bitnesses.
+checkrc d3dtex64.exe 0 "0 failures"
+checkrc d3dtex32.exe 0 "0 failures"
+checkframe d3dtex64.exe own 4cbae1e7
+checkframe d3dtex32.exe own 4cbae1e7
 check filetest64.exe 0
 check filetest32.exe 0
 # The registry has to survive the process that wrote it, so write in one run

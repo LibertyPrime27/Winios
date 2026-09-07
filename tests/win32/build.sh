@@ -45,6 +45,7 @@ for a in 32 64; do
     $CC -O2 -s -o d3dframe$a.exe d3dframe.c -ld3d9
     $CC -O2 -s -o d3dloop$a.exe  d3dloop.c  -ld3d9
     $CC -O2 -s -o d3ddraw$a.exe  d3ddraw.c  -ld3d9
+    $CC -O2 -s -o d3dtex$a.exe   d3dtex.c   -ld3d9
     $CC -O2 -s -o pathtest$a.exe pathtest.c
     # finding files, mapping them, and the registry -- how a game finds its
     # archives and how it finds out where it was installed

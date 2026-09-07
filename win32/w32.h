@@ -512,7 +512,13 @@ void w32_client_size(int *cw, int *ch);
 int  w32_has_window(void);                         /* has the guest made one yet? */
 /* Whether the guest wants a pointer drawn, and where it thinks it is. A game
  * hides the cursor to say "I am doing mouselook now", which is exactly when a
- * virtual cursor should get out of the way. */
+ * virtual cursor should get out of the way.
+ *
+ * user32 now draws the pointer itself, into the frame, from the cursor the
+ * program set. The host's own pointer overlay is the other half of that and
+ * the two must not both be showing: this one is what a program sets and a
+ * mouse moves, the host's is the one a finger drags. Ask this before drawing
+ * one, and do not draw one at all when a real mouse or trackpad is attached. */
 int  w32_cursor_visible(void);
 void w32_cursor_pos(int *x, int *y);
 /* Is this virtual key held? So xinput.c can let a keyboard stand in for a

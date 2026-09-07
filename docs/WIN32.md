@@ -319,6 +319,93 @@ rather than fifty. `uxtheme.dll` answers the questions a themed program asks —
 Windows 95 fallback, and `OpenThemeData` returns a handle so its themed path
 is the one it takes.
 
+## Menus, and the pointer
+
+Two things a person looks for before anything else, and neither was drawn.
+
+A menu used to be a handle with nothing behind it. `CreateMenu` returned a
+distinct number, `AppendMenu` said yes, `GetMenuItemCount` honestly said zero,
+and nothing appeared or could be clicked. That is survivable for an installer,
+which has no menu bar and asks for its system menu only so it can grey out
+Close; it is the whole program for something whose File/Options/Help bar is
+how anything is reached.
+
+The store is a fixed array of menus, one entry per menu that exists, the same
+shape the list-box store has -- and a bar and each of its popups are separate
+menus, because that is how Windows models them and how a resource stores them.
+`LoadMenu` reads both resource formats for the same reason `DialogBoxParam`
+reads both dialog templates: the original is a header, then items each with a
+flags word, an id word for anything that is not a popup, and a NUL-terminated
+UTF-16 string, with `0x80` marking the last item at a level and `0x10` marking
+a popup whose own items follow inline; `MENUEX` is the same tree with wider
+fields and DWORD alignment, and it is what a resource compiler emits the
+moment the script uses anything added after Windows 95. Reading only the first
+would give a menu bar that appears for old programs and not for new ones.
+
+**A menu bar takes room out of the client area, exactly as the caption does.**
+That is the same argument the caption's comment makes and it is not cosmetic:
+a window's contents are positioned from the client origin, so a bar drawn over
+the client area covers the first row of them. `SetMenu` and `DrawMenuBar`
+recompute it, because a menu can arrive long after the window did.
+
+**A popup is not a window.** It is drawn as an overlay above everything, which
+means it cannot go through a window's device context -- whatever painted next
+would draw straight over it. So the popup and the mouse pointer are composited
+into the surface immediately before it is handed to the display and lifted
+straight back out again afterwards, and the surface a window paints into only
+ever holds what the windows drew. The other way round -- leaving them in and
+repainting what was underneath when they move -- is what a compositor with a
+backing store per window does; here there is one shared surface and no backing
+store, so "repaint what was under the pointer" means asking every window that
+overlaps it to paint itself again, which is a guest callback for every pixel of
+mouse travel. Saving the rectangle and putting it back cannot leave a trail at
+all, which is the property that actually matters.
+
+While a menu is up it takes the mouse and the keyboard away from the windows
+under it. That is not tidiness either: the click that dismisses a menu must
+not also press whatever it landed on. Clicking a bar item drops its popup,
+hovering moves the highlight, an item that opens another menu opens it on
+hover, clicking an item sends `WM_COMMAND` with its id down the same path a
+button's click takes, Escape closes one level and clicking anywhere else
+closes the lot. `TrackPopupMenu` runs its own message loop -- it has to, since
+`TPM_RETURNCMD` means the call does not return until something is chosen --
+and gives everything the menu did not want to the window it was addressed to,
+so paints and timers still happen behind an open menu. It is bounded the same
+way `GetMessage` is, because with nobody there to click anything a headless
+run has to end rather than wedge a CI job. Alt opens the first bar item, the
+arrows move, Enter chooses.
+
+### The pointer, and the other pointer
+
+`SetCursor` had been storing a real image handle and `LoadCursor` had been
+returning real pixels, including the stock shapes `image.c` draws itself,
+since the picture decoding landed. Nothing put them on the screen. Now the
+pointer is composited last of all, at the cursor position *less its hot spot*
+-- the hot spot is the pixel the coordinates refer to, an arrow's tip or a
+cross-hair's centre, and ignoring it puts the picture a dozen pixels from what
+is being clicked. `ShowCursor`'s counter is honoured, and that is not a
+nicety: a game that hides the pointer is saying it will draw its own, and
+drawing this one as well gives it two. A program that has set no cursor gets
+the stock arrow, because a window with no pointer over it looks broken.
+
+**The app draws its own pointer overlay, and the two must never both be
+visible.** The app's is for touch -- a finger covers what it is aiming at, so
+something has to say where the tap will land. This one is the pointer a
+program *sets* and a mouse moves. Two arrows a few pixels apart are worse than
+none, because neither is obviously the real one, so the app asks
+`w32_cursor_visible()` before drawing its own and leaves the drawing to this
+one when a real mouse or trackpad is attached.
+
+One limit worth stating: the pointer is composited onto the *surface*, so a
+guest presenting its own Direct3D frames does not get one -- those frames
+never touch this surface, which is also why moving the mouse does not present
+an empty desktop between them. A game that wants a pointer over its own
+rendering draws it itself, which is what a game does anyway.
+
+`dlgtest`'s recorded frame checksum covers this: it changed when the pointer
+started being drawn, and it is the same number in both bitnesses, which is the
+only reason a checksum is worth recording.
+
 ## The message pump, and why a game was being killed
 
 `GetMessage` used to return `WM_QUIT` the moment the queue was empty, on the
@@ -343,6 +430,74 @@ and installers do — wrote a line per iteration, and on a phone each of those
 crosses into the system log and wakes the host app's UI. That was enough on
 its own to hold the main thread at 100% until iOS terminated the process,
 which is a strange way for a debug print to kill a game.
+
+## Sprites: the D3D9 texture path
+
+The version of `d3d9.c` that drew triangles accepted exactly one vertex
+format — `D3DFVF_XYZRHW | D3DFVF_DIFFUSE`, an untextured position already in
+screen space — and refused everything else with a line on stderr. That was the
+right first step, because it isolated vertex fetch, primitive assembly and
+rasterization from the transform pipeline. It also meant no real 2D game drew
+anything, because **a sprite is a textured quad** and every engine that puts
+one on screen sends `D3DFVF_TEX1` with it.
+
+Worse, `CreateTexture` was not in the device's vtable at all. An entry that is
+not there is not a no-op: the call lands on the unimplemented-slot stub, which
+stops the run. So a game died during setup, having produced no frame.
+
+What is there now: `IDirect3DTexture9` with `LockRect` (honouring a
+sub-rectangle, because a texture atlas is filled one sprite at a time),
+`GetSurfaceLevel`, `SetTexture`, `IDirect3DIndexBuffer9`, indexed draws,
+render targets with `StretchRect` and `ColorFill`, `SetScissorRect`,
+`SetTransform` and the world/view/projection multiply, and the blend states
+that matter — `D3DRS_ALPHABLENDENABLE` and the two factors, which between them
+say whether a sprite is composited or added.
+
+Vertex fetch is now driven by the format rather than being one shape:
+`fvf_decode` walks the FVF in the order the specification fixes (position,
+blend weights, normal, point size, diffuse, specular, texture coordinate
+sets), and a **vertex declaration** — what replaced the FVF, and what a
+2015-era engine actually uses — is parsed into the same layout, so one fetch
+serves both. A declaration wins over the FVF when both are set, because an
+engine that moved to declarations often leaves a stale FVF behind.
+
+The pixels go through `w32_d3d11_triangle`, the same integer rasterizer D3D11
+draws with. It already did texturing, colour modulation and alpha blending and
+it is deterministic by construction, so pointing D3D9 at it gives two APIs, one
+rasterizer and one set of frame checksums. `d3dtex.exe` draws a wrapped
+checkerboard quad modulated by vertex colour, a triangle through the transform
+pipeline, a blended quad and an indexed draw out of real buffers; the frame is
+`4cbae1e7` on x86, under qemu on aarch64, and in both bitnesses.
+
+**Shaders are created, bound, and not executed** — the same position D3D11
+takes and for the same reason. A game with its own shaders draws with the
+fixed-function interpretation: texture 0 modulated by the vertex colour. It
+says so once rather than silently.
+
+### Two bugs worth naming
+
+`CreateTexture` was written at slot 20. It is at 23; slot 20 is
+`SetDialogBoxMode` and three slots before `CreateTexture` sits
+`CreateVolumeTexture`. The tables are now `_Static_assert`ed against lengths
+taken mechanically out of `d3d9.h`, which is how this was found.
+
+And the first indexed draw segfaulted the host at address zero on x64 and
+worked perfectly in 32-bit. `StartIndex` is a `UINT`: on x64 it arrives in the
+low half of a register and the **high half is whatever was there before**.
+Reading it at full width turned an index pointer into `0x17d3fb68fa000`. Every
+32-bit argument in this file is masked with `(uint32_t)` for that reason, and
+the idiom was already all over the older code — it was new code that forgot it.
+
+### The rest of the interface
+
+Seventy-eight of `IDirect3DDevice9`'s slots had no entry, among them
+`SetVertexDeclaration`, `SetVertexShader`, `SetRenderTarget`, `CreateQuery`
+and `Reset` — all of which a 2D engine calls before it draws. They are
+generated by walking the header's own `DECLARE_INTERFACE_` block, so the slot
+numbers and argument counts are the header's rather than anyone's memory. Most
+are accepted and do nothing, which is the correct behaviour for a renderer
+with no lighting, no palettes and no patches, and is very different from
+having no entry at all.
 
 ## Both bitnesses, one implementation
 
