@@ -56,6 +56,53 @@ def compressible_zip():
     return buf.getvalue()
 
 
+def zip64_archive():
+    """A zip64 archive: the zip64 EOCD record and its locator sit BETWEEN the
+    central directory and the ordinary EOCD.
+
+    Python only emits those records for an archive that genuinely needs them
+    (over 4 GB, or more than 65535 entries), so the trailer is assembled here
+    instead. The layout is what a real zip64 file has, and it is the layout
+    that matters: a reader that finds the directory by subtracting its size
+    from the EOCD's position lands 76 bytes late -- 56 for the record, 20 for
+    the locator -- and then every local-header offset is wrong.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+        z.writestr('big/a.txt', b'zip64 entry one\n')
+        z.writestr('big/b.txt', b'zip64 entry two\n')
+    d = bytearray(buf.getvalue())
+    i = d.rfind(b'PK\x05\x06')
+    nent, cd_size, cd_off = struct.unpack_from('<HII', d, i + 10)
+
+    # zip64 EOCD record, then its locator, then the EOCD with its 32-bit
+    # fields saturated so a reader has to go and find the real ones.
+    z64 = struct.pack('<IQHHIIQQQQ', 0x06064b50, 44, 45, 45, 0, 0,
+                      nent, nent, cd_size, cd_off)
+    loc = struct.pack('<IIQI', 0x07064b50, 0, i, 1)
+    eocd = bytearray(d[i:])
+    struct.pack_into('<HHHHII', eocd, 4, 0, 0, 0xFFFF, 0xFFFF, 0xFFFFFFFF, 0xFFFFFFFF)
+    return bytes(d[:i]) + z64 + loc + bytes(eocd)
+
+
+def comment_trap_zip():
+    """An archive whose comment contains an EOCD signature.
+
+    A backwards scan for the signature finds this one first, because a comment
+    comes *after* the record it belongs to. The real record is identifiable
+    because its declared comment length reaches exactly the end of the file,
+    and the decoy's does not.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+        z.writestr('ok.txt', 'the real directory was found\n')
+    d = bytearray(buf.getvalue())
+    i = d.rfind(b'PK\x05\x06')
+    decoy = b'PK\x05\x06' + bytes(18)      # a whole fake record, in the comment
+    struct.pack_into('<H', d, i + 20, len(decoy))
+    return bytes(d) + decoy
+
+
 print("installer-detection fixtures:")
 write('fake_inno.exe',     pe([b'TSetupLdrWindow', b'Inno Setup 6.2.0']))
 write('fake_nsis.exe',     pe([b'Nullsoft Install System v3.08',
@@ -72,3 +119,5 @@ write('fake_setupish.exe', pe([b'requireAdministrator']))
 write('not_a_pe.bin',      b'this is not a PE at all' * 40)
 write('fake_zipsfx.exe',   pe([b'sfx loader'], tail=zip_payload()))
 write('compressible.zip',  compressible_zip())
+write('zip64.zip',         zip64_archive())
+write('comment_trap.zip',  comment_trap_zip())

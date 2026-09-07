@@ -895,6 +895,39 @@ will never appear. An installer that re-launches itself elevated stops here;
 one that shells out to a redistributable carries on without it, which is
 usually what you wanted.
 
+### The zip trailer, where a reader can be confidently wrong
+
+Two bugs found by re-reading rather than by use, both in the same place: how
+the central directory is located.
+
+The offsets a zip records are relative to where the *zip* starts, which for an
+archive appended to an .exe is not where the file starts — so a correction is
+needed, and the obvious way to get it is to compute the directory's position
+as `eocd - cd_size` and compare with what the archive claims. That is right
+until the archive is **zip64**, when the zip64 EOCD record (56 bytes) and its
+locator (20) sit between the directory and the trailer. Then every
+local-header offset comes out 76 bytes late and the reader inflates whatever
+happens to be there. A game over 4 GB, or with more than 65535 files, is
+zip64.
+
+So the position is no longer computed, it is *found*: try the recorded offset,
+try the two places a directory could begin given the trailer layout, and
+accept whichever one actually has a directory entry at it.
+
+The second is the end-of-directory record itself. Its signature can appear
+inside an archive comment, and a comment comes *after* the record it belongs
+to, so a backwards scan meets the decoy first. Two filters: the declared
+comment length must reach exactly the end of the file, and — the only test a
+decoy cannot pass by accident — a directory must actually be reachable from
+what the record says. A candidate that fails is skipped and the scan carries
+on. Getting the second filter wrong is what made the first version report a
+real archive as *empty*, which is indistinguishable from an archive that is.
+
+`tests/import/zip64.zip` and `comment_trap.zip` are built for these, by
+`make_fixtures.py`, because neither case arises from an ordinary archive:
+Python only emits zip64 trailers for a file that genuinely needs them, so that
+one is assembled by hand.
+
 ### Crossing into Swift
 
 The app calls the importer through `win_probe_import` and `win_probe_look`,
@@ -912,7 +945,7 @@ whole CI round trip on a macOS runner.
 
 ### Verified
 
-`test_import` is 62 checks with no guest involved: every family against a
+`test_import` is 67 checks with no guest involved: every family against a
 fixture, the flag tables (including that NSIS's `/D=` is last and unquoted),
 the path sanitiser against traversal attempts *and* against names that merely
 contain dots, a real deflate round-trip out of a self-extracting archive,

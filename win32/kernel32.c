@@ -1275,23 +1275,51 @@ static void k_WritePrivateProfileStringA(w32 *w) {
 
     size_t tlen = 0;
     char *text = ini_read(path, &tlen);
+    /* A file that exists but could not be read -- too large for ini_read's
+     * cap, or a permission problem -- must not be treated as absent: the
+     * rewrite below would replace somebody's settings with a single key.
+     * Absent is fine; unreadable is a failure. */
+    if (!text) {
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
+            w32_set_last_error(w, ERROR_ACCESS_DENIED); RET(0); return;
+        }
+    }
     const char *src = text ? text : "";
     size_t cap = tlen + strlen(key) + strlen(val) + strlen(app) + 64;
     char *out = (char *)malloc(cap);
     if (!out) { free(text); w32_set_last_error(w, ERROR_NOT_ENOUGH_MEMORY); RET(0); return; }
     size_t o = 0;
     int in_sec = 0, wrote = 0, seen_sec = 0;
-    #define EMIT(fmt, ...) do { o += (size_t)snprintf(out + o, cap - o, fmt, __VA_ARGS__); } while (0)
+    /* snprintf returns what it *would* have written, so adding that to the
+     * offset walks past the end of the buffer the moment anything truncates
+     * -- and then `cap - o` underflows to an enormous size_t and the next
+     * write is unbounded. Clamped, because the data driving it is an .ini
+     * file the guest wrote. */
+    #define EMIT(...) do { \
+        if (o + 1 < cap) { \
+            int n_ = snprintf(out + o, cap - o, __VA_ARGS__); \
+            size_t room_ = cap - o - 1; \
+            o += n_ < 0 ? 0 : ((size_t)n_ < room_ ? (size_t)n_ : room_); \
+        } \
+    } while (0)
 
     const char *p = src;
     while (*p) {
         const char *e = strchr(p, '\n');
         size_t l = e ? (size_t)(e - p) : strlen(p);
-        char line[2048], trimmed[2048];
-        size_t cl = l < sizeof line - 1 ? l : sizeof line - 1;
-        memcpy(line, p, cl); line[cl] = 0;
-        snprintf(trimmed, sizeof trimmed, "%s", line);
+        /* A bounded copy for *parsing* -- a section name or key longer than
+         * this is not real -- but the line is written back out from the
+         * source bytes with an explicit length, so a long line is passed
+         * through intact rather than silently truncated to 2047. Losing a
+         * line of somebody's settings file is not an acceptable way to
+         * handle one that is unusually long. */
+        char trimmed[2048];
+        size_t cl = l < sizeof trimmed - 1 ? l : sizeof trimmed - 1;
+        memcpy(trimmed, p, cl); trimmed[cl] = 0;
         ini_trim(trimmed);
+        const char *line = p;
+        const int linelen = (int)l;
         p = e ? e + 1 : p + strlen(p);
 
         if (trimmed[0] == '[') {
@@ -1305,7 +1333,7 @@ static void k_WritePrivateProfileStringA(w32 *w) {
             if (in_sec) seen_sec = 1;
             /* A null key with a null value deletes the whole section. */
             if (in_sec && !ARG(1) && !ARG(2)) { wrote = 1; continue; }
-            EMIT("%s\n", line);
+            EMIT("%.*s\n", linelen, line);
             continue;
         }
         if (in_sec && ARG(1)) {
@@ -1319,7 +1347,7 @@ static void k_WritePrivateProfileStringA(w32 *w) {
             }
         }
         if (in_sec && !ARG(1) && !ARG(2)) continue;           /* dropping the section */
-        EMIT("%s\n", line);
+        EMIT("%.*s\n", linelen, line);
     }
     if (!wrote && ARG(1) && ARG(2)) {
         if (!seen_sec) EMIT("[%s]\n", app);

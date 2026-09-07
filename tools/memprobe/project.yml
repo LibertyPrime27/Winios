@@ -2,9 +2,9 @@
 #
 # Hand-written .xcodeproj files rot; this stays readable and diffable, and CI
 # regenerates it from scratch on every build.
-name: MemProbe
+name: winios
 options:
-  bundleIdPrefix: winios.memprobe
+  bundleIdPrefix: winios
   deploymentTarget: { iOS: "15.0" }
   createIntermediateGroups: true
 
@@ -12,7 +12,7 @@ settings:
   base:
     SWIFT_VERSION: "5.9"
     TARGETED_DEVICE_FAMILY: "1,2"
-    SWIFT_OBJC_BRIDGING_HEADER: Shared/MemProbe-Bridging-Header.h
+    SWIFT_OBJC_BRIDGING_HEADER: Shared/winios-Bridging-Header.h
     # xcore and Zydis are built by CMake (see CI) into build-xcore-ios/.
     HEADER_SEARCH_PATHS: $(SRCROOT)/Shared $(SRCROOT)/../../core/include $(SRCROOT)/../../win32 $(SRCROOT)/../../tools/winrun $(SRCROOT)/../../tools/import
     LIBRARY_SEARCH_PATHS: $(SRCROOT)/../../build-xcore-ios $(SRCROOT)/../../build-xcore-ios/core $(SRCROOT)/../../build-xcore-ios/core/zydis $(SRCROOT)/../../build-xcore-ios/core/zydis/zycore
@@ -27,7 +27,7 @@ settings:
     CODE_SIGN_IDENTITY: ""
 
 targets:
-  MemProbe:
+  winios:
     type: application
     platform: iOS
     sources:
@@ -49,12 +49,12 @@ targets:
     entitlements: { path: Host/Host.entitlements }
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: winios.memprobe.app
+        PRODUCT_BUNDLE_IDENTIFIER: winios.app
     dependencies:
-      - target: MemProbeExtension
+      - target: winiosProbe
         embed: true
 
-  MemProbeExtension:
+  winiosProbe:
     type: app-extension
     platform: iOS
     sources:
@@ -68,4 +68,4 @@ targets:
     entitlements: { path: Probe/Probe.entitlements }
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: winios.memprobe.app.probe
+        PRODUCT_BUNDLE_IDENTIFIER: winios.app.probe

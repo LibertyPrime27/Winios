@@ -1,4 +1,4 @@
-# Builds the MemProbe measurement app for iOS and publishes an UNSIGNED .ipa.
+# Builds the winios app for iOS and publishes an UNSIGNED .ipa.
 # Sign it locally with Sideloadly / AltServer / SideStore using your own Apple ID.
 #
 # Free and unlimited on PUBLIC repos. On private repos macOS burns included
@@ -226,8 +226,8 @@ jobs:
         run: |
           set -o pipefail
           xcodebuild \
-            -project tools/memprobe/MemProbe.xcodeproj \
-            -scheme MemProbe \
+            -project tools/memprobe/winios.xcodeproj \
+            -scheme winios \
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
@@ -262,20 +262,20 @@ jobs:
 
       - name: Package unsigned IPA
         run: |
-          APP=$(find build-ios -name 'MemProbe.app' -type d -path '*Release-iphoneos*' | head -n1)
+          APP=$(find build-ios -name 'winios.app' -type d -path '*Release-iphoneos*' | head -n1)
           [ -n "$APP" ] || { echo "No .app produced"; exit 1; }
           # The extension is the entire point of this app. If PlugIns is missing
           # the build silently measures nothing, so fail loudly here instead.
           [ -d "$APP/PlugIns" ] || { echo "PlugIns missing -- extension was not embedded"; exit 1; }
           ls "$APP/PlugIns"
           rm -rf Payload && mkdir -p Payload && cp -R "$APP" Payload/
-          zip -qry MemProbe-unsigned.ipa Payload
-          unzip -l MemProbe-unsigned.ipa | tail -n 3
+          zip -qry winios-unsigned.ipa Payload
+          unzip -l winios-unsigned.ipa | tail -n 3
 
       - uses: actions/upload-artifact@v4
         with:
-          name: MemProbe-unsigned-${{ github.sha }}
-          path: MemProbe-unsigned.ipa
+          name: winios-unsigned-${{ github.sha }}
+          path: winios-unsigned.ipa
           retention-days: 30
 
       - uses: actions/upload-artifact@v4

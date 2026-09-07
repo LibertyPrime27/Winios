@@ -3,11 +3,39 @@
 <plist version="1.0">
 <dict>
   <key>UILaunchScreen</key><dict/>
+  <!-- What the home screen shows. Set explicitly rather than left to the
+       target name: the target is what the build calls itself and the display
+       name is what a person reads, and they should not be able to drift. -->
+  <key>CFBundleDisplayName</key><string>winios</string>
   <!-- CI stamps CFBundleVersion with the git commit so a report says which build it came from. -->
   <key>CFBundleShortVersionString</key><string>0.2</string>
   <key>CFBundleVersion</key><string>dev</string>
   <key>UIApplicationSupportsIndirectInputEvents</key><true/>
+  <!-- Landscape matters: a Windows game is a 16:9 or 4:3 picture, and the app
+       was portrait-only, which would have squeezed every full-screen guest
+       into a portrait viewport on a phone. The library list is happy either
+       way; GuestViewController asks for landscape while a guest is running. -->
   <key>UISupportedInterfaceOrientations</key>
-  <array><string>UIInterfaceOrientationPortrait</string></array>
+  <array>
+    <string>UIInterfaceOrientationPortrait</string>
+    <string>UIInterfaceOrientationLandscapeLeft</string>
+    <string>UIInterfaceOrientationLandscapeRight</string>
+  </array>
+  <key>UISupportedInterfaceOrientations~ipad</key>
+  <array>
+    <string>UIInterfaceOrientationPortrait</string>
+    <string>UIInterfaceOrientationPortraitUpsideDown</string>
+    <string>UIInterfaceOrientationLandscapeLeft</string>
+    <string>UIInterfaceOrientationLandscapeRight</string>
+  </array>
+  <!-- The app's Documents folder (its virtual C:) shows up in the Files app.
+       That is a second way in for a program, and the one people reach for:
+       copy a game folder straight onto the drive rather than going through
+       the picker. ProgramStore already treats the drive as the source of
+       truth, so anything that appears there appears in the library.
+       Note for future edits: an XML comment may not contain a double hyphen,
+       which is why none of these use one as a dash. -->
+  <key>UIFileSharingEnabled</key><true/>
+  <key>LSSupportsOpeningDocumentsInPlace</key><true/>
 </dict>
 </plist>

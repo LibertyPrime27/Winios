@@ -170,6 +170,67 @@ static void test_unzip(const char *dir) {
     if (system(rm)) { }
 }
 
+/* The trailer cases. These are the ones where a reader can be confidently
+ * wrong: it finds *a* directory, at the wrong place, and then inflates
+ * whatever happens to be there. */
+static int extract_count(const char *zip, const char *out, char *first, size_t first_len) {
+    char rm[1200]; snprintf(rm, sizeof rm, "rm -rf '%s'", out);
+    if (system(rm)) { }
+    char err[256] = "";
+    int n = uz_extract(zip, out, 0, 0, 0, err, sizeof err);
+    if (first && first_len) {
+        first[0] = 0;
+        /* read back one known file, so a count of 2 cannot pass on two empty
+         * files with the right names */
+        char p[1400];
+        snprintf(p, sizeof p, "%s/%s", out, "big/a.txt");
+        FILE *f = fopen(p, "rb");
+        if (!f) { snprintf(p, sizeof p, "%s/%s", out, "ok.txt"); f = fopen(p, "rb"); }
+        if (f) { size_t got = fread(first, 1, first_len - 1, f); first[got] = 0; fclose(f); }
+    }
+    return n;
+}
+
+static void test_zip_trailers(const char *dir) {
+    char zip[1024], out[1024], text[256];
+    snprintf(out, sizeof out, "%s/.zip_test", dir);
+
+    /* zip64: the zip64 EOCD record (56 bytes) and its locator (20) sit
+     * between the central directory and the ordinary EOCD. A reader that
+     * finds the directory by subtracting its size from the EOCD's position
+     * lands 76 bytes late and every local-header offset is then wrong. */
+    snprintf(zip, sizeof zip, "%s/zip64.zip", dir);
+    int n = extract_count(zip, out, text, sizeof text);
+    ok(n == 2, "zip64: both entries came out (got %d)", n);
+    ok(strstr(text, "zip64 entry one") != 0,
+       "zip64: and the contents are right, so the offsets were corrected");
+
+    /* A comment containing an EOCD signature. A backwards scan meets the
+     * decoy first, because a comment comes after the record it belongs to. */
+    snprintf(zip, sizeof zip, "%s/comment_trap.zip", dir);
+    n = extract_count(zip, out, text, sizeof text);
+    ok(n == 1, "a decoy EOCD in the comment does not win (got %d file(s))", n);
+    ok(strstr(text, "the real directory was found") != 0,
+       "and the real directory is the one that was read");
+
+    /* And the empty case must still be distinguishable from the decoy case:
+     * both describe zero entries, but one is a real archive. */
+    char empty[1200];
+    snprintf(empty, sizeof empty, "%s/.empty.zip", dir);
+    { FILE *f = fopen(empty, "wb");
+      /* an EOCD and nothing else: the whole of an empty archive */
+      static const unsigned char eocd[22] = { 'P','K',5,6, 0,0, 0,0, 0,0, 0,0, 0,0,0,0, 0,0,0,0, 0,0 };
+      if (f) { fwrite(eocd, 1, sizeof eocd, f); fclose(f); } }
+    char err[256] = "";
+    n = uz_extract(empty, out, 0, 0, 0, err, sizeof err);
+    ok(n == 0 && !err[0], "an empty archive extracts nothing and is not an error (%d, %s)",
+       n, err[0] ? err : "no error");
+    remove(empty);
+
+    char rm[1200]; snprintf(rm, sizeof rm, "rm -rf '%s'", out);
+    if (system(rm)) { }
+}
+
 /* ---- which executable is the game ----------------------------------------- */
 
 /* Built here rather than committed: the ranking depends on the *shape* of a
@@ -414,6 +475,7 @@ int main(int argc, char **argv) {
     test_flags(dir);
     test_names();
     test_unzip(dir);
+    test_zip_trailers(dir);
     test_ranking(dir);
     test_diff(dir);
     test_space(dir);

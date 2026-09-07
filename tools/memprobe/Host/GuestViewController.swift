@@ -46,6 +46,14 @@ final class GuestViewController: UIViewController {
     }
     required init?(coder: NSCoder) { fatalError("not used") }
 
+    /// A running guest gets the whole screen, the long way round. A Windows
+    /// game draws a 16:9 or 4:3 picture and there is nothing to be gained
+    /// from showing it in a portrait letterbox, so this asks for landscape
+    /// while it is up and the rest of the app goes back to whatever it was.
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .landscape }
+    override var prefersStatusBarHidden: Bool { true }
+    override var prefersHomeIndicatorAutoHidden: Bool { true }
+
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .black

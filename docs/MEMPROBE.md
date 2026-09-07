@@ -1,4 +1,7 @@
 # MemProbe — the app, and the probes underneath it
+> The app installs as **winios** (bundle id `winios.app`). This file keeps
+> its old name because the probes it documents came first and the paths
+> under `tools/memprobe/` have not moved; the product is winios.
 
 ## The app
 
