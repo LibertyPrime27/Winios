@@ -57,6 +57,32 @@ enum Settings {
     }
     static var displayMode: (w: Int, h: Int, label: String) { displayModes[displayIndex] }
 
+    // MARK: how big a Windows dialog should be
+    //
+    // Every desktop installer was drawn for a 96 DPI monitor, where its
+    // wizard is about 500 by 350 pixels -- a comfortable window on a desk.
+    // The same dialog on a tablet is a postage stamp, and a frame rendered
+    // small enough to make it fill the screen is a postage stamp enlarged.
+    //
+    // Windows' own answer is DPI scaling, and it is the right one here:
+    // tell the program the display is denser and it lays its dialog out
+    // proportionally bigger, in its own units, with the text drawn at a
+    // size where the strokes have room. Applied by `apply()` before a guest
+    // starts, in the same place as the display mode.
+
+    static let dialogScales = [100, 125, 150, 200, 250]
+
+    /// 150% by default. A tablet held at arm's length is about that much
+    /// further away than a monitor, and it is the setting where a wizard
+    /// looks like a window rather than a stamp or a poster.
+    static var dialogScale: Int {
+        get {
+            let v = store.object(forKey: "dialogScale") as? Int ?? 150
+            return dialogScales.contains(v) ? v : 150
+        }
+        set { store.set(newValue, forKey: "dialogScale") }
+    }
+
     // MARK: mouse
     //
     // Applied in GuestInput.swift, to every source of motion -- touch drag,
@@ -99,6 +125,9 @@ enum Settings {
     static func apply() {
         let m = displayMode
         w32_set_screen_size(Int32(m.w), Int32(m.h))
+        // A dialog is laid out from the DPI, so this has to be set before
+        // one is created -- changing it later would move nothing.
+        w32_set_ui_dpi(Int32(96 * dialogScale / 100))
     }
 
     /// Whether the dynarec can actually be used. See JIT.swift -- this used

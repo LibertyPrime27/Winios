@@ -23,6 +23,9 @@ for a in 32 64; do
     $CC -O2 -s -DSUBDLL=\"sub$a.dll\" -DLATEDLL=\"late$a.dll\" \
         -o dlltest$a.exe dlltest.c -L. -l:libmid$a.a -l:libsub$a.a
     rm -f dlllate$a.def libsub$a.a libmid$a.a
+    # Everything a modern game engine links against, called once each.
+    $CC -O2 -s -o enginedeps$a.exe enginedeps.c -ladvapi32 -lcomdlg32 -ldwmapi \
+        -limm32 -liphlpapi -lrpcrt4 -lwininet -lws2_32 -lwinmm -ld3d11 -luser32 -lgdi32
     # What -k returns from a function we do not have.
     $CC -O2 -s -o keepgoing$a.exe keepgoing.c -luser32
     # The string walking and casing an installer does on every path.

@@ -336,6 +336,26 @@ extern const w32_api w32_shell32[];
 extern const w32_api w32_ole32[];
 extern const w32_api w32_gdi32[];
 extern const w32_api w32_comctl32[];
+/* misc_dlls.c: the long tail a game engine links and rarely calls */
+extern const w32_api w32_imm32[];
+extern const w32_api w32_dwmapi[];
+extern const w32_api w32_avrt[];
+extern const w32_api w32_version[];
+extern const w32_api w32_rpcrt4[];
+extern const w32_api w32_gdiplus[];
+extern const w32_api w32_comdlg32[];
+extern const w32_api w32_dbghelp[];
+extern const w32_api w32_iphlpapi[];
+extern const w32_api w32_propsys[];
+/* net_dlls.c: networking, present so that games start without it */
+extern const w32_api w32_ws2_32[];
+extern const w32_api w32_wininet[];
+const char *w32_ws2_ordinal_name(int ordinal);
+/* d3d11.c: not an implementation -- see the file */
+extern const w32_api w32_d3d11[];
+extern const w32_api w32_d3d10[];
+extern const w32_api w32_d3d12[];
+extern const w32_api w32_dxgi[];
 
 /* --- the screen, and the windows on it -----------------------------------
  *
@@ -347,6 +367,7 @@ uint32_t *w32_desktop_bits(int *cx, int *cy);            /* the screen surface, 
 const uint32_t *w32_desktop_peek(int *cx, int *cy);
 void      w32_desktop_damaged(void);                     /* something drew: present it */
 int       w32_window_area(uint64_t hwnd, int whole, int *x, int *y, int *cx, int *cy);
+int       w32_window_parent_area(uint64_t hwnd, int *x, int *y, int *cx, int *cy);
 int       w32_dialog_pump(w32 *w);                       /* one pass for a host-owned loop */
 
 /* Windows, made from the host side: a dialog template creates controls, and
@@ -375,7 +396,15 @@ void      w32_gdi_fill_rect(uint64_t hdc, int l, int t, int r, int b, uint32_t c
 void      w32_gdi_frame_rect(uint64_t hdc, int l, int t, int r, int b, uint32_t colorref);
 void      w32_gdi_line(uint64_t hdc, int x0, int y0, int x1, int y1, uint32_t colorref);
 int       w32_gdi_text_at(uint64_t hdc, int x, int y, const char *s, int len);
-void      w32_gdi_text_extent(uint64_t hdc, int len, int *cx, int *cy);
+void      w32_gdi_text_extent(uint64_t hdc, const char *s, int len, int *cx, int *cy);
+int       w32_gdi_average_width(uint64_t hdc);   /* what a dialog's units are defined in */
+/* How dense we claim the display is. A desktop installer was drawn for 96
+ * DPI; on a tablet panel that dialog is a postage stamp, so the app raises
+ * this and every dialog lays itself out proportionally bigger -- which is
+ * exactly what Windows' own DPI scaling does. */
+void      w32_set_ui_dpi(int dpi);
+int       w32_ui_dpi(void);
+int       w32_points_to_pixels(int points);
 int       w32_gdi_line_height(uint64_t hdc);
 uint32_t  w32_gdi_brush_color(uint64_t hbrush, int *is_null);
 void      w32_gdi_set_text_color(uint64_t hdc, uint32_t colorref);
@@ -387,6 +416,11 @@ void      w32_gdi_clip_to(uint64_t hdc, int l, int t, int r, int b);
 /* pe.c: the resource directory, which is where a dialog template lives */
 uint64_t  w32_find_resource(w32 *w, uint64_t module, uint64_t type, uint64_t name, int wide);
 uint64_t  w32_resource_data(w32 *w, uint64_t hrsrc, uint32_t *size);
+/* thread.c: what kernel32 builds waitable timers and condition variables on */
+int       w32_cond_sleep(w32 *w, uint64_t cv, uint64_t lock, uint32_t ms, int srw);
+uint64_t  w32_make_event(w32 *w, int manual, int set);
+void      w32_set_event(w32 *w, uint64_t h, int on);
+void      w32_thread_exit_self(w32 *w, uint32_t code);
 /* kernel32.c: a string out of the RT_STRING blocks, for user32's LoadString */
 int       w32_load_string(w32 *w, uint64_t inst, uint32_t id, char *out, size_t cap);
 /* comctl32.c: what a new run has to start without */

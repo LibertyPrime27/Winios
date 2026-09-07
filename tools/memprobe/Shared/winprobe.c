@@ -250,7 +250,9 @@ int win_probe_import(const char *src, const char *drive_c, int installer,
     put(name, name_len, r->name);
     put(dir_rel, dir_rel_len, r->dir_rel);
     put(exe_rel, exe_rel_len, r->exe_rel);
-    put(dll_dir, dll_dir_len, r->dll_dir);
+    /* Relative when we have it: an absolute path outlives the drive it
+     * points into by exactly one app update. */
+    put(dll_dir, dll_dir_len, r->dll_rel[0] ? r->dll_rel : r->dll_dir);
     if (is32)  *is32  = r->is32;
     if (files) *files = r->files;
     if (exes)  *exes  = r->exes;

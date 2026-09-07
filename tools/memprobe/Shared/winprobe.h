@@ -75,8 +75,10 @@ void win_probe_cancel_import(void);
  * `dir_rel` is where its folder actually is, relative to the drive -- the two
  * differ whenever an installer put the program somewhere structured, which a
  * visible install nearly always does. `exe_rel` is which executable inside
- * that folder to run and `dll_dir` is where the program's own DLLs are, for
- * win_probe_run_dir. */
+ * that folder to run and `dll_dir` is where the program's own DLLs are --
+ * relative to the drive, because an absolute path outlives the drive it
+ * points into by exactly one app update: iOS renames the container on every
+ * reinstall. Join it onto the drive before handing it to win_probe_run_dir. */
 int win_probe_import(const char *src, const char *drive_c, int installer,
                      int visible, int keep_going, int timeout_s,
                      char *detail, size_t detail_len,

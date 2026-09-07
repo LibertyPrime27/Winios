@@ -17,11 +17,18 @@ struct Program: Codable {
     var importsMissing: Int
     var lastExit: Int32?
     var lastRunMs: UInt64?
-    /// Where this program's own DLLs are, as a host path. A game finds them
-    /// beside its executable, which for something like an Unreal title is
-    /// three folders below the one the user sees -- so it cannot be worked out
-    /// from `name` and has to be carried. Optional so that an entry written
-    /// before the importer existed still decodes.
+    /// Where this program's own DLLs are, *relative to the drive*. A game
+    /// finds them beside its executable, which for something like an Unreal
+    /// title is three folders below the one the user sees — so it cannot be
+    /// worked out from `name` and has to be carried.
+    ///
+    /// Relative, not absolute, and that is the whole point. iOS gives the app
+    /// a new container directory on every reinstall, so an absolute path
+    /// written down today points at nothing after the next update — and a
+    /// stale one joined onto the current drive produces a path with two
+    /// container ids in it that exists nowhere. Entries written before this
+    /// was understood hold an absolute path; `dllDirURL` takes them, checks
+    /// they still exist, and ignores them when they do not.
     var dllDir: String?
     /// True when this entry is what an installer produced rather than
     /// something copied in ready to run. Worth keeping: if it turns out to be
@@ -149,15 +156,31 @@ enum ProgramStore {
     /// does before deciding whether to offer the entry at all.
     static func exeURL(folder: String, exeRelative: String) -> URL? {
         guard let c = driveC, !folder.isEmpty else { return nil }
-        let base = c.appendingPathComponent(folder)
-        return exeRelative.isEmpty ? base : base.appendingPathComponent(exeRelative)
+        // Never join an absolute path onto the drive. That is how a path ends
+        // up with two container ids in it, naming a directory that has never
+        // existed — and the error it produces ("not found") points at the
+        // program rather than at the entry that is wrong.
+        let rel = folder.hasPrefix("/") ? String(folder.drop(while: { $0 == "/" })) : folder
+        let base = c.appendingPathComponent(rel)
+        let e = exeRelative.hasPrefix("/") ? String(exeRelative.drop(while: { $0 == "/" })) : exeRelative
+        return e.isEmpty ? base : base.appendingPathComponent(e)
     }
 
     /// Where to look for the program's own DLLs. The recorded directory when
     /// the importer worked one out, and otherwise the executable's own folder,
     /// which is right for everything that is not deeply nested.
+    ///
+    /// A recorded path is used only if it leads somewhere. An absolute one
+    /// from before the app was last reinstalled does not, and the fallback --
+    /// the folder the executable is in — is right often enough that using it
+    /// is much better than handing the loader a directory that is not there.
     static func dllDirURL(_ p: Program) -> URL? {
-        if let d = p.dllDir, !d.isEmpty { return URL(fileURLWithPath: d) }
-        return exeURL(p)?.deletingLastPathComponent()
+        let fallback = exeURL(p)?.deletingLastPathComponent()
+        guard let d = p.dllDir, !d.isEmpty else { return fallback }
+        let url: URL? = d.hasPrefix("/")
+            ? URL(fileURLWithPath: d)                 // an old, absolute entry
+            : driveC?.appendingPathComponent(d)       // the current form
+        guard let u = url, FileManager.default.fileExists(atPath: u.path) else { return fallback }
+        return u
     }
 }

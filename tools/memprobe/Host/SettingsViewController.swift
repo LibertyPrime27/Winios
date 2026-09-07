@@ -35,6 +35,11 @@ final class SettingsViewController: UIViewController {
         display.selectedSegmentIndex = Settings.displayIndex
         display.addTarget(self, action: #selector(displayChanged(_:)), for: .valueChanged)
 
+        // --- how big a Windows dialog comes out
+        let scale = UISegmentedControl(items: Settings.dialogScales.map { "\($0)%" })
+        scale.selectedSegmentIndex = Settings.dialogScales.firstIndex(of: Settings.dialogScale) ?? 2
+        scale.addTarget(self, action: #selector(scaleChanged(_:)), for: .valueChanged)
+
         // --- mouse
         sens.minimumValue = 0.2
         sens.maximumValue = 4.0
@@ -67,6 +72,14 @@ final class SettingsViewController: UIViewController {
                  + "frame rate while drawing still goes through software. "
                  + "Takes effect the next time a game starts."),
             display,
+            heading("Installer and dialog size"),
+            note("An installer's window was designed for a desktop monitor, "
+                 + "so on a tablet it comes out tiny. This tells the program "
+                 + "the screen is denser than it is, and it lays its own "
+                 + "window out bigger in response — the same thing Windows "
+                 + "does on a high-resolution laptop. Takes effect the next "
+                 + "time an installer or a dialog opens."),
+            scale,
             heading("Mouse"),
             sensLabel, sens,
             switchRow("Invert vertical look", invert),
@@ -207,6 +220,11 @@ final class SettingsViewController: UIViewController {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
             self?.refreshJIT()
         }
+    }
+
+    @objc private func scaleChanged(_ c: UISegmentedControl) {
+        guard Settings.dialogScales.indices.contains(c.selectedSegmentIndex) else { return }
+        Settings.dialogScale = Settings.dialogScales[c.selectedSegmentIndex]
     }
 
     @objc private func displayChanged(_ c: UISegmentedControl) {

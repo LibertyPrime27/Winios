@@ -567,6 +567,121 @@ static void k_Sleep(w32 *w) {
 }
 static void k_SleepEx(w32 *w) { k_Sleep(w); RET(0); }
 
+/* --- condition variables -------------------------------------------------
+ *
+ * SleepConditionVariable releases a lock, waits to be woken, and takes the
+ * lock back. The C runtime's own threading is built on these, so a program
+ * that never calls one directly still deadlocks without them.
+ *
+ * `g_change` is broadcast by everything that changes shared state here -- an
+ * event being set, a critical section being released, a thread ending -- so
+ * waiting on it is waiting for "something happened", which is a superset of
+ * what the guest's own Wake call means. Waking too often is correct for a
+ * condition variable: the contract is that the predicate must be rechecked
+ * in a loop, and every caller does. Waking too rarely would not be.
+ *
+ * The lock is either a critical section or an SRW lock. An SRW lock here is
+ * a pointer-sized word the guest owns and we do not interpret, so releasing
+ * it is writing zero and taking it is waiting for zero.
+ */
+static void cs_leave(w32 *w, uint64_t p) {
+    int psz = (int)w32_ptrsize(w);
+    uint32_t rec = (uint32_t)w32_read(w, p + cs_off_recur(w), 4);
+    if (rec) rec--;
+    w32_write(w, p + cs_off_recur(w), 4, rec);
+    if (!rec) {
+        w32_write(w, p + cs_off_owner(w), psz, 0);
+        w32_write(w, p + cs_off_lock(w), 4, 0xFFFFFFFFu);
+        pthread_cond_broadcast(&g_change);
+    }
+}
+static void cs_enter(w32 *w, uint64_t p) {
+    int psz = (int)w32_ptrsize(w);
+    uint32_t me = w32_self()->id;
+    for (;;) {
+        uint64_t owner = w32_read(w, p + cs_off_owner(w), psz);
+        if (!owner || owner == me) {
+            w32_write(w, p + cs_off_owner(w), psz, me);
+            uint32_t rec = (uint32_t)w32_read(w, p + cs_off_recur(w), 4) + 1;
+            w32_write(w, p + cs_off_recur(w), 4, rec);
+            w32_write(w, p + cs_off_lock(w), 4, (uint32_t)(rec - 1));
+            return;
+        }
+        if (g_exiting) return;
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 5 * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&g_change, &g_guest, &ts);
+    }
+}
+
+/* Non-zero if woken, zero on timeout -- with the last error set, which is
+ * how a caller tells the two apart. */
+int w32_cond_sleep(w32 *w, uint64_t cv, uint64_t lock, uint32_t ms, int srw) {
+    (void)cv;
+    if (!lock) return 0;
+    int psz = (int)w32_ptrsize(w);
+    if (srw) w32_write(w, lock, psz, 0);
+    else cs_leave(w, lock);
+    pthread_cond_broadcast(&g_change);
+
+    uint64_t until = ms == 0xFFFFFFFFu ? 0 : now_ms() + ms;
+    int woken = 0;
+    for (;;) {
+        if (g_exiting) break;
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        uint64_t slice = 20;
+        if (until) {
+            uint64_t nowv = now_ms();
+            if (nowv >= until) break;
+            if (until - nowv < slice) slice = until - nowv;
+        }
+        ts.tv_nsec += (long)slice * 1000000L;
+        while (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        if (pthread_cond_timedwait(&g_change, &g_guest, &ts) == 0) { woken = 1; break; }
+        /* An infinite wait must still give the caller a chance to recheck its
+         * predicate: one pass is a spurious wake-up, which the contract
+         * explicitly allows and every caller handles. */
+        if (!until) { woken = 1; break; }
+    }
+    if (srw) {
+        while (!g_exiting && w32_read(w, lock, psz)) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += 5 * 1000000L;
+            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+            pthread_cond_timedwait(&g_change, &g_guest, &ts);
+        }
+        w32_write(w, lock, psz, 1);
+    } else cs_enter(w, lock);
+
+    if (!woken) w32_set_last_error(w, 1460);       /* ERROR_TIMEOUT */
+    return woken;
+}
+
+/* An event made from the host side: a waitable timer is one. */
+uint64_t w32_make_event(w32 *w, int manual, int set) {
+    uint64_t h = w32_handle_new(w, H_EVENT, -1);
+    w32_handle *hh = w32_handle_get(w, h);
+    if (hh) hh->flags = (set ? 1u : 0u) | (manual ? 2u : 0u);
+    return h;
+}
+void w32_set_event(w32 *w, uint64_t h, int on) {
+    w32_handle *hh = w32_handle_get(w, h);
+    if (hh) { if (on) hh->flags |= 1u; else hh->flags &= ~1u; }
+    pthread_cond_broadcast(&g_change);
+}
+/* ExitThread's body, callable from elsewhere: FreeLibraryAndExitThread is
+ * ExitThread with a FreeLibrary in front of it, and nothing here unmaps. */
+void w32_thread_exit_self(w32 *w, uint32_t code) {
+    w32_thread *t = w32_self();
+    t->exit_code = code;
+    if (t == &g_threads[0]) { w32_exit(w, (int)code); return; }
+    w32_return_to_host(w);
+}
+
 /* --- interlocked -------------------------------------------------------- */
 
 /* Under the guest lock these cannot be interrupted by another guest thread,

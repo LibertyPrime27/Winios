@@ -100,6 +100,27 @@ unset XCORE_JIT
 # recording of the tester's reflexes is not a test.
 check inputtest64.exe 0 6 -- -input inputtest.script
 check inputtest32.exe 0 6 -- -input inputtest.script
+# Everything a modern game engine links against.
+#
+# A GameMaker game resolved 232 imports and was missing 114, across nineteen
+# DLLs most of which did not exist here. That is not 114 features missing --
+# an unresolved import stops a program before it runs a line of its own code,
+# so it is one program not starting. This guest imports the same set and
+# calls each one, and what it asserts is mostly "this returned an answer its
+# caller can act on" rather than "the right thing happened": there is no
+# network to reach, no IME, no file picker. A game needs a yes or a no; what
+# it cannot survive is the question not existing.
+#
+# Direct3D 11 is the exception, and is checked to *fail* -- with the code
+# that means no device here can do that. If it ever starts succeeding, this
+# is what should notice.
+#
+# Checked by exit code and one line rather than by whole output: this guest
+# deliberately calls two things that refuse, so its run ends with a report,
+# and a report carries a register dump whose addresses move with the
+# allocator. Recording those would be recording the machine.
+checkrc enginedeps64.exe 0 "0 failures"
+checkrc enginedeps32.exe 0 "0 failures"
 # What -k returns from a function we do not have.
 #
 # Its own block rather than one of the helpers above, because the two runs

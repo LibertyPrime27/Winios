@@ -42,6 +42,11 @@ const char *w32_ordinal_name(const char *dll, int ordinal) {
     if (!strcmp(dll, "comctl32.dll"))
         for (size_t i = 0; i < sizeof COMCTL_ORD / sizeof COMCTL_ORD[0]; i++)
             if (COMCTL_ORD[i].ord == ordinal) return COMCTL_ORD[i].name;
+    /* Winsock is the other library that exports by number, and its numbers
+     * have been part of the ABI since 1993. Its map lives with its
+     * implementation; this is the one place the loader asks. */
+    if (!strcmp(dll, "ws2_32.dll") || !strcmp(dll, "wsock32.dll"))
+        return w32_ws2_ordinal_name(ordinal);
     return 0;
 }
 

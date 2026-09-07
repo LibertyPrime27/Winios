@@ -592,13 +592,6 @@ static void k_GetStringTypeW(w32 *w) {
     }
     RET(1);
 }
-static void k_LCMapStringW(w32 *w) { RET(0); }
-static void k_CompareStringW(w32 *w) {
-    const uint16_t *a = W32P(w, ARG(2)), *b = W32P(w, ARG(4)); int na = (int)(int32_t)ARG(3), nb = (int)(int32_t)ARG(5);
-    if (na < 0) { na = 0; while (a[na]) na++; } if (nb < 0) { nb = 0; while (b[nb]) nb++; }
-    int i = 0; for (; i < na && i < nb; i++) if (a[i] != b[i]) { RET(a[i] < b[i] ? 1 : 3); return; }
-    RET(na == nb ? 2 : na < nb ? 1 : 3);
-}
 
 /* ---- memory ---- */
 /* Host page size: the guest's 4 KB pages are a fiction on Apple silicon (16 KB),
@@ -1817,6 +1810,498 @@ int w32_load_string(w32 *w, uint64_t inst, uint32_t id, char *out, size_t cap) {
     }
     return 0;
 }
+/* ---- what the C runtime does before main ---------------------------------
+ *
+ * A modern MSVC program initialises its locale before it runs a line of its
+ * own code, and that init walks a handful of NLS calls. Every one of them
+ * missing is a program that never reaches its entry point -- which is why a
+ * GameMaker game that had 232 of its imports satisfied still did nothing.
+ *
+ * There is one locale here and it is the invariant one. That is a real
+ * answer, not a placeholder: the drive is ASCII, the collation is ordinal,
+ * and a program told so behaves consistently. What it is not is *the user's*
+ * locale, so a game that formats a date will format it the American way.
+ * Saying that plainly is better than inventing a locale we cannot support.
+ */
+enum { LOCALE_INVARIANT_ = 0x007F, LOCALE_USER_DEFAULT_ = 0x0400 };
+
+/* GetLocaleInfoW(locale, type, buf, cch) -- the types a CRT actually asks
+ * for on the way up. Anything else gets an empty string rather than a
+ * failure, because a CRT that cannot read one field copes and a CRT that
+ * gets an error from the whole call sometimes does not. */
+static void locale_info(w32 *w, int wide) {
+    uint32_t type = (uint32_t)ARG(1);
+    uint64_t out = ARG(2);
+    int cap = (int)(int32_t)(uint32_t)ARG(3);
+    const char *v = "";
+    char num[16];
+    switch (type & 0xFFFF) {
+    case 0x0002: v = "en-US";   break;   /* LOCALE_SLOCALIZEDDISPLAYNAME-ish */
+    case 0x0003: v = "English"; break;   /* SENGLANGUAGE */
+    case 0x0005: v = "eng";     break;   /* SABBREVLANGNAME */
+    case 0x0006: v = "United States"; break;
+    case 0x0007: v = "USA";     break;
+    case 0x0009: v = "US";      break;   /* SISO3166CTRYNAME */
+    case 0x000E: v = ".";       break;   /* SDECIMAL */
+    case 0x000F: v = ",";       break;   /* STHOUSAND */
+    case 0x0014: v = "2";       break;   /* IDIGITS */
+    case 0x001B: v = ":";       break;   /* STIME */
+    case 0x001D: v = "M/d/yyyy"; break;  /* SSHORTDATE */
+    case 0x0020: v = "dddd, MMMM d, yyyy"; break;  /* SLONGDATE */
+    case 0x0025: v = "AM";      break;
+    case 0x0026: v = "PM";      break;
+    case 0x0059: v = "/";       break;   /* SDATE */
+    case 0x1004: snprintf(num, sizeof num, "%u", 1252); v = num; break;  /* IDEFAULTANSICODEPAGE */
+    case 0x0059 + 1: v = ""; break;
+    default: v = ""; break;
+    }
+    int n = (int)strlen(v) + 1;
+    if (!out || cap == 0) { RET((uint64_t)(uint32_t)n); return; }   /* asking for the size */
+    if (cap < n) { w32_set_last_error(w, 122); RET(0); return; }    /* ERROR_INSUFFICIENT_BUFFER */
+    for (int i = 0; i < n; i++) {
+        if (wide) w32_write(w, out + (unsigned)i * 2, 2, (uint8_t)v[i]);
+        else      w32_write(w, out + (unsigned)i, 1, (uint8_t)v[i]);
+    }
+    RET((uint64_t)(uint32_t)n);
+}
+static void k_GetLocaleInfoW(w32 *w) { locale_info(w, 1); }
+static void k_GetLocaleInfoA(w32 *w) { locale_info(w, 0); }
+static void k_GetLocaleInfoEx(w32 *w) {
+    /* (name, type, buf, cch): the locale is named rather than numbered, and
+     * the answer is the same one. */
+    uint64_t saved = ARG(0);
+    (void)saved;
+    locale_info(w, 1);
+}
+static void k_IsValidLocale(w32 *w) { (void)w; RET(1); }
+/* EnumSystemLocales calls back once per locale. Calling back once, with the
+ * invariant locale, is a truthful enumeration of what is here -- and a CRT
+ * that gets zero callbacks concludes the system is broken. */
+static void enum_locales(w32 *w, int wide) {
+    uint64_t fn = ARG(0);
+    if (!fn) { RET(0); return; }
+    uint64_t name = w32_heap_alloc(w, 32);
+    const char *s = "0409";
+    for (int i = 0; i <= 4; i++) {
+        if (wide) w32_write(w, name + (unsigned)i * 2, 2, (uint8_t)s[i]);
+        else      w32_write(w, name + (unsigned)i, 1, (uint8_t)s[i]);
+    }
+    uint64_t args[1] = { name };
+    w32_call_guest(w, fn, 1, args);
+    RET(1);
+}
+static void k_EnumSystemLocalesW(w32 *w) { enum_locales(w, 1); }
+static void k_EnumSystemLocalesA(w32 *w) { enum_locales(w, 0); }
+static void k_EnumSystemLocalesEx(w32 *w) { enum_locales(w, 1); }
+
+/* LCMapStringEx / LCMapStringW: the CRT's case folding and sort keys.
+ * LCMAP_UPPERCASE is 0x200 and LCMAP_LOWERCASE 0x100; a sort key
+ * (LCMAP_SORTKEY, 0x400) is asked for by collation and the ordinal answer
+ * is the string itself, which is a consistent ordering even though it is not
+ * a linguistic one. */
+static void lcmap(w32 *w, uint32_t flags, uint64_t src, int srclen, uint64_t dst, int dstlen) {
+    char buf[1024];
+    if (srclen < 0) w32_wtoa(w, src, buf, sizeof buf);
+    else w32_wtoa_n(w, src, srclen, buf, sizeof buf);
+    size_t n = strlen(buf);
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)buf[i];
+        if (flags & 0x200) buf[i] = (char)(c >= 'a' && c <= 'z' ? c - 32 : c);
+        else if (flags & 0x100) buf[i] = (char)(c >= 'A' && c <= 'Z' ? c + 32 : c);
+    }
+    int need = (int)n + 1;
+    if (!dst || dstlen == 0) { RET((uint64_t)(uint32_t)need); return; }
+    if (dstlen < need) { w32_set_last_error(w, 122); RET(0); return; }
+    for (int i = 0; i < need; i++) w32_write(w, dst + (unsigned)i * 2, 2, (uint8_t)buf[i]);
+    RET((uint64_t)(uint32_t)need);
+}
+static void k_LCMapStringEx(w32 *w) {
+    /* (locale, flags, src, srclen, dst, dstlen, version, reserved, sortHandle) */
+    lcmap(w, (uint32_t)ARG(1), ARG(2), (int)(int32_t)(uint32_t)ARG(3), ARG(4), (int)(int32_t)(uint32_t)ARG(5));
+}
+static void k_LCMapStringW(w32 *w) {
+    lcmap(w, (uint32_t)ARG(1), ARG(2), (int)(int32_t)(uint32_t)ARG(3), ARG(4), (int)(int32_t)(uint32_t)ARG(5));
+}
+static void k_CompareStringW(w32 *w) {
+    char a[512], b[512];
+    w32_wtoa_n(w, ARG(2), (int)(int32_t)(uint32_t)ARG(3), a, sizeof a);
+    w32_wtoa_n(w, ARG(4), (int)(int32_t)(uint32_t)ARG(5), b, sizeof b);
+    int r = ((uint32_t)ARG(1) & 1) ? strcasecmp(a, b) : strcmp(a, b);   /* NORM_IGNORECASE */
+    RET(r < 0 ? 1 : r > 0 ? 3 : 2);            /* CSTR_LESS/EQUAL/GREATER */
+}
+static void k_CompareStringEx(w32 *w) {
+    char a[512], b[512];
+    w32_wtoa_n(w, ARG(2), (int)(int32_t)(uint32_t)ARG(3), a, sizeof a);
+    w32_wtoa_n(w, ARG(4), (int)(int32_t)(uint32_t)ARG(5), b, sizeof b);
+    int r = ((uint32_t)ARG(1) & 1) ? strcasecmp(a, b) : strcmp(a, b);
+    RET(r < 0 ? 1 : r > 0 ? 3 : 2);
+}
+static void k_CompareStringOrdinal(w32 *w) {
+    char a[512], b[512];
+    w32_wtoa_n(w, ARG(0), (int)(int32_t)(uint32_t)ARG(1), a, sizeof a);
+    w32_wtoa_n(w, ARG(2), (int)(int32_t)(uint32_t)ARG(3), b, sizeof b);
+    int r = ARG(4) ? strcasecmp(a, b) : strcmp(a, b);
+    RET(r < 0 ? 1 : r > 0 ? 3 : 2);
+}
+
+/* ---- dates and times ---------------------------------------------------- */
+
+/* FILETIME is 100-nanosecond ticks since 1601. The gap to the Unix epoch is
+ * 11644473600 seconds, and it is the one number this whole area turns on. */
+enum { FT_EPOCH_DELTA = 11644473600ll };
+
+static void put_systemtime(w32 *w, uint64_t p, const struct tm *t, int ms) {
+    if (!p) return;
+    uint16_t v[8] = {
+        (uint16_t)(t->tm_year + 1900), (uint16_t)(t->tm_mon + 1), (uint16_t)t->tm_wday,
+        (uint16_t)t->tm_mday, (uint16_t)t->tm_hour, (uint16_t)t->tm_min,
+        (uint16_t)t->tm_sec, (uint16_t)ms,
+    };
+    for (int i = 0; i < 8; i++) w32_write(w, p + (unsigned)i * 2, 2, v[i]);
+}
+static void k_FileTimeToSystemTime(w32 *w) {
+    uint64_t f = ARG(0);
+    if (!f) { RET(0); return; }
+    uint64_t ft = w32_read(w, f, 4) | (w32_read(w, f + 4, 4) << 32);
+    time_t secs = (time_t)(ft / 10000000ull) - FT_EPOCH_DELTA;
+    int ms = (int)((ft / 10000ull) % 1000ull);
+    struct tm tmv;
+    if (!gmtime_r(&secs, &tmv)) { RET(0); return; }
+    put_systemtime(w, ARG(1), &tmv, ms);
+    RET(1);
+}
+static void k_SystemTimeToFileTime(w32 *w) {
+    uint64_t p = ARG(0), out = ARG(1);
+    if (!p || !out) { RET(0); return; }
+    struct tm tmv;
+    memset(&tmv, 0, sizeof tmv);
+    tmv.tm_year = (int)w32_read(w, p, 2) - 1900;
+    tmv.tm_mon  = (int)w32_read(w, p + 2, 2) - 1;
+    tmv.tm_mday = (int)w32_read(w, p + 6, 2);
+    tmv.tm_hour = (int)w32_read(w, p + 8, 2);
+    tmv.tm_min  = (int)w32_read(w, p + 10, 2);
+    tmv.tm_sec  = (int)w32_read(w, p + 12, 2);
+    time_t secs = timegm(&tmv);
+    uint64_t ft = ((uint64_t)secs + FT_EPOCH_DELTA) * 10000000ull
+                + (uint64_t)w32_read(w, p + 14, 2) * 10000ull;
+    w32_write(w, out, 4, ft & 0xFFFFFFFFu);
+    w32_write(w, out + 4, 4, ft >> 32);
+    RET(1);
+}
+/* There is one time zone here and it is UTC. A game that shows a save's
+ * timestamp will show it in UTC, which is wrong by an offset rather than
+ * wrong in a way that breaks anything -- and inventing a zone would be worse
+ * than being consistently one. */
+static void k_SystemTimeToTzSpecificLocalTime(w32 *w) {
+    uint64_t src = ARG(1), dst = ARG(2);
+    if (!src || !dst) { RET(0); return; }
+    for (int i = 0; i < 8; i++) w32_write(w, dst + (unsigned)i * 2, 2, w32_read(w, src + (unsigned)i * 2, 2));
+    RET(1);
+}
+static void k_TzSpecificLocalTimeToSystemTime(w32 *w) { k_SystemTimeToTzSpecificLocalTime(w); }
+static void k_FileTimeToLocalFileTime(w32 *w) {
+    if (!ARG(0) || !ARG(1)) { RET(0); return; }
+    w32_write(w, ARG(1), 4, w32_read(w, ARG(0), 4));
+    w32_write(w, ARG(1) + 4, 4, w32_read(w, ARG(0) + 4, 4));
+    RET(1);
+}
+static void k_LocalFileTimeToFileTime(w32 *w) { k_FileTimeToLocalFileTime(w); }
+
+/* GetDateFormat / GetTimeFormat: a program shows a save's date with these.
+ * The invariant locale's formats, which is what GetLocaleInfoW above says
+ * they are, so the two agree. */
+static void date_time_format(w32 *w, int is_date, int wide) {
+    uint64_t stp = ARG(2), out = ARG(4);
+    int cap = (int)(int32_t)(uint32_t)ARG(5);
+    struct tm tmv;
+    memset(&tmv, 0, sizeof tmv);
+    if (stp) {
+        tmv.tm_year = (int)w32_read(w, stp, 2) - 1900;
+        tmv.tm_mon  = (int)w32_read(w, stp + 2, 2) - 1;
+        tmv.tm_mday = (int)w32_read(w, stp + 6, 2);
+        tmv.tm_hour = (int)w32_read(w, stp + 8, 2);
+        tmv.tm_min  = (int)w32_read(w, stp + 10, 2);
+        tmv.tm_sec  = (int)w32_read(w, stp + 12, 2);
+    } else {
+        time_t now = time(0);
+        gmtime_r(&now, &tmv);
+    }
+    char buf[128];
+    if (is_date) snprintf(buf, sizeof buf, "%d/%d/%04d", tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_year + 1900);
+    else {
+        int h = tmv.tm_hour % 12; if (!h) h = 12;
+        snprintf(buf, sizeof buf, "%d:%02d:%02d %s", h, tmv.tm_min, tmv.tm_sec, tmv.tm_hour < 12 ? "AM" : "PM");
+    }
+    int n = (int)strlen(buf) + 1;
+    if (!out || cap == 0) { RET((uint64_t)(uint32_t)n); return; }
+    if (cap < n) { w32_set_last_error(w, 122); RET(0); return; }
+    for (int i = 0; i < n; i++) {
+        if (wide) w32_write(w, out + (unsigned)i * 2, 2, (uint8_t)buf[i]);
+        else      w32_write(w, out + (unsigned)i, 1, (uint8_t)buf[i]);
+    }
+    RET((uint64_t)(uint32_t)n);
+}
+static void k_GetDateFormatW(w32 *w) { date_time_format(w, 1, 1); }
+static void k_GetDateFormatA(w32 *w) { date_time_format(w, 1, 0); }
+static void k_GetTimeFormatW(w32 *w) { date_time_format(w, 0, 1); }
+static void k_GetTimeFormatA(w32 *w) { date_time_format(w, 0, 0); }
+
+/* ---- the version gate --------------------------------------------------- */
+
+/* VerifyVersionInfo is how a program asks "am I on Windows 7 or later". We
+ * report Windows 10, and the honest way to answer a comparison against it is
+ * to actually perform the comparison rather than always saying yes: a
+ * program that checks it is *not* on something newer than it supports
+ * deserves a real answer too. */
+static void k_VerSetConditionMask(w32 *w) {
+    /* (mask, typeBitMask, condition) -> mask with the condition packed in.
+     * Three bits per type, and the type is a bit position; the packing is
+     * only ever read back by VerifyVersionInfo, so it has to be consistent
+     * with what that does and nothing more. */
+    uint64_t mask = w->is32 ? (ARG(0) | (ARG(1) << 32)) : ARG(0);
+    uint32_t type = (uint32_t)(w->is32 ? ARG(2) : ARG(1));
+    uint32_t cond = (uint32_t)(w->is32 ? ARG(3) : ARG(2)) & 7;
+    int slot = 0;
+    for (uint32_t t = type; t && slot < 20; t >>= 1, slot++) if (t & 1) break;
+    mask |= (uint64_t)cond << (slot * 3);
+    w32_ret64(w, mask);
+}
+static void k_VerifyVersionInfoW(w32 *w) {
+    /* OSVERSIONINFOEX: size, major, minor, build, platform, csd[128], ... */
+    uint64_t p = ARG(0);
+    uint32_t types = (uint32_t)ARG(1);
+    if (!p) { RET(0); return; }
+    uint32_t want_major = (uint32_t)w32_read(w, p + 4, 4);
+    uint32_t want_minor = (uint32_t)w32_read(w, p + 8, 4);
+    /* What we claim to be, which is what GetVersionEx says as well. */
+    const uint32_t have_major = 10, have_minor = 0;
+    /* VER_MAJORVERSION 0x0002, VER_MINORVERSION 0x0001 -- the only two a
+     * game's "is this new enough" check uses. Anything else passes. */
+    int ok = 1;
+    if (types & 0x0002) {
+        if (have_major < want_major) ok = 0;
+        else if (have_major == want_major && (types & 0x0001) && have_minor < want_minor) ok = 0;
+    }
+    if (!ok) w32_set_last_error(w, 1150);      /* ERROR_OLD_WIN_VERSION */
+    RET(ok);
+}
+static void k_VerifyVersionInfoA(w32 *w) { k_VerifyVersionInfoW(w); }
+
+/* ---- the rest of what a game asks kernel32 for --------------------------- */
+
+static void k_DebugBreak(w32 *w) {
+    /* There is no debugger to break into. Saying so once is better than a
+     * trap the run cannot continue from. */
+    w32_note_refused(w, "kernel32!DebugBreak (no debugger attached)");
+    RET(0);
+}
+static void k_GetConsoleWindow(w32 *w) { (void)w; RET(0); }   /* there is no console window */
+static void k_ReadConsoleW(w32 *w) {
+    /* Nothing is typed at a console that does not exist. Zero characters and
+     * success is end-of-input, which every caller handles. */
+    if (ARG(3)) w32_write(w, ARG(3), 4, 0);
+    RET(1);
+}
+static void k_PeekNamedPipe(w32 *w) {
+    for (int i = 2; i <= 4; i++) if (ARG((unsigned)i)) w32_write(w, ARG((unsigned)i), 4, 0);
+    RET(0);
+}
+static void k_SetProcessInformation(w32 *w) { (void)w; RET(1); }
+static void k_HeapWalk(w32 *w) { w32_set_last_error(w, 259); RET(0); }   /* ERROR_NO_MORE_ITEMS */
+static void k_K32GetProcessMemoryInfo(w32 *w) {
+    /* PROCESS_MEMORY_COUNTERS: cb, faults, then eight size_t counters. A
+     * game reports these on a debug overlay; zeros with the right size are
+     * an honest "we do not account for this" rather than an invented figure. */
+    uint64_t p = ARG(1);
+    uint32_t cb = (uint32_t)ARG(2);
+    if (!p || cb < 8) { RET(0); return; }
+    memset(W32P(w, p), 0, cb);
+    w32_write(w, p, 4, cb);
+    RET(1);
+}
+static void k_FreeLibraryAndExitThread(w32 *w) { w32_thread_exit_self(w, (uint32_t)ARG(1)); }
+/* Waitable timers: a timer object that a wait can block on. Built on the
+ * event machinery, because that is what one is. */
+static void k_CreateWaitableTimerW(w32 *w) { RET(w32_make_event(w, 1, 0)); }
+static void k_CreateWaitableTimerA(w32 *w) { RET(w32_make_event(w, 1, 0)); }
+static void k_CreateWaitableTimerExW(w32 *w) { RET(w32_make_event(w, 1, 0)); }
+static void k_SetWaitableTimer(w32 *w) {
+    /* A due time in the past, or none, means signalled now -- which is the
+     * only case that matters here, because nothing else is going to fire it. */
+    w32_set_event(w, ARG(0), 1);
+    RET(1);
+}
+static void k_CancelWaitableTimer(w32 *w) { w32_set_event(w, ARG(0), 0); RET(1); }
+static void k_CreateEventExA(w32 *w) {
+    /* (attrs, name, flags, access): CREATE_EVENT_MANUAL_RESET is 1 and
+     * CREATE_EVENT_INITIAL_SET is 2 -- not the same bits as CreateEvent's
+     * arguments, which is exactly the sort of thing that silently makes an
+     * auto-reset event manual. */
+    uint32_t f = (uint32_t)ARG(2);
+    RET(w32_make_event(w, (f & 1) != 0, (f & 2) != 0));
+}
+static void k_GetFileAttributesExW(w32 *w) {
+    /* (name, level, out): WIN32_FILE_ATTRIBUTE_DATA is attributes, three
+     * FILETIMEs, then the size as two words. */
+    char win[1024], host[1024];
+    w32_wtoa(w, ARG(0), win, sizeof win);
+    w32_host_path(w, win, host, sizeof host);
+    struct stat st;
+    if (stat(host, &st)) { w32_set_last_error(w, 2); RET(0); return; }
+    uint64_t p = ARG(2);
+    if (!p) { RET(0); return; }
+    uint32_t attr = S_ISDIR(st.st_mode) ? 0x10 : 0x80;
+    w32_write(w, p, 4, attr);
+    uint64_t ft = ((uint64_t)st.st_mtime + FT_EPOCH_DELTA) * 10000000ull;
+    for (int i = 0; i < 3; i++) {
+        w32_write(w, p + 4 + (unsigned)i * 8, 4, ft & 0xFFFFFFFFu);
+        w32_write(w, p + 8 + (unsigned)i * 8, 4, ft >> 32);
+    }
+    w32_write(w, p + 28, 4, (uint64_t)st.st_size >> 32);
+    w32_write(w, p + 32, 4, (uint64_t)st.st_size & 0xFFFFFFFFu);
+    RET(1);
+}
+static void k_GetFileAttributesExA(w32 *w) {
+    char host[1024];
+    w32_host_path(w, ARG(0) ? w32_str(w, ARG(0)) : "", host, sizeof host);
+    struct stat st;
+    if (stat(host, &st)) { w32_set_last_error(w, 2); RET(0); return; }
+    uint64_t p = ARG(2);
+    if (!p) { RET(0); return; }
+    w32_write(w, p, 4, S_ISDIR(st.st_mode) ? 0x10 : 0x80);
+    uint64_t ft = ((uint64_t)st.st_mtime + FT_EPOCH_DELTA) * 10000000ull;
+    for (int i = 0; i < 3; i++) {
+        w32_write(w, p + 4 + (unsigned)i * 8, 4, ft & 0xFFFFFFFFu);
+        w32_write(w, p + 8 + (unsigned)i * 8, 4, ft >> 32);
+    }
+    w32_write(w, p + 28, 4, (uint64_t)st.st_size >> 32);
+    w32_write(w, p + 32, 4, (uint64_t)st.st_size & 0xFFFFFFFFu);
+    RET(1);
+}
+/* BY_HANDLE_FILE_INFORMATION: attributes, three times, volume serial, the
+ * size high/low, link count, and the file id high/low. The id has to be
+ * stable and distinct per file, and an inode is exactly that. */
+static void k_GetFileInformationByHandle(w32 *w) {
+    w32_handle *h = w32_handle_get(w, ARG(0));
+    uint64_t p = ARG(1);
+    if (!h || h->type != H_FILE || h->fd < 0 || !p) { w32_set_last_error(w, 6); RET(0); return; }
+    struct stat st;
+    if (fstat(h->fd, &st)) { w32_set_last_error(w, 5); RET(0); return; }
+    w32_write(w, p, 4, S_ISDIR(st.st_mode) ? 0x10 : 0x80);
+    uint64_t ft = ((uint64_t)st.st_mtime + FT_EPOCH_DELTA) * 10000000ull;
+    for (int i = 0; i < 3; i++) {
+        w32_write(w, p + 4 + (unsigned)i * 8, 4, ft & 0xFFFFFFFFu);
+        w32_write(w, p + 8 + (unsigned)i * 8, 4, ft >> 32);
+    }
+    w32_write(w, p + 28, 4, 0x57494E32u);                    /* volume serial */
+    w32_write(w, p + 32, 4, (uint64_t)st.st_size >> 32);
+    w32_write(w, p + 36, 4, (uint64_t)st.st_size & 0xFFFFFFFFu);
+    w32_write(w, p + 40, 4, (uint64_t)st.st_nlink);
+    w32_write(w, p + 44, 4, (uint64_t)st.st_ino >> 32);
+    w32_write(w, p + 48, 4, (uint64_t)st.st_ino & 0xFFFFFFFFu);
+    RET(1);
+}
+static void k_GetFinalPathNameByHandleW(w32 *w) {
+    /* There is no way back from a descriptor to a name on every host, and a
+     * wrong name is worse than none: a program uses this to decide whether
+     * two handles are the same file. */
+    w32_note_refused(w, "kernel32!GetFinalPathNameByHandle (no path from a handle here)");
+    w32_set_last_error(w, 1);
+    RET(0);
+}
+static void k_GetDriveTypeW(w32 *w) {
+    char b[64] = "";
+    if (ARG(0)) w32_wtoa(w, ARG(0), b, sizeof b);
+    /* One drive, and it is fixed. DRIVE_FIXED is 3; a game asks so it can
+     * decide whether to warn about running from removable media. */
+    RET((b[0] == 'C' || b[0] == 'c' || !b[0]) ? 3 : 1);
+}
+/* FormatMessage turns an error code into a sentence. A game puts that
+ * sentence in a message box when something fails, so an empty one turns a
+ * useful report into "an error occurred". */
+static void format_message(w32 *w, int wide) {
+    uint32_t flags = (uint32_t)ARG(0);
+    uint32_t id = (uint32_t)ARG(2);
+    uint64_t out = ARG(4);
+    uint32_t cap = (uint32_t)ARG(5);
+    const char *text;
+    switch (id) {
+    case 0:   text = "The operation completed successfully."; break;
+    case 2:   text = "The system cannot find the file specified."; break;
+    case 3:   text = "The system cannot find the path specified."; break;
+    case 5:   text = "Access is denied."; break;
+    case 6:   text = "The handle is invalid."; break;
+    case 8:   text = "Not enough memory resources are available."; break;
+    case 32:  text = "The process cannot access the file because it is being used by another process."; break;
+    case 87:  text = "The parameter is incorrect."; break;
+    case 112: text = "There is not enough space on the disk."; break;
+    case 122: text = "The data area passed to a system call is too small."; break;
+    case 183: text = "Cannot create a file when that file already exists."; break;
+    case 1150: text = "The specified program requires a newer version of Windows."; break;
+    default:  text = "An error occurred."; break;
+    }
+    size_t n = strlen(text);
+    /* FORMAT_MESSAGE_ALLOCATE_BUFFER (0x100): the caller gets a pointer
+     * written into its buffer argument rather than the text. */
+    if (flags & 0x100) {
+        uint64_t buf = w32_heap_alloc(w, (n + 1) * (wide ? 2 : 1));
+        for (size_t i = 0; i <= n; i++) {
+            if (wide) w32_write(w, buf + i * 2, 2, (uint8_t)text[i]);
+            else      w32_write(w, buf + i, 1, (uint8_t)text[i]);
+        }
+        if (out) w32_write(w, out, (int)w32_ptrsize(w), buf);
+        RET((uint64_t)(uint32_t)n);
+        return;
+    }
+    if (!out || cap == 0) { RET(0); return; }
+    if (n > cap - 1) n = cap - 1;
+    for (size_t i = 0; i < n; i++) {
+        if (wide) w32_write(w, out + i * 2, 2, (uint8_t)text[i]);
+        else      w32_write(w, out + i, 1, (uint8_t)text[i]);
+    }
+    if (wide) w32_write(w, out + n * 2, 2, 0); else w32_write(w, out + n, 1, 0);
+    RET((uint64_t)(uint32_t)n);
+}
+static void k_FormatMessageW(w32 *w) { format_message(w, 1); }
+/* FindFirstFileEx is FindFirstFile with a filter it is allowed to ignore. */
+static void k_FindFirstFileExW(w32 *w) {
+    char b[1024];
+    w32_wtoa(w, ARG(0), b, sizeof b);
+    RET(find_first(w, b, ARG(2), 1));
+}
+static void k_FindFirstFileExA(w32 *w) {
+    RET(find_first(w, ARG(0) ? w32_str(w, ARG(0)) : "", ARG(2), 0));
+}
+static void k_PathCchCombine(w32 *w) {
+    /* (out, cchOut, dir, file) -- join two path pieces. It is in
+     * api-ms-win-core-path, not kernel32, but it forwards here like every
+     * other api-ms-win- name. */
+    uint64_t out = ARG(0);
+    uint32_t cap = (uint32_t)ARG(1);
+    char dir[600] = "", file[600] = "";
+    if (ARG(2)) w32_wtoa(w, ARG(2), dir, sizeof dir);
+    if (ARG(3)) w32_wtoa(w, ARG(3), file, sizeof file);
+    char joined[1216];
+    if (!dir[0]) snprintf(joined, sizeof joined, "%s", file);
+    else if (!file[0]) snprintf(joined, sizeof joined, "%s", dir);
+    else if (file[0] == '\\' || (file[0] && file[1] == ':'))
+        snprintf(joined, sizeof joined, "%s", file);       /* already absolute */
+    else {
+        size_t dl = strlen(dir);
+        int sep = dl && (dir[dl - 1] == '\\' || dir[dl - 1] == '/');
+        snprintf(joined, sizeof joined, "%s%s%s", dir, sep ? "" : "\\", file);
+    }
+    size_t n = strlen(joined);
+    if (!out || cap <= n) { RET((uint64_t)(uint32_t)0x8007007Au); return; }  /* E_NOT_SUFFICIENT_BUFFER */
+    for (size_t i = 0; i <= n; i++) w32_write(w, out + i * 2, 2, (uint8_t)joined[i]);
+    RET(0);
+}
+/* Condition variables. One guest thread runs at a time (see thread.c), so a
+ * sleep on a condition variable is a bounded wait: the lock is released, the
+ * thread yields, and it comes back. Signalling is what wakes it early. */
+static void k_SleepConditionVariableCS(w32 *w) { RET(w32_cond_sleep(w, ARG(0), ARG(1), (uint32_t)ARG(2), 0)); }
+static void k_SleepConditionVariableSRW(w32 *w) { RET(w32_cond_sleep(w, ARG(0), ARG(1), (uint32_t)ARG(2), 1)); }
+
 #define F(n, a)        { #n, a, 0, k_##n, 0 }
 #define FN(n, a, impl) { #n, a, 0, impl, 0 }
 const w32_api w32_kernel32[] = {
@@ -1878,6 +2363,34 @@ const w32_api w32_kernel32[] = {
     F(SetEnvironmentVariableA, 2),
     F(lstrcmpW, 2), F(lstrcmpiW, 2), F(lstrcpynW, 3), F(lstrcpynA, 3),
     F(CompareFileTime, 2), F(SetFileTime, 4), F(GetFileTime, 4), F(MulDiv, 3),
+    /* What the C runtime walks before it reaches main. Every one of these
+     * missing is a program that never runs a line of its own code. */
+    F(GetLocaleInfoW, 4), F(GetLocaleInfoA, 4), F(GetLocaleInfoEx, 4),
+    F(IsValidLocale, 2),
+    F(EnumSystemLocalesW, 2), F(EnumSystemLocalesA, 2), F(EnumSystemLocalesEx, 4),
+    F(LCMapStringEx, 9), F(LCMapStringW, 6),
+    F(CompareStringW, 6), F(CompareStringEx, 9), F(CompareStringOrdinal, 5),
+    /* dates and times */
+    F(FileTimeToSystemTime, 2), F(SystemTimeToFileTime, 2),
+    F(SystemTimeToTzSpecificLocalTime, 3), F(TzSpecificLocalTimeToSystemTime, 3),
+    F(FileTimeToLocalFileTime, 2), F(LocalFileTimeToFileTime, 2),
+    F(GetDateFormatW, 6), F(GetDateFormatA, 6), F(GetTimeFormatW, 6), F(GetTimeFormatA, 6),
+    /* the version gate a game checks before it starts */
+    F(VerSetConditionMask, 3), F(VerifyVersionInfoW, 4), F(VerifyVersionInfoA, 4),
+    /* files, in the shapes a game asks about them */
+    F(GetFileAttributesExW, 3), F(GetFileAttributesExA, 3),
+    F(GetFileInformationByHandle, 2), F(GetFinalPathNameByHandleW, 4),
+    F(FindFirstFileExW, 6), F(FindFirstFileExA, 6),
+    F(GetDriveTypeW, 1), F(PathCchCombine, 4),
+    F(FormatMessageW, 7),
+    /* threads and waiting */
+    F(SleepConditionVariableCS, 3), F(SleepConditionVariableSRW, 4),
+    F(CreateWaitableTimerW, 3), F(CreateWaitableTimerA, 3), F(CreateWaitableTimerExW, 4),
+    F(SetWaitableTimer, 6), F(CancelWaitableTimer, 1),
+    F(CreateEventExA, 4), F(FreeLibraryAndExitThread, 2),
+    /* the rest */
+    F(DebugBreak, 0), F(GetConsoleWindow, 0), F(ReadConsoleW, 5), F(PeekNamedPipe, 6),
+    F(SetProcessInformation, 4), F(HeapWalk, 2), F(K32GetProcessMemoryInfo, 3),
     F(GlobalLock, 1), F(GlobalUnlock, 1), F(GlobalSize, 1),
     F(WritePrivateProfileStringW, 4),
     F(SetDefaultDllDirectories, 1), F(SetDllDirectoryA, 1), F(SetDllDirectoryW, 1),
@@ -1928,8 +2441,37 @@ static void m_timeGetDevCaps(w32 *w) {
     if (ARG(0)) { w32_write(w, ARG(0), 4, 1); w32_write(w, ARG(0) + 4, 4, 1000000); }
     RET(0);
 }
+/* Joysticks, through the interface that predates XInput. Nothing is
+ * attached to this one -- a controller reaches the guest through XInput, and
+ * a game that finds no legacy joystick falls back to that or to the
+ * keyboard. JOYERR_UNPLUGGED is the documented way to say "that port is
+ * empty", which is true of all of them. */
+enum { JOYERR_UNPLUGGED_ = 167, JOYERR_PARMS_ = 165 };
+static void m_joyGetNumDevs(w32 *w) { (void)w; RET(0); }
+static void m_joyGetPos(w32 *w)     { (void)w; RET(JOYERR_UNPLUGGED_); }
+static void m_joyGetPosEx(w32 *w)   { (void)w; RET(JOYERR_UNPLUGGED_); }
+static void m_joyGetDevCapsA(w32 *w) { (void)w; RET(JOYERR_UNPLUGGED_); }
+static void m_joyGetDevCapsW(w32 *w) { (void)w; RET(JOYERR_UNPLUGGED_); }
+static void m_joySetCapture(w32 *w) { (void)w; RET(JOYERR_UNPLUGGED_); }
+static void m_joyReleaseCapture(w32 *w) { (void)w; RET(JOYERR_UNPLUGGED_); }
+static void m_PlaySoundW(w32 *w) { (void)w; RET(0); }
+static void m_PlaySoundA(w32 *w) { (void)w; RET(0); }
+static void m_mciSendStringW(w32 *w) { (void)w; RET(1); }
+static void m_mciSendStringA(w32 *w) { (void)w; RET(1); }
+
 const w32_api w32_winmm[] = {
     { "timeGetTime", 0, 0, m_timeGetTime, 0 },
+    { "joyGetNumDevs", 0, 0, m_joyGetNumDevs, 0 },
+    { "joyGetPos", 2, 0, m_joyGetPos, 0 },
+    { "joyGetPosEx", 2, 0, m_joyGetPosEx, 0 },
+    { "joyGetDevCapsA", 3, 0, m_joyGetDevCapsA, 0 },
+    { "joyGetDevCapsW", 3, 0, m_joyGetDevCapsW, 0 },
+    { "joySetCapture", 4, 0, m_joySetCapture, 0 },
+    { "joyReleaseCapture", 1, 0, m_joyReleaseCapture, 0 },
+    { "PlaySoundW", 3, 0, m_PlaySoundW, 0 },
+    { "PlaySoundA", 3, 0, m_PlaySoundA, 0 },
+    { "mciSendStringW", 4, 0, m_mciSendStringW, 0 },
+    { "mciSendStringA", 4, 0, m_mciSendStringA, 0 },
     { "timeBeginPeriod", 1, 0, m_timeBeginPeriod, 0 },
     { "timeEndPeriod", 1, 0, m_timeEndPeriod, 0 },
     { "timeGetDevCaps", 2, 0, m_timeGetDevCaps, 0 },

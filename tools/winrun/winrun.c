@@ -392,6 +392,30 @@ static const w32_dll g_dlls[] = {
      * comctl32 is what it calls first. */
     { "gdi32.dll",    { w32_gdi32 },                                      0 },
     { "comctl32.dll", { w32_comctl32 },                                   0 },
+    /* The long tail a game engine links whether the game uses it or not.
+     * An import that cannot be resolved is a program that does not start,
+     * so breadth here is what decides how many games get as far as running
+     * at all -- see win32/misc_dlls.c and win32/net_dlls.c. */
+    { "imm32.dll",    { w32_imm32 },                                      0 },
+    { "dwmapi.dll",   { w32_dwmapi },                                     0 },
+    { "avrt.dll",     { w32_avrt },                                       0 },
+    { "version.dll",  { w32_version },                                    0 },
+    { "rpcrt4.dll",   { w32_rpcrt4 },                                     0 },
+    { "gdiplus.dll",  { w32_gdiplus },                                    0 },
+    { "comdlg32.dll", { w32_comdlg32 },                                   0 },
+    { "dbghelp.dll",  { w32_dbghelp },                                    0 },
+    { "iphlpapi.dll", { w32_iphlpapi },                                   0 },
+    { "propsys.dll",  { w32_propsys },                                    0 },
+    { "ws2_32.dll",   { w32_ws2_32 },                                     0 },
+    { "wsock32.dll",  { w32_ws2_32 },                                     0 },
+    { "wininet.dll",  { w32_wininet },                                    0 },
+    /* Not implementations. They exist so a game gets a real "no such
+     * device" and takes its own error path, instead of stopping on an
+     * unresolved import before it has said what else it needs. */
+    { "d3d11.dll",    { w32_d3d11 },                                      0 },
+    { "d3d10.dll",    { w32_d3d10 },                                      0 },
+    { "d3d12.dll",    { w32_d3d12 },                                      0 },
+    { "dxgi.dll",     { w32_dxgi },                                       0 },
 };
 enum { NDLLS = sizeof g_dlls / sizeof g_dlls[0], STUB_RETURN = 0, STUB_EXIT = 1, STUB_FIRST = 2 };
 
@@ -1489,18 +1513,23 @@ int winrun_main(int argc, char **argv) {
          * something outside it looks -- and a checksum plus a thumbnail is
          * both machine-checkable and legible to a person reading a diff. */
         else if (!strcmp(argv[ai], "-frame")) { w->dump_frame = 1; w32_set_present(keep_frame, 0); }
+        /* How dense we claim the display is. A desktop installer was drawn
+         * for 96 DPI and is a postage stamp on a tablet panel; raising this
+         * makes every dialog lay itself out proportionally bigger, exactly
+         * as Windows' own DPI scaling does. */
+        else if (!strcmp(argv[ai], "-dpi") && ai + 1 < argc) { w32_set_ui_dpi(atoi(argv[ai + 1])); ai++; }
         else if (!strcmp(argv[ai], "-L") && ai + 1 < argc) {       /* extra directory to find guest DLLs in */
             static char dir[512];
             snprintf(dir, sizeof dir, "%s%s", argv[ai + 1], argv[ai + 1][strlen(argv[ai + 1]) - 1] == '/' ? "" : "/");
             w->dll_dir = dir; ai++;
         }
         else { fprintf(stderr, "usage: winrun [-v] [-imports] [-survey dir] [-k] [-t seconds]\n"
-                          "              [-C drive_c] [-L dlldir] [-input script] [-screen WxH] [-frame]\n"
+                          "              [-C drive_c] [-L dlldir] [-input script] [-screen WxH] [-frame] [-dpi n]\n"
                           "              program.exe [args...]\n"); return 2; }
         ai++;
     }
     if (ai >= argc) { fprintf(stderr, "usage: winrun [-v] [-imports] [-survey dir] [-k] [-t seconds]\n"
-                                      "              [-C drive_c] [-L dlldir] [-input script] [-screen WxH] [-frame]\n"
+                                      "              [-C drive_c] [-L dlldir] [-input script] [-screen WxH] [-frame] [-dpi n]\n"
                           "              program.exe [args...]\n"); return 2; }
     w->exe_path = argv[ai];
 

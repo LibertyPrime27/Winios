@@ -263,7 +263,16 @@ static void pick_exe(wi_result *r, const char *drive_c, const char *entry_dir) {
     snprintf(r->dll_dir, sizeof r->dll_dir, "%s", r->exe_host);
     char *slash = strrchr(r->dll_dir, '/');
     if (slash) *slash = 0;
-    (void)drive_c;
+    /* And the same as a path *inside* the drive, which is the only form
+     * worth writing down: it survives the drive moving, and the drive moves
+     * every time the app is reinstalled. */
+    r->dll_rel[0] = 0;
+    { size_t dl = strlen(drive_c);
+      if (dl && !strncmp(r->dll_dir, drive_c, dl)) {
+          const char *rest = r->dll_dir + dl;
+          while (*rest == '/') rest++;
+          snprintf(r->dll_rel, sizeof r->dll_rel, "%s", rest);
+      } }
 
     addf(r, "\nWill run: %s (%s)\n  %s\n", e[0].rel,
          e[0].is32 == 1 ? "32-bit" : e[0].is32 == 0 ? "64-bit" : "unreadable header",

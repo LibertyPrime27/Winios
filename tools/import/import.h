@@ -61,6 +61,13 @@ typedef struct {
     char exe_host[1200];     /* the same, as a host path, ready to run        */
     char dll_dir[1200];      /* where its own DLLs are (winrun's -L): a prefix
                               * of exe_host, so it is sized the same          */
+    char dll_rel[1024];      /* the same, relative to C:\. The absolute one is
+                              * only valid for as long as the drive is where
+                              * it is now -- on iOS the app's container is
+                              * renamed on every reinstall, so an absolute
+                              * path recorded today is a path to nothing
+                              * after the next update. Anything stored has to
+                              * be this one.                                  */
     int  is32;
     int  files;              /* how many were copied or extracted             */
     int  exes;               /* how many executables were found               */

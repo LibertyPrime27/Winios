@@ -370,6 +370,96 @@ final class GuestInputView: UIView, UIGestureRecognizerDelegate {
 /// than typed -- so these are hold-to-press, and every way a touch can end
 /// releases the key. A key left stuck down because a finger slid off the
 /// button is the one failure that makes an on-screen control unusable.
+/// The controls a dialog needs, which are not the controls a game needs.
+///
+/// A game wants WASD under a thumb. An installer wants a way to press the
+/// button it is waiting on — and on a phone that is genuinely hard: the Next
+/// button is a small target on a frame that has been scaled to the panel,
+/// and a tap that lands two pixels off does nothing with no feedback.
+///
+/// So: Enter presses the dialog's default button, which is the one an
+/// installer is waiting on at every step; Tab moves between the controls and
+/// draws a box round the one it landed on; Space toggles a check box; Click
+/// presses wherever the pointer already is, for when a drag has put it in the
+/// right place and letting go would move it. Esc is Cancel.
+///
+/// These are not a substitute for tapping — tapping works and is quicker.
+/// They are what makes the difference between an installer you can *usually*
+/// get through and one you always can.
+final class DialogKeys: UIView {
+
+    /// label, virtual-key code, and a wider button for the ones that matter.
+    private static let keys: [(String, Int32, Bool)] = [
+        ("⏎ Enter", 0x0D, true), ("Tab", 0x09, false), ("Space", 0x20, false),
+        ("Esc", 0x1B, false), ("← Bksp", 0x08, false),
+    ]
+
+    init() {
+        super.init(frame: .zero)
+        isUserInteractionEnabled = true
+
+        var items: [UIView] = Self.keys.map { key($0.0, $0.1, wide: $0.2) }
+        // Click is not a key, so it is built separately: it presses the
+        // mouse where the pointer already is rather than where a finger is.
+        items.append(clickButton("Click", right: false))
+        items.append(clickButton("Right", right: true))
+
+        let row = UIStackView(arrangedSubviews: items)
+        row.spacing = 6
+        row.alignment = .center
+        row.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(row)
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: leadingAnchor),
+            row.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor),
+            row.topAnchor.constraint(equalTo: topAnchor),
+            row.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    private func style(_ b: UIButton) {
+        b.titleLabel?.font = .systemFont(ofSize: 15, weight: .semibold)
+        b.setTitleColor(.white, for: .normal)
+        b.backgroundColor = UIColor.white.withAlphaComponent(0.22)
+        b.layer.cornerRadius = 8
+        b.translatesAutoresizingMaskIntoConstraints = false
+        b.heightAnchor.constraint(equalToConstant: 44).isActive = true
+    }
+
+    private func key(_ title: String, _ vk: Int32, wide: Bool) -> UIButton {
+        let b = UIButton(type: .system)
+        b.setTitle(title, for: .normal)
+        b.tag = Int(vk)
+        style(b)
+        b.widthAnchor.constraint(greaterThanOrEqualToConstant: wide ? 96 : 62).isActive = true
+        b.addTarget(self, action: #selector(keyTapped(_:)), for: .touchUpInside)
+        return b
+    }
+
+    /// Down and up together on release. A dialog key is a press, not a hold
+    /// — holding Enter on a wizard would run through several pages.
+    @objc private func keyTapped(_ b: UIButton) {
+        w32_input_key(Int32(b.tag), 1)
+        w32_input_key(Int32(b.tag), 0)
+    }
+
+    private func clickButton(_ title: String, right: Bool) -> UIButton {
+        let b = UIButton(type: .system)
+        b.setTitle(title, for: .normal)
+        b.tag = right ? 1 : 0
+        style(b)
+        b.widthAnchor.constraint(greaterThanOrEqualToConstant: 68).isActive = true
+        b.addTarget(self, action: #selector(clickTapped(_:)), for: .touchUpInside)
+        return b
+    }
+
+    @objc private func clickTapped(_ b: UIButton) {
+        w32_input_mouse_button(Int32(b.tag), 1)
+        w32_input_mouse_button(Int32(b.tag), 0)
+    }
+}
+
 final class OnScreenKeys: UIView {
 
     /// label, virtual-key code

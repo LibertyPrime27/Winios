@@ -31,6 +31,47 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* ---- how big a "point" is ------------------------------------------------
+ *
+ * A Windows dialog is laid out in dialog units, which come from the size of
+ * the system font, which comes from the display's DPI. Every desktop
+ * installer was drawn for 96 DPI, where a wizard is about 500 by 350
+ * pixels -- a comfortable window on a 1280x1024 monitor.
+ *
+ * That same dialog on a tablet's panel is a postage stamp. Rendering the
+ * guest at 2732 pixels wide and then drawing a 500-pixel dialog in the
+ * middle of it is technically faithful and practically unusable; rendering
+ * at 640 and scaling the frame up with nearest-neighbour sampling gives a
+ * dialog that fills the screen out of blocks. Neither is what the person
+ * wanted, and it is why "it renders" and "you can read it" turned out to be
+ * different claims.
+ *
+ * Windows solves this with DPI scaling, and so does this: report a higher
+ * DPI, and every dialog that asks -- which is all of them, through their own
+ * font size and their own dialog units -- lays itself out proportionally
+ * bigger. The text is then drawn at a size where the strokes have room, so
+ * it is sharper as well as larger. Nothing about the program changes; it is
+ * told the truth about a display that is genuinely denser.
+ */
+static int g_dpi = 96;
+static int g_stock_ready;
+void w32_set_ui_dpi(int dpi) {
+    if (dpi < 96) dpi = 96;
+    if (dpi > 480) dpi = 480;
+    if (dpi == g_dpi) return;
+    g_dpi = dpi;
+    /* The stock font's size came from the old DPI, so it has to be made
+     * again -- otherwise every dialog scales its layout and keeps its old
+     * text size, which is worse than not scaling at all. */
+    g_stock_ready = 0;
+}
+int w32_ui_dpi(void) { return g_dpi; }
+/* A point size to a pixel height, at whatever DPI we are claiming. */
+int w32_points_to_pixels(int points) {
+    int h = points * g_dpi / 72;
+    return h < 8 ? 8 : h;
+}
+
 static uint32_t px(uint32_t ref) {
     return 0xFF000000u | ((ref & 0xFFu) << 16) | (ref & 0xFF00u) | ((ref >> 16) & 0xFFu);
 }
@@ -89,7 +130,6 @@ enum {
     DEFAULT_GUI_FONT = 17, DC_BRUSH = 18, DC_PEN = 19, NSTOCK = 20,
 };
 static uint64_t g_stock[NSTOCK];
-static int g_stock_ready;
 
 static gobj *mk_brush(uint32_t color, int style) {
     gobj *o = obj_new(G_BRUSH);
@@ -126,13 +166,15 @@ static void stock_init(void) {
     o = mk_pen(0x000000, PS_SOLID, 1); o->stock = 1; g_stock[BLACK_PEN] = handle_of(o);
     o = mk_pen(0x000000, PS_SOLID, 1); o->stock = 1; g_stock[DC_PEN] = handle_of(o);
     o = mk_pen(0, PS_NULL, 1);         o->stock = 1; g_stock[NULL_PEN] = handle_of(o);
-    /* The UI font. 13 pixels is what Windows uses for a dialog at 96 DPI,
-     * and a dialog template's own font size is applied on top of it. */
-    o = mk_font(-11, 400, "Winios Sans"); o->stock = 1; g_stock[DEFAULT_GUI_FONT] = handle_of(o);
+    /* The UI font: 8 point, which is what a dialog template asks for, at
+     * whatever DPI we are claiming. A dialog that sets its own font size
+     * gets that instead, converted the same way. */
+    o = mk_font(-w32_points_to_pixels(8), 400, "Winios Sans"); o->stock = 1;
+    g_stock[DEFAULT_GUI_FONT] = handle_of(o);
     g_stock[SYSTEM_FONT] = g_stock[DEFAULT_GUI_FONT];
     g_stock[DEVICE_DEFAULT_FONT] = g_stock[DEFAULT_GUI_FONT];
     g_stock[ANSI_VAR_FONT] = g_stock[DEFAULT_GUI_FONT];
-    o = mk_font(-11, 400, "Winios Mono"); o->stock = 1;
+    o = mk_font(-w32_points_to_pixels(8), 400, "Winios Mono"); o->stock = 1;
     g_stock[ANSI_FIXED_FONT] = g_stock[OEM_FIXED_FONT] = g_stock[SYSTEM_FIXED_FONT] = handle_of(o);
 }
 /* A brush and a font that user32 can make without going through the export
@@ -203,15 +245,29 @@ uint64_t w32_dc_for_window(w32 *w, uint64_t hwnd, int whole_window) {
     if (!bits) return 0;
     int x = 0, y = 0, cw = sw, ch = sh;
     if (hwnd && !w32_window_area(hwnd, whole_window, &x, &y, &cw, &ch)) return 0;
+    /* A control cannot draw outside its parent. A template that positions
+     * something slightly over the edge -- and they do -- would otherwise
+     * paint over whatever is beside the dialog, which on one shared surface
+     * means over another window. */
+    int cl = x, ct = y, cr = x + cw, cb = y + ch;
+    if (hwnd) {
+        int px = 0, py = 0, pw = 0, ph = 0;
+        if (w32_window_parent_area(hwnd, &px, &py, &pw, &ph)) {
+            if (px > cl) cl = px;
+            if (py > ct) ct = py;
+            if (px + pw < cr) cr = px + pw;
+            if (py + ph < cb) cb = py + ph;
+        }
+    }
     for (int i = 0; i < MAX_DC; i++) if (!g_dc[i].used) {
         gdc *d = &g_dc[i];
         memset(d, 0, sizeof *d);
         d->used = 1; d->hwnd = hwnd;
         d->bits = bits; d->sw = sw; d->sh = sh;
         d->ox = x; d->oy = y;
-        d->cl = x < 0 ? 0 : x; d->ct = y < 0 ? 0 : y;
-        d->cr = x + cw > sw ? sw : x + cw;
-        d->cb = y + ch > sh ? sh : y + ch;
+        d->cl = cl < 0 ? 0 : cl; d->ct = ct < 0 ? 0 : ct;
+        d->cr = cr > sw ? sw : cr;
+        d->cb = cb > sh ? sh : cb;
         dc_defaults(d);
         return dch_of(d);
     }
@@ -278,9 +334,30 @@ static void font_metrics(const gobj *f, int *cell, int *ascent, int *bold) {
     *bold = f && f->weight >= 600;
 }
 
-static int char_advance(int cell) {
-    int a = cell * GF_ADVANCE / GF_EM;
-    return a < 4 ? 4 : a;
+/* One glyph's advance in pixels at this cell height. Rounded to the nearest
+ * pixel rather than down, or every narrow letter collapses to the same width
+ * at small sizes and the font stops being proportional where it matters
+ * most. Never zero: a glyph that does not move is an infinite loop in any
+ * caller that walks a string by width. */
+static int glyph_advance(int cell, uint32_t ch) {
+    int a = (gf_advance(ch) * cell + GF_EM / 2) / GF_EM;
+    return a < 1 ? 1 : a;
+}
+
+/* A whole run. This has to be a function of the *string*, not of its length
+ * -- which is the whole reason the measuring API takes one. A proportional
+ * font whose extent is computed from a character count is a monospaced font
+ * with extra steps, and every control sized by GetTextExtentPoint32 comes
+ * out the wrong width. */
+static int run_width(int cell, const char *s, int len) {
+    int w = 0;
+    int tab = glyph_advance(cell, ' ') * 4;
+    for (int i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '\t') { w = (w / tab + 1) * tab; continue; }
+        w += glyph_advance(cell, c);
+    }
+    return w;
 }
 
 /* One character, its origin at the cell's top-left in DC space. */
@@ -288,14 +365,23 @@ static void draw_glyph(gdc *d, int x, int y, uint32_t ch, int cell, int bold, ui
     gf_point pts[GF_MAXPTS];
     int n = gf_glyph(ch, pts, GF_MAXPTS);
     int px0 = 0, py0 = 0;
+    /* A one-pixel stroke is right at 11 pixels and spidery at 30. Real text
+     * gets heavier as it gets bigger; a plotter font that does not looks
+     * like a wireframe of text rather than text. */
+    int weight = cell >= 34 ? 3 : cell >= 19 ? 2 : 1;
+    if (bold) weight++;
     for (int i = 0; i < n; i++) {
         /* +GF_EM/2 rounds to the nearest pixel instead of always down, which
          * is the difference between a legible small size and a mush. */
         int gx = x + (pts[i].x * cell + GF_EM / 2) / GF_EM;
         int gy = y + (pts[i].y * cell + GF_EM / 2) / GF_EM;
         if (!pts[i].move) {
-            line(d, px0, py0, gx, gy, p, 1);
-            if (bold) line(d, px0 + 1, py0, gx + 1, gy, p, 1);
+            /* Thickness by drawing the stroke again, offset -- a real pen
+             * width would need the outline of the stroke, and for a UI font
+             * at these sizes the difference is not visible. */
+            for (int k = 0; k < weight; k++) line(d, px0 + k, py0, gx + k, gy, p, 1);
+            if (weight > 1) for (int k = 0; k < weight - 1; k++)
+                line(d, px0, py0 + k, gx, gy + k, p, 1);
         }
         px0 = gx; py0 = gy;
     }
@@ -306,29 +392,44 @@ static int draw_text_run(gdc *d, int x, int y, const char *s, int len) {
     gobj *f = obj_of(d->font);
     int cell, ascent, bold;
     font_metrics(f, &cell, &ascent, &bold);
-    int adv = char_advance(cell);
     uint32_t fg = px(d->textcolor), bg = px(d->bkcolor);
-    if (d->bkmode == OPAQUE_) fill(d, x, y, x + adv * len, y + cell, bg);
+    if (d->bkmode == OPAQUE_) fill(d, x, y, x + run_width(cell, s, len), y + cell, bg);
+    int tab = glyph_advance(cell, ' ') * 4;
     int cx = x;
     for (int i = 0; i < len; i++) {
         unsigned char c = (unsigned char)s[i];
-        if (c == '\t') { cx += adv * 4; continue; }
+        if (c == '\t') { cx = x + ((cx - x) / tab + 1) * tab; continue; }
         draw_glyph(d, cx, y, c, cell, bold, fg);
-        cx += adv;
+        cx += glyph_advance(cell, c);
     }
     if (f && f->underline) fill(d, x, y + ascent + 2, cx, y + ascent + 3, fg);
     if (f && f->strikeout)  fill(d, x, y + ascent * 2 / 3, cx, y + ascent * 2 / 3 + 1, fg);
     return cx - x;
 }
 
-void w32_gdi_text_extent(uint64_t hdc, int len, int *cx, int *cy) {
+void w32_gdi_text_extent(uint64_t hdc, const char *s, int len, int *cx, int *cy) {
     gdc *d = dc_of(hdc);
     if (!d) { if (cx) *cx = 0; if (cy) *cy = 0; return; }
     gobj *f = obj_of(d->font);
     int cell, ascent, bold;
     font_metrics(f, &cell, &ascent, &bold);
-    if (cx) *cx = char_advance(cell) * len;
+    if (cx) *cx = s ? run_width(cell, s, len) : 0;
     if (cy) *cy = cell;
+}
+/* The average character width, which is what a dialog's unit conversion is
+ * defined in terms of -- not the width of any particular letter. Windows
+ * takes the mean over 'A'..'Z' and 'a'..'z', and using anything else puts
+ * every control in a template at the wrong place. */
+int w32_gdi_average_width(uint64_t hdc) {
+    gdc *d = dc_of(hdc);
+    if (!d) return 6;
+    int cell, ascent, bold;
+    font_metrics(obj_of(d->font), &cell, &ascent, &bold);
+    int total = 0;
+    for (int c = 'A'; c <= 'Z'; c++) total += glyph_advance(cell, (uint32_t)c);
+    for (int c = 'a'; c <= 'z'; c++) total += glyph_advance(cell, (uint32_t)c);
+    int avg = total / 52;
+    return avg < 1 ? 1 : avg;
 }
 int w32_gdi_line_height(uint64_t hdc) {
     gdc *d = dc_of(hdc);
@@ -548,12 +649,12 @@ static void g_GetDeviceCaps(w32 *w) {
     switch ((int)ARG(1)) {
     case 8:   RET(sw); return;              /* HORZRES */
     case 10:  RET(sh); return;              /* VERTRES */
-    case 4:   RET(sw * 254 / 960); return;  /* HORZSIZE, mm at 96 DPI */
-    case 6:   RET(sh * 254 / 960); return;  /* VERTSIZE */
+    case 4:   RET(sw * 254 / (g_dpi * 10)); return;   /* HORZSIZE, in mm */
+    case 6:   RET(sh * 254 / (g_dpi * 10)); return;   /* VERTSIZE */
     case 12:  RET(32); return;              /* BITSPIXEL */
     case 14:  RET(1);  return;              /* PLANES */
-    case 88:  RET(96); return;              /* LOGPIXELSX */
-    case 90:  RET(96); return;              /* LOGPIXELSY */
+    case 88:  RET((uint64_t)(uint32_t)g_dpi); return;   /* LOGPIXELSX */
+    case 90:  RET((uint64_t)(uint32_t)g_dpi); return;   /* LOGPIXELSY */
     case 104: RET(1);  return;              /* NUMCOLORS: direct colour */
     case 24:  RET(0);  return;              /* NUMBRUSHES */
     case 38:  RET(0);  return;              /* RASTERCAPS */
@@ -593,7 +694,7 @@ static void g_GetTextAlign(w32 *w) { gdc *d = dc_of(ARG(0)); RET(d ? (uint64_t)d
 static void text_out(gdc *d, int x, int y, const char *s, int len) {
     int cell, ascent, bold;
     font_metrics(obj_of(d->font), &cell, &ascent, &bold);
-    int width = char_advance(cell) * len;
+    int width = run_width(cell, s, len);
     if ((d->align & 6) == TA_CENTER) x -= width / 2;
     else if ((d->align & 6) == TA_RIGHT) x -= width;
     if (d->align & TA_BASELINE) y -= ascent;
@@ -661,14 +762,22 @@ static void g_ExtTextOutW(w32 *w) {
     RET(1);
 }
 
-static void extent(w32 *w, int len, uint64_t hdc, uint64_t out) {
+static void extent(w32 *w, const char *s, int len, uint64_t hdc, uint64_t out) {
     int cx = 0, cy = 0;
-    w32_gdi_text_extent(hdc, len, &cx, &cy);
+    w32_gdi_text_extent(hdc, s, len, &cx, &cy);
     if (out) { w32_write(w, out, 4, (uint64_t)(uint32_t)cx); w32_write(w, out + 4, 4, (uint64_t)(uint32_t)cy); }
     RET(1);
 }
-static void g_GetTextExtentPoint32A(w32 *w) { extent(w, (int)(int32_t)(uint32_t)ARG(2), ARG(0), ARG(3)); }
-static void g_GetTextExtentPoint32W(w32 *w) { extent(w, (int)(int32_t)(uint32_t)ARG(2), ARG(0), ARG(3)); }
+static void g_GetTextExtentPoint32A(w32 *w) {
+    const char *s = ARG(1) ? (const char *)W32P(w, ARG(1)) : "";
+    int len = (int)(int32_t)(uint32_t)ARG(2);
+    extent(w, s ? s : "", len, ARG(0), ARG(3));
+}
+static void g_GetTextExtentPoint32W(w32 *w) {
+    char buf[1024];
+    w32_wtoa_n(w, ARG(1), (int)(int32_t)(uint32_t)ARG(2), buf, sizeof buf);
+    extent(w, buf, (int)strlen(buf), ARG(0), ARG(3));
+}
 static void g_GetTextExtentPointA(w32 *w)   { g_GetTextExtentPoint32A(w); }
 static void g_GetTextExtentPointW(w32 *w)   { g_GetTextExtentPoint32W(w); }
 
@@ -680,8 +789,9 @@ static void g_GetTextMetricsA(w32 *w) {
     if (!d || !p) { RET(0); return; }
     int cell, ascent, bold;
     font_metrics(obj_of(d->font), &cell, &ascent, &bold);
-    int adv = char_advance(cell);
-    int32_t v[8] = { cell, ascent, cell - ascent, 0, 0, adv, adv, bold ? 700 : 400 };
+    int avg = w32_gdi_average_width(ARG(0));
+    int wide = glyph_advance(cell, 'W');
+    int32_t v[8] = { cell, ascent, cell - ascent, 0, 0, avg, wide, bold ? 700 : 400 };
     for (int i = 0; i < 8; i++) w32_write(w, p + (unsigned)i * 4, 4, (uint64_t)(uint32_t)v[i]);
     RET(1);
 }
@@ -922,6 +1032,26 @@ static void g_CreateRectRgn(w32 *w) {
     RET(o ? handle_of(o) : 0);
 }
 static void g_CreateRectRgnIndirect(w32 *w) { g_CreateRectRgn(w); }
+/* Regions. Nothing here clips to a shape, so a region is a rectangle and
+ * combining two of them is the bounding box -- which is what a caller
+ * clipping a window to a rounded rectangle gets: the whole window. Visibly
+ * square corners rather than a missing window. */
+static void g_CombineRgn(w32 *w) { (void)w; RET(2); }        /* SIMPLEREGION */
+static void g_GetRgnBox(w32 *w) {
+    uint64_t r = ARG(1);
+    if (!r) { RET(0); return; }
+    int sw = 0, sh = 0;
+    (void)w32_desktop_bits(&sw, &sh);
+    w32_write(w, r,      4, 0);
+    w32_write(w, r + 4,  4, 0);
+    w32_write(w, r + 8,  4, (uint64_t)(uint32_t)sw);
+    w32_write(w, r + 12, 4, (uint64_t)(uint32_t)sh);
+    RET(2);
+}
+static void g_OffsetRgn(w32 *w) { (void)w; RET(2); }
+static void g_SetRectRgn(w32 *w) { (void)w; RET(1); }
+static void g_PtInRegion(w32 *w) { (void)w; RET(1); }
+
 static void g_GetClipBox(w32 *w) {
     gdc *d = dc_of(ARG(0));
     if (!d || !ARG(1)) { RET(0); return; }
@@ -1002,6 +1132,7 @@ const w32_api w32_gdi32[] = {
     F(SaveDC, 1), F(RestoreDC, 2),
     F(IntersectClipRect, 5), F(SelectClipRgn, 2), F(ExcludeClipRect, 5),
     F(CreateRectRgn, 4), F(CreateRectRgnIndirect, 1), F(GetClipBox, 2),
+    F(CombineRgn, 4), F(GetRgnBox, 2), F(OffsetRgn, 3), F(SetRectRgn, 5), F(PtInRegion, 3),
     F(SetMapMode, 2), F(GetMapMode, 1), F(SetViewportOrgEx, 4),
     F(GetDCBrushColor, 1), F(SetDCBrushColor, 2), F(SetDCPenColor, 2),
     F(GdiFlush, 0), F(GdiSetBatchLimit, 1),

@@ -573,6 +573,43 @@ static void a_CheckTokenMembership(w32 *w) {
     RET(1);
 }
 
+/* ---- the random number generator a game seeds itself from ----------------
+ *
+ * CryptGenRandom is where a game gets its entropy, and it asks for it before
+ * it does anything else. The bytes come from the host's own random source,
+ * which is the whole point -- a fixed seed would make every playthrough
+ * identical in ways nobody asked for.
+ *
+ * The deprecated CryptoAPI is the interface; what is behind it here is
+ * getrandom(2) or /dev/urandom, not a CSP. A program cannot tell, because
+ * the only thing it does with the result is use it. */
+enum { CRYPT_CONTEXT = 0x0C500001u };
+
+static void a_CryptAcquireContextA(w32 *w) {
+    if (ARG(0)) w32_write(w, ARG(0), (int)w32_ptrsize(w), CRYPT_CONTEXT);
+    RET(1);
+}
+static void a_CryptAcquireContextW(w32 *w) { a_CryptAcquireContextA(w); }
+static void a_CryptReleaseContext(w32 *w) { (void)w; RET(1); }
+static void a_CryptGenRandom(w32 *w) {
+    uint64_t n = ARG(1), buf = ARG(2);
+    if (!buf || !n || n > (1u << 20)) { RET(0); return; }
+    unsigned char *p = W32P(w, buf);
+    if (!p) { RET(0); return; }
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (f) {
+        size_t got = fread(p, 1, (size_t)n, f);
+        fclose(f);
+        if (got == n) { RET(1); return; }
+    }
+    /* No entropy source is a reason to fail, not a reason to hand back a
+     * predictable sequence and let a program believe it is random. */
+    w32_note_refused(w, "advapi32!CryptGenRandom (no entropy source)");
+    RET(0);
+}
+static void a_CryptCreateHash(w32 *w)  { if (ARG(4)) w32_write(w, ARG(4), (int)w32_ptrsize(w), 0); RET(0); }
+static void a_CryptDestroyHash(w32 *w) { (void)w; RET(1); }
+
 static void a_GetUserNameA(w32 *w) {
     const char *u = "xcore";
     uint32_t room = ARG(1) ? (uint32_t)w32_read(w, ARG(1), 4) : 0;
@@ -605,5 +642,9 @@ const w32_api w32_advapi32[] = {
     F(InitializeSecurityDescriptor, 2), F(SetSecurityDescriptorDacl, 4),
     F(IsValidSecurityDescriptor, 1), F(InitializeAcl, 3),
     F(AllocateAndInitializeSid, 9), F(FreeSid, 1), F(EqualSid, 2),
+    /* where a game gets its entropy */
+    F(CryptAcquireContextA, 5), F(CryptAcquireContextW, 5),
+    F(CryptReleaseContext, 2), F(CryptGenRandom, 3),
+    F(CryptCreateHash, 5), F(CryptDestroyHash, 1),
     { 0, 0, 0, 0, 0 },
 };

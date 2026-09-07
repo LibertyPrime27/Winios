@@ -158,6 +158,30 @@ static void o_StringFromGUID2(w32 *w) {
     RET(39);
 }
 
+/* A PROPVARIANT is a tagged union; clearing one is releasing whatever the
+ * tag says it holds and setting the tag to VT_EMPTY. Nothing here ever puts
+ * anything in one, so clearing is setting the tag -- and a caller that
+ * clears a variant it was never given a value for is doing the right thing
+ * either way. */
+static void o_PropVariantClear(w32 *w) {
+    if (ARG(0)) { w32_write(w, ARG(0), 2, 0); w32_write(w, ARG(0) + 2, 2, 0); }
+    RET(S_OK_);
+}
+static void o_PropVariantInit(w32 *w) {
+    if (ARG(0)) memset(W32P(w, ARG(0)), 0, 24);
+    RET(0);
+}
+static void o_VariantClear(w32 *w) { o_PropVariantClear(w); }
+/* A free-threaded marshaller lets an object be used from any apartment.
+ * There is one apartment and no marshalling, so there is nothing to make --
+ * and a caller told so uses the object directly, which is correct here. */
+static void o_CoCreateFreeThreadedMarshaler(w32 *w) {
+    if (ARG(1)) w32_write(w, ARG(1), (int)w32_ptrsize(w), 0);
+    RET((uint64_t)(uint32_t)E_NOINTERFACE_);
+}
+static void o_CoInitializeSecurity(w32 *w) { (void)w; RET(S_OK_); }
+static void o_CoTaskMemSize(w32 *w) { (void)w; RET(0); }
+
 #define F(n, a) { #n, a, 0, o_##n, 0 }
 const w32_api w32_ole32[] = {
     F(CoTaskMemAlloc, 1), F(CoTaskMemFree, 1), F(CoTaskMemRealloc, 2),
@@ -166,6 +190,8 @@ const w32_api w32_ole32[] = {
     F(CoCreateGuid, 1), F(CoGetMalloc, 2),
     F(OleInitialize, 1), F(OleUninitialize, 0),
     F(IIDFromString, 2), F(CLSIDFromString, 2), F(StringFromGUID2, 3),
+    F(PropVariantClear, 1), F(PropVariantInit, 1), F(VariantClear, 1),
+    F(CoCreateFreeThreadedMarshaler, 2), F(CoInitializeSecurity, 9), F(CoTaskMemSize, 1),
     { 0, 0, 0, 0, 0 },
 };
 #undef F

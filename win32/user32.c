@@ -192,7 +192,13 @@ enum { HPROC_BASE = 0x00030000u, HPROC_STEP = 4 };
  * area is not cosmetic: a dialog template positions every control from the
  * client origin, and a caption drawn over the client area puts the first row
  * of controls underneath it. */
-enum { CAPTION_H = 22 };
+/* Deep enough for the caption text plus a little air, at whatever DPI we
+ * are claiming -- a fixed pixel height clips the title the moment the
+ * display is dense enough to be worth scaling for. */
+static int caption_height(void) {
+    int h = w32_points_to_pixels(9) + 8;
+    return h < 18 ? 18 : h;
+}
 
 typedef struct {
     int      used;
@@ -221,6 +227,7 @@ typedef struct {
     ctlkind  ctl;               /* non-zero: we draw it, we handle its clicks */
     uint64_t id;                /* child identifier -- the menu argument */
     int      enabled;
+    int      focused;           /* has the keyboard: drawn with a focus rectangle */
     int      checked, pressed;  /* a button's two visible states */
     int      pos, lo, hi, step; /* a progress bar's range */
     int      list;              /* index into the list-box store, -1 for none */
@@ -509,6 +516,8 @@ static uint64_t hproc_addr(ctlkind k);
 static int is_hproc(uint64_t a);
 static void invalidate(uint64_t hwnd);
 static uint64_t send_to(w32 *w, uint64_t hwnd, uint32_t msg, uint64_t wp, uint64_t lp, int wide);
+static void move_window(w32 *w, uint64_t hwnd, int nx, int ny, int ncw, int nch, int repaint);
+static void repaint_area(w32 *w, int x, int y, int cx, int cy);
 static uint64_t deliver(w32 *w, uint64_t hwnd, uint32_t msg, uint64_t wp, uint64_t lp, int wide);
 static uint64_t call_proc(w32 *w, uint64_t proc, uint64_t hwnd, uint32_t msg, uint64_t wp, uint64_t lp, int wide);
 static uint64_t ctl_proc(w32 *w, uint64_t hwnd, uint32_t msg, uint64_t wp, uint64_t lp, int wide);
@@ -573,8 +582,8 @@ uint64_t w32_new_window(w32 *w, const char *cls, const char *text,
      * be this layer inventing chrome nobody asked for and then charging the
      * program for it. */
     if (p->ctl && !(style & WS_CHILD) && (style & WS_CAPTION) == WS_CAPTION) {
-        p->cyo = CAPTION_H;
-        p->ch = ah - CAPTION_H > 1 ? ah - CAPTION_H : 1;
+        p->cyo = caption_height();
+        p->ch = ah - p->cyo > 1 ? ah - p->cyo : 1;
     }
     if (p->ctl == CTL_LISTBOX || p->ctl == CTL_COMBOBOX) {
         for (int i = 0; i < MAX_LISTS; i++) if (!g_list[i].used) {
@@ -635,23 +644,8 @@ void w32_destroy_window(w32 *w, uint64_t hwnd) {
     if (g_focus == hwnd) g_focus = 0;
     pthread_mutex_unlock(&g_lock);
     /* The surface keeps whatever was last drawn on it, so a window that goes
-     * away leaves its pixels behind unless they are painted over. */
-    if (had) {
-        uint64_t dc = w32_dc_for_window(w, 0, 1);
-        if (dc) {
-            w32_gdi_fill_rect(dc, ex, ey, ex + ew, ey + eh, sys_color(COLOR_BACKGROUND));
-            w32_dc_release(dc);
-        }
-    }
-    /* What was underneath has to be drawn again, and the only thing that
-     * knows what that is now is the windows that are left. */
-    for (int i = 0; i < MAX_WINDOWS; i++) {
-        pthread_mutex_lock(&g_lock);
-        uint64_t h = (g_win[i].used && !g_win[i].parent) ? HW_BASE + (uint64_t)i * HW_STEP : 0;
-        pthread_mutex_unlock(&g_lock);
-        if (h) invalidate(h);
-    }
-    w32_desktop_damaged();
+     * away leaves its pixels behind unless what was under it is drawn again. */
+    if (had) repaint_area(w, ex, ey, ew, eh);
 }
 
 void w32_set_window_text(w32 *w, uint64_t hwnd, const char *s) {
@@ -706,11 +700,12 @@ static void u_ShowWindow(w32 *w) {
     pthread_mutex_lock(&g_lock);
     wwin *p = win_of(ARG(0));
     int was = p ? p->visible : 0;
+    int x = p ? p->x : 0, y = p ? p->y : 0, cw = p ? p->w : 0, ch = p ? p->h : 0;
     if (p) p->visible = ARG(1) != SW_HIDE;
     int now = p ? p->visible : 0;
     pthread_mutex_unlock(&g_lock);
     if (now) invalidate(ARG(0));
-    else w32_desktop_damaged();
+    else if (was) repaint_area(w, x, y, cw, ch);   /* it was covering something */
     RET((uint64_t)(uint32_t)was);
 }
 
@@ -777,31 +772,82 @@ static void u_ScreenToClient(w32 *w) {
     RET(1);
 }
 
-static void u_MoveWindow(w32 *w) {
+/* Moving a window uncovers where it used to be. NSIS moves its inner page
+ * dialog rather than recreating it on some pages, so this is the same bug in
+ * a different disguise. */
+static void move_window(w32 *w, uint64_t hwnd, int nx, int ny, int ncw, int nch, int repaint) {
     pthread_mutex_lock(&g_lock);
-    wwin *p = win_of(ARG(0));
-    if (p) { p->x = (int32_t)(uint32_t)ARG(1); p->y = (int32_t)(uint32_t)ARG(2);
-             p->w = (int32_t)(uint32_t)ARG(3); p->h = (int32_t)(uint32_t)ARG(4);
-             p->cw = p->w; p->ch = p->h;
-             push(hwnd_of(p), WM_SIZE, 0, xy_lp(p->cw, p->ch), 0, 0); }
+    wwin *p = win_of(hwnd);
+    if (!p) { pthread_mutex_unlock(&g_lock); return; }
+    int ox = p->x, oy = p->y, ow = p->w, oh = p->h;
+    int was_visible = p->visible;
+    if (p->parent) {
+        wwin *pp = win_of(p->parent);
+        if (pp) { nx += pp->x + pp->cxo; ny += pp->y + pp->cyo; }
+    }
+    p->x = nx; p->y = ny;
+    if (ncw > 0 && nch > 0) {
+        p->w = ncw; p->h = nch;
+        p->cw = ncw; p->ch = nch - p->cyo > 1 ? nch - p->cyo : 1;
+    }
+    int moved = (ox != nx || oy != ny || ow != p->w || oh != p->h);
+    pthread_mutex_unlock(&g_lock);
+    if (!moved) { if (repaint) invalidate(hwnd); return; }
+    if (was_visible) repaint_area(w, ox, oy, ow, oh);
+    if (repaint) invalidate(hwnd);
+}
+
+static void u_MoveWindow(w32 *w) {
+    uint64_t h = ARG(0);
+    if (!h) { RET(0); return; }
+    move_window(w, h, (int)(int32_t)(uint32_t)ARG(1), (int)(int32_t)(uint32_t)ARG(2),
+                (int)(int32_t)(uint32_t)ARG(3), (int)(int32_t)(uint32_t)ARG(4),
+                ARG(5) != 0);
+    pthread_mutex_lock(&g_lock);
+    wwin *p = win_of(h);
+    if (p) push(h, WM_SIZE, 0, xy_lp(p->cw, p->ch), 0, 0);
     pthread_mutex_unlock(&g_lock);
     RET(p ? 1 : 0);
 }
 /* SetWindowPos(hwnd, after, x, y, cx, cy, flags): SWP_NOSIZE/NOMOVE are 1/2 */
 static void u_SetWindowPos(w32 *w) {
     uint32_t f = (uint32_t)ARG(6);
+    uint64_t h = ARG(0);
     pthread_mutex_lock(&g_lock);
-    wwin *p = win_of(ARG(0));
+    wwin *p = win_of(h);
+    int nx = p ? p->x : 0, ny = p ? p->y : 0, ncw = 0, nch = 0;
     if (p) {
-        if (!(f & 2)) { p->x = (int32_t)(uint32_t)ARG(2); p->y = (int32_t)(uint32_t)ARG(3); }
+        /* MoveWindow takes parent-relative coordinates and so does this, so
+         * the current screen position has to be turned back into one or the
+         * window walks across the screen by its parent's origin each time. */
+        int px = 0, py = 0;
+        if (p->parent) { wwin *pp = win_of(p->parent); if (pp) { px = pp->x + pp->cxo; py = pp->y + pp->cyo; } }
+        nx -= px; ny -= py;
+        if (!(f & 2)) { nx = (int)(int32_t)(uint32_t)ARG(2); ny = (int)(int32_t)(uint32_t)ARG(3); }
         if (!(f & 1)) {
-            int32_t cx = (int32_t)(uint32_t)ARG(4), cy = (int32_t)(uint32_t)ARG(5);
-            if (cx > 0 && cy > 0) { p->w = cx; p->h = cy; p->cw = cx; p->ch = cy;
-                                    push(hwnd_of(p), WM_SIZE, 0, xy_lp(cx, cy), 0, 0); }
+            int cx = (int)(int32_t)(uint32_t)ARG(4), cy = (int)(int32_t)(uint32_t)ARG(5);
+            if (cx > 0 && cy > 0) { ncw = cx; nch = cy; }
         }
     }
     pthread_mutex_unlock(&g_lock);
-    RET(p ? 1 : 0);
+    if (!p) { RET(0); return; }
+    move_window(w, h, nx, ny, ncw, nch, 1);
+    if (ncw) {
+        pthread_mutex_lock(&g_lock);
+        wwin *q = win_of(h);
+        if (q) push(h, WM_SIZE, 0, xy_lp(q->cw, q->ch), 0, 0);
+        pthread_mutex_unlock(&g_lock);
+    }
+    /* SWP_SHOWWINDOW / SWP_HIDEWINDOW: 0x40 / 0x80. A wizard shows and hides
+     * its pages through here as often as through ShowWindow. */
+    if (f & 0x40) { pthread_mutex_lock(&g_lock); { wwin *q = win_of(h); if (q) q->visible = 1; } pthread_mutex_unlock(&g_lock); invalidate(h); }
+    if (f & 0x80) {
+        int ex = 0, ey = 0, ew = 0, eh = 0;
+        int had = w32_window_area(h, 1, &ex, &ey, &ew, &eh);
+        pthread_mutex_lock(&g_lock); { wwin *q = win_of(h); if (q) q->visible = 0; } pthread_mutex_unlock(&g_lock);
+        if (had) repaint_area(w, ex, ey, ew, eh);
+    }
+    RET(1);
 }
 static void u_SetWindowTextA(w32 *w) {
     w32_set_window_text(w, ARG(0), ARG(1) ? w32_str(w, ARG(1)) : "");
@@ -1084,7 +1130,7 @@ static void u_DefWindowProcA(w32 *w) {
         wwin *p = win_of(hwnd);
         wwin snap;
         int have = p && p->ctl;
-        if (have) snap = *p;
+        if (have) { snap = *p; snap.focused = (g_focus == hwnd); }
         pthread_mutex_unlock(&g_lock);
         if (have) paint_control(w, hwnd, &snap);
         RET(0); return;
@@ -1291,7 +1337,7 @@ static void u_EnumDisplayDevicesA(w32 *w) { (void)w; RET(0); }
 static void u_ChangeDisplaySettingsA(w32 *w) { (void)w; RET(0); }
 static void u_ChangeDisplaySettingsExA(w32 *w) { (void)w; RET(0); }
 static void u_MonitorFromWindow(w32 *w) { (void)w; RET(0x9101); }
-static void u_MonitorFromPoint(w32 *w) { (void)w; RET(0x9101); }
+static void u_MonitorFromPoint(w32 *w) { (void)w; RET(0x9101); }   /* POINT by value; the answer does not depend on it */
 static void u_GetMonitorInfoA(w32 *w) {
     uint64_t p = ARG(1);
     if (!p) { RET(0); return; }
@@ -1370,6 +1416,21 @@ const uint32_t *w32_desktop_peek(int *cx, int *cy) { return w32_desktop_bits(cx,
 /* Where a window's client area sits on the screen. `whole` asks for the
  * window rectangle instead, which is the same thing here -- there are no
  * decorations to subtract. */
+/* The client area of this window's parent, if it has one. What a child is
+ * allowed to draw inside. */
+int w32_window_parent_area(uint64_t hwnd, int *x, int *y, int *cx, int *cy) {
+    pthread_mutex_lock(&g_lock);
+    wwin *p = win_of(hwnd);
+    wwin *pp = p ? win_of(p->parent) : 0;
+    int ok = pp != 0;
+    if (ok) {
+        *x = pp->x + pp->cxo; *y = pp->y + pp->cyo;
+        *cx = pp->cw; *cy = pp->ch;
+    }
+    pthread_mutex_unlock(&g_lock);
+    return ok;
+}
+
 int w32_window_area(uint64_t hwnd, int whole, int *x, int *y, int *cx, int *cy) {
     pthread_mutex_lock(&g_lock);
     wwin *p = win_of(hwnd);
@@ -1470,15 +1531,27 @@ enum { DT_LEFT = 0, DT_CENTER = 1, DT_RIGHT = 2, DT_VCENTER = 4, DT_BOTTOM = 8,
        DT_WORDBREAK = 0x10, DT_SINGLELINE = 0x20, DT_NOCLIP = 0x100,
        DT_CALCRECT = 0x400, DT_NOPREFIX = 0x800, DT_END_ELLIPSIS = 0x8000 };
 
+/* How many characters of `s` fit in `avail` pixels. Measured, not divided:
+ * the font is proportional, so "how many characters fit" has no answer that
+ * does not involve looking at which characters they are. */
+static int chars_that_fit(uint64_t hdc, const char *s, int len, int avail) {
+    int lo = 0, hi = len;
+    /* The widths are monotonic in the prefix length, so a binary search is
+     * exact and costs six measurements instead of one per character. */
+    while (lo < hi) {
+        int mid = (lo + hi + 1) / 2;
+        int w = 0, dummy = 0;
+        w32_gdi_text_extent(hdc, s, mid, &w, &dummy);
+        if (w <= avail) lo = mid; else hi = mid - 1;
+    }
+    return lo;
+}
+
 static int draw_text_rect(uint64_t hdc, const char *s, int len,
                           int l, int t, int r, int b, uint32_t fmt) {
     int lh = w32_gdi_line_height(hdc);
-    int cw = 0, dummy = 0;
-    w32_gdi_text_extent(hdc, 1, &cw, &dummy);
-    if (cw < 1) cw = 1;
     int width = r - l;
-    int per = width / cw;
-    if (per < 1) per = 1;
+    if (width < 1) width = 1;
     /* Measure first, so DT_VCENTER and DT_CALCRECT know the height before
      * anything is drawn. Two passes over a label is nothing, and getting the
      * height from a single pass means drawing in the wrong place first. */
@@ -1487,12 +1560,20 @@ static int draw_text_rect(uint64_t hdc, const char *s, int len,
     while (i < len && lines < 64) {
         int take_n = len - i, hard = 0;
         for (int k = 0; k < take_n; k++) if (s[i + k] == '\n') { take_n = k; hard = 1; break; }
-        if (!(fmt & DT_SINGLELINE) && (fmt & DT_WORDBREAK) && take_n > per) {
-            int cut = per;
-            while (cut > 0 && s[i + cut] != ' ') cut--;
-            take_n = cut > 0 ? cut : per;
-        } else if (take_n > per && !(fmt & DT_SINGLELINE) && !(fmt & DT_NOCLIP)) {
-            take_n = per;
+        if (!(fmt & DT_SINGLELINE)) {
+            int fits = chars_that_fit(hdc, s + i, take_n, width);
+            if (fits < take_n) {
+                if (fmt & DT_WORDBREAK) {
+                    /* Break on the last space that fits, so a word is not cut
+                     * in half. A single word longer than the line has no such
+                     * space, and is broken where it runs out. */
+                    int cut = fits;
+                    while (cut > 0 && s[i + cut] != ' ') cut--;
+                    take_n = cut > 0 ? cut : (fits > 0 ? fits : 1);
+                } else if (!(fmt & DT_NOCLIP)) {
+                    take_n = fits > 0 ? fits : 1;
+                }
+            }
         }
         starts[lines] = i; lens[lines] = take_n;
         lines++;
@@ -1509,7 +1590,8 @@ static int draw_text_rect(uint64_t hdc, const char *s, int len,
     else if (fmt & DT_BOTTOM) y = b - total;
     if (y < t && !(fmt & DT_NOCLIP)) y = t;
     for (int k = 0; k < lines; k++) {
-        int wpx = lens[k] * cw;
+        int wpx = 0, dummy = 0;
+        w32_gdi_text_extent(hdc, s + starts[k], lens[k], &wpx, &dummy);
         int x = l;
         if (fmt & DT_CENTER) x = l + (width - wpx) / 2;
         else if (fmt & DT_RIGHT) x = r - wpx;
@@ -1559,7 +1641,8 @@ static void paint_control(w32 *w, uint64_t hwnd, wwin *snap) {
                 w32_gdi_fill_rect(wdc, 0, 0, snap->w, snap->cyo, sys_color(COLOR_ACTIVECAPTION));
                 w32_gdi_set_bk_mode(wdc, 1);
                 w32_gdi_set_text_color(wdc, sys_color(COLOR_CAPTIONTEXT));
-                w32_gdi_text_at(wdc, 6, 4, snap->text, (int)strlen(snap->text));
+                int th = w32_gdi_line_height(wdc);
+                w32_gdi_text_at(wdc, 8, (snap->cyo - th) / 2, snap->text, (int)strlen(snap->text));
                 w32_gdi_frame_rect(wdc, 0, 0, snap->w, snap->h, sys_color(COLOR_3DDKSHADOW));
                 w32_dc_release(wdc);
             }
@@ -1591,7 +1674,7 @@ static void paint_control(w32 *w, uint64_t hwnd, wwin *snap) {
             w32_gdi_frame_rect(hdc, 0, top, cw, ch, sys_color(COLOR_BTNSHADOW));
             if (ln) {
                 int tw = 0, th = 0;
-                w32_gdi_text_extent(hdc, ln, &tw, &th);
+                w32_gdi_text_extent(hdc, label, ln, &tw, &th);
                 w32_gdi_fill_rect(hdc, 6, top - 1, 6 + tw + 6, top + 1, sys_color(COLOR_BTNFACE));
                 w32_gdi_text_at(hdc, 9, 0, label, ln);
             }
@@ -1600,7 +1683,11 @@ static void paint_control(w32 *w, uint64_t hwnd, wwin *snap) {
         if (kind == BS_CHECKBOX || kind == BS_AUTOCHECKBOX ||
             kind == BS_3STATE || kind == BS_AUTO3STATE ||
             kind == BS_RADIOBUTTON || kind == BS_AUTORADIOBUTTON) {
-            int box = ch < 16 ? ch : 13;
+            /* Sized from the text beside it. A 13-pixel box next to
+             * 24-pixel text looks like a mistake, because it is one. */
+            int box = w32_gdi_line_height(hdc);
+            if (box > ch) box = ch;
+            if (box < 8) box = 8;
             int by = (ch - box) / 2;
             w32_gdi_fill_rect(hdc, 0, by, box, by + box, 0xFFFFFF);
             bevel(hdc, 0, by, box, by + box, 1);
@@ -1609,16 +1696,20 @@ static void paint_control(w32 *w, uint64_t hwnd, wwin *snap) {
                  * are different controls and have to look different, because
                  * that is how a user knows one choice from many. */
                 uint32_t mark = sys_color(COLOR_BTNTEXT);
+                int in = box / 4 < 2 ? 2 : box / 4;
                 if (kind == BS_RADIOBUTTON || kind == BS_AUTORADIOBUTTON)
-                    w32_gdi_fill_rect(hdc, 4, by + 4, box - 4, by + box - 4, mark);
+                    w32_gdi_fill_rect(hdc, in, by + in, box - in, by + box - in, mark);
                 else {
-                    w32_gdi_line(hdc, 3, by + box / 2, box / 2 - 1, by + box - 4, mark);
-                    w32_gdi_line(hdc, box / 2 - 1, by + box - 4, box - 3, by + 3, mark);
-                    w32_gdi_line(hdc, 3, by + box / 2 + 1, box / 2 - 1, by + box - 3, mark);
-                    w32_gdi_line(hdc, box / 2 - 1, by + box - 3, box - 3, by + 4, mark);
+                    /* A tick, thickened with the box so it does not vanish at
+                     * one pixel on a dense display. */
+                    int t = box / 8 + 1;
+                    for (int k = 0; k < t; k++) {
+                        w32_gdi_line(hdc, in, by + box / 2 + k, box / 2 - 1, by + box - in + k - 1, mark);
+                        w32_gdi_line(hdc, box / 2 - 1, by + box - in + k - 1, box - in, by + in + k, mark);
+                    }
                 }
             }
-            draw_text_rect(hdc, label, ln, box + 5, 0, cw, ch, DT_LEFT | DT_VCENTER | DT_WORDBREAK);
+            draw_text_rect(hdc, label, ln, box + box / 3 + 2, 0, cw, ch, DT_LEFT | DT_VCENTER | DT_WORDBREAK);
             break;
         }
         /* A push button. */
@@ -1703,6 +1794,19 @@ static void paint_control(w32 *w, uint64_t hwnd, wwin *snap) {
     }
     if ((snap->style & WS_BORDER) && snap->ctl != CTL_EDIT && snap->ctl != CTL_LISTBOX)
         w32_gdi_frame_rect(hdc, 0, 0, cw, ch, sys_color(COLOR_WINDOWFRAME));
+    /* Where the keyboard is. Without this, Tab moves something invisible and
+     * Enter presses a button the person cannot see they have selected. */
+    if (snap->focused && snap->ctl != CTL_DIALOG && snap->ctl != CTL_STATIC) {
+        int in = snap->ctl == CTL_BUTTON ? 3 : 1;
+        for (int x = in; x < cw - in; x += 2) {
+            w32_gdi_fill_rect(hdc, x, in, x + 1, in + 1, sys_color(COLOR_BTNTEXT));
+            w32_gdi_fill_rect(hdc, x, ch - in - 1, x + 1, ch - in, sys_color(COLOR_BTNTEXT));
+        }
+        for (int y = in; y < ch - in; y += 2) {
+            w32_gdi_fill_rect(hdc, in, y, in + 1, y + 1, sys_color(COLOR_BTNTEXT));
+            w32_gdi_fill_rect(hdc, cw - in - 1, y, cw - in, y + 1, sys_color(COLOR_BTNTEXT));
+        }
+    }
     w32_dc_release(hdc);
     w32_desktop_damaged();
 }
@@ -1725,6 +1829,7 @@ static uint64_t ctl_proc(w32 *w, uint64_t hwnd, uint32_t msg, uint64_t wp, uint6
     wwin *p = win_of(hwnd);
     if (!p) { pthread_mutex_unlock(&g_lock); return 0; }
     wwin snap = *p;
+    snap.focused = (g_focus == hwnd);
     pthread_mutex_unlock(&g_lock);
 
     switch (msg) {
@@ -2064,6 +2169,37 @@ static void post_command(uint64_t parent, uint64_t id, int code, uint64_t child)
 
 /* Ask for a repaint. A window and then its children, because a control sits
  * on its parent's background and repainting the parent alone would erase it. */
+/* Give an area of the screen back to whoever is under it.
+ *
+ * There is one surface and no per-window backing store, so a window that
+ * hides, moves or is destroyed leaves its pixels exactly where they were.
+ * On a game that never happens -- one window, never moved. On an installer
+ * it happens on every page: an NSIS wizard is an outer dialog with an inner
+ * child dialog per page, and it destroys one and creates the next in the
+ * same place. Without this the previous page stays on screen underneath the
+ * new one, which is precisely what "glitchy" looks like.
+ *
+ * Painter's order, so the answer is: paint the desktop there, then every
+ * window that overlaps it, oldest first. */
+static void repaint_area(w32 *w, int x, int y, int cx, int cy) {
+    if (cx <= 0 || cy <= 0) return;
+    uint64_t dc = w32_dc_for_window(w, 0, 1);
+    if (dc) {
+        w32_gdi_fill_rect(dc, x, y, x + cx, y + cy, sys_color(COLOR_BACKGROUND));
+        w32_dc_release(dc);
+    }
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        pthread_mutex_lock(&g_lock);
+        wwin *p = &g_win[i];
+        int hit = p->used && p->visible && p->w > 0 && p->h > 0 &&
+                  p->x < x + cx && p->x + p->w > x && p->y < y + cy && p->y + p->h > y;
+        uint64_t h = hit ? HW_BASE + (uint64_t)i * HW_STEP : 0;
+        pthread_mutex_unlock(&g_lock);
+        if (h) deliver(w, h, WM_PAINT, 0, 0, 0);
+    }
+    w32_desktop_damaged();
+}
+
 static void invalidate_tree(uint64_t hwnd, int depth) {
     if (depth > 4) return;
     pthread_mutex_lock(&g_lock);
@@ -2258,6 +2394,47 @@ static void end_dialog(uint64_t hwnd, int result) {
     pthread_mutex_unlock(&g_lock);
 }
 
+/* The default push button: the one Enter presses. A template marks it with
+ * BS_DEFPUSHBUTTON, and it is the difference between a wizard you can get
+ * through with a keyboard and one you cannot. */
+static uint64_t default_button(uint64_t dlg) {
+    uint64_t first_button = 0;
+    pthread_mutex_lock(&g_lock);
+    uint64_t found = 0;
+    for (int i = 0; i < MAX_WINDOWS && !found; i++) {
+        wwin *p = &g_win[i];
+        if (!p->used || p->parent != dlg || p->ctl != CTL_BUTTON || !p->visible || !p->enabled) continue;
+        uint64_t h = HW_BASE + (uint64_t)i * HW_STEP;
+        if ((p->style & BS_TYPEMASK) == BS_DEFPUSHBUTTON) found = h;
+        else if (!first_button && (p->style & BS_TYPEMASK) == 0) first_button = h;
+    }
+    pthread_mutex_unlock(&g_lock);
+    /* No marked default: the first plain push button is what Enter does on
+     * Windows too, and on a wizard that is Next. */
+    return found ? found : first_button;
+}
+
+/* Tab order. Windows walks the controls in the order the template created
+ * them and stops at the ones with WS_TABSTOP, wrapping at the end -- which
+ * is exactly the array order here, because the template created them in
+ * that order. */
+static uint64_t next_tabstop(uint64_t dlg, uint64_t from, int back) {
+    pthread_mutex_lock(&g_lock);
+    int start = -1;
+    for (int i = 0; i < MAX_WINDOWS; i++)
+        if (g_win[i].used && HW_BASE + (uint64_t)i * HW_STEP == from) { start = i; break; }
+    uint64_t found = 0;
+    for (int step = 1; step <= MAX_WINDOWS && !found; step++) {
+        int i = start < 0 ? (back ? MAX_WINDOWS - step : step - 1)
+                          : ((start + (back ? -step : step)) % MAX_WINDOWS + MAX_WINDOWS) % MAX_WINDOWS;
+        wwin *p = &g_win[i];
+        if (p->used && p->parent == dlg && p->visible && p->enabled && (p->style & WS_TABSTOP))
+            found = HW_BASE + (uint64_t)i * HW_STEP;
+    }
+    pthread_mutex_unlock(&g_lock);
+    return found;
+}
+
 static uint64_t dlg_default_proc(w32 *w, uint64_t hwnd, uint32_t msg, uint64_t wp, uint64_t lp, int wide) {
     switch (msg) {
     case WM_COMMAND: {
@@ -2269,7 +2446,47 @@ static uint64_t dlg_default_proc(w32 *w, uint64_t hwnd, uint32_t msg, uint64_t w
         end_dialog(hwnd, IDCANCEL);
         return 1;
     case WM_KEYDOWN:
+        /* Getting through a wizard without a mouse. On a phone this is not a
+         * convenience: a Next button is a small target on a frame that has
+         * been scaled to the panel, and Enter is the reliable way to press
+         * the one the installer is waiting on. */
         if (wp == VK_ESCAPE) { end_dialog(hwnd, IDCANCEL); return 1; }
+        if (wp == VK_RETURN) {
+            pthread_mutex_lock(&g_lock);
+            uint64_t f = g_focus;
+            wwin *fp = win_of(f);
+            int focus_is_button = fp && fp->parent == hwnd && fp->ctl == CTL_BUTTON && fp->enabled;
+            pthread_mutex_unlock(&g_lock);
+            /* Enter presses the focused button if there is one, and the
+             * dialog's default button otherwise. */
+            uint64_t target = focus_is_button ? f : default_button(hwnd);
+            if (target) { send_to(w, target, BM_CLICK, 0, 0, wide); return 1; }
+            end_dialog(hwnd, IDOK);
+            return 1;
+        }
+        if (wp == VK_TAB) {
+            pthread_mutex_lock(&g_lock);
+            uint64_t from = g_focus;
+            int shift = (g_keys[VK_SHIFT] & 0x80) != 0;
+            pthread_mutex_unlock(&g_lock);
+            uint64_t nxt = next_tabstop(hwnd, from, shift);
+            if (nxt) {
+                pthread_mutex_lock(&g_lock);
+                g_focus = nxt;
+                pthread_mutex_unlock(&g_lock);
+                invalidate(hwnd);
+            }
+            return 1;
+        }
+        if (wp == VK_SPACE) {
+            pthread_mutex_lock(&g_lock);
+            uint64_t f = g_focus;
+            wwin *fp = win_of(f);
+            int is_button = fp && fp->parent == hwnd && fp->ctl == CTL_BUTTON && fp->enabled;
+            pthread_mutex_unlock(&g_lock);
+            if (is_button) { send_to(w, f, BM_CLICK, 0, 0, wide); return 1; }
+            return 0;
+        }
         return 0;
     default:
         return ctl_proc(w, hwnd, msg, wp, lp, wide);
@@ -2293,7 +2510,12 @@ static void dlg_units(w32 *w, uint64_t hwnd, int *bx, int *by) {
         uint64_t f = p ? p->font : 0;
         pthread_mutex_unlock(&g_lock);
         if (f) w32_gdi_set_font(hdc, f);
-        w32_gdi_text_extent(hdc, 1, &cx, &cy);
+        /* The horizontal unit is the *average* character width -- that is
+         * how Windows defines it, and taking any single letter's width
+         * instead scales every control in the template by the ratio between
+         * that letter and the average. */
+        cx = w32_gdi_average_width(hdc);
+        cy = w32_gdi_line_height(hdc);
         w32_dc_release(hdc);
     }
     *bx = cx < 1 ? 8 : cx;
@@ -2405,7 +2627,7 @@ static uint64_t build_dialog(w32 *w, uint64_t tmpl, uint32_t size, uint64_t pare
         if (px < 0) px = 0;
         if (py < 0) py = 0;
     }
-    int cap = ((style & WS_CAPTION) == WS_CAPTION) ? CAPTION_H : 0;
+    int cap = ((style & WS_CAPTION) == WS_CAPTION) ? caption_height() : 0;
     uint64_t dlg = w32_new_window(w, "#32770", title, (style | WS_VISIBLE) & ~(uint32_t)WS_CHILD,
                                   exstyle, px, py, pw, ph + cap, parent, 0, inst, param, 0);
     if (!dlg) return 0;
@@ -2420,8 +2642,16 @@ static uint64_t build_dialog(w32 *w, uint64_t tmpl, uint32_t size, uint64_t pare
     }
     pthread_mutex_unlock(&g_lock);
 
-    uint64_t font = pointsize > 0 ? w32_make_font(-pointsize * 96 / 72, face) : 0;
-    if (font) send_to(w, dlg, WM_SETFONT, font, 0, 1);
+    /* At the DPI we are claiming, not at 96. Converting the template's point
+     * size against a fixed 96 while the layout scales with the real DPI is
+     * what gives a dialog twice the size with the same tiny text in it. */
+    uint64_t font = pointsize > 0 ? w32_make_font(-w32_points_to_pixels(pointsize), face) : 0;
+    /* deliver, not send_to: the dialog's procedure is the guest's, it
+     * returns FALSE for a message it does not handle, and the default
+     * handling is what records the font. Without it the dialog measures its
+     * units in the system font and its controls draw in the template's --
+     * a correctly sized dialog full of wrongly sized text. */
+    if (font) deliver(w, dlg, WM_SETFONT, font, 0, 1);
 
     int bx, by;
     dlg_units(w, dlg, &bx, &by);
@@ -2542,6 +2772,13 @@ static uint64_t dialog_from_template(w32 *w, uint64_t inst, uint64_t tmpl, uint3
     if (!dlg) return 0;
     /* WM_INITDIALOG carries the parameter, and a program does most of its
      * setup there: filling a list, setting the text of a field. */
+    /* Somewhere for the keyboard to be, *before* WM_INITDIALOG. Windows sets
+     * the default focus first and a dialog procedure returning TRUE means
+     * "keep it" -- so choosing it afterwards would both override a procedure
+     * that set its own and leave the first painted frame showing no focus at
+     * all. */
+    { uint64_t first = next_tabstop(dlg, 0, 0);
+      if (first) { pthread_mutex_lock(&g_lock); g_focus = first; pthread_mutex_unlock(&g_lock); } }
     deliver(w, dlg, WM_INITDIALOG, 0, param, 1);
     invalidate(dlg);
     return dlg;
@@ -2739,6 +2976,224 @@ static void u_GetWindowTextLengthW(w32 *w) { u_GetWindowTextLengthA(w); }
 /* LoadString: a program's own message table. An installer's every caption
  * comes out of here, so a stub returning nothing would draw an empty dialog
  * that looked like a bug in the drawing. */
+/* ---- the window calls a game makes that an installer does not ----------- */
+
+static void u_BringWindowToTop(w32 *w) { RET(send_to(w, ARG(0), 0, 0, 0, 0) == 0 ? 1 : 1); }
+static void u_IntersectRect(w32 *w) {
+    uint64_t out = ARG(0), a = ARG(1), b = ARG(2);
+    if (!out || !a || !b) { RET(0); return; }
+    int32_t al = (int32_t)w32_read(w, a, 4), at = (int32_t)w32_read(w, a + 4, 4);
+    int32_t ar = (int32_t)w32_read(w, a + 8, 4), ab = (int32_t)w32_read(w, a + 12, 4);
+    int32_t bl = (int32_t)w32_read(w, b, 4), bt = (int32_t)w32_read(w, b + 4, 4);
+    int32_t br = (int32_t)w32_read(w, b + 8, 4), bb = (int32_t)w32_read(w, b + 12, 4);
+    int32_t l = al > bl ? al : bl, t = at > bt ? at : bt;
+    int32_t r = ar < br ? ar : br, bo = ab < bb ? ab : bb;
+    if (l >= r || t >= bo) { put_rect(w, out, 0, 0, 0, 0); RET(0); return; }
+    put_rect(w, out, l, t, r, bo);
+    RET(1);
+}
+static void u_UnionRect(w32 *w) {
+    uint64_t out = ARG(0), a = ARG(1), b = ARG(2);
+    if (!out || !a || !b) { RET(0); return; }
+    int32_t al = (int32_t)w32_read(w, a, 4), at = (int32_t)w32_read(w, a + 4, 4);
+    int32_t ar = (int32_t)w32_read(w, a + 8, 4), ab = (int32_t)w32_read(w, a + 12, 4);
+    int32_t bl = (int32_t)w32_read(w, b, 4), bt = (int32_t)w32_read(w, b + 4, 4);
+    int32_t br = (int32_t)w32_read(w, b + 8, 4), bb = (int32_t)w32_read(w, b + 12, 4);
+    put_rect(w, out, al < bl ? al : bl, at < bt ? at : bt,
+                     ar > br ? ar : br, ab > bb ? ab : bb);
+    RET(1);
+}
+static void u_IsRectEmpty(w32 *w) {
+    uint64_t r = ARG(0);
+    if (!r) { RET(1); return; }
+    RET((int32_t)w32_read(w, r, 4) >= (int32_t)w32_read(w, r + 8, 4) ||
+        (int32_t)w32_read(w, r + 4, 4) >= (int32_t)w32_read(w, r + 12, 4));
+}
+/* PtInRect takes a POINT *by value*, and where that value lives is not the
+ * same in the two bitnesses: x64 packs an eight-byte structure into a single
+ * register, so both coordinates arrive as one argument, while x86 pushes
+ * them as two words. Reading it as two arguments on x64 gives the x
+ * coordinate and then whatever was in the next register -- which is how a
+ * hit test passes on one build and fails on the other. */
+static void point_arg(w32 *w, int first, int32_t *x, int32_t *y) {
+    if (w->is32) {
+        *x = (int32_t)(uint32_t)w32_arg(w, first);
+        *y = (int32_t)(uint32_t)w32_arg(w, first + 1);
+    } else {
+        uint64_t pt = w32_arg(w, first);
+        *x = (int32_t)(uint32_t)pt;
+        *y = (int32_t)(uint32_t)(pt >> 32);
+    }
+}
+static void u_PtInRect(w32 *w) {
+    uint64_t r = ARG(0);
+    if (!r) { RET(0); return; }
+    int32_t x, y;
+    point_arg(w, 1, &x, &y);
+    RET(x >= (int32_t)w32_read(w, r, 4) && x < (int32_t)w32_read(w, r + 8, 4) &&
+        y >= (int32_t)w32_read(w, r + 4, 4) && y < (int32_t)w32_read(w, r + 12, 4));
+}
+static void u_SetRect(w32 *w) {
+    put_rect(w, ARG(0), (int)(int32_t)(uint32_t)ARG(1), (int)(int32_t)(uint32_t)ARG(2),
+                        (int)(int32_t)(uint32_t)ARG(3), (int)(int32_t)(uint32_t)ARG(4));
+    RET(1);
+}
+static void u_OffsetRect(w32 *w) {
+    uint64_t r = ARG(0);
+    if (!r) { RET(0); return; }
+    int32_t dx = (int32_t)(uint32_t)ARG(1), dy = (int32_t)(uint32_t)ARG(2);
+    w32_write(w, r,      4, (uint64_t)(uint32_t)((int32_t)w32_read(w, r, 4) + dx));
+    w32_write(w, r + 4,  4, (uint64_t)(uint32_t)((int32_t)w32_read(w, r + 4, 4) + dy));
+    w32_write(w, r + 8,  4, (uint64_t)(uint32_t)((int32_t)w32_read(w, r + 8, 4) + dx));
+    w32_write(w, r + 12, 4, (uint64_t)(uint32_t)((int32_t)w32_read(w, r + 12, 4) + dy));
+    RET(1);
+}
+/* MapWindowPoints(from, to, points, count): screen coordinates are the
+ * common currency, so each point goes out of `from` and into `to`. */
+static void u_MapWindowPoints(w32 *w) {
+    uint64_t from = ARG(0), to = ARG(1), pts = ARG(2);
+    uint32_t n = (uint32_t)ARG(3);
+    int fx = 0, fy = 0, tx = 0, ty = 0, d1 = 0, d2 = 0;
+    if (from) w32_window_area(from, 0, &fx, &fy, &d1, &d2);
+    if (to)   w32_window_area(to, 0, &tx, &ty, &d1, &d2);
+    int dx = fx - tx, dy = fy - ty;
+    for (uint32_t i = 0; i < n && i < 4096 && pts; i++) {
+        uint64_t p = pts + (uint64_t)i * 8;
+        w32_write(w, p,     4, (uint64_t)(uint32_t)((int32_t)w32_read(w, p, 4) + dx));
+        w32_write(w, p + 4, 4, (uint64_t)(uint32_t)((int32_t)w32_read(w, p + 4, 4) + dy));
+    }
+    RET(((uint64_t)(uint32_t)dy << 16) | (uint32_t)(dx & 0xFFFF));
+}
+/* EnumWindows over the top-level windows this program made. There is no
+ * desktop full of other applications, and saying there is would be a lie a
+ * game could act on -- it enumerates to find its own window. */
+static void u_EnumWindows(w32 *w) {
+    uint64_t fn = ARG(0), param = ARG(1);
+    if (!fn) { RET(0); return; }
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        pthread_mutex_lock(&g_lock);
+        uint64_t h = (g_win[i].used && !g_win[i].parent) ? HW_BASE + (uint64_t)i * HW_STEP : 0;
+        pthread_mutex_unlock(&g_lock);
+        if (!h) continue;
+        uint64_t args[2] = { h, param };
+        if (!w32_call_guest(w, fn, 2, args) || w->exited) break;
+    }
+    RET(1);
+}
+static void u_EnumThreadWindows(w32 *w) {
+    uint64_t saved = ARG(0);
+    (void)saved;
+    RET(1);
+}
+/* FindWindowEx(parent, after, class, title): a game looks for its own
+ * window, or for another copy of itself to hand the command line to. */
+static void find_window_ex(w32 *w, int wide) {
+    uint64_t parent = ARG(0), after = ARG(1);
+    char cls[96] = "", title[256] = "";
+    if (ARG(2) >= 0x10000) { if (wide) w32_wtoa(w, ARG(2), cls, sizeof cls); else snprintf(cls, sizeof cls, "%.95s", w32_str(w, ARG(2))); }
+    if (ARG(3) >= 0x10000) { if (wide) w32_wtoa(w, ARG(3), title, sizeof title); else snprintf(title, sizeof title, "%.255s", w32_str(w, ARG(3))); }
+    int past = after == 0;
+    pthread_mutex_lock(&g_lock);
+    uint64_t found = 0;
+    for (int i = 0; i < MAX_WINDOWS && !found; i++) {
+        wwin *p = &g_win[i];
+        uint64_t h = HW_BASE + (uint64_t)i * HW_STEP;
+        if (!p->used) continue;
+        if (!past) { if (h == after) past = 1; continue; }
+        if (parent && p->parent != parent) continue;
+        if (cls[0] && strcasecmp(p->cls, cls)) continue;
+        if (title[0] && strcmp(p->text, title)) continue;
+        found = h;
+    }
+    pthread_mutex_unlock(&g_lock);
+    RET(found);
+}
+static void u_FindWindowExA(w32 *w) { find_window_ex(w, 0); }
+static void u_FindWindowExW(w32 *w) { find_window_ex(w, 1); }
+static void u_FindWindowW(w32 *w) {
+    /* FindWindow is FindWindowEx with no parent and no predecessor, and its
+     * two arguments are the last two of the four. */
+    uint64_t cls = ARG(0), title = ARG(1);
+    (void)cls; (void)title;
+    RET(0);
+}
+/* WINDOWPLACEMENT: length, flags, showCmd, min point, max point, normal rect. */
+static void u_GetWindowPlacement(w32 *w) {
+    uint64_t p = ARG(1);
+    if (!p) { RET(0); return; }
+    int x = 0, y = 0, cx = 0, cy = 0;
+    if (!w32_window_area(ARG(0), 1, &x, &y, &cx, &cy)) { RET(0); return; }
+    w32_write(w, p, 4, 44);
+    w32_write(w, p + 4, 4, 0);
+    w32_write(w, p + 8, 4, 1);                       /* SW_SHOWNORMAL */
+    put_rect(w, p + 28, x, y, x + cx, y + cy);
+    RET(1);
+}
+static void u_SetWindowPlacement(w32 *w) {
+    uint64_t p = ARG(1);
+    if (!p) { RET(0); return; }
+    int l = (int)(int32_t)w32_read(w, p + 28, 4), t = (int)(int32_t)w32_read(w, p + 32, 4);
+    int r = (int)(int32_t)w32_read(w, p + 36, 4), b = (int)(int32_t)w32_read(w, p + 40, 4);
+    if (r > l && b > t) move_window(w, ARG(0), l, t, r - l, b - t, 1);
+    RET(1);
+}
+/* Layered windows: a per-window alpha. Nothing here composites, so the
+ * alpha is recorded and reported back unchanged -- a game that fades its
+ * window in reads back what it set and its fade completes. */
+static void u_SetLayeredWindowAttributes(w32 *w) {
+    pthread_mutex_lock(&g_lock);
+    wwin *p = win_of(ARG(0));
+    if (p) p->userdata = (ARG(1) & 0xFFFFFF) | ((ARG(2) & 0xFF) << 24) | ((ARG(3) & 0xFF) << 32);
+    pthread_mutex_unlock(&g_lock);
+    RET(p ? 1 : 0);
+}
+static void u_GetLayeredWindowAttributes(w32 *w) {
+    pthread_mutex_lock(&g_lock);
+    wwin *p = win_of(ARG(0));
+    uint64_t v = p ? p->userdata : 0;
+    pthread_mutex_unlock(&g_lock);
+    if (!p) { RET(0); return; }
+    if (ARG(1)) w32_write(w, ARG(1), 4, v & 0xFFFFFF);
+    if (ARG(2)) w32_write(w, ARG(2), 1, (v >> 24) & 0xFF);
+    if (ARG(3)) w32_write(w, ARG(3), 4, (v >> 32) & 0xFF);
+    RET(1);
+}
+static void u_GetMonitorInfoW(w32 *w) { u_GetMonitorInfoA(w); }
+static void u_EnumDisplayDevicesW(w32 *w) { (void)w; RET(0); }
+/* MsgWaitForMultipleObjects: a message loop that also waits on handles. With
+ * nothing else to wait for, the answer is "a message arrived" as soon as one
+ * has -- and the timeout keeps a loop that has neither from spinning. */
+static void u_MsgWaitForMultipleObjectsEx(w32 *w) {
+    uint32_t ms = (uint32_t)ARG(3);
+    uint32_t count = (uint32_t)ARG(0);
+    pthread_mutex_lock(&g_lock);
+    int have = g_qhead != g_qtail || g_quit;
+    pthread_mutex_unlock(&g_lock);
+    if (have) { RET(count); return; }              /* WAIT_OBJECT_0 + count: a message */
+    if (ms) w32_host_idle();
+    pthread_mutex_lock(&g_lock);
+    have = g_qhead != g_qtail || g_quit;
+    pthread_mutex_unlock(&g_lock);
+    RET(have ? count : 0x00000102u);               /* WAIT_TIMEOUT */
+}
+static void u_MsgWaitForMultipleObjects(w32 *w) { u_MsgWaitForMultipleObjectsEx(w); }
+/* keybd_event synthesises a key press. A game uses it to release a stuck
+ * modifier, and it goes into the same queue a real key would. */
+static void u_keybd_event(w32 *w) {
+    int vk = (int)(ARG(0) & 0xFF);
+    int up = ((uint32_t)ARG(2) & 2) != 0;          /* KEYEVENTF_KEYUP */
+    w32_input_key(vk, up ? 0 : 1);
+    RET(0);
+}
+static void u_mouse_event(w32 *w) {
+    uint32_t f = (uint32_t)ARG(0);
+    if (f & 0x0002) w32_input_mouse_button(0, 1);  /* LEFTDOWN */
+    if (f & 0x0004) w32_input_mouse_button(0, 0);
+    if (f & 0x0008) w32_input_mouse_button(1, 1);
+    if (f & 0x0010) w32_input_mouse_button(1, 0);
+    RET(0);
+}
+
 static void u_LoadStringA(w32 *w) {
     char buf[512];
     int n = w32_load_string(w, ARG(0), (uint32_t)ARG(1), buf, sizeof buf);
@@ -3299,6 +3754,17 @@ const w32_api w32_user32[] = {
     F(IsDialogMessageA, 2), F(IsDialogMessageW, 2),
     F(GetWindowTextW, 3), F(GetWindowTextLengthA, 1), F(GetWindowTextLengthW, 1),
     F(LoadStringA, 4), F(LoadStringW, 4),
+    /* rectangles, which a game does its own layout with */
+    F(IntersectRect, 3), F(UnionRect, 3), F(IsRectEmpty, 1), F(PtInRect, 3),
+    F(SetRect, 5), F(OffsetRect, 3), F(MapWindowPoints, 4),
+    /* finding and placing windows */
+    F(EnumWindows, 2), F(EnumThreadWindows, 3),
+    F(FindWindowExA, 4), F(FindWindowExW, 4), F(FindWindowW, 2),
+    F(GetWindowPlacement, 2), F(SetWindowPlacement, 2), F(BringWindowToTop, 1),
+    F(SetLayeredWindowAttributes, 4), F(GetLayeredWindowAttributes, 4),
+    F(GetMonitorInfoW, 2), F(EnumDisplayDevicesW, 4),
+    F(MsgWaitForMultipleObjectsEx, 5), F(MsgWaitForMultipleObjects, 5),
+    F(keybd_event, 4), F(mouse_event, 5),
     /* the wide half of the window-long family, which a Unicode program uses
      * for subclassing exactly as an ANSI one uses the narrow half */
     { "GetWindowLongW", 2, 0, u_GetWindowLongA, 0 },

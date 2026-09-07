@@ -29,6 +29,8 @@ final class GuestViewController: UIViewController {
     private var layerView = MetalFrameView()
     private let input = GuestInputView()
     private let keys = OnScreenKeys()
+    /// Shown instead of the game keys while a dialog is what is on screen.
+    private let dialogKeys = DialogKeys()
     private let hud = UILabel()
     private var link: CADisplayLink?
     private var seq: UInt64 = 0
@@ -97,6 +99,13 @@ final class GuestViewController: UIViewController {
         keys.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(keys)
 
+        dialogKeys.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(dialogKeys)
+        // A dialog is what a visible install puts on screen, and WASD is no
+        // use against one. Only one of the two is ever up.
+        keys.isHidden = watching || !Settings.onScreenKeys
+        dialogKeys.isHidden = !watching
+
         hud.translatesAutoresizingMaskIntoConstraints = false
         hud.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         hud.textColor = .white
@@ -123,6 +132,11 @@ final class GuestViewController: UIViewController {
             keys.leadingAnchor.constraint(equalTo: g.leadingAnchor, constant: 16),
             keys.trailingAnchor.constraint(lessThanOrEqualTo: g.trailingAnchor, constant: -16),
             keys.bottomAnchor.constraint(equalTo: g.bottomAnchor, constant: -12),
+            // Centred along the very bottom, below where a centred dialog
+            // reaches -- so the row cannot cover the buttons it exists to
+            // let you press.
+            dialogKeys.centerXAnchor.constraint(equalTo: g.centerXAnchor),
+            dialogKeys.bottomAnchor.constraint(equalTo: g.bottomAnchor, constant: -8),
             hud.topAnchor.constraint(equalTo: g.topAnchor, constant: 12),
             hud.leadingAnchor.constraint(equalTo: g.leadingAnchor, constant: 16),
             close.topAnchor.constraint(equalTo: g.topAnchor, constant: 12),
