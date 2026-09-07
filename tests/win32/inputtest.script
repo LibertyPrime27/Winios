@@ -1,0 +1,24 @@
+# Keyboard and mouse, aimed at particular frames. Read with `winrun -input`.
+# A frame is a Present, so "frame 2" lands between the guest's second and
+# third frames -- where a real event would arrive in a frame loop.
+
+# before the first instruction: the pointer starts somewhere known
+mouse move 320 240
+
+frame 1: key down 87           # W
+frame 1: mouse move 100 120
+
+frame 2: key down 16           # shift, so frame 2 sees W+shift held
+frame 2: mouse down left
+
+frame 3: key up 87             # W released, shift still down
+frame 3: mouse up left
+frame 3: mouse delta 15 -8     # relative motion, as mouselook would send
+
+frame 4: char 65               # a character the host knew the layout for
+frame 4: mouse wheel 120
+frame 4: key down 68           # D
+
+frame 5: key up 16
+frame 5: key up 68
+frame 5: mouse down right

@@ -191,14 +191,15 @@ compiled code for pages that become writable.
 
 ## Verified
 
-`tests/win32/run.sh` runs thirty-six checks over fourteen programs and
+`tests/win32/run.sh` runs thirty-eight checks over fifteen programs and
 compares stdout and exit code with recordings: the three-import `hello`, the
 full mingw-w64 CRT program (`crt.c`: TLS callbacks, `__getmainargs`,
 `_initterm`, malloc/free, `sqrt`, `printf`, `snprintf`, exit code), the n-body
 benchmark, the loader test `dlltest`, the four Direct3D 9 programs `d3dtest`,
 `d3dframe`, `d3dloop` and `d3ddraw`, the file-layer tests `pathtest` and
-`filetest`, the registry test `regtest`, and the exception tests `sehtest` and
-`faulttest` — each as PE32 and PE32+. Three of them are run more than once:
+`filetest`, the registry test `regtest`, the exception tests `sehtest` and
+`faulttest`, and the window-and-input test `inputtest` — each as PE32 and
+PE32+. Three of them are run more than once:
 `regtest` twice per bitness because what it tests is what survives between two
 runs, and `faulttest` both with the dynarec and without it, because "the same
 either way" is the property that matters there.
@@ -419,6 +420,108 @@ the block reads, which is sound right up until a fault hands control to a
 handler the liveness pass never saw. An instruction that can fault is now a
 reader of the flags.
 
+## A window, a message pump, and input
+
+A game's first act is to register a window class, make a window, and then
+loop: pump messages, read the keyboard and mouse, draw a frame. `win32/user32.c`
+is that.
+
+A window is host-side state behind an HWND the guest holds — the same trick COM
+objects use. Its WndProc, though, is *guest* code, so `DispatchMessage` calls
+back into the guest through `w32_call_guest`, the path TLS callbacks and
+`DllMain` already take. `WM_CREATE` goes straight to the WndProc rather than
+through the queue, because a program is entitled to have run it before
+`CreateWindowEx` returns and plenty of them set things up there.
+
+Structure layouts (`WNDCLASS`, `WNDCLASSEX`, `MSG`, `DEVMODE`, `CREATESTRUCT`)
+were read out of mingw-w64's headers with `offsetof`, by a program compiled for
+Windows and run on this emulator. A wrong WndProc offset is a jump to whatever
+was next in the struct, so these are not the place to work from memory.
+
+### Two ways in, because games use both
+
+Messages are the queue. But a game's frame loop mostly does not read them: it
+asks `GetAsyncKeyState` whether W is down *right now* and `GetCursorPos` where
+the mouse is. So an injected event does two things — updates the state array
+immediately, and queues a message. The state is what a frame loop sees, the
+queue is what a message loop sees, and a program using either sees the same
+events. `inputtest` checks both against each other on every frame.
+
+Relative motion is kept apart from the pointer position, because mouselook
+needs deltas that keep coming when the pointer is against the edge of the
+screen, and `SetCursorPos` — which a game calls every frame to recentre —
+must move the position without looking like motion, or the view spins.
+
+### Where input comes from
+
+    void w32_input_key(int vk, int down);
+    void w32_input_key_ch(int vk, int down, uint32_t ch);
+    void w32_input_char(uint32_t ch);
+    void w32_input_mouse_move(int x, int y);        /* absolute, client pixels */
+    void w32_input_mouse_delta(int dx, int dy);     /* relative */
+    void w32_input_mouse_button(int button, int down);
+    void w32_input_mouse_wheel(int delta);
+
+The app's key, pointer and touch handlers call these from the UI thread while
+the guest runs on its own, so the state and the queue are behind a mutex and
+nothing on the injection side touches guest memory — there is no `w32 *` in any
+of these signatures, and that is the point.
+
+`w32_input_key_ch` carries the character the host's keyboard layout resolved.
+It is recorded against the key rather than queued as a `WM_CHAR`, because
+Windows produces `WM_CHAR` inside `TranslateMessage` and a program that never
+calls `TranslateMessage` is entitled to never see one — queueing it as well
+would give a text field two of every letter. `TranslateMessage` uses the
+host's character when there is one and derives a US-layout one otherwise.
+
+Coordinates are client pixels of the guest's window. The app knows the rect it
+drew the last frame into and maps a touch through it, so the scaling lives in
+one place; `w32_client_size()` is that size, and `w32_cursor_visible()` tells
+the app whether the guest wants a pointer drawn at all.
+
+### On the device
+
+Three sources, in the order a game would prefer them:
+
+- **A hardware keyboard**, through `pressesBegan`/`pressesEnded`. `UIPress`
+  gives the raw HID usage *and* the layout-resolved character, which is exactly
+  the pair Windows wants. The HID-to-virtual-key table is written as raw HID
+  numbers with the names in comments: the numbers are the wire format, and a
+  table of them can be checked against the HID spec in one pass.
+- **A hardware mouse or trackpad**, through GameController's `GCMouse` — the
+  only iOS API that reports relative motion, which is what mouselook needs.
+- **The touchscreen**, when there is neither. Dragging moves the cursor the way
+  a trackpad does, relatively, rather than teleporting it under the finger:
+  the finger would cover what it was aiming at, and a game that has hidden the
+  cursor wants deltas anyway. Tap is a left click, two-finger tap a right
+  click, and a long press holds the button down so a drag can drag. A small
+  hold-to-press key overlay covers WASD and the few actions a game needs when
+  no keyboard is attached.
+
+The guest says which mode it is in without being asked: a game that calls
+`ShowCursor(FALSE)` is saying "I am reading relative motion now", so the
+crosshair gets out of the way then and comes back for menus.
+
+### Testing input, which needs a driver
+
+    winrun -input script.txt program.exe
+
+Each line is `[frame N] <event>`, with the events being `key down|up <vk>`,
+`char <n>`, `mouse move|delta <x> <y>`, `mouse down|up left|right|middle` and
+`mouse wheel <delta>`. A frame is a `Present`, so "frame 3" lands where a real
+event would arrive in the middle of a frame loop.
+
+That matters because a recording of the tester's reflexes is not a test.
+`tests/win32/inputtest.script` aims events at particular frames and
+`inputtest.expected` says what each frame saw — byte-identical between PE32 and
+PE32+, and between the interpreter and the dynarec. The device diagnostics runs
+the same script through `win_probe_run_script`, so what CI checks and what the
+device checks are the same events. The guest also exits non-zero if no event
+reached it at all, so a harness that only looks at the exit code cannot pass on
+a run that received nothing.
+
+The script is also how to reproduce an input bug: the script *is* the repro.
+
 ## What a program needs that we do not have
 
     winrun -imports program.exe
@@ -432,23 +535,21 @@ from the binary. Pointed at a real game, it *is* the roadmap.
 `tests/win32/gamelike32.exe` is a fixture for it: a program that does what a
 game does in its first few seconds — makes a window and pumps messages, starts
 a thread, takes a lock, reads the registry, walks a directory, memory-maps a
-file, times a frame, queries the display. It is deliberately not in the test
-suite, because it cannot run yet. What it reports today:
+file, times a frame, queries the display. It is not in the test suite because
+its whole purpose is to name what is missing, and that number is supposed to
+change. What it reports today:
 
-    65 imports resolved, 11 missing
+    75 imports resolved, 1 missing
       kernel32.dll (1)   CreateThread
-      user32.dll   (9)   RegisterClassA, CreateWindowExA, ShowWindow,
-                         PeekMessageA, TranslateMessage, DispatchMessageA,
-                         DefWindowProcA, GetSystemMetrics, EnumDisplaySettingsA
-      winmm.dll    (1)   timeGetTime
 
-It was 17 missing before the registry, file enumeration and memory mapping
-landed, which is what the number is for. Worth reading closely, because it
-corrects the obvious assumption. "No threads" is not quite right:
-`EnterCriticalSection`, `CreateEventA`, `SetEvent`, `InterlockedIncrement`,
-`WaitForSingleObject`, `QueryPerformanceCounter` and `CreateFileA` all resolve
-already — only `CreateThread` itself is absent. What is left is a window and
-its message pump, one thread call and one timer.
+It was 17 before the registry, files and memory mapping landed, and 11 before
+the window and its message pump, which is what the number is for. With `-k`
+the fixture now runs to the end and prints `gamelike: reached the end`.
+
+`CreateThread` is the whole remaining list. Everything else a game touches in
+its first few seconds — a window and a message pump, a lock, an event, the
+registry, a directory walk, a memory-mapped file, a frame timer, the display
+mode — resolves and works.
 
 ## Carrying on past what we do not have
 
@@ -500,12 +601,16 @@ the app.
 
 ## What is deliberately not here yet
 
-Threads (`CreateThread`/`_beginthreadex` report failure), audio, 64-bit
-`__except` (the 32-bit frame list is implemented; the x64 table-driven
-mechanism is not — see the end of `win32/seh.c`), and everything
-user32/gdi32 beyond `MessageBoxA` — which means no window and no message pump,
-and so no installer either. Drawing reaches the screen but goes through the
-reference rasterizer rather than Metal.
+Threads (`CreateThread`/`_beginthreadex` report failure) — which is the last
+thing `gamelike32.exe` asks for that is not here. Audio. DirectInput, which is
+what Fallout 3 and New Vegas actually read the keyboard and mouse through; it
+sits on the state `user32.c` already keeps, so it is a layer rather than a
+subsystem. 64-bit `__except` (the 32-bit frame list is implemented; the x64
+table-driven mechanism is not — see the end of `win32/seh.c`). GDI beyond the
+stubs a message loop needs, and any window decoration: a window here is its own
+client area, which is what a fullscreen game wants and not what a windowed
+program expects. Installers, which need threads. Drawing reaches the screen but
+goes through the reference rasterizer rather than Metal.
 
 Within the loader specifically: `DLL_PROCESS_DETACH` is never sent (nothing is
 ever unloaded and the process exits without unwinding), `DLL_THREAD_ATTACH`

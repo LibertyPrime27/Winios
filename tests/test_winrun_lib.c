@@ -97,6 +97,28 @@ static int test_faults(const char *dir) {
     return bad;
 }
 
+/* A window, a message pump and input, driven by the same script the shell
+ * suite uses -- one recording, one source of truth for what the events are.
+ * The guest exits 2 if nothing reached it, so a passing exit code here means
+ * the events really crossed into the guest rather than the run merely
+ * surviving. Run in both bitnesses because the MSG structure and the WndProc
+ * call differ between them. */
+static int test_input(const char *dir) {
+    char script[600], path[512];
+    snprintf(script, sizeof script, "%s/inputtest.script", dir);
+    int bad = 0;
+    for (int b = 0; b < 2; b++) {
+        snprintf(path, sizeof path, "%s/inputtest%s.exe", dir, b ? "64" : "32");
+        char *av[5] = { (char *)"winrun", (char *)"-input", script, path, (char *)"6" };
+        fflush(stdout);
+        int rc = winrun_main(5, av);
+        fflush(stdout);
+        if (rc != 0) { printf("FAIL inputtest%s exited %d, want 0\n", b ? "64" : "32", rc); bad++; }
+    }
+    if (!bad) printf("ok   inputtest: a window, a message pump, and keyboard and mouse events reaching the guest\n");
+    return bad;
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : "tests/win32";
     /* C:\ for pathtest, and a check that the setting survives winrun_reset --
@@ -144,6 +166,7 @@ int main(int argc, char **argv) {
     bad += test_device_lost(dir);
     bad += test_registry(dir);
     bad += test_faults(dir);
+    bad += test_input(dir);
     printf("test_winrun_lib: %d runs, %d failed\n", 2 * n, bad);
     return bad != 0;
 }

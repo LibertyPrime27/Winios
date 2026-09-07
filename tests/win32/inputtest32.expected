@@ -1,0 +1,58 @@
+RegisterClass: ok
+CreateWindowEx: ok
+WM_CREATE reached the WndProc before CreateWindowEx returned: yes
+IsWindowVisible: 1
+client rect: 640x480
+screen: 1280x720, mouse present 1, buttons 3
+
+queued by window creation:
+  WM_MOUSEMOVE
+  WM_SIZE
+  WM_ACTIVATEAPP
+  WM_ACTIVATE
+  WM_SETFOCUS
+WndProc saw WM_SIZE 1, WM_ACTIVATE 1
+  wndproc: WM_SIZE to 640x480
+
+frame 1:
+  WM_KEYDOWN vk 87
+  WM_MOUSEMOVE at 100,120 keys 0
+  WM_CHAR 'w'
+  wndproc: WM_KEYDOWN vk 87
+  wndproc: WM_CHAR 'w'
+  polled: W 1 A 0 S 0 D 0 shift 0, cursor 100,120, buttons L0 R0
+
+frame 2:
+  WM_KEYDOWN vk 16
+  WM_LBUTTONDOWN at 100,120 keys 0x5
+  wndproc: WM_KEYDOWN vk 16
+  wndproc: WM_LBUTTONDOWN at 100,120
+  polled: W 1 A 0 S 0 D 0 shift 1, cursor 100,120, buttons L1 R0
+
+frame 3:
+  WM_KEYUP vk 87
+  WM_LBUTTONUP at 100,120 keys 0x4
+  WM_MOUSEMOVE at 115,112 keys 0x4
+  polled: W 0 A 0 S 0 D 0 shift 1, cursor 115,112, buttons L0 R0
+
+frame 4:
+  WM_CHAR 'A'
+  WM_MOUSEWHEEL delta 120
+  WM_KEYDOWN vk 68
+  WM_CHAR 'D'
+  wndproc: WM_CHAR 'A'
+  wndproc: WM_KEYDOWN vk 68
+  wndproc: WM_CHAR 'D'
+  polled: W 0 A 0 S 0 D 1 shift 1, cursor 115,112, buttons L0 R0
+
+frame 5:
+  WM_KEYUP vk 16
+  WM_KEYUP vk 68
+  WM_RBUTTONDOWN at 115,112 keys 0x2
+  polled: W 0 A 0 S 0 D 0 shift 0, cursor 115,112, buttons L0 R1
+
+frame 6:
+  polled: W 0 A 0 S 0 D 0 shift 0, cursor 115,112, buttons L0 R1
+
+WndProc was called yes
+IsWindow after DestroyWindow: 0

@@ -24,6 +24,13 @@ int win_probe_run(const char *exe_path, const char *arg1, const char *arg2,
 int win_probe_run_ex(const char *exe_path, int keep_going, int timeout_s,
                      char *out, size_t out_len, uint64_t *ns);
 
+/* Run a guest with a recorded input script (winrun's -input): keyboard and
+ * mouse events aimed at particular frames. The same file the shell suite
+ * uses, so the device and CI see the same events and a recording means the
+ * same thing in both places. */
+int win_probe_run_script(const char *exe_path, const char *script, const char *arg1,
+                         char *out, size_t out_len, uint64_t *ns);
+
 /* Load an executable, resolve its imports, and report which ones nothing here
  * can satisfy -- without running it. This is how the app answers "can this
  * program run, and if not, what is missing?" for an arbitrary .exe the user

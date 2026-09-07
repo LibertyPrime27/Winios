@@ -15,16 +15,23 @@ check() {   # name expected_rc args...
 }
 # Same, but the expectation file is named separately: a guest run twice with
 # different arguments has two outputs and only one name.
-checkx() {  # name expected_file expected_rc args...
+# Arguments after a bare `--` are winrun's own flags rather than the guest's,
+# so a case can ask for an input script without needing another helper.
+checkx() {  # name expected_file expected_rc [guest args...] [-- winrun flags...]
     name=$1; expf=$2; erc=$3; shift 3
-    got=$("$winrun" "./$name" "$@" 2>/tmp/winrun_err.$$); rc=$?
+    gargs=""; wargs=""; seen=0
+    for t in "$@"; do
+        if [ "$t" = "--" ]; then seen=1; continue; fi
+        if [ $seen -eq 1 ]; then wargs="$wargs $t"; else gargs="$gargs $t"; fi
+    done
+    got=$("$winrun" $wargs "./$name" $gargs 2>/tmp/winrun_err.$$); rc=$?
     exp=$(cat "$expf")
     if [ "$got" != "$exp" ] || [ "$rc" -ne "$erc" ]; then
         echo "FAIL $name (rc=$rc, want $erc)"; echo "--- expected"; echo "$exp"; echo "--- got"; echo "$got"; cat /tmp/winrun_err.$$; fail=1
         # diagnostics: is it the JIT? what does -v say?
-        got2=$(XCORE_JIT=0 "$winrun" "./$name" "$@" 2>/dev/null); rc2=$?
+        got2=$(XCORE_JIT=0 "$winrun" $wargs "./$name" $gargs 2>/dev/null); rc2=$?
         [ "$got2" = "$exp" ] && [ "$rc2" -eq "$erc" ] && echo "  (passes with XCORE_JIT=0: JIT-specific)" || echo "  (also fails with XCORE_JIT=0, rc=$rc2)"
-        "$winrun" -v "./$name" "$@" 2>&1 >/dev/null | tail -24 | sed 's/^/  | /'
+        "$winrun" $wargs -v "./$name" $gargs 2>&1 >/dev/null | tail -24 | sed 's/^/  | /'
     else echo "ok   $name"; fi
 }
 # Only the exit code and one line of output. These runs end in the crash
@@ -88,5 +95,10 @@ check faulttest32.exe 0
 checkrc faulttest64.exe 129 "an unhandled exception" die
 checkrc faulttest32.exe 129 "an unhandled exception" die
 unset XCORE_JIT
+# A window, a message pump and input. The events come from a script aimed at
+# particular frames (`winrun -input`), because input needs a driver and a
+# recording of the tester's reflexes is not a test.
+check inputtest64.exe 0 6 -- -input inputtest.script
+check inputtest32.exe 0 6 -- -input inputtest.script
 rm -f /tmp/winrun_err.$$
 exit $fail

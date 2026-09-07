@@ -42,6 +42,10 @@ enum { PT_POINTLIST = 1, PT_LINELIST, PT_LINESTRIP, PT_TRIANGLELIST, PT_TRIANGLE
 static w32_present_fn g_present;
 static void *g_present_ctx;
 void w32_set_present(w32_present_fn fn, void *ctx) { g_present = fn; g_present_ctx = ctx; }
+/* So a second consumer can chain rather than displace the first -- winrun's
+ * input script wants to see every frame go by without taking the frame away
+ * from whoever is drawing it. */
+w32_present_fn w32_get_present(void **ctx) { if (ctx) *ctx = g_present_ctx; return g_present; }
 
 /* How the host asks a guest that is drawing frames to stop: Present starts
  * returning D3DERR_DEVICELOST. A game already has to handle that -- it is

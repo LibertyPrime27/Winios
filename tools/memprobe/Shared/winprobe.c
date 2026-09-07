@@ -90,6 +90,29 @@ int win_probe_run_ex(const char *exe_path, int keep_going, int timeout_s,
     return rc;
 }
 
+/* A guest driven by a recorded input script. The script is the same file the
+ * shell suite uses, so the diagnostics on the device and the check in CI are
+ * looking at the same events -- which is the only way the recorded output can
+ * mean the same thing in both places. */
+int win_probe_run_script(const char *exe_path, const char *script, const char *arg1,
+                         char *out, size_t out_len, uint64_t *ns) {
+    char *argv[6];
+    int argc = 0;
+    argv[argc++] = (char *)"winrun";
+    argv[argc++] = (char *)"-input";
+    argv[argc++] = (char *)script;
+    argv[argc++] = (char *)exe_path;
+    if (arg1) argv[argc++] = (char *)arg1;
+
+    g_fw = g_fh = 0;
+    w32_d3d9_device_lost(0);
+    w32_set_present(grab_frame, 0);
+    uint64_t t0 = now_ns();
+    int rc = run_capture(argc, argv, out, out_len);
+    if (ns) *ns = now_ns() - t0;
+    return rc;
+}
+
 const void *win_probe_frame(int *width, int *height, int *pitch) {
     if (width) *width = g_fw;
     if (height) *height = g_fh;

@@ -398,6 +398,11 @@ final class ProbeViewController: UIViewController {
             // handler to work on real silicon, under a real signal.
             ("sehtest64.exe", [], 0, "sehtest64"),     ("sehtest32.exe", [], 0, "sehtest32"),
             ("faulttest64.exe", [], 0, "faulttest64"), ("faulttest32.exe", [], 0, "faulttest32"),
+            // A window, a message pump, a keyboard and a mouse. Driven by the
+            // bundled script so this checks the same events CI does; the exit
+            // code alone would pass on a run that received nothing.
+            ("inputtest64.exe", ["6"], 0, "inputtest64"),
+            ("inputtest32.exe", ["6"], 0, "inputtest32"),
         ]
         let cases = single.map { s in all.filter { $0.0 == s } } ?? all
 
@@ -421,8 +426,18 @@ final class ProbeViewController: UIViewController {
             let a1 = args.count > 0 ? strdup(args[0]) : nil
             let a2 = args.count > 1 ? strdup(args[1]) : nil
             xc_jit_enable(1)
-            let rc = exe.withCString { p in
-                win_probe_run(p, a1, a2, &out, out.count, &ns, &x87n, &x87c)
+            let rc: Int32
+            if name.hasPrefix("inputtest") {
+                let script = dir.appendingPathComponent("inputtest.script").path
+                rc = exe.withCString { p in
+                    script.withCString { sp in
+                        win_probe_run_script(p, sp, a1, &out, out.count, &ns)
+                    }
+                }
+            } else {
+                rc = exe.withCString { p in
+                    win_probe_run(p, a1, a2, &out, out.count, &ns, &x87n, &x87c)
+                }
             }
             xc_jit_enable(0)
             if a1 != nil { free(a1) }

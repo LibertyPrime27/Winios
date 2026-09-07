@@ -22,6 +22,8 @@ final class GuestViewController: UIViewController {
     /// program passes the app's C: drive.
     private let root: URL?
     private var layerView = MetalFrameView()
+    private let input = GuestInputView()
+    private let keys = OnScreenKeys()
     private let hud = UILabel()
     private var link: CADisplayLink?
     private var seq: UInt64 = 0
@@ -45,6 +47,14 @@ final class GuestViewController: UIViewController {
         layerView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(layerView)
 
+        // Over the frame, so it sees every touch first; the frame view has
+        // nothing to interact with.
+        input.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(input)
+
+        keys.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(keys)
+
         hud.translatesAutoresizingMaskIntoConstraints = false
         hud.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         hud.textColor = .white
@@ -64,6 +74,13 @@ final class GuestViewController: UIViewController {
             layerView.leadingAnchor.constraint(equalTo: g.leadingAnchor),
             layerView.trailingAnchor.constraint(equalTo: g.trailingAnchor),
             layerView.bottomAnchor.constraint(equalTo: g.bottomAnchor),
+            input.topAnchor.constraint(equalTo: layerView.topAnchor),
+            input.leadingAnchor.constraint(equalTo: layerView.leadingAnchor),
+            input.trailingAnchor.constraint(equalTo: layerView.trailingAnchor),
+            input.bottomAnchor.constraint(equalTo: layerView.bottomAnchor),
+            keys.leadingAnchor.constraint(equalTo: g.leadingAnchor, constant: 16),
+            keys.trailingAnchor.constraint(lessThanOrEqualTo: g.trailingAnchor, constant: -16),
+            keys.bottomAnchor.constraint(equalTo: g.bottomAnchor, constant: -12),
             hud.topAnchor.constraint(equalTo: g.topAnchor, constant: 12),
             hud.leadingAnchor.constraint(equalTo: g.leadingAnchor, constant: 16),
             close.topAnchor.constraint(equalTo: g.topAnchor, constant: 12),
@@ -76,6 +93,9 @@ final class GuestViewController: UIViewController {
         guard !running else { return }
         running = true
         started = CFAbsoluteTimeGetCurrent()
+        // A hardware keyboard's presses arrive through the responder chain,
+        // so something has to be first responder for them to arrive at all.
+        input.becomeFirstResponder()
 
         let l = CADisplayLink(target: self, selector: #selector(tick))
         l.add(to: .main, forMode: .common)
@@ -105,6 +125,7 @@ final class GuestViewController: UIViewController {
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        input.resignFirstResponder()
         win_probe_request_stop()
         link?.invalidate()
         link = nil
@@ -127,8 +148,16 @@ final class GuestViewController: UIViewController {
             guard let base = buf.baseAddress else { return 0 }
             return win_probe_copy_frame(&seq, base, buf.count, &w, &h, &pitch)
         }
-        guard got == 1, w > 0, h > 0 else { return }
+        guard got == 1, w > 0, h > 0 else {
+            input.syncCursor()
+            return
+        }
         framesSeen += 1
+        // The frame's size is what a touch has to be scaled against, and the
+        // guest may have changed it (a mode switch), so it is set every frame
+        // rather than once.
+        input.frameSize = CGSize(width: CGFloat(w), height: CGFloat(h))
+        input.syncCursor()
         scratch.withUnsafeBytes { buf in
             if let base = buf.baseAddress {
                 layerView.upload(base, width: Int(w), height: Int(h), pitch: Int(pitch))

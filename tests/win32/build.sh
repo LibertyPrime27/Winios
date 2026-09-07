@@ -36,6 +36,8 @@ for a in 32 64; do
     # structured exception handling: the dispatch, and faults
     $CC -O2 -s -o sehtest$a.exe   sehtest.c
     $CC -O2 -s -o faulttest$a.exe faulttest.c
+    # a window, a message pump, a keyboard and a mouse
+    $CC -O2 -s -o inputtest$a.exe inputtest.c -ld3d9 -luser32
 done
 
 # Not run by the suite: it calls things we do not implement, on purpose.

@@ -31,6 +31,21 @@ static w32 g_w;
 static xc_mem g_mem;
 static xc_cpu g_cpu;
 
+enum { MAX_SCRIPT = 256 };
+static struct { int frame, kind, a, b; } g_script[MAX_SCRIPT];
+static int g_nscript, g_frame;
+enum { EV_KEY = 1, EV_CHAR, EV_MOVE, EV_DELTA, EV_BUTTON, EV_WHEEL };
+
+/* winrun's chain link in the present callback, so the input script can watch
+ * frames go by without taking them from whoever is drawing. `g_hook_on` says
+ * we are the installed callback, so a second run in the same process puts
+ * back what was there instead of chaining the hook to itself -- which is an
+ * infinite loop, and is what the in-process harness found the first time it
+ * ran a scripted guest twice. */
+static w32_present_fn g_next_present;
+static void *g_next_present_ctx;
+static int g_hook_on;
+
 /* Where the run loop resumes when the signal handler turns a host SIGSEGV
  * back into a guest fault. Defined here because both the run loop and the
  * handler need it, and they are far apart. See on_crash. */
@@ -334,6 +349,7 @@ static const w32_dll g_dlls[] = {
     { "msvcrt.dll",   w32_msvcrt,   0,                0 },
     { "ntdll.dll",    w32_ntdll,    w32_seh_ntdll,    0 },
     { "user32.dll",   w32_user32,   0,                0 },
+    { "winmm.dll",    w32_winmm,    0,                0 },
     { "d3d9.dll",     w32_d3d9,     0,                0 },
     { "advapi32.dll", w32_advapi32, 0,                0 },
 };
@@ -789,9 +805,95 @@ static void winrun_reset(void) {
     w32_reset_statics();
     w32_registry_reset();
     w32_seh_reset();
+    w32_input_reset();
+    g_nscript = 0; g_frame = 0;
+    if (g_hook_on) { w32_set_present(g_next_present, g_next_present_ctx); g_hook_on = 0; }
+    g_next_present = 0; g_next_present_ctx = 0;
     w32_com_reset();
     w32_d3d9_reset();
     xc_cache_flush();
+}
+
+/* -input <file>: a script of keyboard and mouse events, delivered to the
+ * guest at chosen frames.
+ *
+ * Input needs a driver. On the device it is a finger or a keyboard; here it
+ * has to come from somewhere deterministic, or a recorded expectation is a
+ * recording of the tester's reflexes. Each line is
+ *
+ *     [frame N] <event>
+ *
+ * with the events being `key down|up <vk>`, `char <n>`, `mouse move <x> <y>`,
+ * `mouse delta <dx> <dy>`, `mouse down|up left|right|middle` and
+ * `mouse wheel <delta>`; `#` starts a comment. Lines with no frame given are
+ * delivered before the guest starts. A frame is a Present, so "frame 3" means
+ * "just before the guest draws its fourth frame" -- the same moment a real
+ * event would land in the middle of a frame loop.
+ *
+ * It is also how to reproduce an input bug: the script *is* the repro.
+ */
+static void script_fire(int frame) {
+    for (int i = 0; i < g_nscript; i++) {
+        if (g_script[i].frame != frame) continue;
+        switch (g_script[i].kind) {
+        case EV_KEY:    w32_input_key(g_script[i].a, g_script[i].b); break;
+        case EV_CHAR:   w32_input_char((uint32_t)g_script[i].a); break;
+        case EV_MOVE:   w32_input_mouse_move(g_script[i].a, g_script[i].b); break;
+        case EV_DELTA:  w32_input_mouse_delta(g_script[i].a, g_script[i].b); break;
+        case EV_BUTTON: w32_input_mouse_button(g_script[i].a, g_script[i].b); break;
+        case EV_WHEEL:  w32_input_mouse_wheel(g_script[i].a); break;
+        default: break;
+        }
+    }
+}
+
+static int script_load(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) { perror(path); return -1; }
+    char line[256];
+    int lineno = 0;
+    while (fgets(line, sizeof line, f)) {
+        lineno++;
+        char *h = strchr(line, '#'); if (h) *h = 0;
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p || *p == '\n') continue;
+        int frame = 0, n = 0;
+        if (!strncmp(p, "frame ", 6) && sscanf(p + 6, "%d%n", &frame, &n) == 1) {
+            p += 6 + n;
+            while (*p == ' ' || *p == ':' || *p == '\t') p++;
+        }
+        if (g_nscript >= MAX_SCRIPT) { fprintf(stderr, "winrun: -input: more than %d events\n", MAX_SCRIPT); break; }
+        int kind = 0, a = 0, b = 0;
+        char w1[16] = {0}, w2[16] = {0};
+        if (sscanf(p, "key %15s %d", w1, &a) == 2) { kind = EV_KEY; b = !strcmp(w1, "down"); }
+        else if (sscanf(p, "char %d", &a) == 1) kind = EV_CHAR;
+        else if (sscanf(p, "mouse move %d %d", &a, &b) == 2) kind = EV_MOVE;
+        else if (sscanf(p, "mouse delta %d %d", &a, &b) == 2) kind = EV_DELTA;
+        else if (sscanf(p, "mouse wheel %d", &a) == 1) kind = EV_WHEEL;
+        else if (sscanf(p, "mouse %15s %15s", w1, w2) == 2 &&
+                 (!strcmp(w1, "down") || !strcmp(w1, "up"))) {
+            kind = EV_BUTTON;
+            b = !strcmp(w1, "down");
+            a = !strcmp(w2, "right") ? 1 : !strcmp(w2, "middle") ? 2 : 0;
+        }
+        if (!kind) { fprintf(stderr, "winrun: -input: %s:%d: cannot read \"%s\"\n", path, lineno, p); fclose(f); return -1; }
+        g_script[g_nscript].frame = frame;
+        g_script[g_nscript].kind = kind;
+        g_script[g_nscript].a = a; g_script[g_nscript].b = b;
+        g_nscript++;
+    }
+    fclose(f);
+    return 0;
+}
+
+/* Every presented frame passes through here so the script can be fired
+ * between frames, then on to whatever else wanted the pixels. */
+static void present_hook(void *ctx, const void *px, int w, int h, int pitch) {
+    (void)ctx;
+    g_frame++;
+    script_fire(g_frame);
+    if (g_next_present) g_next_present(g_next_present_ctx, px, w, h, pitch);
 }
 
 /* WINRUN_PRESENT_PPM=<prefix>: write every presented frame as <prefix>NNN.ppm.
@@ -936,6 +1038,7 @@ int winrun_main(int argc, char **argv) {
         if (!strcmp(argv[ai], "-v")) w->verbose++;
         else if (!strcmp(argv[ai], "-vv")) w->verbose += 2;
         else if (!strcmp(argv[ai], "-imports")) w->imports_only = 1;
+        else if (!strcmp(argv[ai], "-input") && ai + 1 < argc) { if (script_load(argv[++ai])) return 2; }
         else if (!strcmp(argv[ai], "-k")) w->keep_going = 1;
         else if (!strcmp(argv[ai], "-t") && ai + 1 < argc) { w->deadline_ns = now_ns_host() + (uint64_t)atoll(argv[ai + 1]) * 1000000000ull; ai++; }
         else if (!strcmp(argv[ai], "-C") && ai + 1 < argc) { w32_set_drive_c(argv[ai + 1]); ai++; }
@@ -974,6 +1077,14 @@ int winrun_main(int argc, char **argv) {
     { const char *c = getenv("WINRUN_DRIVE_C"); if (c && *c) w32_set_drive_c(c); }
     stubs_init(w);
     { const char *ppm = getenv("WINRUN_PRESENT_PPM"); if (ppm) w32_set_present(present_ppm, (void *)ppm); }
+    if (g_nscript) {
+        /* chain: the script fires first, then whatever wanted the frame */
+        g_next_present = w32_get_present(&g_next_present_ctx);
+        if (g_next_present == present_hook) { g_next_present = 0; g_next_present_ctx = 0; }
+        w32_set_present(present_hook, 0);
+        g_hook_on = 1;
+        script_fire(0);                    /* events with no frame: before the first instruction */
+    }
     /* TEB/PEB/stack/heap first (TLS callbacks need them); they come from the
      * arena's bump allocator or host mmap, neither of which lands on a PE32+
      * preferred base (0x140000000) or a PE32 one (0x400000) */

@@ -843,8 +843,30 @@ const w32_api w32_ntdll[] = {
     { "NtQueryInformationProcess", 5, 0, n_NtQueryInformationProcess, 0 },
     { 0, 0, 0, 0, 0 }
 };
-static void u_MessageBoxA(w32 *w) { fprintf(stderr, "[MessageBox] %s: %s\n", GSTR(ARG(2)), GSTR(ARG(1))); RET(1); }
-const w32_api w32_user32[] = {
-    { "MessageBoxA", 4, 0, u_MessageBoxA, 0 },
+/* winmm.dll -- the timer a game reads every frame.
+ *
+ * timeGetTime is milliseconds since the process started, not since boot: a
+ * game subtracts two readings, and starting from zero keeps the arithmetic
+ * away from the 32-bit wrap for the length of any session. timeBeginPeriod
+ * asks for a finer scheduler tick, which is not ours to give and not needed
+ * when the clock is already a nanosecond one. */
+static void m_timeGetTime(w32 *w) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    static uint64_t base;
+    uint64_t now = (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+    if (!base) base = now;
+    RET((uint32_t)(now - base));
+}
+static void m_timeBeginPeriod(w32 *w) { (void)w; RET(0); }
+static void m_timeEndPeriod(w32 *w) { (void)w; RET(0); }
+static void m_timeGetDevCaps(w32 *w) {
+    if (ARG(0)) { w32_write(w, ARG(0), 4, 1); w32_write(w, ARG(0) + 4, 4, 1000000); }
+    RET(0);
+}
+const w32_api w32_winmm[] = {
+    { "timeGetTime", 0, 0, m_timeGetTime, 0 },
+    { "timeBeginPeriod", 1, 0, m_timeBeginPeriod, 0 },
+    { "timeEndPeriod", 1, 0, m_timeEndPeriod, 0 },
+    { "timeGetDevCaps", 2, 0, m_timeGetDevCaps, 0 },
     { 0, 0, 0, 0, 0 }
 };

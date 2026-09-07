@@ -223,6 +223,7 @@ extern const w32_api w32_seh_ntdll[];
 extern const w32_api w32_msvcrt[];
 extern const w32_api w32_ntdll[];
 extern const w32_api w32_user32[];
+extern const w32_api w32_winmm[];
 extern const w32_api w32_d3d9[];
 extern const w32_api w32_advapi32[];
 
@@ -231,10 +232,43 @@ extern const w32_api w32_advapi32[];
 void w32_registry_flush(void);
 void w32_registry_reset(void);
 
+/* user32.c: input from the host.
+ *
+ * The app's keyboard, pointer and touch handlers call these from whatever
+ * thread they run on, while the guest runs on its own -- so nothing here
+ * touches guest memory, and the state and message queue behind them are
+ * locked. Each event does two things: it updates the state a frame loop polls
+ * with GetAsyncKeyState/GetCursorPos, and it queues the message a message
+ * loop pumps. A program that uses either sees the same events.
+ *
+ * Coordinates are *client pixels* of the guest's window -- the app knows the
+ * rect it drew the last frame into and maps a touch through it, so the
+ * letterboxing lives in one place. w32_client_size() is that size. */
+void w32_input_key(int vk, int down);              /* a virtual-key transition */
+/* The same, carrying the character the host's keyboard layout resolved for
+ * it. TranslateMessage uses that instead of deriving one, so a non-US layout
+ * types what it should -- and a program that never calls TranslateMessage
+ * still sees no WM_CHAR, as on Windows. */
+void w32_input_key_ch(int vk, int down, uint32_t ch);
+void w32_input_char(uint32_t ch);                  /* a character with no key behind it */
+void w32_input_mouse_move(int x, int y);           /* absolute, client pixels */
+void w32_input_mouse_delta(int dx, int dy);        /* relative: mouselook, a trackpad */
+void w32_input_mouse_button(int button, int down); /* 0 left, 1 right, 2 middle */
+void w32_input_mouse_wheel(int delta);             /* +/-120 per notch */
+void w32_input_reset(void);
+void w32_client_size(int *cw, int *ch);
+int  w32_has_window(void);                         /* has the guest made one yet? */
+/* Whether the guest wants a pointer drawn, and where it thinks it is. A game
+ * hides the cursor to say "I am doing mouselook now", which is exactly when a
+ * virtual cursor should get out of the way. */
+int  w32_cursor_visible(void);
+void w32_cursor_pos(int *x, int *y);
+
 /* d3d9.c: where a presented frame goes. NULL simply drops it, which is what
  * the headless test and CI want; the iOS app sets it to a Metal blit. */
 typedef void (*w32_present_fn)(void *ctx, const void *pixels, int width, int height, int pitch);
 void w32_set_present(w32_present_fn fn, void *ctx);
+w32_present_fn w32_get_present(void **ctx);        /* so a second consumer can chain */
 /* Ask a guest that is presenting frames to stop: Present and
  * TestCooperativeLevel start returning D3DERR_DEVICELOST, which a game
  * already knows how to exit on. */
