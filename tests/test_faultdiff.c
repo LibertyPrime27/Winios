@@ -40,7 +40,9 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <string.h>
+#include <unistd.h>
 #include <sys/mman.h>
 
 #include "xcore/hostpc.h"
@@ -56,7 +58,22 @@ typedef struct { const char *name; int x87; int before; const uint8_t *code; siz
  * on both sides, so a stack can be walked *into* it: the cases that push
  * twice need the first push to land somewhere real. */
 static uint8_t *g_data, *g_stack, *g_code, *g_hole, *g_above;
-enum { DATA_SIZE = 4096, STACK_SIZE = 65536, CODE_SIZE = 4096, HOLE_SIZE = 4096 };
+enum { DATA_SIZE = 4096, STACK_SIZE = 65536, CODE_SIZE = 4096 };
+
+/* The hole's size is the host's page size, not a constant.
+ *
+ * It used to be 4096, which is correct on x86-64 and on the aarch64 machine
+ * qemu-user reports -- and wrong on Apple silicon, where a page is 16 KB. The
+ * mapping arithmetic was the failure and not the geometry: `mmap(3 * 4096)`
+ * gets rounded up to a single 16 KB page, `span + 4096` is then not page
+ * aligned, and mprotect refuses it with EINVAL. So on the one machine this
+ * test exists for -- real hardware, real signals -- it never ran at all.
+ *
+ * Nothing in the cases cares how big the hole is; they need an address inside
+ * it and one just above it, with mapped pages either side. So it is a runtime
+ * value, and the mapped/unmapped/mapped sandwich is built out of whole pages
+ * whatever their size. */
+static size_t g_page = 4096;
 
 static xc_cpu *g_cpu;
 static sigjmp_buf g_jmp;
@@ -79,7 +96,7 @@ static void on_segv(int sig, siginfo_t *si, void *uctx) {
     uint64_t pc = XC_HOST_PC(uctx);
     uint64_t lo = 0, hi = 0;
     int in_jit = pc && xc_jit_code_range(&lo, &hi) && pc >= lo && pc < hi;
-    if (g_armed && in_jit && addr >= hole && addr < hole + HOLE_SIZE) {
+    if (g_armed && in_jit && addr >= hole && addr < hole + g_page) {
         uint64_t grip = 0;
         void *stub = xc_jit_fault_stub(pc, &grip);
         if (stub && XC_HAVE_HOST_PC_SET) {
@@ -92,7 +109,7 @@ static void on_segv(int sig, siginfo_t *si, void *uctx) {
             return;
         }
     }
-    if (g_armed && !in_jit && addr >= hole && addr < hole + HOLE_SIZE) {
+    if (g_armed && !in_jit && addr >= hole && addr < hole + g_page) {
         g_cpu->stop = XC_STOP_FAULT;
         g_cpu->fault_kind = XC_FAULT_MEM;
         g_cpu->fault_addr = addr;
@@ -182,14 +199,38 @@ int main(int argc, char **argv) {
     g_data = claim(DATA_SIZE, PROT_READ | PROT_WRITE);
     g_stack = claim(STACK_SIZE, PROT_READ | PROT_WRITE);
     g_code = claim(CODE_SIZE, PROT_READ | PROT_WRITE);
-    /* three pages, with the middle one taken away */
-    uint8_t *span = claim(3 * HOLE_SIZE, PROT_READ | PROT_WRITE);
-    g_hole = span + HOLE_SIZE;
-    g_above = span + 2 * HOLE_SIZE;
-    if (mprotect(g_hole, HOLE_SIZE, PROT_NONE) != 0) { perror("mprotect"); return 2; }
+    /* Three pages, with the middle one taken away. The size comes from the
+     * host, because mprotect only accepts page-aligned addresses and lengths
+     * and a 16 KB-page machine rejects a 4 KB offset outright.
+     *
+     * FAULTDIFF_PAGE overrides it upwards, which is how the 16 KB arithmetic
+     * gets exercised on a 4 KB host: the value has to be a multiple of the
+     * real page size, and then everything mprotect sees is still aligned. It
+     * is a test hook for this test's own geometry and nothing else reads it. */
+    { long ps = sysconf(_SC_PAGESIZE);
+      g_page = ps > 0 ? (size_t)ps : 4096;
+      const char *forced = getenv("FAULTDIFF_PAGE");
+      if (forced) {
+          size_t want = (size_t)strtoul(forced, 0, 0);
+          if (want && want % g_page == 0) g_page = want;
+          else { printf("test_faultdiff: FAULTDIFF_PAGE=%s is not a multiple of the "
+                        "host's %zu-byte page\n", forced, g_page); return 2; }
+      } }
+    uint8_t *span = claim(3 * g_page, PROT_READ | PROT_WRITE);
+    g_hole = span + g_page;
+    g_above = span + 2 * g_page;
+    if (mprotect(g_hole, g_page, PROT_NONE) != 0) {
+        /* Worth being loud rather than terse: this is the exact failure that
+         * hid the whole test on Apple silicon, and "Invalid argument" on its
+         * own says nothing about why. */
+        printf("test_faultdiff: mprotect(%p, %zu) failed: %s\n",
+               (void *)g_hole, g_page, strerror(errno));
+        return 2;
+    }
 
     if (getenv("FAULTDIFF_TRACE"))
-        printf("data %p stack %p code %p hole %p\n", (void*)g_data, (void*)g_stack, (void*)g_code, (void*)g_hole);
+        printf("data %p stack %p code %p hole %p page %zu\n", (void*)g_data, (void*)g_stack,
+               (void*)g_code, (void*)g_hole, g_page);
     struct sigaction sa; memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = on_segv; sa.sa_flags = SA_SIGINFO;
     sigaction(SIGSEGV, &sa, 0); sigaction(SIGBUS, &sa, 0);

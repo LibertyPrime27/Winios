@@ -61,6 +61,15 @@ jobs:
           # qemu-user does now that the interpreter's accesses are plain
           # loads and stores rather than calls into memcpy.
           $Q build-a64/test_faultdiff 24
+          # Again with a 16 KB page. Apple silicon has one, this runner has
+          # 4 KB, and the difference is not cosmetic: the test builds a
+          # mapped/unmapped/mapped sandwich, and mprotect only accepts
+          # page-aligned addresses. A 4 KB offset into a 16 KB page is
+          # rejected outright -- which is how this test came to be skipped
+          # entirely on the one machine it exists for, while passing here.
+          # Checking it on the cheap runner is what stops that recurring.
+          FAULTDIFF_PAGE=16384 $Q build-a64/test_faultdiff 24
+          FAULTDIFF_PAGE=65536 $Q build-a64/test_faultdiff 8
           $Q build-a64/test_bench 50000
           $Q build-a64/test_winrun_lib tests/win32
           printf '#!/bin/sh\nexec %s %s/build-a64/winrun "$@"\n' "$Q" "$PWD" > /tmp/winrun-q && chmod +x /tmp/winrun-q
@@ -177,6 +186,12 @@ jobs:
           out8=$(./build-mac/test_faultdiff 100 2>&1); rc8=$?
           echo "$out8" | tail -1 | while IFS= read -r l; do echo "::notice::faultdiff: ${l}"; done
           echo "$out8" | grep -E '^  \[' | head -8 | while IFS= read -r l; do echo "::error::faultdiff: ${l}"; done
+          # A test that failed to *set itself up* has no case lines to report,
+          # so the grep above finds nothing and the only trace is a notice --
+          # which is how "mprotect: Invalid argument" once got reported as
+          # information rather than as the reason the job failed. Any non-zero
+          # exit gets an error annotation of its own.
+          [ $rc8 -eq 0 ] || echo "$out8" | tail -3 | while IFS= read -r l; do echo "::error::faultdiff (exit $rc8): ${l}"; done
           out6=$(./build-mac/test_bench 200000 2>&1); rc6=$?
           echo "$out6" | grep -E "interp|x87" | head -4 | while IFS= read -r l; do echo "::notice::bench: ${l}"; done
           out5=$(sh tests/win32/run.sh build-mac/winrun tests/win32 2>&1); rc5=$?
