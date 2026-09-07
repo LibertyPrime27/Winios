@@ -10,6 +10,7 @@
  */
 #define _GNU_SOURCE
 #include "../../win32/w32.h"
+#include "xcore/hostpc.h"
 
 #include <errno.h>
 #include <setjmp.h>
@@ -20,7 +21,6 @@
 #include <strings.h>
 #include <sys/mman.h>
 #include <time.h>
-#include <ucontext.h>
 #include <dirent.h>
 #include <unistd.h>
 
@@ -666,33 +666,15 @@ static void process_init(w32 *w, int argc, char **argv) {
 #include <execinfo.h>
 #define HAVE_BACKTRACE 1
 #endif
-/* Where the host was when the signal arrived. Needed to tell a guest access
- * to an unmapped guest page -- which the interpreter can turn into a guest
- * exception -- from the same access made by compiled code, where the guest's
- * registers are in host registers and no honest CONTEXT can be built. Returns
- * 0 where the layout is unknown, and 0 means "assume the worst". */
-static uint64_t *host_pc_slot(void *uctx) {
-#if defined(__APPLE__) && defined(__aarch64__)
-    return (uint64_t *)&((ucontext_t *)uctx)->uc_mcontext->__ss.__pc;
-#elif defined(__linux__) && defined(__aarch64__)
-    return (uint64_t *)&((ucontext_t *)uctx)->uc_mcontext.pc;
-#else
-    (void)uctx; return 0;                       /* only ARM64 has compiled code */
-#endif
-}
-
-static uint64_t host_pc_of(void *uctx) {
-#if defined(__APPLE__) && defined(__aarch64__)
-    return (uint64_t)((ucontext_t *)uctx)->uc_mcontext->__ss.__pc;
-#elif defined(__APPLE__) && defined(__x86_64__)
-    return (uint64_t)((ucontext_t *)uctx)->uc_mcontext->__ss.__rip;
-#elif defined(__linux__) && defined(__aarch64__)
-    return (uint64_t)((ucontext_t *)uctx)->uc_mcontext.pc;
-#elif defined(__linux__) && defined(__x86_64__)
-    return (uint64_t)((ucontext_t *)uctx)->uc_mcontext.gregs[REG_RIP];
-#else
-    (void)uctx; return 0;
-#endif
+/* Where the host was when the signal arrived, and moving it there. The
+ * per-platform spelling of both is in xcore/hostpc.h, which says why Darwin's
+ * arm64 needs accessor macros rather than a field. 0 means the layout is
+ * unknown, and unknown means assume the worst. */
+static uint64_t host_pc_of(void *uctx) { return XC_HOST_PC(uctx); }
+static int host_pc_move(void *uctx, uint64_t pc) {
+    if (!XC_HAVE_HOST_PC_SET) return 0;
+    XC_HOST_PC_SET(uctx, pc);
+    return 1;
 }
 
 /* A 32-bit guest's arena is one 4 GB PROT_NONE reservation with the pages it
@@ -737,14 +719,13 @@ static void on_crash(int sig, siginfo_t *si, void *uctx) {
     if (g_fault_armed && in_jit && pc && c) {
         uint64_t grip = 0;
         void *stub = xc_jit_fault_stub(pc, &grip);
-        uint64_t *pcp = host_pc_slot(uctx);
-        if (stub && pcp) {
+        if (stub) {
             c->stop = XC_STOP_FAULT;
             c->fault_kind = XC_FAULT_MEM;
             c->fault_addr = gaddr;
             c->rip = grip;                      /* the stub only spills; the RIP is ours to set */
-            *pcp = (uint64_t)(uintptr_t)stub;
-            return;
+            if (host_pc_move(uctx, (uint64_t)(uintptr_t)stub)) return;
+            c->stop = XC_STOP_NONE;             /* cannot move the PC here; fall through and report */
         }
     }
     /* The interpreter's own accesses. Here the cpu struct is already the

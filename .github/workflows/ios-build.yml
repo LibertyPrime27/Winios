@@ -140,13 +140,18 @@ jobs:
       # which project.yml hardcodes in LIBRARY_SEARCH_PATHS.
       - name: Build xcore + Zydis for iOS arm64
         run: |
+          set -o pipefail
+          # Tee'd, because this is the first place Apple clang sees the C and
+          # the only place an iOS-only header problem can show up -- and the
+          # run page will not show log text without a sign-in, so the failure
+          # handler below turns these lines into annotations.
           # d12mt (and dxil-spirv / SPIRV-Cross under it) is built and tested
           # on the Linux job; its iOS cross-build is a separate step to come.
           cmake -S . -B build-xcore-ios \
             -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
-            -DCMAKE_BUILD_TYPE=Release -DWINIOS_D12MT=OFF
-          cmake --build build-xcore-ios --target xcore_golden winrun_lib -j3
+            -DCMAKE_BUILD_TYPE=Release -DWINIOS_D12MT=OFF 2>&1 | tee -a ios-cc.log
+          cmake --build build-xcore-ios --target xcore_golden winrun_lib -j3 2>&1 | tee -a ios-cc.log
           echo "--- static libs produced ---"
           find build-xcore-ios -name '*.a' | sed 's/^/  /'
 
@@ -217,17 +222,28 @@ jobs:
 
 
       # GitHub serves raw job logs from a blob host that is unreachable from
-      # some networks. Workflow-command annotations go through the API instead,
-      # so the actual compiler errors stay readable without downloading logs.
+      # some networks, and the run page shows no log text at all without a
+      # sign-in. Workflow-command annotations go through the API instead, so
+      # the actual compiler errors are readable from the run page itself.
+      #
+      # Every log this job produces, not just Xcode's: the C build for iOS
+      # arm64 runs first and is the only place Apple clang sees these sources,
+      # so it is exactly where an iOS-only problem appears. A missing log is
+      # skipped rather than fatal -- the step is a diagnostic and always exits
+      # 0, because a second failure on top of the real one only obscures it.
       - name: Surface build errors as annotations
         if: failure()
         run: |
-          echo "::group::compiler errors"
-          grep -E "error:|error MT|The following build commands failed" build.log \
-            | sed 's/[[:space:]]*$//' | sort -u | head -30 \
-            | while IFS= read -r line; do echo "::error::${line}"; done
-          echo "::endgroup::"
-          tail -n 40 build.log
+          for f in ios-cc.log build.log; do
+            [ -f "$f" ] || { echo "(no $f -- the job did not get that far)"; continue; }
+            echo "::group::$f"
+            grep -E "error:|fatal error|error MT|The following build commands failed" "$f" \
+              | sed 's/[[:space:]]*$//' | sort -u | head -20 \
+              | while IFS= read -r line; do echo "::error::${line}"; done
+            tail -n 40 "$f"
+            echo "::endgroup::"
+          done
+          exit 0
 
       - name: Package unsigned IPA
         run: |
@@ -251,5 +267,11 @@ jobs:
         if: failure()
         with:
           name: build-log-${{ github.sha }}
-          path: build.log
+          # Whichever of them exists: a failure before Xcode runs leaves only
+          # the C build's log, and "no files found" was the least useful thing
+          # the previous version of this step could say.
+          path: |
+            ios-cc.log
+            build.log
+          if-no-files-found: ignore
           retention-days: 7

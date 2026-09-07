@@ -42,7 +42,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <ucontext.h>
+
+#include "xcore/hostpc.h"
 
 #define B(...) ((const uint8_t[]){ __VA_ARGS__ })
 typedef struct { const char *name; int x87; int before; const uint8_t *code; size_t len; } faultcase;
@@ -63,19 +64,8 @@ static volatile int g_armed;
 static volatile int g_via_stub;          /* the last run was recovered through a stub */
 static volatile int g_via_jmp;           /* ... or through the interpreter, from a callout */
 
-static uint64_t *pc_slot(void *uctx) {
-#if defined(__APPLE__) && defined(__aarch64__)
-    return (uint64_t *)&((ucontext_t *)uctx)->uc_mcontext->__ss.__pc;
-#elif defined(__linux__) && defined(__aarch64__)
-    return (uint64_t *)&((ucontext_t *)uctx)->uc_mcontext.pc;
-#elif defined(__linux__) && defined(__x86_64__)
-    return (uint64_t *)&((ucontext_t *)uctx)->uc_mcontext.gregs[REG_RIP];
-#elif defined(__APPLE__) && defined(__x86_64__)
-    return (uint64_t *)&((ucontext_t *)uctx)->uc_mcontext->__ss.__rip;
-#else
-    (void)uctx; return 0;
-#endif
-}
+/* Same plumbing as the runtime's, from the same header, so the two cannot
+ * disagree about how to read or move a signal context's PC. */
 
 /* Two cases, the same two winrun has. A compiled block reaching for the hole
  * goes to its recovery stub. An instruction the dynarec does not lower is run
@@ -86,19 +76,19 @@ static uint64_t *pc_slot(void *uctx) {
 static void on_segv(int sig, siginfo_t *si, void *uctx) {
     uint64_t addr = (uint64_t)(uintptr_t)si->si_addr;
     uint64_t hole = (uint64_t)(uintptr_t)g_hole;
-    uint64_t *pcp = pc_slot(uctx);
+    uint64_t pc = XC_HOST_PC(uctx);
     uint64_t lo = 0, hi = 0;
-    int in_jit = xc_jit_code_range(&lo, &hi) && pcp && *pcp >= lo && *pcp < hi;
+    int in_jit = pc && xc_jit_code_range(&lo, &hi) && pc >= lo && pc < hi;
     if (g_armed && in_jit && addr >= hole && addr < hole + HOLE_SIZE) {
         uint64_t grip = 0;
-        void *stub = xc_jit_fault_stub(*pcp, &grip);
-        if (stub) {
+        void *stub = xc_jit_fault_stub(pc, &grip);
+        if (stub && XC_HAVE_HOST_PC_SET) {
             g_cpu->stop = XC_STOP_FAULT;
             g_cpu->fault_kind = XC_FAULT_MEM;
             g_cpu->fault_addr = addr;
             g_cpu->rip = grip;
             g_via_stub = 1;
-            *pcp = (uint64_t)(uintptr_t)stub;
+            XC_HOST_PC_SET(uctx, (uint64_t)(uintptr_t)stub);
             return;
         }
     }
