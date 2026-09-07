@@ -45,7 +45,7 @@ uint64_t w32_com_vtable(w32 *w, w32_com_class *cls) {
     uint64_t v = w32_alloc(w, (uint64_t)psz * (uint32_t)cls->nmethods + 16, 0);
     if (!v) { fprintf(stderr, "winrun: no memory for the %s vtable\n", cls->name); return 0; }
     cls->dll.name = cls->name;
-    cls->dll.apis = cls->methods;
+    cls->dll.apis[0] = cls->methods;
     for (int i = 0; i < cls->nmethods; i++) {
         const w32_api *m = &cls->methods[i];
         uint64_t s;

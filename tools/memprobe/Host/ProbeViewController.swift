@@ -407,6 +407,12 @@ final class ProbeViewController: UIViewController {
             // for. Also script-driven, so the keys reach XInput.
             ("audiotest64.exe", [], 0, "audiotest64"),
             ("audiotest32.exe", [], 0, "audiotest32"),
+            // Threads. Real pthreads, one of them executing guest code at a
+            // time; the device is where that matters most, because iOS
+            // schedules them across performance and efficiency cores and so
+            // interleaves the handovers differently than a desktop does.
+            ("threadtest64.exe", [], 0, "threadtest64"),
+            ("threadtest32.exe", [], 0, "threadtest32"),
         ]
         let cases = single.map { s in all.filter { $0.0 == s } } ?? all
 

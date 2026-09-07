@@ -203,11 +203,11 @@ static void setup_tls(w32 *w, w32_module *m, const uint8_t *t, int plus,
     if (size) memcpy(W32P(w, block), W32P(w, raw_start), size);
     w32_write(w, idx_addr, 4, index);
     /* ThreadLocalStoragePointer -> the array of per-module blocks */
-    if (!w->tls_array) {
-        w->tls_array = w32_alloc(w, 4096, 0);
-        w32_write(w, w->teb + (plus ? TEB64_TLSPTR : TEB32_TLSPTR), psz, w->tls_array);
+    if (!w32_self()->tls_array) {
+        w32_self()->tls_array = w32_alloc(w, 4096, 0);
+        w32_write(w, w32_self()->teb + (plus ? TEB64_TLSPTR : TEB32_TLSPTR), psz, w32_self()->tls_array);
     }
-    w32_write(w, w->tls_array + (uint64_t)psz * index, psz, block);
+    w32_write(w, w32_self()->tls_array + (uint64_t)psz * index, psz, block);
     w->tls_slots[index] = block;
     m->tls_callbacks = cb_addr;
     if (m->is_exe) { w->tls_index = index; w->tls_callbacks = cb_addr; }

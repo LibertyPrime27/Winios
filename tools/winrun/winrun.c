@@ -48,10 +48,12 @@ static void *g_next_present_ctx;
 static int g_hook_on;
 
 /* Where the run loop resumes when the signal handler turns a host SIGSEGV
- * back into a guest fault. Defined here because both the run loop and the
- * handler need it, and they are far apart. See on_crash. */
-static sigjmp_buf g_fault_jmp;
-static volatile int g_fault_armed;
+ * back into a guest fault. Per thread, because the fault is delivered on the
+ * thread that caused it and that is the only stack it can unwind. Defined
+ * here because both the run loop and the handler need it, and they are far
+ * apart. See on_crash. */
+static _Thread_local sigjmp_buf g_fault_jmp;
+static _Thread_local volatile int g_fault_armed;
 
 /* ------------------------------------------------------------- memory */
 
@@ -259,7 +261,7 @@ uint64_t w32_ptrsize(w32 *w) { return w->is32 ? 4 : 8; }
 /* --------------------------------------------------- calling convention */
 
 uint64_t w32_arg(w32 *w, int i) {
-    xc_cpu *c = w->c;
+    xc_cpu *c = w32_cpu(w);
     if (w->is32) return w32_read(w, c->gpr[XC_RSP] + 4 + 4u * i, 4);
     switch (i) {
     case 0: return c->gpr[XC_RCX];
@@ -271,14 +273,14 @@ uint64_t w32_arg(w32 *w, int i) {
 }
 double w32_farg(w32 *w, int i) {
     double d;
-    if (w->is32) { uint64_t v = w32_read(w, w->c->gpr[XC_RSP] + 4 + 4u * i, 8); memcpy(&d, &v, 8); return d; }
-    if (i < 4) { memcpy(&d, &w->c->xmm[i].lo, 8); return d; }
+    if (w->is32) { uint64_t v = w32_read(w, w32_cpu(w)->gpr[XC_RSP] + 4 + 4u * i, 8); memcpy(&d, &v, 8); return d; }
+    if (i < 4) { memcpy(&d, &w32_cpu(w)->xmm[i].lo, 8); return d; }
     uint64_t v = w32_arg(w, i); memcpy(&d, &v, 8); return d;
 }
-void w32_ret(w32 *w, uint64_t v) { w->c->gpr[XC_RAX] = w->is32 ? (uint32_t)v : v; }
+void w32_ret(w32 *w, uint64_t v) { w32_cpu(w)->gpr[XC_RAX] = w->is32 ? (uint32_t)v : v; }
 void w32_ret64(w32 *w, uint64_t v) {
-    if (w->is32) { w->c->gpr[XC_RAX] = (uint32_t)v; w->c->gpr[XC_RDX] = (uint32_t)(v >> 32); }
-    else w->c->gpr[XC_RAX] = v;
+    if (w->is32) { w32_cpu(w)->gpr[XC_RAX] = (uint32_t)v; w32_cpu(w)->gpr[XC_RDX] = (uint32_t)(v >> 32); }
+    else w32_cpu(w)->gpr[XC_RAX] = v;
 }
 /* double -> 80-bit extended, for x87 return values (32-bit cdecl math) */
 static xc_f80 f80_from_double(double v) {
@@ -299,17 +301,18 @@ static xc_f80 f80_from_double(double v) {
 void w32_fret(w32 *w, double v) {
     if (w->is32) {
         /* x87 ST(0): the interpreter owns the stack; push through the CPU struct */
-        xc_cpu *c = w->c;
+        xc_cpu *c = w32_cpu(w);
         int top = (c->fsw >> 11) & 7;
         top = (top - 1) & 7;
         c->fsw = (uint16_t)((c->fsw & ~0x3800) | (top << 11));
         c->fpr[top] = f80_from_double(v);
         c->ftag_empty &= (uint8_t)~(1u << top);
-    } else memcpy(&w->c->xmm[0].lo, &v, 8);
+    } else memcpy(&w32_cpu(w)->xmm[0].lo, &v, 8);
 }
+/* The TEB is the only copy: GetLastError reads it from there, and the TEB is
+ * per thread, so this is per thread with nothing extra to keep in step. */
 void w32_set_last_error(w32 *w, uint32_t e) {
-    w->last_error = e;
-    w32_write(w, w->teb + (w->is32 ? TEB32_LASTERROR : TEB64_LASTERROR), 4, e);
+    w32_write(w, w32_self()->teb + (w->is32 ? TEB32_LASTERROR : TEB64_LASTERROR), 4, e);
 }
 
 /* ------------------------------------------------------------- handles */
@@ -344,23 +347,24 @@ void w32_handle_close(w32 *w, uint64_t h) {
 /* --------------------------------------------------------------- stubs */
 
 static const w32_dll g_dlls[] = {
-    /* name, exports, a second table of exports (SEH lives in its own file
-     * but belongs to these two DLLs), module handle */
-    { "kernel32.dll", w32_kernel32, w32_seh_kernel32, 0 },
-    { "msvcrt.dll",   w32_msvcrt,   0,                0 },
-    { "ntdll.dll",    w32_ntdll,    w32_seh_ntdll,    0 },
-    { "user32.dll",   w32_user32,   0,                0 },
-    { "winmm.dll",    w32_winmm,    0,                0 },
-    { "dsound.dll",   w32_dsound,   0,                0 },
+    /* kernel32's exports are split across three files: the bulk in
+     * kernel32.c, exception handling in seh.c, threads and synchronisation
+     * in thread.c. */
+    { "kernel32.dll", { w32_kernel32, w32_seh_kernel32, w32_thread_api }, 0 },
+    { "msvcrt.dll",   { w32_msvcrt, w32_thread_crt },                     0 },
+    { "ntdll.dll",    { w32_ntdll, w32_seh_ntdll },                       0 },
+    { "user32.dll",   { w32_user32 },                                     0 },
+    { "winmm.dll",    { w32_winmm },                                      0 },
+    { "dsound.dll",   { w32_dsound },                                     0 },
     /* Every XInput version games link against, all the same implementation:
      * the DLL name changed five times and the eight functions did not. */
-    { "xinput1_4.dll", w32_xinput,  0,                0 },
-    { "xinput1_3.dll", w32_xinput,  0,                0 },
-    { "xinput1_2.dll", w32_xinput,  0,                0 },
-    { "xinput1_1.dll", w32_xinput,  0,                0 },
-    { "xinput9_1_0.dll", w32_xinput, 0,               0 },
-    { "d3d9.dll",     w32_d3d9,     0,                0 },
-    { "advapi32.dll", w32_advapi32, 0,                0 },
+    { "xinput1_4.dll",   { w32_xinput },                                  0 },
+    { "xinput1_3.dll",   { w32_xinput },                                  0 },
+    { "xinput1_2.dll",   { w32_xinput },                                  0 },
+    { "xinput1_1.dll",   { w32_xinput },                                  0 },
+    { "xinput9_1_0.dll", { w32_xinput },                                  0 },
+    { "d3d9.dll",     { w32_d3d9 },                                       0 },
+    { "advapi32.dll", { w32_advapi32 },                                   0 },
 };
 enum { NDLLS = sizeof g_dlls / sizeof g_dlls[0], STUB_RETURN = 0, STUB_EXIT = 1, STUB_FIRST = 2 };
 
@@ -402,8 +406,8 @@ uint64_t w32_stub_for(w32 *w, const char *dll, const char *name) {
         for (int i = STUB_FIRST; i < w->nstubs; i++)
             if (w->stubs[i].dll == &g_dlls[d] && w->stubs[i].api && !strcmp(w->stubs[i].api->name, name))
                 return w->stubs[i].api->data_size ? w->data_exports[i] : stub_addr(w, i);
-        for (int t = 0; t < 2; t++) {
-            const w32_api *tab = t ? g_dlls[d].apis2 : g_dlls[d].apis;
+        for (int t = 0; t < W32_DLL_TABLES; t++) {
+            const w32_api *tab = g_dlls[d].apis[t];
             for (const w32_api *a = tab; a && a->name; a++) if (!strcmp(a->name, name)) {
                 int i = stub_new(w, &g_dlls[d], a, 0);
                 if (a->data_size) { w->data_exports[i] = w32_heap_alloc(w, (uint64_t)a->data_size); return w->data_exports[i]; }
@@ -435,7 +439,12 @@ static void stubs_init(w32 *w) {
 
 /* ------------------------------------------------------------ run loop */
 
-void w32_exit(w32 *w, int code) { w->exited = 1; w->exit_code = code; w->c->stop = XC_STOP_HLT; }
+void w32_exit(w32 *w, int code) {
+    w32_thread_exit_all();          /* every other thread unwinds out of its run loop */
+    w->exited = 1;
+    w->exit_code = code;
+    w32_cpu(w)->stop = XC_STOP_HLT;
+}
 
 /* Remember that something we do not implement was called. Names are the
  * stub's own "dll!Name" strings, which outlive the run. */
@@ -449,7 +458,7 @@ static void note_unimplemented(w32 *w, const char *name) {
 }
 
 static void dispatch(w32 *w, int i) {
-    xc_cpu *c = w->c;
+    xc_cpu *c = w32_cpu(w);
     const w32_api *a = w->stubs[i].api;
     if (!a) {
         const char *full = w->stubs[i].missing;
@@ -515,10 +524,16 @@ static uint64_t now_ns_host(void) {
 
 /* Run until the process exits (depth 0) or the return-to-host stub is hit
  * (depth > 0, i.e. inside w32_call_guest). */
+/* How many guest instructions a thread runs before offering the lock to
+ * another. Large enough that the handover is not the cost of running, small
+ * enough that a thread waiting on another does not wait long: at the rates
+ * the dynarec reaches this is well under a millisecond. */
+enum { SLICE = 1u << 18 };
+
 static int run_loop(w32 *w) {
-    xc_cpu *c = w->c;
+    xc_cpu *c = w32_cpu(w);
     for (;;) {
-        if (w->exited) return 0;
+        if (w->exited || w32_exiting()) return 0;
         if (g_stop_request) { w->stop_reason = "stopped by request"; w32_exit(w, 124); return 0; }
         if (w->deadline_ns && now_ns_host() > w->deadline_ns) {
             w->stop_reason = "ran past its time limit";
@@ -527,17 +542,21 @@ static int run_loop(w32 *w) {
         xc_stop st;
         if (sigsetjmp(g_fault_jmp, 1) == 0) {
             g_fault_armed = 1;
-            st = xc_run(c, 1u << 20);
+            st = xc_run(c, SLICE);
             g_fault_armed = 0;
         } else {
             st = XC_STOP_FAULT;                 /* on_crash recovered a guest access */
         }
-        if (st == XC_STOP_STEPS) continue;
+        /* Hand the guest lock over between slices. Without this a thread that
+         * never blocks would keep every other one from starting, which is
+         * exactly what a game's main loop does while a loading thread is
+         * meant to be working. */
+        if (st == XC_STOP_STEPS) { w32_guest_yield(); continue; }
         if (st == XC_STOP_BREAKPOINT) {
             uint64_t at = c->rip - 1;
             if (at >= w->stub_base && at < w->stub_base + 16u * W32_MAX_STUBS && !((at - w->stub_base) & 15)) {
                 int i = (int)((at - w->stub_base) / 16);
-                if (i == STUB_RETURN) { if (w->depth > 0) return 1; w->stop_reason = "a stray return-to-host stub"; fprintf(stderr, "winrun: stray return-to-host\n"); w32_exit(w, 126); return 0; }
+                if (i == STUB_RETURN) { if (w32_self()->depth > 0) return 1; w->stop_reason = "a stray return-to-host stub"; fprintf(stderr, "winrun: stray return-to-host\n"); w32_exit(w, 126); return 0; }
                 if (i == STUB_EXIT) { w32_exit(w, (int)(uint32_t)c->gpr[XC_RAX]); return 0; }
                 if (i < w->nstubs) { dispatch(w, i); continue; }
             }
@@ -576,8 +595,17 @@ static int run_loop(w32 *w) {
     }
 }
 
+/* Leave the innermost w32_call_guest as returning from the guest function
+ * would: set RIP to the return-to-host stub the call pushed. ExitThread does
+ * this rather than unwinding the host stack, because the host stack below it
+ * belongs to the emulator, not to the guest. */
+void w32_return_to_host(w32 *w) {
+    w32_cpu(w)->rip = stub_addr(w, STUB_RETURN);
+    w->redirected = 1;
+}
+
 uint64_t w32_call_guest(w32 *w, uint64_t fn, int nargs, const uint64_t *args) {
-    xc_cpu *c = w->c;
+    xc_cpu *c = w32_cpu(w);
     uint64_t saved_gpr[16]; memcpy(saved_gpr, c->gpr, sizeof saved_gpr);
     uint64_t saved_rip = c->rip;
     uint64_t sp = c->gpr[XC_RSP];
@@ -598,9 +626,9 @@ uint64_t w32_call_guest(w32 *w, uint64_t fn, int nargs, const uint64_t *args) {
     }
     c->gpr[XC_RSP] = sp;
     c->rip = fn;
-    w->depth++;
+    w32_self()->depth++;
     run_loop(w);
-    w->depth--;
+    w32_self()->depth--;
     uint64_t ret = c->gpr[XC_RAX];
     if (!w->exited) { memcpy(c->gpr, saved_gpr, sizeof saved_gpr); c->rip = saved_rip; c->gpr[XC_RAX] = ret; }
     return ret;
@@ -618,31 +646,31 @@ static void process_init(w32 *w, int argc, char **argv) {
     /* standard handles first, so they are 4, 8 and 12 */
     w32_handle_new(w, H_FILE, 0); w32_handle_new(w, H_FILE, 1); w32_handle_new(w, H_FILE, 2);
     /* TEB + PEB: two pages each, zeroed */
-    w->teb = w32_alloc(w, 0x2000, 0);
+    w32_self()->teb = w32_alloc(w, 0x2000, 0);
     w->peb = w32_alloc(w, 0x1000, 0);
     /* stack: 1 MB (mingw CRT probes the TEB stack limits) */
     uint64_t stack_size = 1u << 20;
-    w->stack_limit = w32_alloc(w, stack_size, 0);
-    w->stack_base = w->stack_limit + stack_size;
-    if (!w->teb || !w->peb || !w->stack_limit) { fprintf(stderr, "winrun: cannot map TEB/PEB/stack: %s\n", strerror(errno)); exit(2); }
+    w32_self()->stack_limit = w32_alloc(w, stack_size, 0);
+    w32_self()->stack_base = w32_self()->stack_limit + stack_size;
+    if (!w32_self()->teb || !w->peb || !w32_self()->stack_limit) { fprintf(stderr, "winrun: cannot map TEB/PEB/stack: %s\n", strerror(errno)); exit(2); }
     if (w->is32) {
-        w32_write(w, w->teb + 0x00, 4, 0xFFFFFFFFu);          /* ExceptionList: end of chain */
-        w32_write(w, w->teb + 0x04, 4, w->stack_base);
-        w32_write(w, w->teb + 0x08, 4, w->stack_limit);
-        w32_write(w, w->teb + 0x18, 4, w->teb);                /* Self */
-        w32_write(w, w->teb + 0x20, 4, 4242);                  /* pid */
-        w32_write(w, w->teb + 0x24, 4, 4243);                  /* tid */
-        w32_write(w, w->teb + TEB32_PEB, 4, w->peb);
+        w32_write(w, w32_self()->teb + 0x00, 4, 0xFFFFFFFFu);          /* ExceptionList: end of chain */
+        w32_write(w, w32_self()->teb + 0x04, 4, w32_self()->stack_base);
+        w32_write(w, w32_self()->teb + 0x08, 4, w32_self()->stack_limit);
+        w32_write(w, w32_self()->teb + 0x18, 4, w32_self()->teb);                /* Self */
+        w32_write(w, w32_self()->teb + 0x20, 4, 4242);                  /* pid */
+        w32_write(w, w32_self()->teb + 0x24, 4, 4243);                  /* tid */
+        w32_write(w, w32_self()->teb + TEB32_PEB, 4, w->peb);
         w32_write(w, w->peb + 0x18, 4, w32_handle_new(w, H_HEAP, -1));
         w32_write(w, w->peb + 0x64, 4, 4);                     /* NumberOfProcessors */
         w32_write(w, w->peb + 0xA4, 4, 10); w32_write(w, w->peb + 0xA8, 4, 0); w32_write(w, w->peb + 0xAC, 2, 19045);
     } else {
-        w32_write(w, w->teb + 0x08, 8, w->stack_base);
-        w32_write(w, w->teb + 0x10, 8, w->stack_limit);
-        w32_write(w, w->teb + 0x30, 8, w->teb);                /* Self */
-        w32_write(w, w->teb + 0x40, 8, 4242);                  /* ClientId.UniqueProcess */
-        w32_write(w, w->teb + 0x48, 8, 4243);                  /* ClientId.UniqueThread */
-        w32_write(w, w->teb + TEB64_PEB, 8, w->peb);
+        w32_write(w, w32_self()->teb + 0x08, 8, w32_self()->stack_base);
+        w32_write(w, w32_self()->teb + 0x10, 8, w32_self()->stack_limit);
+        w32_write(w, w32_self()->teb + 0x30, 8, w32_self()->teb);                /* Self */
+        w32_write(w, w32_self()->teb + 0x40, 8, 4242);                  /* ClientId.UniqueProcess */
+        w32_write(w, w32_self()->teb + 0x48, 8, 4243);                  /* ClientId.UniqueThread */
+        w32_write(w, w32_self()->teb + TEB64_PEB, 8, w->peb);
         w32_write(w, w->peb + 0x30, 8, w32_handle_new(w, H_HEAP, -1));
         w32_write(w, w->peb + 0xB8, 4, 4);                     /* NumberOfProcessors */
         w32_write(w, w->peb + 0x118, 4, 10); w32_write(w, w->peb + 0x11C, 4, 0); w32_write(w, w->peb + 0x120, 2, 19045);
@@ -700,7 +728,8 @@ static int host_pc_move(void *uctx, uint64_t pc) {
  * the bug -- and only when the faulting code was not a compiled block, whose
  * register state cannot be reconstructed yet. */
 static void on_crash(int sig, siginfo_t *si, void *uctx) {
-    xc_cpu *c = g_w.c;
+    /* the faulting thread's registers: the signal was delivered on it */
+    xc_cpu *c = w32_self()->c;
     uint64_t lo = 0, hi = 0; int have = xc_jit_code_range(&lo, &hi);
     uint64_t fault = (uint64_t)(uintptr_t)si->si_addr;
     uint64_t pc = host_pc_of(uctx);
@@ -761,9 +790,9 @@ static void on_crash(int sig, siginfo_t *si, void *uctx) {
                  " (see core/src/jit/jit.c)"
                : in_arena ? " -- inside the 4 GB arena (unmapped guest page)" : "",
         (unsigned long long)g_w.image_base, (unsigned)g_w.image_size, (unsigned long long)g_w.entry,
-        (unsigned long long)g_w.stub_base, (unsigned long long)g_w.teb, (unsigned long long)g_w.peb,
-        (unsigned long long)g_w.stack_limit, (unsigned long long)g_w.stack_base, (unsigned long long)g_w.heap_cur,
-        g_w.depth, g_w.exited);
+        (unsigned long long)g_w.stub_base, (unsigned long long)w32_self()->teb, (unsigned long long)g_w.peb,
+        (unsigned long long)w32_self()->stack_limit, (unsigned long long)w32_self()->stack_base,
+        (unsigned long long)g_w.heap_cur, w32_self()->depth, g_w.exited);
     if (write(2, buf, (size_t)(n > 0 ? n : 0)) < 0) { }
 #ifdef HAVE_BACKTRACE
     /* where the host was: the frames name the runtime function (or the core
@@ -798,6 +827,7 @@ static void winrun_reset(void) {
     w32_input_reset();
     w32_dsound_reset();
     w32_xinput_reset();
+    w32_thread_reset();
     g_nscript = 0; g_frame = 0;
     if (g_hook_on) { w32_set_present(g_next_present, g_next_present_ctx); g_hook_on = 0; }
     g_next_present = 0; g_next_present_ctx = 0;
@@ -1172,7 +1202,7 @@ static void report_imports(w32 *w) {
  * only appears on a crash is a report you cannot ask for.
  */
 int w32_crash_report(w32 *w, char *out, size_t out_len) {
-    xc_cpu *c = w->c;
+    xc_cpu *c = w32_cpu(w);
     size_t n = 0;
     #define P(...) do { if (n < out_len) n += (size_t)snprintf(out + n, out_len - n, __VA_ARGS__); } while (0)
 
@@ -1209,8 +1239,8 @@ int w32_crash_report(w32 *w, char *out, size_t out_len) {
           w->mods[i].is_exe ? "  (exe)" : "");
     P("    %-24s %012llx\n", "[import stubs]", (unsigned long long)w->stub_base);
     P("    %-24s %012llx..%012llx\n", "[stack]",
-      (unsigned long long)w->stack_limit, (unsigned long long)w->stack_base);
-    P("    %-24s %012llx\n", "[teb]", (unsigned long long)w->teb);
+      (unsigned long long)w32_self()->stack_limit, (unsigned long long)w32_self()->stack_base);
+    P("    %-24s %012llx\n", "[teb]", (unsigned long long)w32_self()->teb);
 
     /* Which module the fault is in is usually the whole answer. */
     for (int i = 0; i < w->nmods; i++)
@@ -1266,16 +1296,20 @@ int winrun_main(int argc, char **argv) {
       uint16_t magic = (uint16_t)(h[pe + 24] | h[pe + 25] << 8);
       w->is32 = magic == 0x10B; }
 
-    w->c = &g_cpu; w->mem = &g_mem;
+    /* Register the thread the process starts on before anything else asks
+     * w32_self() for it -- process_init fills in its TEB and stack as it
+     * makes them. */
+    w32_thread_main(w, &g_cpu, 0, 0, 0);
+    w->mem = &g_mem;
     if (w->is32) {
         void *base = mmap(0, 1ull << 32, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (base == MAP_FAILED) { perror("reserve 4 GB arena"); return 2; }
         w->base = base;
         xc_mem_init_arena(w->mem, base, 1ull << 32);
-        xc_cpu_init(w->c, XC_MODE_32, w->mem);
+        xc_cpu_init(w32_cpu(w), XC_MODE_32, w->mem);
     } else {
         xc_mem_init_identity(w->mem);
-        xc_cpu_init(w->c, XC_MODE_64, w->mem);
+        xc_cpu_init(w32_cpu(w), XC_MODE_64, w->mem);
     }
     { const char *c = getenv("WINRUN_DRIVE_C"); if (c && *c) w32_set_drive_c(c); }
     stubs_init(w);
@@ -1297,18 +1331,29 @@ int winrun_main(int argc, char **argv) {
         if (g_surveying) sv_collect(w); else report_imports(w);
         return 0;
     }
+    /* From here on this thread is running guest code, so it holds the guest
+     * lock like any other thread would -- including through DllMain and the
+     * TLS callbacks below, which are guest code too.
+     *
+     * Forgetting this is what a lost update under a working critical section
+     * turned out to be: the threads *this* thread creates all took the lock,
+     * and the thread the process started on did not. Two consequences, the
+     * second worse than the first -- no exclusion between it and them, and
+     * pthread_cond_timedwait called on a mutex the caller does not hold,
+     * which is undefined and can let two threads in at once. */
+    w32_guest_lock();
     w32_write(w, w->peb + (w->is32 ? 0x08 : 0x10), w->is32 ? 4 : 8, w->image_base);   /* PEB.ImageBaseAddress */
     /* the initial thread: TEB in gs (x64) / fs (x86), stack, entry point */
-    xc_cpu *c = w->c;
+    xc_cpu *c = w32_cpu(w);
     if (w->is32) {
-        c->fs_base = w->teb;
+        c->fs_base = w32_self()->teb;
         c->sreg[1] = 0x1b; c->sreg[0] = c->sreg[2] = c->sreg[3] = 0x23; c->sreg[4] = 0x3b;   /* what a 32-bit Windows process sees */
-        uint32_t sp = (uint32_t)(w->stack_base - 0x100);
+        uint32_t sp = (uint32_t)(w32_self()->stack_base - 0x100);
         sp -= 4; w32_write(w, sp, 4, stub_addr(w, STUB_EXIT));   /* entry returns -> exit with eax */
         c->gpr[XC_RSP] = sp;
     } else {
-        c->gs_base = w->teb;
-        uint64_t sp = (w->stack_base - 0x100) & ~15ull;
+        c->gs_base = w32_self()->teb;
+        uint64_t sp = (w32_self()->stack_base - 0x100) & ~15ull;
         sp -= 8; w32_write(w, sp, 8, stub_addr(w, STUB_EXIT));
         c->gpr[XC_RSP] = sp;
         c->gpr[XC_RCX] = w->peb;                             /* what BaseThreadInitThunk passes */
@@ -1342,8 +1387,9 @@ int winrun_main(int argc, char **argv) {
                     w->mods[i].is_exe ? "  (exe)" : "", w->mods[i].exp_size ? "  exports" : "");
     }
     if (w->verbose) fprintf(stderr, "winrun: %d-bit, entry %#llx, rsp %#llx, teb %#llx, peb %#llx\n", w->is32 ? 32 : 64,
-                            (unsigned long long)c->rip, (unsigned long long)c->gpr[XC_RSP], (unsigned long long)w->teb, (unsigned long long)w->peb);
+                            (unsigned long long)c->rip, (unsigned long long)c->gpr[XC_RSP], (unsigned long long)w32_self()->teb, (unsigned long long)w->peb);
     int code = w32_run(w);
+    w32_guest_unlock();
     fflush(stdout);
     /* A report whenever there is something to report: an abnormal end, or a
      * clean one that leaned on functions we do not have. */

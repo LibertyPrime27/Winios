@@ -40,6 +40,15 @@ for a in 32 64; do
     $CC -O2 -s -o inputtest$a.exe inputtest.c -ld3d9 -luser32
     # audio that initialises, and a gamepad the keyboard can stand in for
     $CC -O2 -s -o audiotest$a.exe audiotest.c -ldsound -lxinput -lole32
+    # threads: CreateThread and the CRT's own, critical sections, events,
+    # mutexes, interlocked, TLS. Written so every check is true under every
+    # interleaving, so a pass means locking works rather than that the
+    # scheduler happened to be kind (see the file).
+    $CC -O2 -s -o threadtest$a.exe threadtest.c
+    # Not in the suite: the same increment 25000 times with no forced
+    # handover. It is how the lost update was found; it is not a test,
+    # because a passing run proves nothing.
+    $CC -O2 -s -o threadstress$a.exe threadstress.c
 done
 
 # Not run by the suite: it calls things we do not implement, on purpose.

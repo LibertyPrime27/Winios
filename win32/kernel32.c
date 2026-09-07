@@ -269,11 +269,9 @@ static void k_ExitProcess(w32 *w) { w32_exit(w, (int)(uint32_t)ARG(0)); }
 static void k_TerminateProcess(w32 *w) { w32_exit(w, (int)(uint32_t)ARG(1)); }
 static void k_GetCurrentProcess(w32 *w) { RET(w->is32 ? 0xFFFFFFFFu : ~0ull); }
 static void k_GetCurrentProcessId(w32 *w) { RET(4242); }
-static void k_GetCurrentThread(w32 *w) { RET(w->is32 ? 0xFFFFFFFEu : ~1ull); }
-static void k_GetCurrentThreadId(w32 *w) { RET(4243); }
 static void k_GetCommandLineA(w32 *w) { RET(w->cmdline); }
 static void k_GetCommandLineW(w32 *w) { RET(w->cmdline_w); }
-static void k_GetLastError(w32 *w) { RET(w32_read(w, w->teb + (w->is32 ? TEB32_LASTERROR : TEB64_LASTERROR), 4)); }
+static void k_GetLastError(w32 *w) { RET(w32_read(w, w32_self()->teb + (w->is32 ? TEB32_LASTERROR : TEB64_LASTERROR), 4)); }
 static void k_SetLastError(w32 *w) { w32_set_last_error(w, (uint32_t)ARG(0)); }
 static void k_GetStartupInfoA(w32 *w) {
     uint64_t p = ARG(0); int psz = (int)w32_ptrsize(w);
@@ -420,7 +418,6 @@ static void k_GetVersionExA(w32 *w) {
     RET(1);
 }
 static void k_GetVersionExW(w32 *w) { k_GetVersionExA(w); }
-static void k_Sleep(w32 *w) { uint32_t ms = (uint32_t)ARG(0); if (ms) usleep(ms * 1000u); }
 static void k_GetTickCount(w32 *w) { RET((uint32_t)ticks_ms()); }
 static void k_GetTickCount64(w32 *w) { w32_ret64(w, ticks_ms()); }
 static void k_QueryPerformanceCounter(w32 *w) { w32_write(w, ARG(0), 8, ticks_ns()); RET(1); }
@@ -567,7 +564,7 @@ static void k_VirtualQuery(w32 *w) {
     if (w->is32) addr = (uint32_t)addr;
     uint64_t base = addr & ~0xFFFull, size = 0x1000, state = 0x1000 /* MEM_COMMIT */, prot = 0x40;
     if (addr >= w->image_base && addr < w->image_base + w->image_size) { base = w->image_base; size = w->image_size; }
-    else if (addr >= w->stack_limit && addr < w->stack_base) { base = w->stack_limit; size = w->stack_base - w->stack_limit; prot = 0x04; }
+    else if (addr >= w32_self()->stack_limit && addr < w32_self()->stack_base) { base = w32_self()->stack_limit; size = w32_self()->stack_base - w32_self()->stack_limit; prot = 0x04; }
     /* MEMORY_BASIC_INFORMATION: BaseAddress, AllocationBase, AllocationProtect, [pad], RegionSize, State, Protect, Type */
     memset(W32P(w, out), 0, w->is32 ? 28 : 48);
     w32_write(w, out, psz, base); w32_write(w, out + psz, psz, base); w32_write(w, out + 2 * psz, 4, prot);
@@ -608,12 +605,12 @@ static void k_TlsGetValue(w32 *w) {
     uint32_t i = (uint32_t)ARG(0); int psz = (int)w32_ptrsize(w);
     if (i >= W32_MAX_TLS) { w32_set_last_error(w, ERROR_INVALID_PARAMETER); RET(0); return; }
     w32_set_last_error(w, 0);
-    RET(w32_read(w, w->teb + (w->is32 ? TEB32_TLS : TEB64_TLS) + (uint64_t)psz * i, psz));
+    RET(w32_read(w, w32_self()->teb + (w->is32 ? TEB32_TLS : TEB64_TLS) + (uint64_t)psz * i, psz));
 }
 static void k_TlsSetValue(w32 *w) {
     uint32_t i = (uint32_t)ARG(0); int psz = (int)w32_ptrsize(w);
     if (i >= W32_MAX_TLS) { w32_set_last_error(w, ERROR_INVALID_PARAMETER); RET(0); return; }
-    w32_write(w, w->teb + (w->is32 ? TEB32_TLS : TEB64_TLS) + (uint64_t)psz * i, psz, ARG(1)); RET(1);
+    w32_write(w, w32_self()->teb + (w->is32 ? TEB32_TLS : TEB64_TLS) + (uint64_t)psz * i, psz, ARG(1)); RET(1);
 }
 static void k_FlsAlloc(w32 *w) { k_TlsAlloc(w); }
 static void k_FlsFree(w32 *w) { k_TlsFree(w); }
@@ -622,8 +619,6 @@ static void k_FlsSetValue(w32 *w) { k_TlsSetValue(w); }
 static void k_nop_true(w32 *w) { RET(1); }
 static void k_nop_void(w32 *w) { (void)w; }
 static void k_nop_zero(w32 *w) { RET(0); }
-static void k_InitializeCriticalSectionEx(w32 *w) { RET(1); }
-static void k_TryEnterCriticalSection(w32 *w) { RET(1); }
 
 /* ---- files and console ---- */
 static void k_GetStdHandle(w32 *w) {
@@ -673,7 +668,7 @@ static void k_CreateFileW(w32 *w) {
     uint64_t saved = ARG(0);
     /* reuse the A version by pointing arg 0 at a temporary guest string */
     uint64_t tmp = w32_strdup(w, name);
-    if (w->is32) w32_write(w, w->c->gpr[XC_RSP] + 4, 4, tmp); else w->c->gpr[XC_RCX] = tmp;
+    if (w->is32) w32_write(w, w32_cpu(w)->gpr[XC_RSP] + 4, 4, tmp); else w32_cpu(w)->gpr[XC_RCX] = tmp;
     k_CreateFileA(w);
     w32_heap_free(w, tmp);
     (void)saved;
@@ -749,23 +744,12 @@ static void k_FormatMessageA(w32 *w) {
 static void k_GetThreadPriority(w32 *w) { RET(0); }
 static void k_SetThreadPriority(w32 *w) { RET(1); }
 static void k_GetExitCodeProcess(w32 *w) { w32_write(w, ARG(1), 4, 0); RET(1); }
-static void k_CreateEventA(w32 *w) { RET(w32_handle_new(w, H_EVENT, -1)); }
-static void k_CreateEventW(w32 *w) { RET(w32_handle_new(w, H_EVENT, -1)); }
-static void k_CreateMutexA(w32 *w) { RET(w32_handle_new(w, H_MUTEX, -1)); }
-static void k_SetEvent(w32 *w) { RET(1); }
-static void k_ResetEvent(w32 *w) { RET(1); }
-static void k_WaitForSingleObject(w32 *w) { RET(0); }
-static void k_ReleaseMutex(w32 *w) { RET(1); }
 static void k_GetProcessAffinityMask(w32 *w) { w32_write(w, ARG(1), (int)w32_ptrsize(w), 0xF); w32_write(w, ARG(2), (int)w32_ptrsize(w), 0xF); RET(1); }
 static void k_SetErrorMode(w32 *w) { RET(0); }
 static void k_RtlPcToFileHeader(w32 *w) { w32_write(w, ARG(1), (int)w32_ptrsize(w), w->image_base); RET(w->image_base); }
 static void k_RtlLookupFunctionEntry(w32 *w) { RET(0); }
 static void k_RtlVirtualUnwind(w32 *w) { RET(0); }
 static void k_RtlUnwindEx(w32 *w) { fprintf(stderr, "winrun: RtlUnwindEx: exception unwinding is not supported\n"); w32_exit(w, 129); }
-static void k_InterlockedIncrement(w32 *w) { uint64_t p = ARG(0); uint32_t v = (uint32_t)w32_read(w, p, 4) + 1; w32_write(w, p, 4, v); RET(v); }
-static void k_InterlockedDecrement(w32 *w) { uint64_t p = ARG(0); uint32_t v = (uint32_t)w32_read(w, p, 4) - 1; w32_write(w, p, 4, v); RET(v); }
-static void k_InterlockedExchange(w32 *w) { uint64_t p = ARG(0); uint32_t old = (uint32_t)w32_read(w, p, 4); w32_write(w, p, 4, ARG(1)); RET(old); }
-static void k_InterlockedCompareExchange(w32 *w) { uint64_t p = ARG(0); uint32_t old = (uint32_t)w32_read(w, p, 4); if (old == (uint32_t)ARG(2)) w32_write(w, p, 4, ARG(1)); RET(old); }
 static void k_EncodePointer(w32 *w) { RET(ARG(0)); }
 static void k_DecodePointer(w32 *w) { RET(ARG(0)); }
 static void k_InitializeSListHead(w32 *w) { memset(W32P(w, ARG(0)), 0, 16); }
@@ -788,7 +772,7 @@ static void k_GetCurrentProcessorNumber(w32 *w) { RET(0); }
 #define F(n, a)        { #n, a, 0, k_##n, 0 }
 #define FN(n, a, impl) { #n, a, 0, impl, 0 }
 const w32_api w32_kernel32[] = {
-    F(ExitProcess, 1), F(TerminateProcess, 2), F(GetCurrentProcess, 0), F(GetCurrentProcessId, 0), F(GetCurrentThread, 0), F(GetCurrentThreadId, 0),
+    F(ExitProcess, 1), F(TerminateProcess, 2), F(GetCurrentProcess, 0), F(GetCurrentProcessId, 0),
     F(GetCommandLineA, 0), F(GetCommandLineW, 0), F(GetLastError, 0), F(SetLastError, 1), F(GetStartupInfoA, 1), F(GetStartupInfoW, 1),
     F(GetEnvironmentStringsA, 0), F(GetEnvironmentStringsW, 0), FN(FreeEnvironmentStringsA, 1, k_FreeEnvironmentStrings), FN(FreeEnvironmentStringsW, 1, k_FreeEnvironmentStrings),
     FN(GetEnvironmentStrings, 0, k_GetEnvironmentStringsA), F(GetEnvironmentVariableA, 3), F(GetEnvironmentVariableW, 3),
@@ -796,7 +780,7 @@ const w32_api w32_kernel32[] = {
     F(FreeLibrary, 1), F(GetProcAddress, 2), F(GetModuleFileNameA, 3), F(GetModuleFileNameW, 3),
     F(IsDebuggerPresent, 0), F(OutputDebugStringA, 1),
     F(GetSystemInfo, 1), F(GetNativeSystemInfo, 1), F(GetVersion, 0), F(GetVersionExA, 1), F(GetVersionExW, 1),
-    F(Sleep, 1), F(GetTickCount, 0), F(GetTickCount64, 0), F(QueryPerformanceCounter, 1), F(QueryPerformanceFrequency, 1),
+    F(GetTickCount, 0), F(GetTickCount64, 0), F(QueryPerformanceCounter, 1), F(QueryPerformanceFrequency, 1),
     F(GetSystemTimeAsFileTime, 1), F(GetSystemTimePreciseAsFileTime, 1), F(GetLocalTime, 1), F(GetSystemTime, 1), F(GetTimeZoneInformation, 1),
     F(GetACP, 0), F(GetOEMCP, 0), F(GetConsoleCP, 0), F(GetConsoleOutputCP, 0), F(IsValidCodePage, 1), F(GetCPInfo, 2),
     F(GetUserDefaultLCID, 0), F(GetUserDefaultLangID, 0), F(GetSystemDefaultLCID, 0), F(GetThreadLocale, 0),
@@ -805,8 +789,6 @@ const w32_api w32_kernel32[] = {
     F(GetProcessHeap, 0), F(HeapCreate, 3), F(HeapDestroy, 1), F(HeapAlloc, 3), F(HeapReAlloc, 4), F(HeapFree, 3), F(HeapSize, 3), F(HeapValidate, 3), F(HeapSetInformation, 4),
     F(LocalAlloc, 2), F(LocalFree, 1), F(GlobalAlloc, 2), F(GlobalFree, 1),
     F(TlsAlloc, 0), F(TlsFree, 1), F(TlsGetValue, 1), F(TlsSetValue, 2), F(FlsAlloc, 1), F(FlsFree, 1), F(FlsGetValue, 1), F(FlsSetValue, 2),
-    FN(InitializeCriticalSection, 1, k_nop_void), FN(InitializeCriticalSectionAndSpinCount, 2, k_nop_true), F(InitializeCriticalSectionEx, 3),
-    FN(DeleteCriticalSection, 1, k_nop_void), FN(EnterCriticalSection, 1, k_nop_void), FN(LeaveCriticalSection, 1, k_nop_void), F(TryEnterCriticalSection, 1),
     FN(InitializeSRWLock, 1, k_nop_void), FN(AcquireSRWLockExclusive, 1, k_nop_void), FN(ReleaseSRWLockExclusive, 1, k_nop_void),
     FN(AcquireSRWLockShared, 1, k_nop_void), FN(ReleaseSRWLockShared, 1, k_nop_void), FN(InitOnceExecuteOnce, 4, k_nop_true),
     FN(InitializeConditionVariable, 1, k_nop_void), FN(WakeAllConditionVariable, 1, k_nop_void), FN(WakeConditionVariable, 1, k_nop_void),
@@ -817,14 +799,13 @@ const w32_api w32_kernel32[] = {
     F(UnmapViewOfFile, 1), F(FlushViewOfFile, 2),
     F(SetFilePointer, 4), F(SetFilePointerEx, 5), F(FlushFileBuffers, 1), F(GetConsoleMode, 2), F(SetConsoleMode, 2), F(GetConsoleScreenBufferInfo, 2), F(SetConsoleCtrlHandler, 2),
     F(GetFileAttributesA, 1), F(DeleteFileA, 1), F(GetCurrentDirectoryA, 2), F(SetCurrentDirectoryA, 1), F(GetTempPathA, 2), F(GetFullPathNameA, 4), F(FormatMessageA, 7),
-    F(GetThreadPriority, 1), F(SetThreadPriority, 2), F(GetExitCodeProcess, 2), F(CreateEventA, 4), F(CreateEventW, 4), F(CreateMutexA, 3), F(SetEvent, 1), F(ResetEvent, 1),
-    F(WaitForSingleObject, 2), F(ReleaseMutex, 1), F(GetProcessAffinityMask, 3), F(SetErrorMode, 1),
+    F(GetThreadPriority, 1), F(SetThreadPriority, 2), F(GetExitCodeProcess, 2),
+    F(GetProcessAffinityMask, 3), F(SetErrorMode, 1),
     /* RaiseException, RtlCaptureContext, RtlUnwind, the vectored handlers and
      * the unhandled filter are in win32/seh.c, which kernel32 pulls in as its
      * second table. What is left here is the 64-bit table-driven unwinder,
      * which is not implemented. */
     F(RtlPcToFileHeader, 2), F(RtlLookupFunctionEntry, 3), F(RtlVirtualUnwind, 8), F(RtlUnwindEx, 6),
-    F(InterlockedIncrement, 1), F(InterlockedDecrement, 1), F(InterlockedExchange, 2), F(InterlockedCompareExchange, 3),
     F(EncodePointer, 1), F(DecodePointer, 1), F(InitializeSListHead, 1), F(SetHandleCount, 1), F(GetLogicalDrives, 0), F(GetDriveTypeA, 1),
     F(GetComputerNameA, 2), F(GetUserNameA, 2), F(lstrlenA, 1), F(lstrlenW, 1), F(lstrcpyA, 2), F(lstrcmpiA, 2),
     F(GetSystemDirectoryA, 2), F(GetWindowsDirectoryA, 2), F(IsProcessorFeaturePresent, 1), F(GetCurrentProcessorNumber, 0),

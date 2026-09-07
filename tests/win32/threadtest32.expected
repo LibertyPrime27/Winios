@@ -1,0 +1,26 @@
+32-bit
+
+CreateThread x4: 4 created
+thread ids distinct and none is the caller's: yes
+WaitForMultipleObjects(all): all finished
+threads that ran: 4 (want 4)
+guarded total: 1600 (want 1600)
+interlocked total: 1600 (want 1600)
+both totals agree: yes
+GetExitCodeThread: 0x1234 (want 0x1234)
+waiting again on a finished thread: returns at once
+
+CreateEvent x2: ok
+an unsignalled event times out: yes
+ping-pong 50 times: ok, 50 bounces
+auto-reset consumed by the first wait: yes
+manual-reset stays signalled: yes
+...until reset: yes
+
+mutex: acquire ok, again (recursive) ok
+release twice: ok
+critical section entered twice and left twice: ok
+TryEnter on a free one: ok
+
+TlsAlloc: ok
+TlsGetValue here: 0xabcd (want 0xabcd)

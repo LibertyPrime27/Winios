@@ -102,7 +102,7 @@ void w32_seh_reset(void) {
  * FSAVE stores it -- eight ten-byte entries from ST(0) -- so a guest that
  * reads it sees its own stack in its own order. */
 static void save_x87(w32 *w, uint64_t fsa) {
-    xc_cpu *c = w->c;
+    xc_cpu *c = w32_cpu(w);
     w32_write(w, fsa + 0, 4, c->fcw);
     w32_write(w, fsa + 4, 4, c->fsw);
     uint32_t tag = 0;
@@ -120,7 +120,7 @@ static void save_x87(w32 *w, uint64_t fsa) {
 
 /* Capture the CPU into a guest CONTEXT. */
 void w32_context_save(w32 *w, uint64_t ctx) {
-    xc_cpu *c = w->c;
+    xc_cpu *c = w32_cpu(w);
     xc_flags_sync(c);
     if (w->is32) {
         for (uint64_t o = 0; o < CTX32_SIZE; o += 4) w32_write(w, ctx + o, 4, 0);
@@ -159,7 +159,7 @@ void w32_context_save(w32 *w, uint64_t ctx) {
  * every field it could have edited has to be read back, not just the ones we
  * expect it to touch. */
 void w32_context_load(w32 *w, uint64_t ctx) {
-    xc_cpu *c = w->c;
+    xc_cpu *c = w32_cpu(w);
     if (w->is32) {
         c->gpr[XC_RDI] = (uint32_t)w32_read(w, ctx + CTX32_EDI, 4);
         c->gpr[XC_RSI] = (uint32_t)w32_read(w, ctx + CTX32_ESI, 4);
@@ -204,7 +204,7 @@ static void rec_write(w32 *w, uint64_t rec, uint32_t code, uint32_t flags,
  * control to an arbitrary address. */
 static int frame_ok(w32 *w, uint64_t p, uint64_t prev) {
     if (p <= prev) return 0;                                   /* must move up the stack */
-    if (p < w->stack_limit || p + 8 > w->stack_base) return 0;
+    if (p < w32_self()->stack_limit || p + 8 > w32_self()->stack_base) return 0;
     if (p & (w->is32 ? 3u : 7u)) return 0;
     return 1;
 }
@@ -236,7 +236,7 @@ const char *w32_exception_name(uint32_t code) {
  */
 int w32_raise(w32 *w, uint32_t code, uint32_t flags, uint64_t exc_addr,
               int nparams, const uint64_t *params) {
-    xc_cpu *c = w->c;
+    xc_cpu *c = w32_cpu(w);
     g_last_code = code; g_last_addr = exc_addr;
     if (g_depth >= 8) {
         fprintf(stderr, "winrun: exception %#x while dispatching seven others; giving up\n", code);
@@ -250,7 +250,7 @@ int w32_raise(w32 *w, uint32_t code, uint32_t flags, uint64_t exc_addr,
      * back up the stack does not immediately land in our records. */
     uint64_t scratch = (sp - 256 - recsz - ctxsz - 2u * (uint64_t)p) & ~15ull;
     if (w->is32) scratch = (uint32_t)scratch;
-    if (scratch < w->stack_limit) {
+    if (scratch < w32_self()->stack_limit) {
         fprintf(stderr, "winrun: no room on the guest stack to dispatch exception %#x\n", code);
         return 0;
     }
@@ -278,12 +278,12 @@ int w32_raise(w32 *w, uint32_t code, uint32_t flags, uint64_t exc_addr,
     /* The frame list. 64-bit Windows does not have one -- see the note at the
      * end of this file -- so this is the 32-bit path only. */
     if (!handled && w->is32) {
-        uint64_t frame = w32_read(w, w->teb + 0, 4), prev = 0;
+        uint64_t frame = w32_read(w, w32_self()->teb + 0, 4), prev = 0;
         while (frame && frame != 0xFFFFFFFFu) {
             if (!frame_ok(w, frame, prev)) {
                 fprintf(stderr, "winrun: exception registration list is corrupt at %#llx "
                                 "(stack is %#llx..%#llx)\n", (unsigned long long)frame,
-                        (unsigned long long)w->stack_limit, (unsigned long long)w->stack_base);
+                        (unsigned long long)w32_self()->stack_limit, (unsigned long long)w32_self()->stack_base);
                 break;
             }
             uint64_t next = w32_read(w, frame + 0, 4);
@@ -329,7 +329,7 @@ uint32_t w32_last_exception(uint64_t *addr) {
 
 /* A CPU fault becomes the exception Windows would have raised for it. */
 int w32_fault_to_exception(w32 *w) {
-    xc_cpu *c = w->c;
+    xc_cpu *c = w32_cpu(w);
     if (c->fault_kind == XC_FAULT_DIVIDE) return w32_raise(w, EXC_INT_DIVIDE_BY_ZERO, 0, c->rip, 0, 0);
     /* ExceptionInformation for an access violation: [0] is 0 for a read, 1
      * for a write, 8 for an execute; [1] is the address. We do not yet know
@@ -341,7 +341,7 @@ int w32_fault_to_exception(w32 *w) {
     /* An access just past the far end of the guest stack is a stack overflow,
      * and a guest that has a handler for one wants to be told that rather
      * than "access violation" -- the recovery is different. */
-    if (w->stack_limit && c->fault_addr + 0x10000 >= w->stack_limit && c->fault_addr < w->stack_limit)
+    if (w32_self()->stack_limit && c->fault_addr + 0x10000 >= w32_self()->stack_limit && c->fault_addr < w32_self()->stack_limit)
         code = EXC_STACK_OVERFLOW;
     return w32_raise(w, code, 0, c->rip, code == EXC_STACK_OVERFLOW ? 0 : 2, params);
 }
@@ -364,7 +364,7 @@ static void k_RaiseException(w32 *w) {
     if (n > EXC_MAXIMUM_PARAMETERS) n = EXC_MAXIMUM_PARAMETERS;
     for (uint32_t i = 0; i < n; i++) params[i] = pp ? w32_read(w, pp + (uint64_t)p * i, p) : 0;
 
-    xc_cpu *c = w->c;
+    xc_cpu *c = w32_cpu(w);
     uint64_t ret_addr = w32_read(w, c->gpr[XC_RSP], p);
     /* Return to the caller *first*, so the state a handler sees is the state
      * after RaiseException returned -- which is what continuing execution has
@@ -398,8 +398,8 @@ static void k_RtlUnwind(w32 *w) {
     if (!w->is32) { RET(0); return; }
     uint64_t target = ARG(0);
     uint64_t urec = ARG(2);
-    uint64_t frame = w32_read(w, w->teb + 0, 4), prev = 0;
-    xc_cpu *c = w->c;
+    uint64_t frame = w32_read(w, w32_self()->teb + 0, 4), prev = 0;
+    xc_cpu *c = w32_cpu(w);
     uint64_t saved_rsp = c->gpr[XC_RSP], saved_rip = c->rip;
 
     /* An EXCEPTION_RECORD for the unwind, if the caller did not supply one */
@@ -422,10 +422,10 @@ static void k_RtlUnwind(w32 *w) {
         if (w->exited) return;
         /* pop as we go, so a handler that faults does not see a frame that
          * has already been unwound */
-        w32_write(w, w->teb + 0, 4, next);
+        w32_write(w, w32_self()->teb + 0, 4, next);
         prev = frame; frame = next;
     }
-    if (target && target != 0xFFFFFFFFu) w32_write(w, w->teb + 0, 4, target);
+    if (target && target != 0xFFFFFFFFu) w32_write(w, w32_self()->teb + 0, 4, target);
     c->gpr[XC_RSP] = saved_rsp; c->rip = saved_rip;
     RET(0);
 }
@@ -470,7 +470,7 @@ static void k_RtlRemoveVectoredExceptionHandler(w32 *w) { k_RemoveVectoredExcept
 static void k_RtlCaptureContext(w32 *w) {
     uint64_t ctx = ARG(0);
     if (!ctx) { RET(0); return; }
-    xc_cpu *c = w->c;
+    xc_cpu *c = w32_cpu(w);
     int p = w->is32 ? 4 : 8;
     uint64_t ret_addr = w32_read(w, c->gpr[XC_RSP], p);
     uint64_t saved_rip = c->rip, saved_rsp = c->gpr[XC_RSP];

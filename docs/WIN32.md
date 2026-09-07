@@ -191,7 +191,7 @@ compiled code for pages that become writable.
 
 ## Verified
 
-`tests/win32/run.sh` runs forty checks over sixteen programs and
+`tests/win32/run.sh` runs forty-four checks over seventeen programs and
 compares stdout and exit code with recordings: the three-import `hello`, the
 full mingw-w64 CRT program (`crt.c`: TLS callbacks, `__getmainargs`,
 `_initterm`, malloc/free, `sqrt`, `printf`, `snprintf`, exit code), the n-body
@@ -199,10 +199,14 @@ benchmark, the loader test `dlltest`, the four Direct3D 9 programs `d3dtest`,
 `d3dframe`, `d3dloop` and `d3ddraw`, the file-layer tests `pathtest` and
 `filetest`, the registry test `regtest`, the exception tests `sehtest` and
 `faulttest`, the window-and-input test `inputtest`, and the audio and gamepad
-test `audiotest` — each as PE32 and PE32+. Three of them are run more than once:
-`regtest` twice per bitness because what it tests is what survives between two
-runs, and `faulttest` both with the dynarec and without it, because "the same
-either way" is the property that matters there.
+test `audiotest`, and the threading test `threadtest` — each as PE32 and PE32+.
+Four of them are run more than once: `regtest` twice per bitness because what
+it tests is what survives between two runs, and `faulttest` and `threadtest`
+both with the dynarec and without it, because "the same either way" is the
+property that matters there — for `faulttest` because a fault inside a
+compiled block takes a different path, and for `threadtest` because the two
+engines hand the guest lock over at different granularities and so interleave
+differently.
 
 `d3dtest` calls Direct3D 9 the way a game starts up — `Direct3DCreate9`,
 `GetAdapterIdentifier`, `CreateDevice`, `Clear`, `Present`, then
@@ -596,6 +600,109 @@ pieces, that the cursor moves at roughly the format's rate (a wide window: it
 is a clock, not a real-time guarantee), and that injected keys arrive as stick
 deflection and buttons.
 
+## Threads
+
+`win32/thread.c`. `CreateThread`, `_beginthreadex`, `_beginthread`,
+`ExitThread`, `TerminateThread`, thread handles you can wait on,
+`GetExitCodeThread`, `SuspendThread`/`ResumeThread`, priorities, critical
+sections, events, mutexes, semaphores, the interlocked family, `Sleep`,
+`SwitchToThread`, and `TlsAlloc`/`TlsGetValue`/`TlsSetValue`. Nearly every
+game written after about 2000 starts a thread in its first second — a loader,
+an audio mixer, a decompressor — and until this landed each of them failed at
+that line.
+
+A guest thread is a real `pthread`. What it is not is a thread that runs at
+the same time as the others: **one thread executes guest instructions at a
+time**, holding a single lock that is handed over between execution slices
+(`SLICE` is 2^18 instructions) and at every call that would block. So there
+is real concurrency of *waiting* — a thread inside `WaitForSingleObject` is
+not on the CPU, and a game whose loader thread blocks on a file read is
+correctly overlapped with its main thread — and no concurrency of *executing*.
+
+That is a deliberate trade, and worth being explicit about because it is the
+kind of thing that reads as an oversight. Everything the emulator itself owns
+is shared, mutable and was written single-threaded: the block cache, the code
+arena, the guest heap, the handle table, the module list, the recovery-stub
+side table. Making those individually thread-safe is a large amount of work
+whose payoff is throughput; making the *guest's* threads correct is a small
+amount of work whose payoff is that programs run at all. The big lock buys the
+second immediately and leaves the first as a later optimisation. What it costs
+is parallel speedup — a performance ceiling, not a compatibility one — and a
+guest that busy-waits on another thread without ever calling into the API
+would spin for a full slice before yielding.
+
+### What is per-thread and what is not
+
+Registers, the TEB, the stack, the last-error value and the TLS slot
+*contents* are per thread. Guest memory, the heap, handles, the module list
+and TLS *index allocation* are per process. Writing it down that way is what
+made the change small: the fields that had to move out of `w32` were
+`teb`, `stack_base`, `stack_limit`, `last_error`, `depth`, `tls_array` and
+`tls_slots`, and they were **deleted** from the struct rather than left in
+place, so every site that still used the old ones failed to compile instead of
+silently reading the main thread's copy. TLS values needed no work at all —
+they already lived in the TEB, and the TEB was already per-thread-shaped.
+
+Each thread gets its own `xc_cpu`, its own stack and its own TEB with the
+stack bounds filled in, because the CRT probes them and 32-bit SEH checks that
+a registration record lies inside them. Thread ids are `5000 + slot`.
+
+### The bug, and why the test is written the way it is
+
+The first run of `threadtest` under load reported a guarded total of 99997
+against an interlocked total of 100000. Both counters are incremented the same
+number of times by the same threads; the guarded one is protected by a
+critical section and the interlocked one by `InterlockedIncrement`.
+
+Disassembling the guest settled it: `InterlockedIncrement` had compiled to a
+native `lock addl $0x1,(mem)` — one instruction, so no interleaving can split
+it, so it cannot lose an update no matter what the locking does. The guarded
+increment is three instructions (load, add, store) and can. So the failure was
+not in the counters; it was that the critical section was not excluding
+anything.
+
+The cause: **every guest thread took the guest lock, and the thread the
+process started on did not.** `w32_run()` on the main thread had never been
+bracketed by `w32_guest_lock()`/`w32_guest_unlock()`. Two consequences, one
+obvious and one worse — no exclusion between the main thread and the workers,
+and `pthread_cond_timedwait` being called on a mutex the caller did not hold,
+which is undefined behaviour and can leave the mutex in a state where two
+waiters both proceed. One `w32_guest_lock()` in `tools/winrun/winrun.c`, around
+the main thread's guest execution and including `DllMain` and the TLS
+callbacks (which are guest code too), fixed both.
+
+Two things made it findable. The first is that `threadtest` forces the race
+rather than hoping for it: inside the guarded read-modify-write there is a
+`Sleep(0)`, which hands the guest lock over in the middle of the update. That
+turns a three-in-a-hundred-thousand flake into a deterministic loud failure.
+The second is that every line `threadtest` prints is true under *every*
+interleaving — "four threads each added 400, so the total is 1600", "the ids
+are distinct", "both counters agree" — which is what makes a recorded
+expectation possible for a concurrent program at all. A test that recorded an
+*order* would record the scheduler.
+
+`tests/win32/threadstress.c` is the same increment 25000 times per thread with
+no forced handover. It is deliberately **not** in the suite: it is how the
+lost update was originally found, and a passing run of it proves nothing.
+
+It is also where I got in my own way for an hour: I checked the output by
+grepping it for the lines I expected, and so did not see that
+`WaitForMultipleObjects` had timed out and the run was simply incomplete. The
+counters I was staring at came from a truncated run. Reading the whole output
+instead of grepping it is what unblocked it.
+
+### Verified
+
+`threadtest` runs as PE32 and PE32+, through the interpreter and the dynarec,
+on x86-64 (gcc and clang) and on aarch64 under `qemu-aarch64` — both engines
+on purpose, because the dynarec hands the lock over at a block boundary and
+the interpreter at an instruction, so they interleave differently and only
+running both shows the answer does not depend on which. It also runs inside
+`test_winrun_lib`, back to back with every other guest in both directions,
+which is where a `winrun_reset()` that forgot the thread table or the
+per-thread CPUs would show up. `threadstress` has been run sixteen times
+across both bitnesses and both engines: 0 lost updates.
+
 ## Surveying a library, not a fixture
 
     winrun -survey <dir>
@@ -645,17 +752,23 @@ file, times a frame, queries the display. It is not in the test suite because
 its whole purpose is to name what is missing, and that number is supposed to
 change. What it reports today:
 
-    75 imports resolved, 1 missing
-      kernel32.dll (1)   CreateThread
+    76 imports resolved, 0 missing
+    nothing is missing: this program can be run.
 
-It was 17 before the registry, files and memory mapping landed, and 11 before
-the window and its message pump, which is what the number is for. With `-k`
-the fixture now runs to the end and prints `gamelike: reached the end`.
+It was 17 before the registry, files and memory mapping landed, 11 before the
+window and its message pump, and 1 before threads — which is what the number
+is for. Everything a game touches in its first few seconds — a window and a
+message pump, a thread, a lock, an event, the registry, a directory walk, a
+memory-mapped file, a frame timer, the display mode — resolves and works, and
+the fixture now runs to the end and prints `gamelike: reached the end`
+**without `-k`**.
 
-`CreateThread` is the whole remaining list. Everything else a game touches in
-its first few seconds — a window and a message pump, a lock, an event, the
-registry, a directory walk, a memory-mapped file, a frame timer, the display
-mode — resolves and works.
+The number being zero does not make it a test. Its purpose is still to name
+what is missing, and it will go back above zero the moment it is pointed at
+something bigger; the honest reading of a zero here is "the first few seconds
+of a game-shaped program no longer stop on an unimplemented function", which
+is a floor, not a ceiling. What one program asks for is not what every program
+asks for — that is what `-survey` is for.
 
 ## Carrying on past what we do not have
 
@@ -667,8 +780,9 @@ half-works is worse than one that stops — but it is the wrong tool for finding
 out what a real program needs, because you learn one name per run.
 
 `-k` logs the call, returns zero, and carries on. One run then names
-*everything* the program needed. `gamelike32.exe` reaches its last line and
-reports sixteen missing functions in the order it called them.
+*everything* the program needed, rather than one name per run. `gamelike32.exe`
+no longer needs it — it reaches its last line on its own — but a real game
+still will, and the flag is how its list gets taken in one pass.
 
 The obstacle was the x86 calling convention: a stdcall callee pops its own
 arguments, and an import table gives a name and nothing else. Guess the count
@@ -707,22 +821,23 @@ the app.
 
 ## What is deliberately not here yet
 
-Threads (`CreateThread`/`_beginthreadex` report failure) — which is the last
-thing `gamelike32.exe` asks for that is not here, and the largest single
-compatibility gap: nearly every game after 2000 starts one. Audio that actually
-reaches a speaker (it initialises, and a buffer's contents are right by the time
+Audio that actually reaches a speaker (it initialises, and a buffer's contents are right by the time
 `Play` is called — CoreAudio is the missing consumer). DirectInput, which is
 what Fallout 3 and New Vegas read the keyboard and mouse through; it sits on the
 state `user32.c` already keeps, so it is a layer rather than a subsystem. 64-bit `__except` (the 32-bit frame list is implemented; the x64
 table-driven mechanism is not — see the end of `win32/seh.c`). GDI beyond the
 stubs a message loop needs, and any window decoration: a window here is its own
 client area, which is what a fullscreen game wants and not what a windowed
-program expects. Installers, which need threads. Drawing reaches the screen but
-goes through the reference rasterizer rather than Metal.
+program expects. Installers. Drawing reaches the screen but goes through the
+reference rasterizer rather than Metal. And guest threads do not run in
+parallel — one executes at a time, which is a speed limit rather than a
+compatibility one (see the Threads section).
 
 Within the loader specifically: `DLL_PROCESS_DETACH` is never sent (nothing is
 ever unloaded and the process exits without unwinding), `DLL_THREAD_ATTACH`
-cannot exist until threads do, delay-loaded imports are left to the guest's own
+and `DLL_THREAD_DETACH` are not sent to guest DLLs even though threads now
+exist (nothing has needed them yet, and a DLL that allocates per-thread state
+in its `DllMain` would), delay-loaded imports are left to the guest's own
 helper, and `GetProcAddress` by ordinal works on guest DLLs but not on the
 host-implemented ones, which have no ordinals to speak of.
 

@@ -276,7 +276,7 @@ static void m_setlocale(w32 *w) { if (!g_locale_c) g_locale_c = w32_strdup(w, "C
  * go to MXCSR too. This is how MSVC-built programs end up in 53-bit mode
  * -- the dynarec's native x87 mode -- so it has to be real. */
 static uint32_t cw_abstract(const w32 *w) {
-    uint16_t f = w->c->fcw; uint32_t a = 0;
+    uint16_t f = w32_cpu(w)->fcw; uint32_t a = 0;
     /* FCW mask bit -> _EM_* abstract bit, in FCW bit order: IM DM ZM OM UM PM */
     static const struct { uint16_t fcw; uint32_t em; } M[] = {
         { 0x01, 0x10 },      /* IM -> _EM_INVALID   */
@@ -292,7 +292,7 @@ static uint32_t cw_abstract(const w32 *w) {
     return a;
 }
 static void cw_apply(w32 *w, uint32_t a) {
-    uint16_t f = (uint16_t)(w->c->fcw & ~0x0F3Fu);
+    uint16_t f = (uint16_t)(w32_cpu(w)->fcw & ~0x0F3Fu);
     static const struct { uint32_t em; uint16_t fcw; } M[] = {
         { 0x01, 0x20 }, { 0x02, 0x10 }, { 0x04, 0x08 },
         { 0x08, 0x04 }, { 0x10, 0x01 }, { 0x80000, 0x02 },
@@ -300,10 +300,10 @@ static void cw_apply(w32 *w, uint32_t a) {
     for (unsigned i = 0; i < sizeof M / sizeof M[0]; i++) if (a & M[i].em) f |= M[i].fcw;
     f |= (uint16_t)(((a >> 8) & 3) << 10);
     switch (a & 0x30000) { case 0x20000: break; case 0x10000: f |= 0x200; break; default: f |= 0x300; break; }
-    w->c->fcw = f;
-    uint32_t m = w->c->mxcsr & ~0x7F80u;                      /* masks 7-12, RC 13-14 */
+    w32_cpu(w)->fcw = f;
+    uint32_t m = w32_cpu(w)->mxcsr & ~0x7F80u;                      /* masks 7-12, RC 13-14 */
     m |= (uint32_t)(f & 0x3F) << 7; m |= (uint32_t)((f >> 10) & 3) << 13;
-    w->c->mxcsr = m;
+    w32_cpu(w)->mxcsr = m;
 }
 static void m__controlfp(w32 *w) {
     uint32_t nw = (uint32_t)ARG(0), mask = (uint32_t)ARG(1), cur = cw_abstract(w);
@@ -317,9 +317,9 @@ static void m__controlfp_s(w32 *w) {
     if (ARG(0)) w32_write(w, ARG(0), 4, cw_abstract(w));
     RET(0);
 }
-static void m__fpreset(w32 *w) { w->c->fcw = 0x027F; w->c->fsw = 0; w->c->ftag_empty = 0xFF; w->c->mxcsr = 0x1F80; }
-static void m__clearfp(w32 *w) { uint32_t sw = w->c->fsw & 0x3F; w->c->fsw &= ~0x80FFu; RET(sw); }
-static void m__statusfp(w32 *w) { RET(w->c->fsw & 0x3F); }
+static void m__fpreset(w32 *w) { w32_cpu(w)->fcw = 0x027F; w32_cpu(w)->fsw = 0; w32_cpu(w)->ftag_empty = 0xFF; w32_cpu(w)->mxcsr = 0x1F80; }
+static void m__clearfp(w32 *w) { uint32_t sw = w32_cpu(w)->fsw & 0x3F; w32_cpu(w)->fsw &= ~0x80FFu; RET(sw); }
+static void m__statusfp(w32 *w) { RET(w32_cpu(w)->fsw & 0x3F); }
 static void m__configthreadlocale(w32 *w) { RET(0); }
 static void m__set_invalid_parameter_handler(w32 *w) { RET(0); }
 static void m__crt_atexit(w32 *w) { m_atexit(w); }
@@ -469,10 +469,10 @@ static void m__read(w32 *w) { ssize_t r = read((int)ARG(0), W32P(w, ARG(1)), (ui
  * entry points -- the arguments follow the fixed ones in memory / registers) or
  * a pointer handed to us (v* entry points) */
 static uint64_t vararg_start(w32 *w, int fixed) {
-    if (w->is32) return w->c->gpr[XC_RSP] + 4 + 4u * fixed;
+    if (w->is32) return w32_cpu(w)->gpr[XC_RSP] + 4 + 4u * fixed;
     /* x64: the first four arguments are in registers; spill them to the home area
      * so the variadic reader can walk memory. The home area is [rsp+8, rsp+0x28). */
-    xc_cpu *c = w->c;
+    xc_cpu *c = w32_cpu(w);
     uint64_t home = c->gpr[XC_RSP] + 8;
     w32_write(w, home + 0, 8, c->gpr[XC_RCX]); w32_write(w, home + 8, 8, c->gpr[XC_RDX]);
     w32_write(w, home + 16, 8, c->gpr[XC_R8]); w32_write(w, home + 24, 8, c->gpr[XC_R9]);

@@ -107,5 +107,17 @@ check inputtest32.exe 0 6 -- -input inputtest.script
 # keyboard reaches XInput.
 check audiotest64.exe 0 -- -input audiotest.script
 check audiotest32.exe 0 -- -input audiotest.script
+# Threads. Every line of the expected output is true under every interleaving
+# -- "four threads each added 400, so the total is 1600" -- so a pass means
+# the locking held, not that the scheduler happened to be kind. Run twice for
+# the same reason faulttest is: the dynarec hands the guest lock over at a
+# block boundary and the interpreter at an instruction, so they interleave
+# differently and only checking both proves the answer does not depend on it.
+check threadtest64.exe 0
+check threadtest32.exe 0
+XCORE_JIT=0; export XCORE_JIT
+check threadtest64.exe 0
+check threadtest32.exe 0
+unset XCORE_JIT
 rm -f /tmp/winrun_err.$$
 exit $fail

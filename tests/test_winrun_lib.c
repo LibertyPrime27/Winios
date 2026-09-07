@@ -139,6 +139,11 @@ int main(int argc, char **argv) {
         { "filetest64.exe", 0 }, { "filetest32.exe", 0 },
         { "sehtest64.exe", 0 },  { "sehtest32.exe", 0 },
         { "audiotest64.exe", 0 }, { "audiotest32.exe", 0 },
+        /* Threads, run back to back with everything else on purpose: the
+         * thread table, the guest lock and the per-thread CPUs are globals
+         * like any other, so this is where a winrun_reset() that forgot one
+         * of them shows up. */
+        { "threadtest64.exe", 0 }, { "threadtest32.exe", 0 },
     };
     const int n = (int)(sizeof G / sizeof G[0]);
     int bad = 0;
