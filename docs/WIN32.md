@@ -295,6 +295,54 @@ is not quite right: `EnterCriticalSection`, `CreateEventA`, `SetEvent`,
 window and its message pump are the larger hole, and file enumeration and
 memory-mapped files are what a game reaches for to load its archives.
 
+## Carrying on past what we do not have
+
+    winrun -k program.exe          # and -t seconds, for one that will not stop
+
+Normally, calling an unimplemented import ends the run: it names the function
+and exits 127. That is right for the test suite — a guest that silently
+half-works is worse than one that stops — but it is the wrong tool for finding
+out what a real program needs, because you learn one name per run.
+
+`-k` logs the call, returns zero, and carries on. One run then names
+*everything* the program needed. `gamelike32.exe` reaches its last line and
+reports sixteen missing functions in the order it called them.
+
+The obstacle was the x86 calling convention: a stdcall callee pops its own
+arguments, and an import table gives a name and nothing else. Guess the count
+and the caller's stack is corrupt somewhere far away. `win32/stdcall_args.c` is
+generated from mingw-w64's import libraries, which decorate stdcall imports as
+`_Name@bytes` — 9817 functions across the DLLs a Windows program is likely to
+name. A name that is not in the table still ends the run, because "I cannot
+return from this safely" is worth saying rather than guessing. On x64 there is
+no callee-pop, so anything can be returned from.
+
+**Returning zero is a lie, and sometimes a consequential one.** Zero means
+failure for most of the API but success for some (`RegOpenKeyEx` returns
+`ERROR_SUCCESS`), and `FindFirstFile` fails with `INVALID_HANDLE_VALUE`, not
+zero — which is why `gamelike` goes on to call `FindNextFile` and `FindClose`
+on a handle it should have known was bad. For discovery that is fine and even
+useful; it is not a way to run anything for real, and `-k` is off by default
+for that reason.
+
+## When something goes wrong
+
+Any abnormal end — a fault, an int3 that is not one of ours, the time limit,
+the Stop button — and any clean end that leaned on functions we do not have,
+prints a run report: the reason, the guest's registers, the instructions at
+RIP, which module RIP is inside and at what offset, the module map with the
+stack and TEB, and everything called that is not implemented.
+
+It is written for a clean exit too, because "exited 0 having called nine
+functions that returned nothing" is also a diagnosis — and because the person
+reading it is usually not the person who ran it. A report that only appears on
+a crash is a report you cannot ask for.
+
+`w32_request_stop()` ends a run from another thread; it is checked between
+execution slices, so nothing is interrupted mid-instruction. `-t seconds` is
+the same thing on a timer, which is what stops a runaway program from wedging
+the app.
+
 ## What is deliberately not here yet
 
 Threads (`CreateThread`/`_beginthreadex` report failure), structured

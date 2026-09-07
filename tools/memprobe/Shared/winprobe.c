@@ -63,7 +63,32 @@ int win_probe_copy_frame(uint64_t *seq, void *dst, size_t dst_len,
     return got;
 }
 
-void win_probe_request_stop(void) { w32_d3d9_device_lost(1); }
+/* Both halves of stopping: a guest drawing frames leaves its loop when Present
+ * fails, and one that is not drawing anything needs the run loop to end it. */
+void win_probe_request_stop(void) { w32_d3d9_device_lost(1); w32_request_stop(); }
+
+int win_probe_run_ex(const char *exe_path, int keep_going, int timeout_s,
+                     char *out, size_t out_len, uint64_t *ns) {
+    char tbuf[16];
+    char *argv[8];
+    int argc = 0;
+    argv[argc++] = (char *)"winrun";
+    if (keep_going) argv[argc++] = (char *)"-k";
+    if (timeout_s > 0) {
+        snprintf(tbuf, sizeof tbuf, "%d", timeout_s);
+        argv[argc++] = (char *)"-t";
+        argv[argc++] = tbuf;
+    }
+    argv[argc++] = (char *)exe_path;
+
+    g_fw = g_fh = 0;
+    w32_d3d9_device_lost(0);
+    w32_set_present(grab_frame, 0);
+    uint64_t t0 = now_ns();
+    int rc = run_capture(argc, argv, out, out_len);
+    if (ns) *ns = now_ns() - t0;
+    return rc;
+}
 
 const void *win_probe_frame(int *width, int *height, int *pitch) {
     if (width) *width = g_fw;

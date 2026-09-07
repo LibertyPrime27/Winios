@@ -109,6 +109,16 @@ struct w32 {
     int        nmods, nloaded;
     const char *dll_dir;         /* extra directory to search for guest DLLs (-L) */
     int        imports_only;     /* -imports: load, report what is missing, do not run */
+    int        keep_going;       /* -k: an unimplemented import returns 0 instead of ending the run */
+
+    /* what was called that we do not implement, and how often. A run in
+     * keep_going mode produces this whole list instead of stopping at the
+     * first name, which is the difference between one clue and a work queue. */
+    struct { const char *name; uint32_t calls; } unimpl[128];
+    int        nunimpl;
+    uint32_t   unimpl_dropped;   /* distinct names past the end of the table */
+    uint64_t   deadline_ns;      /* stop after this (0 = no limit) */
+    const char *stop_reason;     /* why the run ended, for the crash report */
     w32_handle handles[W32_MAX_HANDLES];
     uint32_t  last_error;
 
@@ -203,6 +213,11 @@ void w32_raster_triangle(void *target, int width, int height, int pitch,
                          const float *xy1, uint32_t c1,
                          const float *xy2, uint32_t c2);
 
+/* stdcall_args.c (generated): how many bytes of arguments a stdcall function
+ * pops on x86, so an unimplemented import can return without corrupting the
+ * stack. -1 when the name is unknown, which is not the same as zero. */
+int w32_stdcall_bytes(const char *name);
+
 /* kernel32.c: where C:\ is on the host. NULL or "" keeps the command-line
  * behaviour (absolute guest paths become relative); the app sets it to its own
  * storage so a program copied in from Files finds its data. */
@@ -214,6 +229,18 @@ void w32_reset_statics(void);
 
 /* runtime (winrun.c) */
 int w32_run(w32 *w);
+
+/* Ask a running guest to stop. Callable from another thread -- the app's Stop
+ * button -- and checked between execution slices, so it does not have to
+ * interrupt anything. */
+void w32_request_stop(void);
+
+/* Everything worth knowing about where a run ended: the reason, the guest's
+ * registers, the instructions at RIP, the module map, and what it called that
+ * we do not implement. Written whether the run crashed or merely stopped,
+ * because "it exited 0 having called nine things that returned nothing" is
+ * also a diagnosis. Returns the number of bytes written. */
+int w32_crash_report(w32 *w, char *out, size_t out_len);
 
 /* TEB/PEB offsets that both bitnesses need */
 #define TEB64_LASTERROR 0x68

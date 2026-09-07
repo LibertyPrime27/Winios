@@ -17,6 +17,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PAGE 4096ull
@@ -363,13 +364,48 @@ static void stubs_init(w32 *w) {
 
 void w32_exit(w32 *w, int code) { w->exited = 1; w->exit_code = code; w->c->stop = XC_STOP_HLT; }
 
+/* Remember that something we do not implement was called. Names are the
+ * stub's own "dll!Name" strings, which outlive the run. */
+static void note_unimplemented(w32 *w, const char *name) {
+    for (int k = 0; k < w->nunimpl; k++)
+        if (w->unimpl[k].name == name) { w->unimpl[k].calls++; return; }
+    if (w->nunimpl >= (int)(sizeof w->unimpl / sizeof w->unimpl[0])) { w->unimpl_dropped++; return; }
+    w->unimpl[w->nunimpl].name = name;
+    w->unimpl[w->nunimpl].calls = 1;
+    w->nunimpl++;
+}
+
 static void dispatch(w32 *w, int i) {
     xc_cpu *c = w->c;
     const w32_api *a = w->stubs[i].api;
     if (!a) {
-        fprintf(stderr, "winrun: call to unimplemented %s at return address %#llx\n",
-                w->stubs[i].missing, (unsigned long long)w32_read(w, c->gpr[XC_RSP], w->is32 ? 4 : 8));
-        w32_exit(w, 127);
+        const char *full = w->stubs[i].missing;
+        const char *bang = full ? strchr(full, '!') : 0;
+        const char *name = bang ? bang + 1 : full;
+        note_unimplemented(w, full);
+
+        /* On x86 a stdcall callee pops its own arguments, so returning needs
+         * the byte count -- and getting it wrong corrupts the caller's stack
+         * far away from here. The generated table has ~9800 of them; a name
+         * that is not in it cannot be returned from safely, and saying so is
+         * better than guessing. x64 has no callee-pop, so anything can return. */
+        int bytes = name ? w32_stdcall_bytes(name) : -1;
+        if (!w->keep_going || (w->is32 && bytes < 0)) {
+            fprintf(stderr, "winrun: call to unimplemented %s at return address %#llx%s\n",
+                    full, (unsigned long long)w32_read(w, c->gpr[XC_RSP], w->is32 ? 4 : 8),
+                    w->keep_going && bytes < 0 ? "  (argument count unknown: cannot return from it)" : "");
+            w32_exit(w, 127);
+            return;
+        }
+        uint64_t rsp = c->gpr[XC_RSP];
+        if (w->is32) {
+            c->rip = w32_read(w, rsp, 4);
+            c->gpr[XC_RSP] = (uint32_t)(rsp + 4 + (uint32_t)bytes);
+        } else {
+            c->rip = w32_read(w, rsp, 8);
+            c->gpr[XC_RSP] = rsp + 8;
+        }
+        c->gpr[XC_RAX] = 0;          /* the most common "no" -- see the caveat in WIN32.md */
         return;
     }
     if (w->verbose > 1) fprintf(stderr, "winrun: %s!%s(%#llx, %#llx, %#llx, %#llx)\n",
@@ -389,25 +425,42 @@ static void dispatch(w32 *w, int i) {
     }
 }
 
+/* The app's Stop button, and any other thread that wants a guest to end.
+ * Checked between execution slices rather than interrupting one, so there is
+ * no question of stopping halfway through an instruction. */
+static volatile int g_stop_request;
+void w32_request_stop(void) { g_stop_request = 1; }
+
+static uint64_t now_ns_host(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
 /* Run until the process exits (depth 0) or the return-to-host stub is hit
  * (depth > 0, i.e. inside w32_call_guest). */
 static int run_loop(w32 *w) {
     xc_cpu *c = w->c;
     for (;;) {
         if (w->exited) return 0;
+        if (g_stop_request) { w->stop_reason = "stopped by request"; w32_exit(w, 124); return 0; }
+        if (w->deadline_ns && now_ns_host() > w->deadline_ns) {
+            w->stop_reason = "ran past its time limit";
+            w32_exit(w, 124); return 0;
+        }
         xc_stop st = xc_run(c, 1u << 20);
         if (st == XC_STOP_STEPS) continue;
         if (st == XC_STOP_BREAKPOINT) {
             uint64_t at = c->rip - 1;
             if (at >= w->stub_base && at < w->stub_base + 16u * W32_MAX_STUBS && !((at - w->stub_base) & 15)) {
                 int i = (int)((at - w->stub_base) / 16);
-                if (i == STUB_RETURN) { if (w->depth > 0) return 1; fprintf(stderr, "winrun: stray return-to-host\n"); w32_exit(w, 126); return 0; }
+                if (i == STUB_RETURN) { if (w->depth > 0) return 1; w->stop_reason = "a stray return-to-host stub"; fprintf(stderr, "winrun: stray return-to-host\n"); w32_exit(w, 126); return 0; }
                 if (i == STUB_EXIT) { w32_exit(w, (int)(uint32_t)c->gpr[XC_RAX]); return 0; }
                 if (i < w->nstubs) { dispatch(w, i); continue; }
             }
             fprintf(stderr, "winrun: int3 in guest code at %#llx\n", (unsigned long long)at);
             w32_exit(w, 128 + 5); return 0;
         }
+        w->stop_reason = xc_stop_name(st);
         char dis[128]; xc_disasm(c, c->rip, dis, sizeof dis);
         fprintf(stderr, "winrun: stopped: %s at rip=%#llx  [%s]", xc_stop_name(st), (unsigned long long)c->rip, dis);
         if (st == XC_STOP_FAULT) fprintf(stderr, "  fault_addr=%#llx", (unsigned long long)c->fault_addr);
@@ -561,6 +614,7 @@ static void winrun_reset(void) {
     memset(&g_cpu, 0, sizeof g_cpu);
     memset(g_free, 0, sizeof g_free);
     g_bump32 = 0x10000000u;
+    g_stop_request = 0;
     w32_reset_statics();
     w32_com_reset();
     w32_d3d9_reset();
@@ -635,6 +689,70 @@ static void report_imports(w32 *w) {
     }
 }
 
+/* Everything worth knowing about where a run ended.
+ *
+ * Written for a clean exit as well as a crash, because "exited 0 having called
+ * nine functions that returned nothing" is also a diagnosis, and because the
+ * person reading this is usually not the person who ran it -- a report that
+ * only appears on a crash is a report you cannot ask for.
+ */
+int w32_crash_report(w32 *w, char *out, size_t out_len) {
+    xc_cpu *c = w->c;
+    size_t n = 0;
+    #define P(...) do { if (n < out_len) n += (size_t)snprintf(out + n, out_len - n, __VA_ARGS__); } while (0)
+
+    P("winios run report\n");
+    P("  program   %s (%d-bit)\n", w->exe_path ? w->exe_path : "?", w->is32 ? 32 : 64);
+    P("  ended     %s\n", w->stop_reason ? w->stop_reason : "normally");
+    P("  exit code %d\n", w->exit_code);
+
+    P("\n  rip %016llx  rsp %016llx  rbp %016llx\n",
+      (unsigned long long)c->rip, (unsigned long long)c->gpr[XC_RSP], (unsigned long long)c->gpr[XC_RBP]);
+    static const char *rn[16] = { "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
+                                  "r8","r9","r10","r11","r12","r13","r14","r15" };
+    for (int i = 0; i < (w->is32 ? 8 : 16); i++)
+        P("  %-4s%016llx%s", rn[i], (unsigned long long)c->gpr[i], (i % 4) == 3 ? "\n" : "");
+    if ((w->is32 ? 8 : 16) % 4) P("\n");
+
+    /* Forward from RIP only: disassembling backwards on x86 is guesswork, and
+     * a report that guesses is worse than one that says less. */
+    P("\n  at rip:\n");
+    uint64_t at = c->rip;
+    for (int i = 0; i < 6; i++) {
+        char dis[160];
+        int len = xc_disasm(c, at, dis, sizeof dis);
+        if (len <= 0) { P("    %016llx  (cannot decode)\n", (unsigned long long)at); break; }
+        P("    %016llx  %s\n", (unsigned long long)at, dis);
+        at += (uint64_t)len;
+    }
+
+    P("\n  modules:\n");
+    for (int i = 0; i < w->nmods; i++)
+        P("    %-24s %012llx..%012llx%s\n", w->mods[i].name,
+          (unsigned long long)w->mods[i].base,
+          (unsigned long long)(w->mods[i].base + w->mods[i].size),
+          w->mods[i].is_exe ? "  (exe)" : "");
+    P("    %-24s %012llx\n", "[import stubs]", (unsigned long long)w->stub_base);
+    P("    %-24s %012llx..%012llx\n", "[stack]",
+      (unsigned long long)w->stack_limit, (unsigned long long)w->stack_base);
+    P("    %-24s %012llx\n", "[teb]", (unsigned long long)w->teb);
+
+    /* Which module the fault is in is usually the whole answer. */
+    for (int i = 0; i < w->nmods; i++)
+        if (c->rip >= w->mods[i].base && c->rip < w->mods[i].base + w->mods[i].size)
+            P("\n  rip is in %s, at +%#llx\n", w->mods[i].name,
+              (unsigned long long)(c->rip - w->mods[i].base));
+
+    if (w->nunimpl) {
+        P("\n  called but not implemented (%d):\n", w->nunimpl);
+        for (int k = 0; k < w->nunimpl; k++)
+            P("    %6u x  %s\n", w->unimpl[k].calls, w->unimpl[k].name);
+        if (w->unimpl_dropped) P("    (and %u more distinct)\n", w->unimpl_dropped);
+    }
+    #undef P
+    return (int)n;
+}
+
 int winrun_main(int argc, char **argv) {
     winrun_reset();
     w32 *w = &g_w;
@@ -645,16 +763,18 @@ int winrun_main(int argc, char **argv) {
         if (!strcmp(argv[ai], "-v")) w->verbose++;
         else if (!strcmp(argv[ai], "-vv")) w->verbose += 2;
         else if (!strcmp(argv[ai], "-imports")) w->imports_only = 1;
+        else if (!strcmp(argv[ai], "-k")) w->keep_going = 1;
+        else if (!strcmp(argv[ai], "-t") && ai + 1 < argc) { w->deadline_ns = now_ns_host() + (uint64_t)atoll(argv[ai + 1]) * 1000000000ull; ai++; }
         else if (!strcmp(argv[ai], "-C") && ai + 1 < argc) { w32_set_drive_c(argv[ai + 1]); ai++; }
         else if (!strcmp(argv[ai], "-L") && ai + 1 < argc) {       /* extra directory to find guest DLLs in */
             static char dir[512];
             snprintf(dir, sizeof dir, "%s%s", argv[ai + 1], argv[ai + 1][strlen(argv[ai + 1]) - 1] == '/' ? "" : "/");
             w->dll_dir = dir; ai++;
         }
-        else { fprintf(stderr, "usage: winrun [-v] [-imports] [-C drive_c] [-L dlldir] program.exe [args...]\n"); return 2; }
+        else { fprintf(stderr, "usage: winrun [-v] [-imports] [-k] [-t seconds] [-C drive_c] [-L dlldir] program.exe [args...]\n"); return 2; }
         ai++;
     }
-    if (ai >= argc) { fprintf(stderr, "usage: winrun [-v] [-imports] [-C drive_c] [-L dlldir] program.exe [args...]\n"); return 2; }
+    if (ai >= argc) { fprintf(stderr, "usage: winrun [-v] [-imports] [-k] [-t seconds] [-C drive_c] [-L dlldir] program.exe [args...]\n"); return 2; }
     w->exe_path = argv[ai];
 
     /* bitness decides the memory model, so peek at the header first */
@@ -735,6 +855,14 @@ int winrun_main(int argc, char **argv) {
                             (unsigned long long)c->rip, (unsigned long long)c->gpr[XC_RSP], (unsigned long long)w->teb, (unsigned long long)w->peb);
     int code = w32_run(w);
     fflush(stdout);
+    /* A report whenever there is something to report: an abnormal end, or a
+     * clean one that leaned on functions we do not have. */
+    if (w->stop_reason || w->nunimpl) {
+        static char rep[16384];
+        w32_crash_report(w, rep, sizeof rep);
+        printf("\n%s", rep);
+        fflush(stdout);
+    }
     if (w->verbose) {
         uint64_t jb, jco, jbytes, jl, jlw, jls; xc_jit_stats(&jb, &jco, &jbytes);
         xc_jit_link_stats(&jl, &jlw, &jls);

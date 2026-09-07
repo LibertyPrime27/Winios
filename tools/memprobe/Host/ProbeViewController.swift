@@ -70,7 +70,8 @@ final class ProbeViewController: UIViewController {
             button("4 · JIT: attach StikDebug, then execute in a blessed arena", #selector(attachJIT)),
             button("9 · JIT arena: try a bigger one next launch", #selector(stepArena)),
             row([("Open an .exe…", #selector(openExe)), ("Run it", #selector(runPicked))]),
-            row([("Copy report", #selector(copyReport)), ("Reset results", #selector(resetAll))]),
+            row([("Stop the running program", #selector(stopGuest)), ("Copy report", #selector(copyReport))]),
+            row([("Reset results", #selector(resetAll))]),
             frameView,
             results,
         ])
@@ -200,6 +201,13 @@ final class ProbeViewController: UIViewController {
             self.refresh()
         }
     }
+    /// Stop whatever is running. Safe to tap when nothing is: the flag is
+    /// cleared at the start of every run.
+    @objc private func stopGuest() {
+        win_probe_request_stop()
+        title = "stopping…"
+    }
+
     /// Run whatever was picked. It may well not get far -- that is what the
     /// import report was for -- so the output is captured either way.
     @objc private func runPicked() {
@@ -209,14 +217,18 @@ final class ProbeViewController: UIViewController {
         }
         work("picked exe") {
             if let arena = self.ensureArena() { _ = self.handArenaToXcore(arena) }
-            var out = [CChar](repeating: 0, count: 65536)
+            var out = [CChar](repeating: 0, count: 262144)
             var ns: UInt64 = 0
             xc_jit_enable(1)
-            let rc = exe.path.withCString { win_probe_run($0, nil, nil, &out, out.count, &ns, nil, nil) }
+            // keep_going: one run names everything it needed, not just the
+            // first thing it tripped on. 120 s so a runaway cannot wedge the
+            // app -- Stop ends it sooner.
+            let rc = exe.path.withCString { win_probe_run_ex($0, 1, 120, &out, out.count, &ns) }
             xc_jit_enable(0)
             var text = "\(exe.lastPathComponent) exited \(rc) after \(ns / 1_000_000) ms\n\n"
             text += String(cString: out)
-            if rc == 127 { text += "\n(exit 127 is an unimplemented import being called — the line above names it)\n" }
+            if rc == 127 { text += "\n(127: it called something we cannot even return from — see the report)\n" }
+            if rc == 124 { text += "\n(124: stopped by the time limit or the Stop button)\n" }
             DispatchQueue.main.async { self.winLine = text; self.refresh() }
         }
     }

@@ -16,6 +16,14 @@ int win_probe_run(const char *exe_path, const char *arg1, const char *arg2,
                   char *out, size_t out_len, uint64_t *ns, uint64_t *x87_native,
                   uint64_t *x87_callout);
 
+/* The same, for a program we did not ship and cannot vouch for.
+ *   keep_going  an unimplemented import returns 0 and the run continues, so
+ *               one run names everything it needed instead of the first thing
+ *   timeout_s   a runaway program cannot wedge the app (0 = no limit)
+ * The captured output ends with the run report either way. */
+int win_probe_run_ex(const char *exe_path, int keep_going, int timeout_s,
+                     char *out, size_t out_len, uint64_t *ns);
+
 /* Load an executable, resolve its imports, and report which ones nothing here
  * can satisfy -- without running it. This is how the app answers "can this
  * program run, and if not, what is missing?" for an arbitrary .exe the user
