@@ -19,13 +19,15 @@
 #include <strings.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
 enum { ERROR_FILE_NOT_FOUND = 2, ERROR_ACCESS_DENIED = 5, ERROR_INVALID_HANDLE = 6, ERROR_NOT_ENOUGH_MEMORY = 8,
        ERROR_INVALID_PARAMETER = 87, ERROR_PROC_NOT_FOUND = 127, ERROR_MOD_NOT_FOUND = 126, ERROR_ALREADY_EXISTS = 183,
-       ERROR_INSUFFICIENT_BUFFER = 122, ERROR_CALL_NOT_IMPLEMENTED = 120 };
+       ERROR_INSUFFICIENT_BUFFER = 122, ERROR_CALL_NOT_IMPLEMENTED = 120,
+       ERROR_FILENAME_EXCED_RANGE = 206 };
 
 static uint64_t bool_(int b) { return b ? 1 : 0; }
 static uint64_t filetime_now(void) {
@@ -42,9 +44,21 @@ static char g_drive_c[1024];
 void w32_set_drive_c(const char *path) { snprintf(g_drive_c, sizeof g_drive_c, "%s", path ? path : ""); }
 const char *w32_drive_c(void) { return g_drive_c; }
 
-/* The directory the executable lives in, which is also the guest's working
- * directory: a Windows program is normally started in its own install folder
- * and opens "data\\x.bsa" expecting that. */
+/* The current directory. A Windows program starts in its own install folder
+ * and opens "data\\x.bsa" expecting that, so that is where this begins -- but
+ * it is a variable and not a rule, because an installer changes directory and
+ * then opens things relative to the new one. SetCurrentDirectory used to
+ * return success without doing anything, which is the kind of lie that shows
+ * up later as a file not found in a place nobody looked.
+ *
+ * Two forms are kept: the host path relative paths are resolved against
+ * (empty meaning "the executable's directory", which is what every recorded
+ * test expects), and the Windows path GetCurrentDirectory reports back. */
+static char g_cwd_host[1024];
+static char g_cwd_win[1024];
+
+/* The directory the executable lives in, which is where the working
+ * directory starts. */
 /* A path is a path, not an essay: bounding each half explicitly is what lets
  * the compiler see that joining them cannot overrun the caller's buffer, and
  * truncating an absurd path is the right behaviour anyway. */
@@ -82,8 +96,41 @@ static void host_path(w32 *w, const char *win, char *out, size_t n) {
         return;
     }
     if (tmp[0] == '/') { snprintf(out, n, "%.*s", P_REST, tmp); return; }   /* already a host path */
+    if (g_cwd_host[0]) { snprintf(out, n, "%.*s/%.*s", P_DIR, g_cwd_host, P_REST, tmp); return; }
     exe_dir(w, dir, sizeof dir);
     snprintf(out, n, "%.*s/%.*s", P_DIR, dir, P_REST, tmp);
+}
+
+/* The same, for the other files in this layer: shell32 has to resolve the
+ * folders it reports back to real directories. One set of rules for where a
+ * Windows path lands, in one place, rather than a second set that drifts. */
+void w32_host_path(w32 *w, const char *win, char *out, size_t n) { host_path(w, win, out, n); }
+
+/* Create the directories a Windows program expects to already exist.
+ *
+ * Only called when something is about to be installed, never for an ordinary
+ * run: a directory walk of C:\ is observable, so conjuring six folders into
+ * a drive that a test recorded the contents of would change that recording
+ * for no reason. An installer, on the other hand, will refuse to start
+ * without somewhere to install to.
+ */
+void w32_drive_init(void) {
+    if (!g_drive_c[0]) return;
+    static const char *dirs[] = {
+        "Program Files", "Program Files (x86)", "Program Files/Common Files",
+        "Windows", "Windows/System32", "Windows/Temp", "Windows/Fonts",
+        "ProgramData", "Temp",
+        "Users", "Users/winios", "Users/winios/Desktop", "Users/winios/Documents",
+        "Users/winios/AppData", "Users/winios/AppData/Roaming",
+        "Users/winios/AppData/Local", "Users/winios/AppData/LocalLow",
+        "Users/winios/Saved Games", "Users/winios/Start Menu",
+        "Users/Public", "Users/Public/Documents",
+    };
+    for (size_t i = 0; i < sizeof dirs / sizeof dirs[0]; i++) {
+        char path[P_DIR + P_REST + 8];
+        snprintf(path, sizeof path, "%.*s/%.*s", P_DIR, g_drive_c, P_REST, dirs[i]);
+        (void)mkdir(path, 0777);      /* already there is the normal case */
+    }
 }
 
 /* ---- finding files, and mapping them ----
@@ -719,11 +766,50 @@ static void k_GetFileAttributesA(w32 *w) {
 }
 static void k_DeleteFileA(w32 *w) { char path[4096]; host_path(w, GSTR(ARG(0)), path, sizeof path); RET(bool_(unlink(path) == 0)); }
 static void k_GetCurrentDirectoryA(w32 *w) {
-    uint32_t n = (uint32_t)ARG(0); uint64_t buf = ARG(1); const char *d = "C:\\xcore";
+    uint32_t n = (uint32_t)ARG(0); uint64_t buf = ARG(1);
+    const char *d = g_cwd_win[0] ? g_cwd_win : "C:\\xcore";
     if (n <= strlen(d)) { RET(strlen(d) + 1); return; }
     memcpy(W32P(w, buf), d, strlen(d) + 1); RET(strlen(d));
 }
-static void k_SetCurrentDirectoryA(w32 *w) { RET(1); }
+static void k_GetCurrentDirectoryW(w32 *w) {
+    uint32_t n = (uint32_t)ARG(0); uint64_t buf = ARG(1);
+    const char *d = g_cwd_win[0] ? g_cwd_win : "C:\\xcore";
+    size_t l = strlen(d);
+    if (n <= l) { RET(l + 1); return; }
+    uint16_t *o = W32P(w, buf);
+    if (o) { for (size_t i = 0; i < l; i++) o[i] = (uint8_t)d[i]; o[l] = 0; }
+    RET(l);
+}
+/* Really change directory, and fail when the directory is not there. The
+ * guest-visible form is kept alongside the host one because a program that
+ * sets a directory and then asks for it expects its own spelling back. */
+static void set_cwd(w32 *w, const char *win) {
+    char host[4096];
+    host_path(w, win, host, sizeof host);
+    struct stat st;
+    if (stat(host, &st) || !S_ISDIR(st.st_mode)) {
+        w32_set_last_error(w, ERROR_FILE_NOT_FOUND); RET(0); return;
+    }
+    snprintf(g_cwd_host, sizeof g_cwd_host, "%.*s", (int)sizeof g_cwd_host - 1, host);
+    /* An absolute Windows path is reported verbatim; a relative one is
+     * resolved against what we had. Built in a temporary first: the source of
+     * the join is the destination of it, and snprintf may not overlap. */
+    char next[sizeof g_cwd_win];
+    const char *at = g_cwd_win[0] ? g_cwd_win : "C:\\xcore";
+    int n = win[1] == ':' ? snprintf(next, sizeof next, "%s", win)
+                          : snprintf(next, sizeof next, "%s\\%s", at, win);
+    /* Truncating a path is worse than refusing one: the caller would go on to
+     * open something it did not name. Nothing real is this long. */
+    if (n < 0 || (size_t)n >= sizeof next) {
+        w32_set_last_error(w, ERROR_FILENAME_EXCED_RANGE); RET(0); return;
+    }
+    memcpy(g_cwd_win, next, (size_t)n + 1);
+    RET(1);
+}
+static void k_SetCurrentDirectoryA(w32 *w) { set_cwd(w, GSTR(ARG(0))); }
+static void k_SetCurrentDirectoryW(w32 *w) {
+    char s[1024]; w32_wtoa(w, ARG(0), s, sizeof s); set_cwd(w, s);
+}
 static void k_GetTempPathA(w32 *w) { uint32_t n = (uint32_t)ARG(0); const char *d = "C:\\Temp\\"; if (n > strlen(d)) memcpy(W32P(w, ARG(1)), d, strlen(d) + 1); RET(strlen(d)); }
 static void k_GetFullPathNameA(w32 *w) {
     const char *s = GSTR(ARG(0)); uint32_t n = (uint32_t)ARG(1); uint64_t buf = ARG(2);
@@ -767,6 +853,488 @@ static void k_lstrcmpiA(w32 *w) { RET((uint64_t)(int64_t)strcasecmp(GSTR(ARG(0))
 static void k_GetSystemDirectoryA(w32 *w) { const char *d = "C:\\Windows\\System32"; if ((uint32_t)ARG(1) > strlen(d)) memcpy(W32P(w, ARG(0)), d, strlen(d) + 1); RET(strlen(d)); }
 static void k_GetWindowsDirectoryA(w32 *w) { const char *d = "C:\\Windows"; if ((uint32_t)ARG(1) > strlen(d)) memcpy(W32P(w, ARG(0)), d, strlen(d) + 1); RET(strlen(d)); }
 static void k_IsProcessorFeaturePresent(w32 *w) { uint32_t f = (uint32_t)ARG(0); RET(bool_(f == 6 || f == 10 || f == 13 || f == 17 || f == 23)); }   /* SSE, SSE2, SSE3, SSE4, fastfail */
+/* ---- what an installer does ------------------------------------------------
+ *
+ * A setup program in silent mode is, almost entirely, a file copier with a
+ * registry writer attached: it asks how much space is free, makes some
+ * directories, copies files into them, sets a few attributes, writes an
+ * uninstall key, and leaves. Every one of those was missing, so an installer
+ * stopped at the first of them regardless of how well it had been unpacked.
+ *
+ * These are also what a *game* needs on a second run: a program that saved
+ * settings on Tuesday expects to move and rename them on Wednesday.
+ */
+
+/* One copy, with the flag the API actually has: fail rather than overwrite. */
+static int copy_one(const char *src, const char *dst, int fail_if_exists) {
+    struct stat st;
+    if (fail_if_exists && stat(dst, &st) == 0) { errno = EEXIST; return -1; }
+    FILE *a = fopen(src, "rb");
+    if (!a) return -1;
+    FILE *b = fopen(dst, "wb");
+    if (!b) { int e = errno; fclose(a); errno = e; return -1; }
+    char buf[64 * 1024];
+    size_t n;
+    int bad = 0;
+    while ((n = fread(buf, 1, sizeof buf, a)) > 0)
+        if (fwrite(buf, 1, n, b) != n) { bad = 1; break; }
+    if (ferror(a)) bad = 1;
+    fclose(a);
+    if (fclose(b)) bad = 1;
+    if (bad) { remove(dst); return -1; }
+    /* Carry the mode across, so a copied executable stays executable. Times
+     * are not carried: an installer sets them itself when it cares, and
+     * pretending a fresh copy is old confuses the drive diff. */
+    if (stat(src, &st) == 0) (void)chmod(dst, st.st_mode & 07777);
+    return 0;
+}
+
+static void copy_file(w32 *w, int wide, int fail_arg_is_bool) {
+    char a[1024], b[1024], pa[4096], pb[4096];
+    if (wide) { w32_wtoa(w, ARG(0), a, sizeof a); w32_wtoa(w, ARG(1), b, sizeof b); }
+    else { snprintf(a, sizeof a, "%s", GSTR(ARG(0))); snprintf(b, sizeof b, "%s", GSTR(ARG(1))); }
+    host_path(w, a, pa, sizeof pa);
+    host_path(w, b, pb, sizeof pb);
+    /* CopyFile's third argument is bFailIfExists; CopyFileEx's is a progress
+     * callback and its *sixth* is a flags word with COPY_FILE_FAIL_IF_EXISTS
+     * (1) in it. Same operation, different shape, and getting it the wrong way
+     * round means silently refusing every overwrite. */
+    int fail = fail_arg_is_bool ? (int)ARG(2) != 0 : ((uint32_t)ARG(5) & 1u) != 0;
+    if (copy_one(pa, pb, fail)) {
+        w32_set_last_error(w, errno == EEXIST ? ERROR_ALREADY_EXISTS
+                            : errno == ENOENT ? ERROR_FILE_NOT_FOUND : ERROR_ACCESS_DENIED);
+        RET(0); return;
+    }
+    RET(1);
+}
+static void k_CopyFileA(w32 *w) { copy_file(w, 0, 1); }
+static void k_CopyFileW(w32 *w) { copy_file(w, 1, 1); }
+static void k_CopyFileExA(w32 *w) { copy_file(w, 0, 0); }
+static void k_CopyFileExW(w32 *w) { copy_file(w, 1, 0); }
+
+/* MOVEFILE_REPLACE_EXISTING 1, MOVEFILE_COPY_ALLOWED 2,
+ * MOVEFILE_DELAY_UNTIL_REBOOT 4. The third is what an installer uses for a
+ * file that is in use; there is no reboot here, so it is done immediately,
+ * which is the outcome the caller wanted a reboot for. */
+static void move_file(w32 *w, int wide, int has_flags) {
+    char a[1024], b[1024], pa[4096], pb[4096];
+    if (wide) { w32_wtoa(w, ARG(0), a, sizeof a); w32_wtoa(w, ARG(1), b, sizeof b); }
+    else { snprintf(a, sizeof a, "%s", GSTR(ARG(0))); snprintf(b, sizeof b, "%s", GSTR(ARG(1))); }
+    host_path(w, a, pa, sizeof pa);
+    uint32_t flags = has_flags ? (uint32_t)ARG(2) : 0;
+    /* A null destination with DELAY_UNTIL_REBOOT means "delete this on the
+     * way out", which is how an uninstaller removes a file it is holding. */
+    if (!ARG(1)) { RET(bool_(unlink(pa) == 0 || errno == ENOENT)); return; }
+    host_path(w, b, pb, sizeof pb);
+    struct stat st;
+    if (!(flags & 1u) && stat(pb, &st) == 0) {
+        w32_set_last_error(w, ERROR_ALREADY_EXISTS); RET(0); return;
+    }
+    if (rename(pa, pb) == 0) { RET(1); return; }
+    /* Across devices rename cannot work, and an installer moving out of a
+     * temp directory hits that constantly. COPY_ALLOWED is the caller's
+     * permission to do it the slow way; DELAY_UNTIL_REBOOT implies it. */
+    if (errno == EXDEV && (flags & 6u)) {
+        if (copy_one(pa, pb, 0) == 0 && unlink(pa) == 0) { RET(1); return; }
+    }
+    w32_set_last_error(w, errno == ENOENT ? ERROR_FILE_NOT_FOUND : ERROR_ACCESS_DENIED);
+    RET(0);
+}
+static void k_MoveFileA(w32 *w)   { move_file(w, 0, 0); }
+static void k_MoveFileW(w32 *w)   { move_file(w, 1, 0); }
+static void k_MoveFileExA(w32 *w) { move_file(w, 0, 1); }
+static void k_MoveFileExW(w32 *w) { move_file(w, 1, 1); }
+
+static void make_dir(w32 *w, int wide) {
+    char a[1024], pa[4096];
+    if (wide) w32_wtoa(w, ARG(0), a, sizeof a); else snprintf(a, sizeof a, "%s", GSTR(ARG(0)));
+    host_path(w, a, pa, sizeof pa);
+    if (mkdir(pa, 0777) == 0) { RET(1); return; }
+    w32_set_last_error(w, errno == EEXIST ? ERROR_ALREADY_EXISTS
+                        : errno == ENOENT ? ERROR_FILE_NOT_FOUND : ERROR_ACCESS_DENIED);
+    RET(0);
+}
+static void k_CreateDirectoryA(w32 *w) { make_dir(w, 0); }
+static void k_CreateDirectoryW(w32 *w) { make_dir(w, 1); }
+static void remove_dir(w32 *w, int wide) {
+    char a[1024], pa[4096];
+    if (wide) w32_wtoa(w, ARG(0), a, sizeof a); else snprintf(a, sizeof a, "%s", GSTR(ARG(0)));
+    host_path(w, a, pa, sizeof pa);
+    if (rmdir(pa) == 0) { RET(1); return; }
+    w32_set_last_error(w, errno == ENOENT ? ERROR_FILE_NOT_FOUND : ERROR_ACCESS_DENIED);
+    RET(0);
+}
+static void k_RemoveDirectoryA(w32 *w) { remove_dir(w, 0); }
+static void k_RemoveDirectoryW(w32 *w) { remove_dir(w, 1); }
+
+static void k_DeleteFileW(w32 *w) {
+    char a[1024], pa[4096]; w32_wtoa(w, ARG(0), a, sizeof a);
+    host_path(w, a, pa, sizeof pa);
+    if (unlink(pa) == 0) { RET(1); return; }
+    w32_set_last_error(w, ERROR_FILE_NOT_FOUND); RET(0);
+}
+static void k_GetFileAttributesW(w32 *w) {
+    char a[1024], pa[4096]; w32_wtoa(w, ARG(0), a, sizeof a);
+    host_path(w, a, pa, sizeof pa);
+    struct stat st;
+    if (stat(pa, &st)) { w32_set_last_error(w, ERROR_FILE_NOT_FOUND); RET(0xFFFFFFFFu); return; }
+    RET(S_ISDIR(st.st_mode) ? FA_DIRECTORY : (st.st_mode & S_IWUSR) ? FA_NORMAL : (FA_NORMAL | FA_READONLY));
+}
+/* Only the read-only bit means anything on a POSIX filesystem. Hidden,
+ * system and archive are accepted and dropped: refusing them would stop an
+ * installer that is merely tidying up, and pretending to store them would be
+ * a lie the next GetFileAttributes would expose. */
+static void set_attrs(w32 *w, int wide) {
+    char a[1024], pa[4096];
+    if (wide) w32_wtoa(w, ARG(0), a, sizeof a); else snprintf(a, sizeof a, "%s", GSTR(ARG(0)));
+    host_path(w, a, pa, sizeof pa);
+    struct stat st;
+    if (stat(pa, &st)) { w32_set_last_error(w, ERROR_FILE_NOT_FOUND); RET(0); return; }
+    mode_t m = st.st_mode & 07777;
+    if ((uint32_t)ARG(1) & FA_READONLY) m &= (mode_t)~(S_IWUSR | S_IWGRP | S_IWOTH);
+    else m |= S_IWUSR;
+    RET(bool_(chmod(pa, m) == 0));
+}
+static void k_SetFileAttributesA(w32 *w) { set_attrs(w, 0); }
+static void k_SetFileAttributesW(w32 *w) { set_attrs(w, 1); }
+
+/* How much room is there? An installer asks before it starts and refuses to
+ * go on if the answer is zero or unavailable, so this has to be a real
+ * number. It is the host filesystem's, which is the truth: the virtual C: is
+ * a directory on it. */
+static void disk_free_ex(w32 *w, int wide) {
+    char a[1024], pa[4096];
+    if (ARG(0)) {
+        if (wide) w32_wtoa(w, ARG(0), a, sizeof a); else snprintf(a, sizeof a, "%s", GSTR(ARG(0)));
+    } else snprintf(a, sizeof a, "C:\\");
+    host_path(w, a, pa, sizeof pa);
+    struct statvfs vfs;
+    uint64_t avail = 4ull << 30, total = 32ull << 30;
+    if (statvfs(pa, &vfs) == 0 || statvfs(g_drive_c[0] ? g_drive_c : ".", &vfs) == 0) {
+        uint64_t unit = vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize;
+        avail = (uint64_t)vfs.f_bavail * unit;
+        total = (uint64_t)vfs.f_blocks * unit;
+    }
+    if (ARG(1)) w32_write(w, ARG(1), 8, avail);       /* free to the caller  */
+    if (ARG(2)) w32_write(w, ARG(2), 8, total);       /* total               */
+    if (ARG(3)) w32_write(w, ARG(3), 8, avail);       /* free on the volume  */
+    RET(1);
+}
+static void k_GetDiskFreeSpaceExA(w32 *w) { disk_free_ex(w, 0); }
+static void k_GetDiskFreeSpaceExW(w32 *w) { disk_free_ex(w, 1); }
+/* The older call, in clusters. 512-byte sectors and 8 per cluster keeps the
+ * arithmetic exact and the numbers inside 32 bits, which is what callers of
+ * this version are assuming. */
+static void disk_free_old(w32 *w) {
+    struct statvfs vfs;
+    uint64_t avail = 4ull << 30, total = 32ull << 30;
+    if (statvfs(g_drive_c[0] ? g_drive_c : ".", &vfs) == 0) {
+        uint64_t unit = vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize;
+        avail = (uint64_t)vfs.f_bavail * unit;
+        total = (uint64_t)vfs.f_blocks * unit;
+    }
+    const uint32_t cluster = 4096, sector = 512;
+    uint64_t freec = avail / cluster, totc = total / cluster;
+    if (freec > 0xFFFFFFFFull) freec = 0xFFFFFFFFull;
+    if (totc  > 0xFFFFFFFFull) totc  = 0xFFFFFFFFull;
+    if (ARG(1)) w32_write(w, ARG(1), 4, cluster / sector);
+    if (ARG(2)) w32_write(w, ARG(2), 4, sector);
+    if (ARG(3)) w32_write(w, ARG(3), 4, freec);
+    if (ARG(4)) w32_write(w, ARG(4), 4, totc);
+    RET(1);
+}
+static void k_GetDiskFreeSpaceA(w32 *w) { disk_free_old(w); }
+static void k_GetDiskFreeSpaceW(w32 *w) { disk_free_old(w); }
+
+/* NTFS, because an installer that finds FAT32 refuses to write a file over
+ * 4 GB and some refuse to install at all. */
+static void volume_info(w32 *w, int wide) {
+    const char *label = "winios", *fs = "NTFS";
+    #define PUT(a, n, s) do { if ((a) && (uint32_t)(n) > strlen(s)) { \
+        if (wide) { uint16_t *d = W32P(w, (a)); \
+                    if (d) { size_t i = 0; \
+                             while (s[i]) { d[i] = (uint8_t)s[i]; i++; } \
+                             d[i] = 0; } } \
+        else memcpy(W32P(w, (a)), s, strlen(s) + 1); } } while (0)
+    PUT(ARG(1), ARG(2), label);
+    PUT(ARG(6), ARG(7), fs);
+    #undef PUT
+    if (ARG(3)) w32_write(w, ARG(3), 4, 0x1234ABCDu);   /* serial number */
+    if (ARG(4)) w32_write(w, ARG(4), 4, 255);           /* max component length */
+    /* CASE_PRESERVED_NAMES | UNICODE_ON_DISK | PERSISTENT_ACLS */
+    if (ARG(5)) w32_write(w, ARG(5), 4, 0x2 | 0x4 | 0x8);
+    RET(1);
+}
+static void k_GetVolumeInformationA(w32 *w) { volume_info(w, 0); }
+static void k_GetVolumeInformationW(w32 *w) { volume_info(w, 1); }
+
+/* A temp file name that does not already exist. The real one uses the process
+ * id and a counter; a counter alone is enough here, and checking is what
+ * makes it correct rather than merely unlikely. */
+static void temp_name(w32 *w, int wide) {
+    static unsigned seq;
+    char dir[1024], base[8], host[4096], win[1200];
+    if (wide) { w32_wtoa(w, ARG(0), dir, sizeof dir); w32_wtoa(w, ARG(1), base, sizeof base); }
+    else { snprintf(dir, sizeof dir, "%s", GSTR(ARG(0))); snprintf(base, sizeof base, "%s", GSTR(ARG(1))); }
+    if (!dir[0]) snprintf(dir, sizeof dir, "C:\\Temp");
+    size_t dl = strlen(dir);
+    while (dl && (dir[dl - 1] == '\\' || dir[dl - 1] == '/')) dir[--dl] = 0;
+    uint32_t unique = (uint32_t)ARG(2);
+    for (int tries = 0; tries < 4096; tries++) {
+        uint32_t u = unique ? unique : ((++seq) & 0xFFFFu) | 0x1000u;
+        snprintf(win, sizeof win, "%.*s\\%.3s%04x.tmp", P_DIR, dir, base[0] ? base : "tmp", u);
+        host_path(w, win, host, sizeof host);
+        struct stat st;
+        if (unique || stat(host, &st) != 0) {
+            /* A non-zero unique means "give me the name, do not create it";
+             * zero means the name has to be reserved, or two callers a
+             * microsecond apart get the same one. */
+            if (!unique) { FILE *f = fopen(host, "wb"); if (!f) continue; fclose(f); }
+            if (ARG(3)) {
+                if (wide) { uint16_t *d = W32P(w, ARG(3));
+                            if (d) { size_t i = 0; for (; win[i]; i++) d[i] = (uint8_t)win[i]; d[i] = 0; } }
+                else memcpy(W32P(w, ARG(3)), win, strlen(win) + 1);
+            }
+            RET(u); return;
+        }
+    }
+    w32_set_last_error(w, ERROR_ACCESS_DENIED); RET(0);
+}
+static void k_GetTempFileNameA(w32 *w) { temp_name(w, 0); }
+static void k_GetTempFileNameW(w32 *w) { temp_name(w, 1); }
+static void k_GetTempPathW(w32 *w) {
+    const char *d = "C:\\Temp\\"; size_t l = strlen(d);
+    if ((uint32_t)ARG(0) > l) { uint16_t *o = W32P(w, ARG(1));
+        if (o) { for (size_t i = 0; i < l; i++) o[i] = (uint8_t)d[i]; o[l] = 0; } }
+    RET(l);
+}
+
+static void k_SetEndOfFile(w32 *w) {
+    w32_handle *h = w32_handle_get(w, ARG(0));
+    if (!h || h->type != H_FILE) { w32_set_last_error(w, ERROR_INVALID_HANDLE); RET(0); return; }
+    off_t at = lseek(h->fd, 0, SEEK_CUR);
+    RET(bool_(at >= 0 && ftruncate(h->fd, at) == 0));
+}
+
+/* No short names here -- the drive is a POSIX directory and has none -- so
+ * both of these return the path unchanged, which is what a filesystem
+ * without 8.3 aliases does on real Windows too. */
+static void path_identity(w32 *w, int wide) {
+    char s[1024];
+    if (wide) w32_wtoa(w, ARG(0), s, sizeof s); else snprintf(s, sizeof s, "%s", GSTR(ARG(0)));
+    size_t l = strlen(s);
+    uint32_t n = (uint32_t)ARG(2);
+    if (n > l && ARG(1)) {
+        if (wide) { uint16_t *d = W32P(w, ARG(1));
+                    if (d) { for (size_t i = 0; i < l; i++) d[i] = (uint8_t)s[i]; d[l] = 0; } }
+        else memcpy(W32P(w, ARG(1)), s, l + 1);
+        RET(l); return;
+    }
+    RET(l + 1);
+}
+static void k_GetShortPathNameA(w32 *w) { path_identity(w, 0); }
+static void k_GetShortPathNameW(w32 *w) { path_identity(w, 1); }
+static void k_GetLongPathNameA(w32 *w)  { path_identity(w, 0); }
+static void k_GetLongPathNameW(w32 *w)  { path_identity(w, 1); }
+
+/* There is one process, and there will be one process: the runtime's globals
+ * -- the block cache, the code arena, the handle table -- are per process and
+ * a second guest process would need a second set of all of them. So this
+ * fails, and says so in the report rather than returning a handle that goes
+ * nowhere. An installer that re-launches itself elevated stops here; one that
+ * shells out to a redistributable carries on without it, which is usually
+ * what you want anyway. */
+static void k_CreateProcessA(w32 *w) {
+    w32_note_refused(w, "kernel32!CreateProcess (one guest process at a time)");
+    w32_set_last_error(w, ERROR_CALL_NOT_IMPLEMENTED); RET(0);
+}
+
+/* ---- .ini files ------------------------------------------------------------
+ *
+ * Older games keep their settings in one, and installers write them. The
+ * format is simple enough that implementing it properly costs less than
+ * explaining a stub: sections in brackets, key=value lines, last one wins,
+ * comments after ; or #.
+ */
+static void ini_host(w32 *w, uint64_t p, int wide, char *out, size_t n) {
+    char win[1024];
+    if (!p) { snprintf(out, n, "%s", ""); return; }
+    if (wide) w32_wtoa(w, p, win, sizeof win); else snprintf(win, sizeof win, "%s", w32_str(w, p));
+    /* A bare name means the Windows directory on real Windows. Ours is on the
+     * drive, which is also where a program that wrote one will look. */
+    if (!strchr(win, '\\') && !strchr(win, '/') && win[0]) {
+        char q[1200]; snprintf(q, sizeof q, "C:\\Windows\\%.*s", P_REST, win);
+        host_path(w, q, out, n); return;
+    }
+    host_path(w, win, out, n);
+}
+static char *ini_read(const char *path, size_t *len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    if (fseek(f, 0, SEEK_END)) { fclose(f); return 0; }
+    long n = ftell(f);
+    if (n < 0 || n > (8 << 20) || fseek(f, 0, SEEK_SET)) { fclose(f); return 0; }
+    char *b = (char *)malloc((size_t)n + 1);
+    if (!b) { fclose(f); return 0; }
+    size_t got = fread(b, 1, (size_t)n, f);
+    fclose(f);
+    b[got] = 0;
+    *len = got;
+    return b;
+}
+static void ini_trim(char *s) {
+    size_t n = strlen(s);
+    while (n && (s[n-1] == ' ' || s[n-1] == '\t' || s[n-1] == '\r' || s[n-1] == '\n')) s[--n] = 0;
+    size_t i = 0; while (s[i] == ' ' || s[i] == '\t') i++;
+    if (i) memmove(s, s + i, n - i + 1);
+}
+/* Walk the file, calling back for each key in `want_section`. Sharing the
+ * walk between read, enumerate and write is what keeps their ideas of the
+ * format from drifting apart. */
+typedef int (*ini_fn)(void *ctx, const char *key, const char *val);
+static void ini_walk(const char *text, const char *want_section, ini_fn fn, void *ctx) {
+    char sec[256] = "", line[2048];
+    const char *p = text;
+    while (*p) {
+        const char *e = strchr(p, '\n');
+        size_t l = e ? (size_t)(e - p) : strlen(p);
+        if (l >= sizeof line) l = sizeof line - 1;
+        memcpy(line, p, l); line[l] = 0;
+        p = e ? e + 1 : p + strlen(p);
+        ini_trim(line);
+        if (!line[0] || line[0] == ';' || line[0] == '#') continue;
+        if (line[0] == '[') {
+            char *close = strchr(line, ']');
+            if (close) { *close = 0; snprintf(sec, sizeof sec, "%.*s", (int)sizeof sec - 1, line + 1); ini_trim(sec); }
+            continue;
+        }
+        if (want_section && strcasecmp(sec, want_section)) continue;
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = 0;
+        char *key = line, *val = eq + 1;
+        ini_trim(key); ini_trim(val);
+        if (fn(ctx, key, val)) return;
+    }
+}
+typedef struct { const char *key; char val[1024]; int found; } ini_get_ctx;
+static int ini_get_step(void *c, const char *key, const char *val) {
+    ini_get_ctx *g = (ini_get_ctx *)c;
+    if (strcasecmp(key, g->key)) return 0;
+    snprintf(g->val, sizeof g->val, "%s", val);
+    g->found = 1;
+    return 0;                    /* keep going: the last one wins, as on Windows */
+}
+static void profile_string(w32 *w, int wide) {
+    char app[256], key[256], def[1024], path[4096];
+    if (wide) { w32_wtoa(w, ARG(0), app, sizeof app); w32_wtoa(w, ARG(1), key, sizeof key);
+                w32_wtoa(w, ARG(2), def, sizeof def); }
+    else { snprintf(app, sizeof app, "%s", ARG(0) ? GSTR(ARG(0)) : "");
+           snprintf(key, sizeof key, "%s", ARG(1) ? GSTR(ARG(1)) : "");
+           snprintf(def, sizeof def, "%s", ARG(2) ? GSTR(ARG(2)) : ""); }
+    ini_host(w, ARG(5), wide, path, sizeof path);
+    size_t tlen = 0; char *text = ini_read(path, &tlen);
+    ini_get_ctx g; g.key = key; g.found = 0; g.val[0] = 0;
+    if (text && ARG(0) && ARG(1)) ini_walk(text, app, ini_get_step, &g);
+    free(text);
+    const char *out = g.found ? g.val : def;
+    size_t l = strlen(out);
+    uint32_t n = (uint32_t)ARG(4);
+    if (!n || !ARG(3)) { RET(0); return; }
+    if (l + 1 > n) l = n - 1;
+    if (wide) { uint16_t *d = W32P(w, ARG(3));
+                if (d) { for (size_t i = 0; i < l; i++) d[i] = (uint8_t)out[i]; d[l] = 0; } }
+    else { memcpy(W32P(w, ARG(3)), out, l); w32_write(w, ARG(3) + l, 1, 0); }
+    RET(l);
+}
+static void k_GetPrivateProfileStringA(w32 *w) { profile_string(w, 0); }
+static void k_GetPrivateProfileStringW(w32 *w) { profile_string(w, 1); }
+static void k_GetPrivateProfileIntA(w32 *w) {
+    char app[256], key[256], path[4096];
+    snprintf(app, sizeof app, "%s", ARG(0) ? GSTR(ARG(0)) : "");
+    snprintf(key, sizeof key, "%s", ARG(1) ? GSTR(ARG(1)) : "");
+    ini_host(w, ARG(3), 0, path, sizeof path);
+    size_t tlen = 0; char *text = ini_read(path, &tlen);
+    ini_get_ctx g; g.key = key; g.found = 0; g.val[0] = 0;
+    if (text) ini_walk(text, app, ini_get_step, &g);
+    free(text);
+    RET(g.found ? (uint32_t)strtol(g.val, 0, 0) : (uint32_t)ARG(2));
+}
+/* Writing one means rewriting the file, because a value can change length.
+ * Three cases and they are all here: the key exists (replace the line), the
+ * section exists but not the key (insert at the end of the section, not the
+ * end of the file -- putting it after a later section header would file it
+ * under the wrong section), and neither exists (append both). */
+static void k_WritePrivateProfileStringA(w32 *w) {
+    char app[256], key[256], val[1024], path[4096];
+    snprintf(app, sizeof app, "%s", ARG(0) ? GSTR(ARG(0)) : "");
+    snprintf(key, sizeof key, "%s", ARG(1) ? GSTR(ARG(1)) : "");
+    snprintf(val, sizeof val, "%s", ARG(2) ? GSTR(ARG(2)) : "");
+    ini_host(w, ARG(3), 0, path, sizeof path);
+    if (!app[0]) { RET(0); return; }
+
+    size_t tlen = 0;
+    char *text = ini_read(path, &tlen);
+    const char *src = text ? text : "";
+    size_t cap = tlen + strlen(key) + strlen(val) + strlen(app) + 64;
+    char *out = (char *)malloc(cap);
+    if (!out) { free(text); w32_set_last_error(w, ERROR_NOT_ENOUGH_MEMORY); RET(0); return; }
+    size_t o = 0;
+    int in_sec = 0, wrote = 0, seen_sec = 0;
+    #define EMIT(fmt, ...) do { o += (size_t)snprintf(out + o, cap - o, fmt, __VA_ARGS__); } while (0)
+
+    const char *p = src;
+    while (*p) {
+        const char *e = strchr(p, '\n');
+        size_t l = e ? (size_t)(e - p) : strlen(p);
+        char line[2048], trimmed[2048];
+        size_t cl = l < sizeof line - 1 ? l : sizeof line - 1;
+        memcpy(line, p, cl); line[cl] = 0;
+        snprintf(trimmed, sizeof trimmed, "%s", line);
+        ini_trim(trimmed);
+        p = e ? e + 1 : p + strlen(p);
+
+        if (trimmed[0] == '[') {
+            /* Leaving the section we wanted without having written the key:
+             * it goes here, before the next header. */
+            if (in_sec && !wrote && ARG(1)) { EMIT("%s=%s\n", key, val); wrote = 1; }
+            char name[256]; snprintf(name, sizeof name, "%.*s", (int)sizeof name - 1, trimmed + 1);
+            char *close = strchr(name, ']'); if (close) *close = 0;
+            ini_trim(name);
+            in_sec = !strcasecmp(name, app);
+            if (in_sec) seen_sec = 1;
+            /* A null key with a null value deletes the whole section. */
+            if (in_sec && !ARG(1) && !ARG(2)) { wrote = 1; continue; }
+            EMIT("%s\n", line);
+            continue;
+        }
+        if (in_sec && ARG(1)) {
+            char k2[2048]; snprintf(k2, sizeof k2, "%s", trimmed);
+            char *eq = strchr(k2, '='); if (eq) *eq = 0;
+            ini_trim(k2);
+            if (!strcasecmp(k2, key)) {
+                if (ARG(2)) { EMIT("%s=%s\n", key, val); }   /* replace */
+                wrote = 1;                                    /* null value deletes */
+                continue;
+            }
+        }
+        if (in_sec && !ARG(1) && !ARG(2)) continue;           /* dropping the section */
+        EMIT("%s\n", line);
+    }
+    if (!wrote && ARG(1) && ARG(2)) {
+        if (!seen_sec) EMIT("[%s]\n", app);
+        EMIT("%s=%s\n", key, val);
+    }
+    #undef EMIT
+    free(text);
+    FILE *f = fopen(path, "wb");
+    if (!f) { free(out); w32_set_last_error(w, ERROR_ACCESS_DENIED); RET(0); return; }
+    size_t put = fwrite(out, 1, o, f);
+    int ok = (put == o) && (fclose(f) == 0);
+    free(out);
+    RET(bool_(ok));
+}
+
 static void k_GetCurrentProcessorNumber(w32 *w) { RET(0); }
 
 #define F(n, a)        { #n, a, 0, k_##n, 0 }
@@ -799,6 +1367,24 @@ const w32_api w32_kernel32[] = {
     F(UnmapViewOfFile, 1), F(FlushViewOfFile, 2),
     F(SetFilePointer, 4), F(SetFilePointerEx, 5), F(FlushFileBuffers, 1), F(GetConsoleMode, 2), F(SetConsoleMode, 2), F(GetConsoleScreenBufferInfo, 2), F(SetConsoleCtrlHandler, 2),
     F(GetFileAttributesA, 1), F(DeleteFileA, 1), F(GetCurrentDirectoryA, 2), F(SetCurrentDirectoryA, 1), F(GetTempPathA, 2), F(GetFullPathNameA, 4), F(FormatMessageA, 7),
+    /* What an installer does, and what a game does on its second run: copy,
+     * move, make and remove directories, set attributes, ask how much room is
+     * left, and keep settings in an .ini. */
+    F(GetFileAttributesW, 1), F(DeleteFileW, 1), F(GetCurrentDirectoryW, 2), F(SetCurrentDirectoryW, 1), F(GetTempPathW, 2),
+    F(SetFileAttributesA, 2), F(SetFileAttributesW, 2),
+    F(CopyFileA, 3), F(CopyFileW, 3), F(CopyFileExA, 6), F(CopyFileExW, 6),
+    F(MoveFileA, 2), F(MoveFileW, 2), F(MoveFileExA, 3), F(MoveFileExW, 3),
+    F(CreateDirectoryA, 2), F(CreateDirectoryW, 2), F(RemoveDirectoryA, 1), F(RemoveDirectoryW, 1),
+    F(GetDiskFreeSpaceA, 5), F(GetDiskFreeSpaceW, 5), F(GetDiskFreeSpaceExA, 4), F(GetDiskFreeSpaceExW, 4),
+    F(GetVolumeInformationA, 8), F(GetVolumeInformationW, 8),
+    F(GetTempFileNameA, 4), F(GetTempFileNameW, 4), F(SetEndOfFile, 1),
+    F(GetShortPathNameA, 3), F(GetShortPathNameW, 3), F(GetLongPathNameA, 3), F(GetLongPathNameW, 3),
+    F(GetPrivateProfileStringA, 6), F(GetPrivateProfileStringW, 6), F(GetPrivateProfileIntA, 4),
+    F(WritePrivateProfileStringA, 4),
+    /* Implemented, and refuses: there is one guest process and the runtime's
+     * globals are per process. It reports itself in the run report so a
+     * program that needed a child is not a silent mystery. */
+    F(CreateProcessA, 10), FN(CreateProcessW, 10, k_CreateProcessA),
     F(GetThreadPriority, 1), F(SetThreadPriority, 2), F(GetExitCodeProcess, 2),
     F(GetProcessAffinityMask, 3), F(SetErrorMode, 1),
     /* RaiseException, RtlCaptureContext, RtlUnwind, the vectored handlers and

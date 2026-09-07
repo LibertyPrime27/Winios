@@ -703,6 +703,211 @@ which is where a `winrun_reset()` that forgot the thread table or the
 per-thread CPUs would show up. `threadstress` has been run sixteen times
 across both bitnesses and both engines: 0 lost updates.
 
+## Importing a program from outside
+
+Two files, `tools/import/` and a CLI (`wimport`) so both halves can be tested
+on a desktop. The app calls the same code through `win_probe_import`.
+
+A download is one of two things and they need opposite treatment:
+
+- **a game** — already installed, a folder of files, usually inside a zip;
+- **an installer** — a program whose *output* is the game.
+
+Getting that wrong is not harmless. Copy an installer in as a game and the
+library gets an entry that opens a dialog and stops, and there is no dialog
+here to click. So the file is examined first and the likely mode offered as the
+default, with the other still one tap away — a detector that cannot be
+corrected is worse than one that asks.
+
+### What kind of file is this
+
+`sk_identify` reads the first few megabytes and the last 64 KB and looks for
+the marker the builder left: a loader's window class, a self-extractor's own
+name, an archive header. Inno Setup, NSIS, InstallShield, an MSI
+bootstrapper, 7-Zip / WinRAR / zip self-extractors, Wise and Setup Factory are
+each recognised by bytes rather than by name — `setup.exe` says nothing, and a
+repackaged installer is routinely renamed to the game's title.
+
+The tail matters for one case and it is worth saying why: a zip self-extractor
+has no dependable marker except the end-of-central-directory record, which is
+at the end of the file by definition. Reading a gigabyte of payload to find it
+would be absurd, so head and tail are read separately.
+
+When nothing matches, the answer splits: a PE that wants to elevate or talks
+about installing is *"an installer, family not recognised"* and gets the flags
+the common families accept; anything else is *"not an installer"*. Both notes
+say they are guesses.
+
+### The window is the part that cannot be drawn
+
+A real installer's UI is comctl32 controls, and comctl32 is not implemented.
+That would be the end of it, except that every family in wide use has a silent
+mode — put there so deployments can happen without a human clicking Next — and
+**a silent installer is a file copier with a registry writer attached**, which
+is a shape this runtime can be honest about.
+
+So each family carries its own silent arguments, and the differences are not
+cosmetic:
+
+- Inno takes the directory as its own `/DIR="..."` argument and needs `/SP-`
+  as well, or it opens a "This will install…" prompt before it ever looks at
+  `/SILENT`. `/NORESTART` matters because the alternative is an installer
+  trying to reboot a phone.
+- NSIS takes `/D=<dir>`, **unquoted, and it must be the last argument** —
+  anything after it is treated as part of the path. Quoting it is the single
+  most common way a scripted NSIS install lands in the wrong folder.
+- InstallShield's switches wrap msiexec's, so the directory goes through `/v`
+  as a property — and msiexec is a Windows service, not a library, so this
+  family is marked as not expected to work and says so before it runs.
+- 7-Zip and WinRAR self-extractors are archive tools, so their arguments are
+  archive arguments: an output directory and "do not ask".
+
+A zip payload is never executed at all, whatever the wrapper claims to be. It
+is unpacked, which removes every way running it could fail.
+
+### What did it install?
+
+Asking the installer would mean parsing a different script format per family.
+The filesystem already knows: snapshot the drive, run the setup, snapshot
+again, and the difference is the install. That works identically for Inno,
+NSIS, a self-extractor and something never seen before.
+
+Two exclusions, both learned rather than assumed. Temp, because an installer
+unpacks itself into it and leaves most of it behind — counting that would bury
+the twenty files that matter under two thousand that do not. And
+`registry.txt`, because the registry is a file at the root of the drive and
+*every* installer touches it, so it would appear in every report as though it
+had been installed.
+
+Where the program ended up is the directory the executables landed in, not the
+common prefix of every added path: an installer that also drops one file in
+`Windows\System32` has a common prefix of nothing at all. If it honoured the
+directory it was given, that is used; if it ignored it, the report says so.
+
+### Which executable is the game?
+
+A game folder routinely holds half a dozen: an uninstaller, a crash handler, a
+redistributable, a launcher shim, and the program. Offering the alphabetically
+first is wrong most of the time and offering a list of eight is only slightly
+better.
+
+Names are the weakest signal. The engines leave *structural* fingerprints,
+and those are worth far more:
+
+| | why it is reliable |
+|---|---|
+| `<Name>_Data` beside `<Name>.exe` | a Unity game cannot start without it |
+| `<Name>.pck` | Godot's package, named after its binary |
+| `data.win` | GameMaker's bundle |
+| `Binaries/Win64/…-Shipping.exe` | Unreal's own layout |
+| `nw.pak` / `resources.pak` | an NW.js or Chromium bundle |
+
+Then position (top of the folder beats three levels down), then the name the
+user knows it by, and only then size — as a weak tiebreak, because a bundled
+runtime can be bigger than the game. Against that, two penalties: a name that
+is a helper or an installer, and anything inside a redistributable or support
+folder. Size is the one signal that would otherwise favour a bundled
+`vcredist_x64.exe`, which is why it is worth least.
+
+The chosen executable's own directory becomes the DLL search path (`winrun
+-L`), because that is where a program finds its libraries — and for an Unreal
+title that is three folders below the one the library shows, so it cannot be
+inferred from the entry and has to be carried.
+
+### Paths from outside are not trusted
+
+An archive can name `../../etc/passwd` or `C:\Windows\System32\x.dll`. The
+sanitiser works component by component — the only way to do it correctly,
+since a filter that looks for the substring `..` rejects `a..b` and accepts
+`x/../../y` once a first pass has rewritten it. Drive letters, leading
+separators and every `..` component are dropped rather than causing a
+rejection, so a slightly odd archive still unpacks and a malicious one lands
+entirely inside the destination. `uz_safe_name` is exported and tested
+directly, because it should not only be reachable through a real archive.
+
+### What an installer needed that was missing
+
+Silent or not, an installer stopped at the first thing it asked for. The list
+turned out to be short and every item is something a *game* wants too, on its
+second run:
+
+- `CopyFile`, `MoveFile(Ex)` (including the cross-device fallback an installer
+  hits constantly moving files out of Temp, and the delete-on-reboot form an
+  uninstaller uses), `CreateDirectory`, `RemoveDirectory`, `SetFileAttributes`,
+  `GetTempFileName`, `SetEndOfFile`, the wide halves of the file calls;
+- `GetDiskFreeSpaceEx` — a real installer refuses to start if this fails, so
+  an emulator where it fails is one where nothing installs. It reports the
+  host filesystem's real numbers, because the virtual C: is a directory on it;
+- `GetVolumeInformation`, reporting NTFS: an installer that finds FAT32
+  refuses to write a file over 4 GB, and some refuse entirely;
+- **a real current directory.** `SetCurrentDirectory` used to return success
+  without doing anything — the kind of lie that surfaces later as a file not
+  found in a place nobody looked. It now moves, fails when the directory is
+  not there, and refuses a path too long to hold rather than truncating one
+  (truncating is worse: the caller would go on to open something it did not
+  name);
+- `.ini` files — `GetPrivateProfileString`, `GetPrivateProfileInt`,
+  `WritePrivateProfileString` — implemented properly rather than stubbed,
+  because the format is simple enough that implementing it costs less than
+  explaining a stub, and older games keep their settings in one. Writing means
+  rewriting the file, and all three cases are handled: the key exists, the
+  section exists but not the key (insert at the *end of the section* — after a
+  later header would file it under the wrong one), and neither exists;
+- `shell32.dll`, which was not here at all: `SHGetFolderPath`,
+  `SHGetSpecialFolderPath`, `SHCreateDirectoryEx`, `IsUserAnAdmin`. An
+  installer asks where Program Files is before it copies anything. A *game*
+  asks the same questions later and for a better reason — saves, which a
+  modern Windows game writes to `Documents` or `AppData` rather than its own
+  folder. `CSIDL_FLAG_CREATE` is honoured by actually creating the directory,
+  which is what the flag asks for.
+
+`w32_drive_init()` makes the skeleton those answers point at — Program Files,
+Windows\System32, Temp, ProgramData, a user profile — so a folder that is
+reported is a folder that exists. It is called before an install and never
+before an ordinary run: a directory walk of `C:\` is observable, and conjuring
+six folders into a drive whose contents a test recorded would change that
+recording for no reason.
+
+Two calls are implemented and still refuse: `CreateProcess` and
+`ShellExecute`. There is one guest process and the runtime's globals — block
+cache, code arena, handle table — are per process. They fail with a real error
+*and put themselves in the run report*, because "it tried to launch something"
+is a fact worth having, and a caller told "done" would wait for a window that
+will never appear. An installer that re-launches itself elevated stops here;
+one that shells out to a redistributable carries on without it, which is
+usually what you wanted.
+
+### Verified
+
+`test_import` is 53 checks with no guest involved: every family against a
+fixture, the flag tables (including that NSIS's `/D=` is last and unquoted),
+the path sanitiser against traversal attempts *and* against names that merely
+contain dots, a real deflate round-trip out of a self-extracting archive,
+executable ranking over Unity and Unreal trees the test builds itself, and the
+drive diff.
+
+The fixtures under `tests/import/` are minimal PE headers with each family's
+real marker bytes inside them, rebuilt by `make_fixtures.py`. They are not
+installers and cannot run — identification only reads bytes, so that is all a
+fixture has to be. The exception is `fake_zipsfx.exe`, which has a genuine zip
+appended, because "can a self-extractor be unpacked" is not answerable against
+a fake one.
+
+`tests/import/install.sh` is the end-to-end half: 26 checks over
+`tests/win32/fakesetup.c`, a guest that does what a silent install does in the
+order one does it — checks free space, resolves the shell folders, makes
+directories, copies files, keeps settings in an `.ini`, reads one back, writes
+an uninstall key, and leaves a file in Temp that must *not* be counted. It is
+deliberately strict: it **fails** unless it was handed the flags the Inno
+family takes, so a broken flag table cannot pass by installing anyway. Both
+bitnesses, and the program it installs then loads with nothing missing.
+
+One portability bug worth recording, because of how it was found: `strdup` and
+`lstat` are POSIX rather than C, so under a strict `-std=c11` they become
+implicit declarations returning `int` — a pointer with its top half missing on
+a 64-bit target. The default CMake build asks for `gnu11` and never saw it.
+The aarch64 cross-check with `-std=c11` did.
+
 ## Surveying a library, not a fixture
 
     winrun -survey <dir>
@@ -828,8 +1033,14 @@ state `user32.c` already keeps, so it is a layer rather than a subsystem. 64-bit
 table-driven mechanism is not — see the end of `win32/seh.c`). GDI beyond the
 stubs a message loop needs, and any window decoration: a window here is its own
 client area, which is what a fullscreen game wants and not what a windowed
-program expects. Installers. Drawing reaches the screen but goes through the
-reference rasterizer rather than Metal. And guest threads do not run in
+program expects. Drawing reaches the screen but goes through the reference
+rasterizer rather than Metal.
+
+Installers are a partial answer rather than a missing one: silent mode works,
+and the importer runs it and keeps what it produces (see above), but an
+installer that insists on its window, hands its payload to msiexec, or
+re-launches itself as a second process still stops -- and the first of those
+needs comctl32, which is the real gap. And guest threads do not run in
 parallel — one executes at a time, which is a speed limit rather than a
 compatibility one (see the Threads section).
 

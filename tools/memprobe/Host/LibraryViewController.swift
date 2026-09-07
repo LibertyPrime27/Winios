@@ -43,47 +43,12 @@ final class LibraryViewController: UITableViewController {
         navigationController?.pushViewController(ProbeViewController(), animated: true)
     }
 
-    /// Add a program: a folder for anything real, a single .exe for a test.
-    /// The import report runs immediately, because "can this run at all" is
-    /// the only useful first question and it costs a few milliseconds.
+    /// Add a program. Two shapes arrive from outside -- a game that is already
+    /// installed, and an installer whose output is the game -- and they need
+    /// opposite treatment, so the choosing and the explaining happen on their
+    /// own screen rather than behind this button.
     @objc private func addProgram() {
-        ExeBrowser.shared.pick(from: self) { [weak self] _, exe in
-            guard let self else { return }
-            defer { self.reload() }
-            guard let exe, let c = ExeBrowser.driveC else { return }
-            // The library entry is the top-level item on the drive, which is
-            // the folder when one was picked and the file when it was not.
-            let rel = exe.path.replacingOccurrences(of: c.path + "/", with: "")
-            let parts = rel.split(separator: "/").map(String.init)
-            let name = parts.first ?? exe.lastPathComponent
-            let inner = parts.count > 1 ? parts.dropFirst().joined(separator: "/") : ""
-
-            var buf = [CChar](repeating: 0, count: 65536)
-            _ = exe.path.withCString { win_probe_imports($0, &buf, buf.count) }
-            let report = String(cString: buf)
-            let missing = Self.number(after: "imports resolved, ", in: report, trailing: " missing")
-            let resolved = Self.number(before: " imports resolved", in: report)
-
-            ProgramStore.update(Program(name: name, exeRelative: inner,
-                                        is32: report.contains(": 32-bit"),
-                                        importsResolved: resolved, importsMissing: missing,
-                                        lastExit: nil, lastRunMs: nil))
-        }
-    }
-
-    /// Pull the two counts out of the report rather than plumbing a second
-    /// return value through the C bridge for something printed one line up.
-    private static func number(before marker: String, in text: String) -> Int {
-        guard let r = text.range(of: marker) else { return -1 }
-        let head = text[..<r.lowerBound]
-        let digits = head.reversed().prefix { $0.isNumber }.reversed()
-        return Int(String(digits)) ?? -1
-    }
-    private static func number(after marker: String, in text: String, trailing: String) -> Int {
-        guard let r = text.range(of: marker) else { return -1 }
-        let tail = text[r.upperBound...]
-        let digits = tail.prefix { $0.isNumber }
-        return Int(String(digits)) ?? -1
+        navigationController?.pushViewController(ImportViewController(), animated: true)
     }
 
     // MARK: - table
@@ -101,8 +66,9 @@ final class LibraryViewController: UITableViewController {
         if programs.isEmpty {
             var c = UIListContentConfiguration.subtitleCell()
             c.text = "No programs yet"
-            c.secondaryText = "Tap + to add a Windows .exe, or a folder containing one. "
-                            + "A folder is the usual case: a program is rarely one file."
+            c.secondaryText = "Tap + to add one: a folder or .zip for a game you already "
+                            + "have, or a setup .exe to install one. A folder is the usual "
+                            + "case -- a program is rarely a single file."
             c.secondaryTextProperties.numberOfLines = 0
             cell.contentConfiguration = c
             cell.accessoryType = .none

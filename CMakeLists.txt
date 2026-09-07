@@ -1,6 +1,17 @@
 cmake_minimum_required(VERSION 3.20)
 project(winios C CXX)
 
+# zlib: the importer needs deflate to read a zip, and every platform this
+# actually ships on has it -- iOS, macOS and Linux all do -- so it is a
+# find_package rather than a vendored copy.
+#
+# Not REQUIRED, though, because it is findable for the *host* and not
+# necessarily for a cross target: the aarch64-linux cross build used to check
+# the dynarec has no arm64 zlib in its sysroot, and losing that check to gain
+# the importer would be a bad trade. Where zlib is missing the importer is
+# skipped and everything else builds as before.
+find_package(ZLIB)
+
 enable_testing()
 
 add_subdirectory(core)
@@ -82,7 +93,7 @@ endif()
 if(NOT WIN32)
     # The same sources twice: once as the command-line tool, once as a library
     # the device build links (tools/memprobe) so an iPad can run a .exe.
-    add_library(winrun_lib STATIC tools/winrun/winrun.c win32/pe.c win32/kernel32.c win32/msvcrt.c win32/com.c win32/d3d9.c win32/raster.c win32/stdcall_args.c win32/advapi32.c win32/seh.c win32/user32.c win32/dsound.c win32/xinput.c win32/thread.c)
+    add_library(winrun_lib STATIC tools/winrun/winrun.c win32/pe.c win32/kernel32.c win32/msvcrt.c win32/com.c win32/d3d9.c win32/raster.c win32/stdcall_args.c win32/advapi32.c win32/seh.c win32/user32.c win32/dsound.c win32/xinput.c win32/thread.c win32/shell32.c)
     target_link_libraries(winrun_lib PUBLIC xcore)
     if(NOT APPLE)
         target_link_libraries(winrun_lib PUBLIC m)
@@ -92,11 +103,48 @@ if(NOT WIN32)
     set_property(TARGET winrun_lib PROPERTY C_STANDARD 11)
     target_compile_options(winrun_lib PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
-    add_executable(winrun tools/winrun/winrun.c win32/pe.c win32/kernel32.c win32/msvcrt.c win32/com.c win32/d3d9.c win32/raster.c win32/stdcall_args.c win32/advapi32.c win32/seh.c win32/user32.c win32/dsound.c win32/xinput.c win32/thread.c)
+    add_executable(winrun tools/winrun/winrun.c win32/pe.c win32/kernel32.c win32/msvcrt.c win32/com.c win32/d3d9.c win32/raster.c win32/stdcall_args.c win32/advapi32.c win32/seh.c win32/user32.c win32/dsound.c win32/xinput.c win32/thread.c win32/shell32.c)
     target_link_libraries(winrun PRIVATE xcore m)
     target_include_directories(winrun PRIVATE win32)
     set_property(TARGET winrun PROPERTY C_STANDARD 11)
     target_compile_options(winrun PRIVATE -Wall -Wextra -Wno-unused-parameter)
+
+    # --- the importer: bringing a program in from outside ---------------------
+    if(ZLIB_FOUND)
+        # Its own library so the app links the same code the CLI tests, and so the
+        # parts that have nothing to do with the emulator (a zip reader, installer
+        # detection, a drive diff) can be tested without starting a guest.
+        add_library(import_lib STATIC
+            tools/import/setupkind.c tools/import/unzip.c
+            tools/import/drivediff.c tools/import/import.c)
+        target_include_directories(import_lib PUBLIC tools/import)
+        target_link_libraries(import_lib PUBLIC ZLIB::ZLIB)
+        set_property(TARGET import_lib PROPERTY C_STANDARD 11)
+        target_compile_options(import_lib PRIVATE -Wall -Wextra)
+
+        add_executable(wimport tools/wimport/wimport.c)
+        target_link_libraries(wimport PRIVATE import_lib winrun_lib)
+        set_property(TARGET wimport PROPERTY C_STANDARD 11)
+        target_compile_options(wimport PRIVATE -Wall -Wextra)
+
+        # Links winrun_lib as well, though it never starts a guest: installer mode
+        # has to create the drive skeleton before a setup program looks for
+        # Program Files, and that lives in the win32 layer. A header dependency
+        # would have been worth avoiding; a link dependency is not.
+        add_executable(test_import tests/test_import.c)
+        target_link_libraries(test_import PRIVATE import_lib winrun_lib)
+        target_include_directories(test_import PRIVATE tests)
+        add_test(NAME import COMMAND test_import ${CMAKE_CURRENT_SOURCE_DIR}/tests/import)
+
+        # Installer mode end to end, against a guest that behaves like a silent
+        # install and refuses to work if it was handed the wrong flags.
+        add_test(NAME import_installer COMMAND ${CMAKE_COMMAND} -E env
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/import/install.sh
+            $<TARGET_FILE:wimport> ${CMAKE_CURRENT_SOURCE_DIR}/tests/win32)
+    else()
+        message(STATUS "zlib not found for this target: skipping the importer "
+                       "(tools/import, wimport). Everything else is unaffected.")
+    endif()
 
     # Several guests back to back in one process -- what the device build does
     # when the button is tapped again, and what would break first if

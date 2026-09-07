@@ -106,8 +106,15 @@ final class ProgramViewController: UIViewController {
             var out = [CChar](repeating: 0, count: 1 << 20)
             var ns: UInt64 = 0
             xc_jit_enable(1)
-            let rc = exe.path.withCString {
-                win_probe_run_ex($0, keepGoing ? 1 : 0, 120, &out, out.count, &ns)
+            // The program's own DLL directory goes with it: an imported game
+            // loads its libraries from beside its executable, and for a deeply
+            // nested one that is not the folder the library shows.
+            let dll = ProgramStore.dllDirURL(self.program)?.path ?? ""
+            let rc = exe.path.withCString { p in
+                dll.withCString { d in
+                    win_probe_run_dir(p, dll.isEmpty ? nil : d, keepGoing ? 1 : 0,
+                                      120, &out, out.count, &ns)
+                }
             }
             xc_jit_enable(0)
             var text = "\(exe.lastPathComponent) exited \(rc) after \(ns / 1_000_000) ms\n"

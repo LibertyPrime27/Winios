@@ -12,6 +12,7 @@
 #include "winprobe.h"
 #include "winrun.h"
 #include "w32.h"
+#include "import.h"
 #include "xcore/cpu.h"
 
 #include <fcntl.h>
@@ -21,6 +22,15 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+/* Forward declarations for the helpers at the bottom of the file. They were
+ * being called from above without them, which older compilers accepted as an
+ * implicit declaration and newer ones reject outright -- and this file is only
+ * ever built by Xcode, so nothing in the Linux checks would have caught it. */
+static uint64_t now_ns(void);
+typedef int (*cap_fn)(void *ctx);
+static int with_capture(cap_fn body, void *ctx, char *out, size_t out_len);
+static int run_capture(int argc, char **argv, char *out, size_t out_len);
 
 /* Presented frames are copied out rather than referenced: the guest memory
  * they live in is unmapped when the next run resets the process, and the UI
@@ -67,10 +77,10 @@ int win_probe_copy_frame(uint64_t *seq, void *dst, size_t dst_len,
  * fails, and one that is not drawing anything needs the run loop to end it. */
 void win_probe_request_stop(void) { w32_d3d9_device_lost(1); w32_request_stop(); }
 
-int win_probe_run_ex(const char *exe_path, int keep_going, int timeout_s,
-                     char *out, size_t out_len, uint64_t *ns) {
+int win_probe_run_dir(const char *exe_path, const char *dll_dir, int keep_going,
+                      int timeout_s, char *out, size_t out_len, uint64_t *ns) {
     char tbuf[16];
-    char *argv[8];
+    char *argv[10];
     int argc = 0;
     argv[argc++] = (char *)"winrun";
     if (keep_going) argv[argc++] = (char *)"-k";
@@ -79,6 +89,11 @@ int win_probe_run_ex(const char *exe_path, int keep_going, int timeout_s,
         argv[argc++] = (char *)"-t";
         argv[argc++] = tbuf;
     }
+    /* Where the program's own DLLs are. An imported game keeps them beside
+     * its executable, which for something like an Unreal title is three
+     * directories below the folder the user sees -- so this cannot be
+     * inferred from the entry and has to be carried. */
+    if (dll_dir && *dll_dir) { argv[argc++] = (char *)"-L"; argv[argc++] = (char *)dll_dir; }
     argv[argc++] = (char *)exe_path;
 
     g_fw = g_fh = 0;
@@ -89,6 +104,59 @@ int win_probe_run_ex(const char *exe_path, int keep_going, int timeout_s,
     if (ns) *ns = now_ns() - t0;
     return rc;
 }
+
+int win_probe_run_ex(const char *exe_path, int keep_going, int timeout_s,
+                     char *out, size_t out_len, uint64_t *ns) {
+    return win_probe_run_dir(exe_path, 0, keep_going, timeout_s, out, out_len, ns);
+}
+
+/* ---- importing --------------------------------------------------------------
+ *
+ * The importer runs a guest (installer mode does, at least), so it belongs on
+ * this side of the bridge where the capture machinery already is. The report
+ * it produces and the guest output it caused are concatenated deliberately:
+ * when an install fails, the reason is in the guest's run report and the
+ * importer's own summary only says that nothing appeared.
+ */
+typedef struct {
+    const char *src, *drive_c;
+    int installer, keep_going, timeout_s;
+    wi_result *out;
+} import_args;
+
+static int call_import(void *ctx) {
+    import_args *a = (import_args *)ctx;
+    if (a->installer)
+        return wi_import_installer(a->src, a->drive_c, winrun_main,
+                                   a->keep_going, a->timeout_s, 0, 0, a->out);
+    return wi_import_game(a->src, a->drive_c, 0, 0, a->out);
+}
+
+int win_probe_import(const char *src, const char *drive_c, int installer,
+                     int keep_going, int timeout_s, wi_result *out) {
+    if (!out) return -1;
+    import_args a = { src, drive_c, installer, keep_going, timeout_s, out };
+    char guest[128 * 1024];
+    int rc = with_capture(call_import, &a, guest, sizeof guest);
+    if (guest[0]) {
+        size_t used = strlen(out->detail);
+        size_t room = used + 80 < sizeof out->detail ? sizeof out->detail - used - 80 : 0;
+        if (room) {
+            /* The tail, not the head. An installer prints progress and *then*
+             * the run report, and the run report -- which names what it called
+             * that is not implemented -- is the part worth keeping. Cutting
+             * the front is the right way round. */
+            size_t n = strlen(guest);
+            const char *from = n > room ? guest + (n - room) : guest;
+            snprintf(out->detail + used, sizeof out->detail - used,
+                     "\n---- what the program printed%s ----\n%s",
+                     n > room ? " (last part)" : "", from);
+        }
+    }
+    return rc;
+}
+
+wi_probe_result win_probe_look(const char *path) { return wi_probe(path); }
 
 /* A guest driven by a recorded input script. The script is the same file the
  * shell suite uses, so the diagnostics on the device and the check in CI are
@@ -129,7 +197,13 @@ static uint64_t now_ns(void) {
 /* stdout is a file for the duration, because winrun writes its report there
  * and an iOS app's stdout goes nowhere anyone can see. Same trick as
  * win_probe_run; factored out so both use one copy of the descriptor juggling. */
-static int run_capture(int argc, char **argv, char *out, size_t out_len) {
+/* Run something with fd 1 pointed at a temp file, and hand back what it
+ * wrote. Written as "any callable" rather than "winrun_main with an argv"
+ * because the importer also has to be run this way: it starts a guest of its
+ * own, and the guest's output -- the run report, which names everything the
+ * installer wanted and did not get -- is the most useful part of an import
+ * that failed. */
+static int with_capture(cap_fn body, void *ctx, char *out, size_t out_len) {
     const char *tmpdir = getenv("TMPDIR");
     char tmp[1024];
     snprintf(tmp, sizeof tmp, "%swinprobe.%d.out", tmpdir && *tmpdir ? tmpdir : "/tmp/", (int)getpid());
@@ -139,7 +213,7 @@ static int run_capture(int argc, char **argv, char *out, size_t out_len) {
     int fd = open(tmp, O_RDWR | O_CREAT | O_TRUNC, 0600);
     if (fd >= 0) { dup2(fd, STDOUT_FILENO); close(fd); }
 
-    int rc = winrun_main(argc, argv);
+    int rc = body(ctx);
 
     fflush(stdout);
     if (saved >= 0) { dup2(saved, STDOUT_FILENO); close(saved); }
@@ -151,6 +225,16 @@ static int run_capture(int argc, char **argv, char *out, size_t out_len) {
     }
     remove(tmp);
     return rc;
+}
+
+typedef struct { int argc; char **argv; } run_args;
+static int call_winrun(void *ctx) {
+    run_args *a = (run_args *)ctx;
+    return winrun_main(a->argc, a->argv);
+}
+static int run_capture(int argc, char **argv, char *out, size_t out_len) {
+    run_args a = { argc, argv };
+    return with_capture(call_winrun, &a, out, out_len);
 }
 
 int win_probe_imports(const char *exe_path, char *out, size_t out_len) {

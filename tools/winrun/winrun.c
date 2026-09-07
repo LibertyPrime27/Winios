@@ -354,6 +354,9 @@ static const w32_dll g_dlls[] = {
     { "msvcrt.dll",   { w32_msvcrt, w32_thread_crt },                     0 },
     { "ntdll.dll",    { w32_ntdll, w32_seh_ntdll },                       0 },
     { "user32.dll",   { w32_user32 },                                     0 },
+    /* Where a program is allowed to put things: an installer asks before it
+     * copies anything, and a game asks again later, for its saves. */
+    { "shell32.dll",  { w32_shell32 },                                    0 },
     { "winmm.dll",    { w32_winmm },                                      0 },
     { "dsound.dll",   { w32_dsound },                                     0 },
     /* Every XInput version games link against, all the same implementation:
@@ -447,7 +450,14 @@ void w32_exit(w32 *w, int code) {
 }
 
 /* Remember that something we do not implement was called. Names are the
- * stub's own "dll!Name" strings, which outlive the run. */
+ * stub's own "dll!Name" strings, which outlive the run.
+ *
+ * Not static, because a function that *is* implemented and still has to
+ * refuse -- CreateProcess, with no second process to create -- belongs in the
+ * same list. The report is the roadmap, and "it returned failure and here is
+ * why" is worth more in it than a silent zero. */
+static void note_unimplemented(w32 *w, const char *name);
+void w32_note_refused(w32 *w, const char *name) { note_unimplemented(w, name); }
 static void note_unimplemented(w32 *w, const char *name) {
     for (int k = 0; k < w->nunimpl; k++)
         if (w->unimpl[k].name == name) { w->unimpl[k].calls++; return; }

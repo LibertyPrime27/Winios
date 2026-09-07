@@ -6,6 +6,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "import.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -15,6 +17,25 @@ extern "C" {
 int win_probe_run(const char *exe_path, const char *arg1, const char *arg2,
                   char *out, size_t out_len, uint64_t *ns, uint64_t *x87_native,
                   uint64_t *x87_callout);
+
+/* The same, plus the directory the program's own DLLs are in (winrun's -L).
+ * An imported game keeps them beside its executable, which may be several
+ * folders below the one the user sees, so it cannot be inferred here. */
+int win_probe_run_dir(const char *exe_path, const char *dll_dir, int keep_going,
+                      int timeout_s, char *out, size_t out_len, uint64_t *ns);
+
+/* --- importing ---
+ *
+ * Both modes, with the guest's own output appended to the report: when an
+ * install produces nothing, the reason is in the run report and not in the
+ * importer's summary. `installer` picks the mode; `keep_going` and
+ * `timeout_s` only apply to installer mode. See tools/import/import.h. */
+int win_probe_import(const char *src, const char *drive_c, int installer,
+                     int keep_going, int timeout_s, wi_result *out);
+
+/* What is this file: a folder, an archive, a program, or a setup? Changes
+ * nothing on disk, so the UI can ask before offering a mode. */
+wi_probe_result win_probe_look(const char *path);
 
 /* The same, for a program we did not ship and cannot vouch for.
  *   keep_going  an unimplemented import returns 0 and the run continues, so

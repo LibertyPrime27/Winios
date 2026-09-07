@@ -49,6 +49,14 @@ for a in 32 64; do
     # handover. It is how the lost update was found; it is not a test,
     # because a passing run proves nothing.
     $CC -O2 -s -o threadstress$a.exe threadstress.c
+    # A program that behaves like a silent install, for testing the importer
+    # against: it checks free space, resolves the shell folders, makes
+    # directories, copies files, keeps settings in an .ini and writes an
+    # uninstall key -- and refuses to do any of it unless it was handed the
+    # flags the Inno Setup family takes. Not in the guest suite: it is driven
+    # by tests/import/install.sh through wimport, which is what exercises the
+    # detection and the flag table as well as the run.
+    $CC -O2 -s -o fakesetup$a.exe fakesetup.c -ladvapi32 -lshell32
 done
 
 # Not run by the suite: it calls things we do not implement, on purpose.

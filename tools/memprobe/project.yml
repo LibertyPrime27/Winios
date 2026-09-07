@@ -14,11 +14,13 @@ settings:
     TARGETED_DEVICE_FAMILY: "1,2"
     SWIFT_OBJC_BRIDGING_HEADER: Shared/MemProbe-Bridging-Header.h
     # xcore and Zydis are built by CMake (see CI) into build-xcore-ios/.
-    HEADER_SEARCH_PATHS: $(SRCROOT)/Shared $(SRCROOT)/../../core/include $(SRCROOT)/../../win32 $(SRCROOT)/../../tools/winrun
+    HEADER_SEARCH_PATHS: $(SRCROOT)/Shared $(SRCROOT)/../../core/include $(SRCROOT)/../../win32 $(SRCROOT)/../../tools/winrun $(SRCROOT)/../../tools/import
     LIBRARY_SEARCH_PATHS: $(SRCROOT)/../../build-xcore-ios $(SRCROOT)/../../build-xcore-ios/core $(SRCROOT)/../../build-xcore-ios/core/zydis $(SRCROOT)/../../build-xcore-ios/core/zydis/zycore
     # winrun_lib is the PE loader + kernel32/msvcrt: it lets the app run a real
     # Windows .exe. It must precede xcore, which it calls into.
-    OTHER_LDFLAGS: -lwinrun_lib -lxcore_golden -lxcore -lsoftfloat -lZydis -lZycore
+    # import_lib is the importer: a zip reader, installer detection, a drive
+    # diff. It calls winrun_lib (to run a setup program) so it comes first.
+    OTHER_LDFLAGS: -limport_lib -lwinrun_lib -lxcore_golden -lxcore -lsoftfloat -lZydis -lZycore -lz
     # Unsigned by design -- signing happens locally with Sideloadly.
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"

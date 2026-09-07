@@ -7,3 +7,6 @@
 #import "winprobe.h"
 #import "xcore/bench.h"
 #import "w32.h"
+#import "import.h"
+#import "setupkind.h"
+#import "drivediff.h"

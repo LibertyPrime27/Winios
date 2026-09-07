@@ -1,0 +1,67 @@
+#!/bin/sh
+# Installer mode, end to end.
+#   install.sh <wimport> <guestdir> [scratch]
+#
+# `fakesetup` is a program that does what a silent install does, in the order
+# one does it (see tests/win32/fakesetup.c). What is being checked here is the
+# whole chain rather than any one link: identify the family from the bytes,
+# choose that family's silent flags, get them to the guest intact, run it, tell
+# what it wrote from what was already there, and pick the installed program out
+# of the result.
+#
+# It is deliberately strict about the flags. fakesetup *fails* unless it was
+# given the ones Inno Setup takes, so a broken flag table cannot pass by
+# installing anyway.
+set -e
+wimport=$1; guests=$2
+scratch=${3:-${TMPDIR:-/tmp}/wimport-test.$$}
+fail=0
+
+for bits in 32 64; do
+    setup="$guests/fakesetup$bits.exe"
+    [ -f "$setup" ] || { echo "FAIL fakesetup$bits.exe is not built"; fail=1; continue; }
+    drive="$scratch/c$bits"
+    rm -rf "$drive"; mkdir -p "$drive"
+
+    out=$("$wimport" install "$setup" "$drive" 2>&1) || true
+
+    # The chain, one claim at a time. Grepping for each rather than diffing the
+    # whole thing: the report contains file sizes and a path, and recording
+    # those would be recording this machine.
+    # printf, not echo: sh's echo interprets backslash escapes, and every
+    # pattern here is a Windows path -- so a failure message would report
+    # "C:akesetup32" and send you looking for the wrong bug.
+    check() {  # description pattern
+        if printf '%s\n' "$out" | grep -qF "$2"; then printf 'ok   %s-bit: %s\n' "$bits" "$1"
+        else printf 'FAIL %s-bit: %s (looking for "%s")\n' "$bits" "$1" "$2"; fail=1; fi
+    }
+    check "identified as Inno Setup"        "Inno Setup"
+    check "given the silent flags"          "/SILENT /SP- /NORESTART /DIR=C:\\fakesetup$bits"
+    check "the guest saw them"              "silent=1 sp-=1 norestart=1"
+    check "free space was reported"         "free:  enough"
+    check "Program Files was resolved"      "progs: C:\\Program Files"
+    check "the .ini read back"              "Display/Width = 1920"
+    check "it finished"                     "The installer exited 0"
+    check "the install was found"            "fakesetup$bits/FakeGame.exe"
+    check "and its data file"                "fakesetup$bits/data/assets.dat"
+    check "the temp file was not counted"   "temporary files and the registry ignored"
+    check "an executable was chosen"        "Will run: FakeGame.exe"
+
+    # And the point of all of it: the installed program is one we can run.
+    if [ -f "$drive/fakesetup$bits/FakeGame.exe" ]; then
+        echo "ok   $bits-bit: the installed executable is on the drive"
+    else
+        echo "FAIL $bits-bit: nothing was installed"; fail=1
+        printf '%s\n' "$out" | tail -20 | sed 's/^/  | /'
+    fi
+    # The registry key an uninstaller would look for.
+    if grep -q "Uninstall" "$drive/registry.txt" 2>/dev/null; then
+        echo "ok   $bits-bit: the uninstall key was written"
+    else
+        echo "FAIL $bits-bit: no uninstall key in the registry"; fail=1
+    fi
+    rm -rf "$drive"
+done
+
+rmdir "$scratch" 2>/dev/null || true
+exit $fail

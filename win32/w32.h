@@ -188,6 +188,11 @@ uint64_t w32_wstrdup(w32 *w, const char *s);                /* UTF-16 */
 size_t   w32_wcslen(w32 *w, uint64_t p);
 const char *w32_str(w32 *w, uint64_t addr);                 /* host pointer to a guest C string ("" for NULL) */
 void     w32_wtoa(w32 *w, uint64_t wp, char *out, size_t n);   /* UTF-16 -> ASCII-ish */
+/* A Windows path as the host sees it: under the drive root for an absolute
+ * one, under the current directory for a relative one. Every file call goes
+ * through this, so anything outside kernel32.c that touches a path has to use
+ * it too rather than growing a second set of rules. */
+void     w32_host_path(w32 *w, const char *win, char *out, size_t n);
 
 /* calling convention */
 uint64_t w32_arg(w32 *w, int i);
@@ -201,6 +206,17 @@ uint64_t w32_ptrsize(w32 *w);
 uint64_t w32_call_guest(w32 *w, uint64_t fn, int nargs, const uint64_t *args);
 void     w32_exit(w32 *w, int code);
 void     w32_set_last_error(w32 *w, uint32_t e);
+/* Record that a call was made that we cannot honour, so it appears in the run
+ * report alongside the imports that were never implemented at all. For a
+ * function that exists here and still has to fail -- CreateProcess, with no
+ * second process to create -- which is more useful in the report than a
+ * silent zero. */
+void     w32_note_refused(w32 *w, const char *name);
+/* Create the directories a Windows installer expects to find (Program Files,
+ * Windows\System32, Temp, a user profile) under the current C:. Called before
+ * an install, not before an ordinary run: a directory walk of C:\ is
+ * observable and an empty drive is what the tests recorded. */
+void     w32_drive_init(void);
 
 /* handles */
 uint64_t w32_handle_new(w32 *w, w32_htype t, int fd);
@@ -283,6 +299,7 @@ w32_thread *w32_thread_main(w32 *w, xc_cpu *c, uint64_t teb, uint64_t lo, uint64
 void w32_return_to_host(w32 *w);
 extern const w32_api w32_d3d9[];
 extern const w32_api w32_advapi32[];
+extern const w32_api w32_shell32[];
 
 /* advapi32.c: the registry is persisted next to the guest's C: drive. Called
  * when a run ends so an installer's writes survive to the next launch. */

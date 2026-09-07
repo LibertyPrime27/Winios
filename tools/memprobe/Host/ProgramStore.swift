@@ -17,12 +17,24 @@ struct Program: Codable {
     var importsMissing: Int
     var lastExit: Int32?
     var lastRunMs: UInt64?
+    /// Where this program's own DLLs are, as a host path. A game finds them
+    /// beside its executable, which for something like an Unreal title is
+    /// three folders below the one the user sees -- so it cannot be worked out
+    /// from `name` and has to be carried. Optional so that an entry written
+    /// before the importer existed still decodes.
+    var dllDir: String?
+    /// True when this entry is what an installer produced rather than
+    /// something copied in ready to run. Worth keeping: if it turns out to be
+    /// broken, the question "did the install finish?" is the first one, and it
+    /// cannot be asked later without knowing there was an install.
+    var installed: Bool?
 
     var canProbablyRun: Bool { importsMissing == 0 }
     var subtitle: String {
         var s = is32 ? "32-bit" : "64-bit"
         s += importsMissing == 0 ? " · nothing missing"
                                  : " · \(importsMissing) missing of \(importsResolved + importsMissing)"
+        if installed == true { s += " · installed here" }
         if let e = lastExit { s += " · last exit \(e)" }
         return s
     }
@@ -67,7 +79,7 @@ enum ProgramStore {
             }
             out.append(Program(name: name, exeRelative: isDir.boolValue ? exe : "",
                                is32: true, importsResolved: 0, importsMissing: -1,
-                               lastExit: nil, lastRunMs: nil))
+                               lastExit: nil, lastRunMs: nil, dllDir: nil, installed: nil))
         }
         return out.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
@@ -90,9 +102,22 @@ enum ProgramStore {
     }
 
     /// The executable to hand to winrun.
-    static func exeURL(_ p: Program) -> URL? {
+    static func exeURL(_ p: Program) -> URL? { exeURL(name: p.name, exeRelative: p.exeRelative) }
+
+    /// The same, before there is a Program: the importer has the two strings
+    /// and needs the path in order to ask what the program requires, which it
+    /// does before deciding whether to offer the entry at all.
+    static func exeURL(name: String, exeRelative: String) -> URL? {
         guard let c = driveC else { return nil }
-        let base = c.appendingPathComponent(p.name)
-        return p.exeRelative.isEmpty ? base : base.appendingPathComponent(p.exeRelative)
+        let base = c.appendingPathComponent(name)
+        return exeRelative.isEmpty ? base : base.appendingPathComponent(exeRelative)
+    }
+
+    /// Where to look for the program's own DLLs. The recorded directory when
+    /// the importer worked one out, and otherwise the executable's own folder,
+    /// which is right for everything that is not deeply nested.
+    static func dllDirURL(_ p: Program) -> URL? {
+        if let d = p.dllDir, !d.isEmpty { return URL(fileURLWithPath: d) }
+        return exeURL(p)?.deletingLastPathComponent()
     }
 }
