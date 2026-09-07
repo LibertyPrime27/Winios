@@ -1363,6 +1363,72 @@ static void k_WritePrivateProfileStringA(w32 *w) {
     RET(bool_(ok));
 }
 
+/* ---- where DLLs are looked for --------------------------------------------
+ *
+ * SetDefaultDllDirectories is the one an NSIS installer calls first, and it
+ * calls it for security rather than for function: it narrows the search so a
+ * planted DLL in the current directory cannot be picked up ahead of the real
+ * one. Our loader already searches only the executable's own directory plus
+ * whatever -L named, which is narrower than the default it is trying to get
+ * rid of -- so agreeing is honest, and it is what lets the installer start.
+ *
+ * It was the *only* thing a 580 MB GameMaker installer asked for that was not
+ * here, which is worth recording: the list of what a real installer needs is
+ * much shorter than it looks from the outside.
+ */
+static void k_SetDefaultDllDirectories(w32 *w) { (void)w; RET(1); }
+
+/* An extra directory to look in, which we can honour for real. NULL or an
+ * empty string goes back to the default. */
+static char g_extra_dll_dir[1024];
+static void set_dll_dir(w32 *w, const char *win) {
+    if (!win || !*win) { g_extra_dll_dir[0] = 0; w->dll_dir = 0; RET(1); return; }
+    char host[900];
+    host_path(w, win, host, sizeof host);
+    /* The loader expects a trailing separator: it joins without adding one. */
+    size_t n = strlen(host);
+    snprintf(g_extra_dll_dir, sizeof g_extra_dll_dir, "%s%s", host,
+             (n && host[n - 1] == '/') ? "" : "/");
+    w->dll_dir = g_extra_dll_dir;
+    RET(1);
+}
+static void k_SetDllDirectoryA(w32 *w) { set_dll_dir(w, ARG(0) ? GSTR(ARG(0)) : 0); }
+static void k_SetDllDirectoryW(w32 *w) {
+    if (!ARG(0)) { set_dll_dir(w, 0); return; }
+    char s[1024]; w32_wtoa(w, ARG(0), s, sizeof s); set_dll_dir(w, s);
+}
+/* AddDllDirectory returns an opaque cookie, and the caller only ever passes
+ * it back to RemoveDllDirectory. One search directory is kept, so the cookie
+ * can be any non-NULL value -- but it has to be non-NULL, because that is how
+ * the caller tests for failure. */
+static void k_AddDllDirectory(w32 *w) {
+    if (!ARG(0)) { w32_set_last_error(w, ERROR_INVALID_PARAMETER); RET(0); return; }
+    char s[1024]; w32_wtoa(w, ARG(0), s, sizeof s);
+    set_dll_dir(w, s);
+    RET(1);          /* a cookie, not a boolean */
+}
+static void k_RemoveDllDirectory(w32 *w) { g_extra_dll_dir[0] = 0; w->dll_dir = 0; RET(1); }
+
+/* lstrcat is the Win32 spelling of strcat, and it is what an installer built
+ * without a CRT uses to join paths. */
+static void k_lstrcatA(w32 *w) {
+    uint64_t dst = ARG(0);
+    const char *src = ARG(1) ? GSTR(ARG(1)) : "";
+    char *d = W32P(w, dst);
+    if (!d) { RET(0); return; }
+    size_t at = strlen(d);
+    memcpy(d + at, src, strlen(src) + 1);
+    RET(dst);
+}
+static void k_lstrcatW(w32 *w) {
+    uint16_t *d = W32P(w, ARG(0));
+    if (!d) { RET(0); return; }
+    size_t at = 0; while (d[at]) at++;
+    const uint16_t *sp = ARG(1) ? W32P(w, ARG(1)) : 0;
+    if (sp) { size_t i = 0; for (; sp[i]; i++) d[at + i] = sp[i]; d[at + i] = 0; }
+    RET(ARG(0));
+}
+
 static void k_GetCurrentProcessorNumber(w32 *w) { RET(0); }
 
 #define F(n, a)        { #n, a, 0, k_##n, 0 }
@@ -1413,6 +1479,11 @@ const w32_api w32_kernel32[] = {
      * globals are per process. It reports itself in the run report so a
      * program that needed a child is not a silent mystery. */
     F(CreateProcessA, 10), FN(CreateProcessW, 10, k_CreateProcessA),
+    /* Where DLLs are searched for. SetDefaultDllDirectories is what an NSIS
+     * installer calls before anything else. */
+    F(SetDefaultDllDirectories, 1), F(SetDllDirectoryA, 1), F(SetDllDirectoryW, 1),
+    F(AddDllDirectory, 1), F(RemoveDllDirectory, 1),
+    F(lstrcatA, 2), F(lstrcatW, 2),
     F(GetThreadPriority, 1), F(SetThreadPriority, 2), F(GetExitCodeProcess, 2),
     F(GetProcessAffinityMask, 3), F(SetErrorMode, 1),
     /* RaiseException, RtlCaptureContext, RtlUnwind, the vectored handlers and

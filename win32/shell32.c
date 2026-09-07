@@ -198,18 +198,68 @@ static void s_SHFileOperationA(w32 *w) {
  * Zero is a documented failure and callers check it. */
 static void s_SHGetFileInfoA(w32 *w) { (void)w; RET(0); }
 static void s_SHGetFileInfoW(w32 *w) { (void)w; RET(0); }
+
+/* ---- the older way of asking, which is the way installers ask -------------
+ *
+ * SHGetFolderPath is the convenient call. The older pair is
+ * SHGetSpecialFolderLocation, which hands back an *item ID list*, and
+ * SHGetPathFromIDList, which turns one into a path -- and an NSIS installer
+ * resolves $SMPROGRAMS, $DESKTOP and $APPDATA through that pair. Both were
+ * here as stubs that returned failure, which is worse than being absent: the
+ * import resolves, so nothing reports it, and the installer just cannot find
+ * anywhere to put a shortcut.
+ *
+ * A PIDL is opaque to whoever receives it -- the only defined thing to do
+ * with one is pass it back to the shell -- so ours is simply a marker and the
+ * folder id. That is a complete implementation of the contract rather than a
+ * pretence at one: every path the caller can take through it works.
+ */
+enum { PIDL_MAGIC = 0x50494432u };   /* "PID2" */
+
+static void s_SHGetSpecialFolderLocation2(w32 *w) {
+    uint32_t id = (uint32_t)ARG(1);
+    if (!ARG(2)) { RET((uint64_t)(uint32_t)E_INVALIDARG_); return; }
+    if (!csidl_path(id)) { w32_write(w, ARG(2), w->is32 ? 4 : 8, 0);
+                           RET((uint64_t)(uint32_t)E_FAIL_); return; }
+    /* 12 bytes: the marker, the folder id, and the two zero bytes that
+     * terminate an item ID list. */
+    uint64_t p = w32_heap_alloc(w, 12);
+    if (!p) { RET((uint64_t)(uint32_t)E_FAIL_); return; }
+    w32_write(w, p + 0, 4, PIDL_MAGIC);
+    w32_write(w, p + 4, 4, id);
+    w32_write(w, p + 8, 4, 0);
+    w32_write(w, ARG(2), w->is32 ? 4 : 8, p);
+    RET(S_OK_);
+}
+
+static void path_from_idlist(w32 *w, int wide) {
+    uint64_t pidl = ARG(0);
+    if (!pidl || !ARG(1)) { RET(0); return; }
+    uint32_t magic = (uint32_t)w32_read(w, pidl, 4);
+    if (magic != PIDL_MAGIC) { RET(0); return; }
+    const char *path = csidl_path((uint32_t)w32_read(w, pidl + 4, 4));
+    if (!path) { RET(0); return; }
+    /* The caller is about to write a shortcut into it, so it has to exist. */
+    make_win_dirs(w, path);
+    put_path(w, ARG(1), wide, path);
+    RET(1);
+}
+static void s_SHGetPathFromIDListA2(w32 *w) { path_from_idlist(w, 0); }
+static void s_SHGetPathFromIDListW(w32 *w)  { path_from_idlist(w, 1); }
+/* Freeing one. An item ID list is documented as the caller's to free with
+ * CoTaskMemFree or ILFree; both end up here. */
+static void s_ILFree(w32 *w) { if (ARG(0)) w32_heap_free(w, ARG(0)); RET(0); }
 /* Telling the shell something changed, when there is no shell. Doing nothing
  * is the correct and complete implementation. */
 static void s_SHChangeNotify(w32 *w) { (void)w; RET(0); }
-static void s_SHGetPathFromIDListA(w32 *w) { (void)w; RET(0); }
-static void s_SHGetSpecialFolderLocation(w32 *w) { (void)w; RET((uint64_t)(uint32_t)E_FAIL_); }
 /* An installer asks whether it is running elevated so it can decide between
  * Program Files and the user's own folder. There are no privileges here and
  * every path is writable, so the honest answer is yes. */
 static void s_IsUserAnAdmin(w32 *w) { (void)w; RET(1); }
 static void s_SHGetKnownFolderPath(w32 *w) { (void)w; RET((uint64_t)(uint32_t)E_FAIL_); }
 
-#define F(n, a) { #n, a, 0, s_##n, 0 }
+#define F(n, a)        { #n, a, 0, s_##n, 0 }
+#define FN(n, a, impl) { #n, a, 0, impl, 0 }
 const w32_api w32_shell32[] = {
     F(SHGetFolderPathA, 5), F(SHGetFolderPathW, 5),
     F(SHGetSpecialFolderPathA, 4), F(SHGetSpecialFolderPathW, 4),
@@ -217,9 +267,14 @@ const w32_api w32_shell32[] = {
     F(ShellExecuteA, 6), F(ShellExecuteW, 6), F(ShellExecuteExA, 1),
     F(SHFileOperationA, 1),
     F(SHGetFileInfoA, 5), F(SHGetFileInfoW, 5),
-    F(SHChangeNotify, 4), F(SHGetPathFromIDListA, 2),
-    F(SHGetSpecialFolderLocation, 3), F(IsUserAnAdmin, 0),
+    F(SHChangeNotify, 4), F(IsUserAnAdmin, 0),
+    /* The older folder pair, which is the one installers use. */
+    FN(SHGetSpecialFolderLocation, 3, s_SHGetSpecialFolderLocation2),
+    FN(SHGetPathFromIDList, 2, s_SHGetPathFromIDListA2),
+    FN(SHGetPathFromIDListA, 2, s_SHGetPathFromIDListA2),
+    F(SHGetPathFromIDListW, 2), F(ILFree, 1),
     F(SHGetKnownFolderPath, 4),
     { 0, 0, 0, 0, 0 },
 };
 #undef F
+#undef FN

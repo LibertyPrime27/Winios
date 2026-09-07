@@ -48,6 +48,28 @@ int main(int argc, char **argv) {
     if (!silent) return fail("no silent flag: a real installer would open a window here");
     if (!dir[0]) return fail("no /DIR=: nowhere to install to");
 
+    /* 0. Narrow the DLL search path, which is the first thing a real NSIS
+     *    installer does -- for security, not for function: it stops a DLL
+     *    planted next to the setup file being picked up ahead of the real
+     *    one. Reached through GetProcAddress rather than linked, because that
+     *    is how an installer that must still run on older Windows calls a
+     *    function added in Windows 8, and it is how the real one does it.
+     *
+     *    This is here because a 580 MB GameMaker installer stopped on exactly
+     *    this call, and it was the only thing it asked for that was missing. */
+    {
+        HMODULE k32 = GetModuleHandleA("kernel32.dll");
+        typedef BOOL (WINAPI *SetDefaultDllDirectories_t)(DWORD);
+        SetDefaultDllDirectories_t sdd = k32
+            ? (SetDefaultDllDirectories_t)(void *)GetProcAddress(k32, "SetDefaultDllDirectories")
+            : NULL;
+        if (!sdd) return fail("SetDefaultDllDirectories is not exported");
+        /* LOAD_LIBRARY_SEARCH_SYSTEM32 | _APPLICATION_DIR | _USER_DIRS */
+        if (!sdd(0x800 | 0x200 | 0x400))
+            return fail("SetDefaultDllDirectories failed");
+        printf("dllsearch: narrowed\n");
+    }
+
     /* 1. Is there room? A real installer refuses to start if this fails, so
      *    an emulator where it fails is an emulator where nothing installs. */
     ULARGE_INTEGER avail, total, freebytes;
@@ -107,6 +129,30 @@ int main(int argc, char **argv) {
     GetPrivateProfileStringA("Display", "Width", "?", got, sizeof got, ini);
     if (strcmp(got, "1920")) return fail("the .ini did not read back");
     printf("ini:   Display/Width = %s\n", got);
+
+    /* 6b. Where does a Start Menu shortcut go? An installer asks through the
+     *     older pair -- SHGetSpecialFolderLocation for an item ID list, then
+     *     SHGetPathFromIDList to turn it into a path -- and frees the list
+     *     with CoTaskMemFree. All three were either missing or stubs that
+     *     returned failure, which is how an installer ends up unable to find
+     *     anywhere to put a shortcut. */
+    {
+        LPITEMIDLIST pidl = NULL;
+        if (SHGetSpecialFolderLocation(NULL, CSIDL_PROGRAMS, &pidl) != S_OK || !pidl)
+            return fail("SHGetSpecialFolderLocation(CSIDL_PROGRAMS) failed");
+        char menu[MAX_PATH] = "";
+        if (!SHGetPathFromIDListA(pidl, menu) || !menu[0])
+            return fail("SHGetPathFromIDList gave nothing back");
+        CoTaskMemFree(pidl);
+        printf("menu:  %s\n", menu);
+        /* And it has to be a directory we can actually write into, or the
+         * path was only a plausible string. */
+        char probe[MAX_PATH];
+        snprintf(probe, sizeof probe, "%s\\FakeGame.lnk", menu);
+        HANDLE lnk = CreateFileA(probe, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+        if (lnk == INVALID_HANDLE_VALUE) return fail("the Start Menu path is not writable");
+        CloseHandle(lnk);
+    }
 
     /* 7. The uninstall key, which is how Windows knows the program is there. */
     HKEY key;

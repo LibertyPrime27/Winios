@@ -357,6 +357,9 @@ static const w32_dll g_dlls[] = {
     /* Where a program is allowed to put things: an installer asks before it
      * copies anything, and a game asks again later, for its saves. */
     { "shell32.dll",  { w32_shell32 },                                    0 },
+    /* Not a COM runtime: the few calls a program makes on the way past COM,
+     * chiefly the allocator that owns an item ID list the shell handed back. */
+    { "ole32.dll",    { w32_ole32 },                                      0 },
     { "winmm.dll",    { w32_winmm },                                      0 },
     { "dsound.dll",   { w32_dsound },                                     0 },
     /* Every XInput version games link against, all the same implementation:

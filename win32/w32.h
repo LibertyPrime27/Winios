@@ -300,6 +300,7 @@ void w32_return_to_host(w32 *w);
 extern const w32_api w32_d3d9[];
 extern const w32_api w32_advapi32[];
 extern const w32_api w32_shell32[];
+extern const w32_api w32_ole32[];
 
 /* advapi32.c: the registry is persisted next to the guest's C: drive. Called
  * when a run ends so an installer's writes survive to the next launch. */

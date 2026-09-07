@@ -45,6 +45,18 @@ int win_probe_look(const char *path, int *is32, int *is_installer,
                    char *family, size_t family_len,
                    char *note, size_t note_len);
 
+/* How far along an import is, for a UI that has to show something during a
+ * 580 MB extraction. Polled rather than pushed: see the note in winprobe.c.
+ * `stage` is a short noun ("extracting", "copying", "installing"), `total` is
+ * 0 when it is not known. All parameters are optional. */
+void win_probe_progress(char *stage, size_t stage_len, uint64_t *done, uint64_t *total);
+
+/* Ask a running import to stop at its next step. It leaves what it has
+ * already written in place -- an abandoned half-copy is visible in the
+ * library and can be deleted, which is better than a silent rollback that
+ * loses a 10-minute extraction the person actually wanted. */
+void win_probe_cancel_import(void);
+
 /* Import, in one of the two modes. Returns 0 when the program is ready to
  * run. `installer` picks the mode; `keep_going` and `timeout_s` apply only to
  * installer mode.

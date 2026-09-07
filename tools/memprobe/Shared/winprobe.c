@@ -123,6 +123,57 @@ int win_probe_run_ex(const char *exe_path, int keep_going, int timeout_s,
  * when an install fails, the reason is in the guest's run report and the
  * importer's own summary only says that nothing appeared.
  */
+/* --- progress, polled rather than pushed -------------------------------------
+ *
+ * A 580 MB download unpacks for a long time, and a spinner with no numbers on
+ * it is indistinguishable from a hang -- which on a phone is when people force
+ * quit. So the importer's progress is recorded here and the UI asks for it on
+ * a timer.
+ *
+ * Polled and not a callback on purpose: handing Swift a C function pointer
+ * with a context pointer to marshal is a lot of moving parts for something
+ * whose only job is to update a label, and none of it can be compiled or
+ * tested on the machine this was written on. A static, a mutex and a getter
+ * can be reasoned about. */
+static pthread_mutex_t g_prog_lock = PTHREAD_MUTEX_INITIALIZER;
+static char     g_prog_stage[64];
+static uint64_t g_prog_done, g_prog_total;
+static int      g_prog_cancel;
+
+static void prog_set(const char *stage, uint64_t done, uint64_t total) {
+    pthread_mutex_lock(&g_prog_lock);
+    snprintf(g_prog_stage, sizeof g_prog_stage, "%.*s", (int)sizeof g_prog_stage - 1,
+             stage ? stage : "");
+    g_prog_done = done;
+    g_prog_total = total;
+    pthread_mutex_unlock(&g_prog_lock);
+}
+
+/* The importer's callback. Returning non-zero cancels, which is how the Stop
+ * button reaches a copy that is halfway through 2000 files. */
+static int import_progress(void *ctx, const char *stage, uint64_t done, uint64_t total) {
+    (void)ctx;
+    prog_set(stage, done, total);
+    pthread_mutex_lock(&g_prog_lock);
+    int stop = g_prog_cancel;
+    pthread_mutex_unlock(&g_prog_lock);
+    return stop;
+}
+
+void win_probe_progress(char *stage, size_t stage_len, uint64_t *done, uint64_t *total) {
+    pthread_mutex_lock(&g_prog_lock);
+    if (stage && stage_len) snprintf(stage, stage_len, "%.*s", (int)stage_len - 1, g_prog_stage);
+    if (done) *done = g_prog_done;
+    if (total) *total = g_prog_total;
+    pthread_mutex_unlock(&g_prog_lock);
+}
+
+void win_probe_cancel_import(void) {
+    pthread_mutex_lock(&g_prog_lock);
+    g_prog_cancel = 1;
+    pthread_mutex_unlock(&g_prog_lock);
+}
+
 typedef struct {
     const char *src, *drive_c;
     int installer, keep_going, timeout_s;
@@ -133,8 +184,8 @@ static int call_import(void *ctx) {
     import_args *a = (import_args *)ctx;
     if (a->installer)
         return wi_import_installer(a->src, a->drive_c, winrun_main,
-                                   a->keep_going, a->timeout_s, 0, 0, a->out);
-    return wi_import_game(a->src, a->drive_c, 0, 0, a->out);
+                                   a->keep_going, a->timeout_s, import_progress, 0, a->out);
+    return wi_import_game(a->src, a->drive_c, import_progress, 0, a->out);
 }
 
 /* Copy a C string into a caller's buffer, truncating rather than overrunning.
@@ -156,6 +207,12 @@ int win_probe_import(const char *src, const char *drive_c, int installer,
     wi_result *r = (wi_result *)calloc(1, sizeof *r);
     if (!r) { put(detail, detail_len, "out of memory\n"); return -1; }
     r->is32 = -1;
+    /* A cancel left over from a previous import would stop this one on its
+     * first callback. */
+    pthread_mutex_lock(&g_prog_lock);
+    g_prog_cancel = 0;
+    pthread_mutex_unlock(&g_prog_lock);
+    prog_set("starting", 0, 0);
 
     import_args a = { src, drive_c, installer, keep_going, timeout_s, r };
     char *guest = (char *)malloc(128 * 1024);
@@ -180,6 +237,7 @@ int win_probe_import(const char *src, const char *drive_c, int installer,
     }
     free(guest);
 
+    prog_set("", 0, 0);
     put(name, name_len, r->name);
     put(exe_rel, exe_rel_len, r->exe_rel);
     put(dll_dir, dll_dir_len, r->dll_dir);

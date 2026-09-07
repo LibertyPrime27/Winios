@@ -36,6 +36,11 @@ for bits in 32 64; do
         else printf 'FAIL %s-bit: %s (looking for "%s")\n' "$bits" "$1" "$2"; fail=1; fi
     }
     check "identified as Inno Setup"        "Inno Setup"
+    # The two that a real NSIS installer stopped on, on a real device: the
+    # DLL-search narrowing it does first, and the older shell-folder pair it
+    # resolves a Start Menu path through.
+    check "narrowed the DLL search path"    "dllsearch: narrowed"
+    check "resolved the Start Menu"         "menu:  C:\\Users\\winios\\Start Menu\\Programs"
     check "given the silent flags"          "/SILENT /SP- /NORESTART /DIR=C:\\fakesetup$bits"
     check "the guest saw them"              "silent=1 sp-=1 norestart=1"
     check "free space was reported"         "free:  enough"

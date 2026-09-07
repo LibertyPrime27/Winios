@@ -328,7 +328,10 @@ int wi_import_game(const char *src, const char *drive_c,
         if (uz_mkdirs(stage)) { addf(out, "could not create %s\n", name); return -1; }
 
         int skipped = 0; char err[256] = "";
-        int n = uz_extract(src, stage, (uz_progress)cb, ctx, &skipped, err, sizeof err);
+        /* No cast: uz_progress and wi_progress are the same signature, and a
+         * cast here would keep compiling if one of them ever stopped being. */
+        uz_progress zcb = cb;
+        int n = uz_extract(src, stage, zcb, ctx, &skipped, err, sizeof err);
         if (n < 0) { addf(out, "extraction failed: %s\n", err); return -1; }
         out->files = n;
         addf(out, "%d file%s extracted", n, n == 1 ? "" : "s");
