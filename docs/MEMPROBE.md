@@ -215,6 +215,22 @@ the ladder just to see the GPU result again.
   misses are dropped rather than queued, which is what makes the number on
   screen the rate the *emulator* managed rather than the rate the screen
   refreshed at.
+- **9 · JIT arena** — how much executable memory the debugger will bless, which
+  is the ceiling on how much guest code can ever be resident: the bless happens
+  once per launch and the region cannot grow afterwards. 1 MB was an arbitrary
+  first choice and is already too small — one pass through the bundled guests
+  emitted 1044 KB, and only fit because each run flushes the block cache, which
+  a game never does.
+
+  So it climbs one size per launch (1, 4, 16, 64, 256 MB), the same shape as
+  the memory ladder: the size to try next is remembered, a size that blessed is
+  remembered as good, and a size whose attempt never came back is remembered as
+  bad, after which the next launch drops to the last good one. Backing off to a
+  size that has already worked is what stops it being a crash loop. The size in
+  flight is forced to disk before the breakpoint, because the next thing that
+  happens may be a fatal SIGTRAP and otherwise the finding is lost. **Reset
+  results** clears the in-flight attempt but keeps what the ladder has learnt —
+  those are facts about the device, not results.
 - **6 · Memory ladder** — the ladder on its own.
 
   A note on what the numbers are measured on: every probe runs at

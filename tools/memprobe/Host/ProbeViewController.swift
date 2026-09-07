@@ -64,6 +64,7 @@ final class ProbeViewController: UIViewController {
             row([("6 · Memory ladder", #selector(runLadder)), ("Clear frame", #selector(clearFrame))]),
             button("8 · Run a Windows program full screen (live frames)", #selector(runGuest)),
             button("4 · JIT: attach StikDebug, then execute in a blessed arena", #selector(attachJIT)),
+            button("9 · JIT arena: try a bigger one next launch", #selector(stepArena)),
             row([("Copy report", #selector(copyReport)), ("Reset results", #selector(resetAll))]),
             frameView,
             results,
@@ -380,6 +381,9 @@ final class ProbeViewController: UIViewController {
         ResultStore.reset()
         markerPath.withCString { jit_probe_reset($0) }
         ["cpu", "bench", "gpu", "jit", "win"].forEach { store.removeObject(forKey: $0) }
+        // arenaGoodKB/arenaBadKB are findings about this device, not results:
+        // they survive a reset. Only the in-flight attempt is cleared.
+        arenaPendingKB = 0
         refresh()
     }
 
@@ -457,7 +461,59 @@ final class ProbeViewController: UIViewController {
     private var sharedArena: UnsafeMutablePointer<jit_arena>?
     private var arenaInXcore = false
     private var arenaReport = ""
-    private let arenaSize = 1 << 20
+
+    /// How big an arena to ask the debugger to bless, and what we have learnt
+    /// about how big it will go.
+    ///
+    /// This is the ceiling on how much guest code can ever be resident: the
+    /// bless happens once per launch and the region cannot grow afterwards, so
+    /// a game that compiles more than this has nowhere to put it. 1 MB was an
+    /// arbitrary first choice and it is already too small — one pass through
+    /// the twelve bundled guests emitted 1044 KB, and only fit because each
+    /// run flushes the block cache, which a game never does.
+    ///
+    /// So it climbs, one size per launch, the same way the memory ladder does:
+    /// the size to try next is remembered, a size that blessed is remembered as
+    /// good, and a size whose attempt did not come back is remembered as bad
+    /// and the next launch drops to the last good one. Backing off to a size
+    /// that has already worked is what stops this being a crash loop.
+    private var arenaKB: Int {
+        get { store.object(forKey: "arenaKB") as? Int ?? 1024 }
+        set { store.set(newValue, forKey: "arenaKB") }
+    }
+    private var arenaGoodKB: Int {
+        get { store.object(forKey: "arenaGoodKB") as? Int ?? 0 }
+        set { store.set(newValue, forKey: "arenaGoodKB") }
+    }
+    private var arenaBadKB: Int {
+        get { store.object(forKey: "arenaBadKB") as? Int ?? 0 }
+        set { store.set(newValue, forKey: "arenaBadKB") }
+    }
+    /// The size an attempt was in the middle of when the app last stopped.
+    /// Non-zero on launch means that attempt never finished.
+    private var arenaPendingKB: Int {
+        get { store.object(forKey: "arenaPendingKB") as? Int ?? 0 }
+        set { store.set(newValue, forKey: "arenaPendingKB") }
+    }
+    private var arenaSize: Int { arenaKB << 10 }
+
+    private static let arenaLadder = [1024, 4096, 16384, 65536, 262144]   // 1 MB … 256 MB
+
+    /// Set the size the *next* launch will try. This launch has already used
+    /// its one bless, so nothing changes until the app is restarted.
+    @objc private func stepArena() {
+        let next = Self.arenaLadder.first { $0 > arenaKB && ($0 < arenaBadKB || arenaBadKB == 0) }
+        arenaKB = next ?? Self.arenaLadder[0]
+        jitLine = arenaStatus() + "\n    (restart the app to try it — the bless for this launch has already happened)"
+        refresh()
+    }
+
+    private func arenaStatus() -> String {
+        var s = "JIT arena: will try \(arenaKB >> 10) MB on the next launch"
+        if arenaGoodKB > 0 { s += "; largest blessed so far \(arenaGoodKB >> 10) MB" }
+        if arenaBadKB > 0 { s += "; \(arenaBadKB >> 10) MB did not come back" }
+        return s
+    }
 
     /// The one bless of this launch, on demand. Every button that needs
     /// executable memory goes through here, so none of them can trigger a
@@ -496,11 +552,36 @@ final class ProbeViewController: UIViewController {
             return describe(probe) + "\n    (no debugger attached — use the JIT button to attach StikDebug)"
         }
         if probe.state == JIT_CRASHED && sharedArena == nil {
+            // An attempt that never came back. If we know what size it was
+            // asking for, that is the finding: record it as the ceiling and
+            // drop back to a size that has already worked, which is safe
+            // because it worked. Otherwise it is a crash we cannot attribute
+            // and the marker stays for the user to clear.
+            let attempted = arenaPendingKB
+            arenaPendingKB = 0
+            if attempted > 0 {
+                arenaBadKB = arenaBadKB == 0 ? attempted : min(arenaBadKB, attempted)
+                arenaKB = arenaGoodKB > 0 ? arenaGoodKB : Self.arenaLadder[0]
+                return describe(probe)
+                    + "\n    \(attempted >> 10) MB did not bless: the attempt never came back."
+                    + "\n    Dropped to \(arenaKB >> 10) MB. " + arenaStatus()
+                    + "\n    (Reset results clears the marker, then this size can be blessed)"
+            }
             return describe(probe) + "\n    (a previous bless/execute crashed; Reset results clears the marker to retry)"
         }
 
         var fresh: Int32 = 0
+        // Durable *before* we walk into the breakpoint. UserDefaults writes
+        // lazily and the next thing that happens may be a fatal SIGTRAP, so
+        // this one is forced out: if it is not on disk, the next launch cannot
+        // say which size failed and the finding is lost.
+        arenaPendingKB = arenaKB
+        store.synchronize()
         let arena = markerPath.withCString { jit_arena_shared(arenaSize, &r, $0, &fresh) }
+        if arena != nil && arena!.pointee.blessed != 0 {
+            arenaPendingKB = 0
+            arenaGoodKB = max(arenaGoodKB, arenaKB)
+        }
         guard let arena else {
             arenaReport = describe(r)
             return arenaReport
@@ -511,7 +592,8 @@ final class ProbeViewController: UIViewController {
             _ = withUnsafeBytes(of: &code) { raw in
                 markerPath.withCString { jit_arena_run(arena, raw.baseAddress, 4, &r, $0) }
             }
-            arenaReport = describe(r) + "\n    (debugger was attached — blessed \(arenaSize >> 10) KB and executed directly)"
+            arenaReport = describe(r) + "\n    (debugger was attached — blessed \(arenaKB >> 10) KB and executed directly)"
+                        + "\n    " + arenaStatus()
         } else if arenaReport.isEmpty {
             // Reusing an arena blessed earlier this launch: jit_arena_shared
             // filled `r` in with exactly that story, so use it rather than
