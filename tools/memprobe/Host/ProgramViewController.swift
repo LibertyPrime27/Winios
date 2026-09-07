@@ -2,7 +2,12 @@ import UIKit
 
 /// One program: run it, watch it, read what happened.
 ///
-/// Two ways to run, and the difference matters. **Run** carries on past
+/// **Run** draws: it goes full screen and shows the frames the guest
+/// presents, which is what running a game means. The two capture runs below
+/// it answer a different question -- why doesn't this work -- and print what
+/// the program said instead of showing it.
+///
+/// Of those two, one carries on past
 /// functions we have not implemented — they log themselves and return zero —
 /// so one run names everything the program wanted. That is how to learn what
 /// to build next, and it is *not* a way to run something for real: zero means
@@ -41,9 +46,16 @@ final class ProgramViewController: UIViewController {
 
         let stack = UIStackView(arrangedSubviews: [
             status,
-            row([("▶  Run", #selector(runKeepGoing)), ("Run strictly", #selector(runStrict))]),
+            // Rendered, full screen, is what running a game means -- so it is
+            // the first button and the one labelled Run. The text-capture
+            // runs below it are for finding out why something does not work,
+            // which is a different question and no longer the default answer
+            // to "run this".
+            button("▶  Run", #selector(runFullScreen)),
+            row([("Run and capture output", #selector(runKeepGoing)),
+                 ("Strictly", #selector(runStrict))]),
             row([("What it needs", #selector(showImports)), ("Stop", #selector(stop))]),
-            row([("Full screen (live frames)", #selector(runFullScreen)), ("Copy", #selector(copyOut))]),
+            row([("Copy output", #selector(copyOut))]),
             output,
         ])
         stack.axis = .vertical

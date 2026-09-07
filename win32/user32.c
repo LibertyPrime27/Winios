@@ -983,6 +983,9 @@ static void u_GetKeyNameTextA(w32 *w) {
 
 /* --- the display -------------------------------------------------------- */
 
+static void u_wsprintfA(w32 *w) { w32_do_wsprintf(w, 0); }
+static void u_wsprintfW(w32 *w) { w32_do_wsprintf(w, 1); }
+
 /* GetSystemMetrics: SM_CXSCREEN 0, SM_CYSCREEN 1, SM_CXFULLSCREEN 16,
  * SM_CYFULLSCREEN 17, SM_CMOUSEBUTTONS 43, SM_MOUSEPRESENT 19. A game reads
  * these to pick a resolution, so they have to agree with what d3d9 reports. */
@@ -1106,6 +1109,10 @@ const w32_api w32_user32[] = {
     F(ClipCursor, 1), F(GetClipCursor, 1),
     F(MapVirtualKeyA, 2), F(MapVirtualKeyW, 2), F(VkKeyScanA, 1), F(GetKeyNameTextA, 3),
     /* the display, and the calls a message loop needs to get through */
+    /* Cdecl and variadic: the caller pops, so the count is not used. NSIS
+     * builds every path it reports with this. */
+    { "wsprintfA", 2, 1, u_wsprintfA, 0 },
+    { "wsprintfW", 2, 1, u_wsprintfW, 0 },
     F(GetSystemMetrics, 1),
     F(EnumDisplaySettingsA, 3), F(EnumDisplaySettingsW, 3), F(EnumDisplayDevicesA, 4),
     F(ChangeDisplaySettingsA, 2), F(ChangeDisplaySettingsExA, 5),

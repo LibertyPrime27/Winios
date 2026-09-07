@@ -332,15 +332,62 @@ static void k_GetStartupInfoA(w32 *w) {
 static void k_GetEnvironmentStringsA(w32 *w) { RET(w->env_block); }
 static void k_GetEnvironmentStringsW(w32 *w) { RET(w->env_block_w); }
 static void k_FreeEnvironmentStrings(w32 *w) { RET(1); }
+/* Variables set while the process runs.
+ *
+ * The environment the guest was started with is a block of NAME=VALUE in its
+ * own memory, sized once -- so it cannot absorb a new variable, let alone a
+ * longer value for one it already has. Rather than reallocate and relocate
+ * that block (and leave every pointer a guest may have taken into it
+ * dangling), anything set later lives here and is consulted first. An
+ * installer sets a handful; sixty-four is not a limit anyone will meet. */
+enum { ENV_MAX = 64 };
+static struct { char name[128], val[1024]; int used; } g_envset[ENV_MAX];
+
+static int env_find(const char *name) {
+    for (int i = 0; i < ENV_MAX; i++)
+        if (g_envset[i].used && !strcasecmp(g_envset[i].name, name)) return i;
+    return -1;
+}
+/* The value of a variable, or NULL. Checks what was set at runtime before
+ * the block the process started with, because a later set has to win. */
+const char *w32_env_lookup(w32 *w, const char *name) {
+    int i = env_find(name);
+    if (i >= 0) return g_envset[i].val;
+    if (!w->env_block) return 0;
+    const char *e = W32P(w, w->env_block);
+    if (!e) return 0;
+    size_t nl = strlen(name);
+    for (; *e; e += strlen(e) + 1)
+        if (!strncasecmp(e, name, nl) && e[nl] == '=') return e + nl + 1;
+    return 0;
+}
+/* NULL removes it. Returns 0 if there is no room, which is a failure the
+ * caller can see rather than a silent no-op. */
+int w32_env_set(const char *name, const char *val) {
+    if (!name || !*name || strlen(name) >= sizeof g_envset[0].name) return 0;
+    int i = env_find(name);
+    if (!val) { if (i >= 0) g_envset[i].used = 0; return 1; }
+    if (strlen(val) >= sizeof g_envset[0].val) return 0;
+    if (i < 0) for (i = 0; i < ENV_MAX && g_envset[i].used; i++) { }
+    if (i >= ENV_MAX) return 0;
+    snprintf(g_envset[i].name, sizeof g_envset[i].name, "%s", name);
+    snprintf(g_envset[i].val, sizeof g_envset[i].val, "%s", val);
+    g_envset[i].used = 1;
+    return 1;
+}
+
 static void k_GetEnvironmentVariableA(w32 *w) {
     const char *name = GSTR(ARG(0)); uint64_t buf = ARG(1); uint32_t n = (uint32_t)ARG(2);
-    const char *e = W32P(w, w->env_block); size_t nl = strlen(name);
-    for (; *e; e += strlen(e) + 1) if (!strncasecmp(e, name, nl) && e[nl] == '=') {
-        size_t vl = strlen(e + nl + 1);
-        if (vl + 1 > n) { RET(vl + 1); return; }
-        memcpy(W32P(w, buf), e + nl + 1, vl + 1); RET(vl); return;
-    }
-    w32_set_last_error(w, 203 /* ERROR_ENVVAR_NOT_FOUND */); RET(0);
+    const char *v = w32_env_lookup(w, name);
+    if (!v) { w32_set_last_error(w, 203 /* ERROR_ENVVAR_NOT_FOUND */); RET(0); return; }
+    size_t vl = strlen(v);
+    if (vl + 1 > n || !buf) { RET(vl + 1); return; }
+    memcpy(W32P(w, buf), v, vl + 1);
+    RET(vl);
+}
+static void k_SetEnvironmentVariableA(w32 *w) {
+    const char *name = ARG(0) ? GSTR(ARG(0)) : 0;
+    RET(bool_(name && w32_env_set(name, ARG(1) ? GSTR(ARG(1)) : 0)));
 }
 /* A module handle is a loaded guest image's base, or one of the fake pages
  * that stand for a host-implemented DLL. GetModuleHandle never loads: an
@@ -1265,13 +1312,25 @@ static void k_GetPrivateProfileIntA(w32 *w) {
  * section exists but not the key (insert at the end of the section, not the
  * end of the file -- putting it after a later section header would file it
  * under the wrong section), and neither exists (append both). */
-static void k_WritePrivateProfileStringA(w32 *w) {
-    char app[256], key[256], val[1024], path[4096];
-    snprintf(app, sizeof app, "%s", ARG(0) ? GSTR(ARG(0)) : "");
-    snprintf(key, sizeof key, "%s", ARG(1) ? GSTR(ARG(1)) : "");
-    snprintf(val, sizeof val, "%s", ARG(2) ? GSTR(ARG(2)) : "");
-    ini_host(w, ARG(3), 0, path, sizeof path);
-    if (!app[0]) { RET(0); return; }
+/* The rewrite itself, shared by the A and W forms. An .ini is bytes on disk
+ * either way, and two implementations would be two chances to get the
+ * insert-at-the-end-of-the-section case wrong. `key` or `val` NULL means
+ * delete, as the API defines it. */
+int w32_ini_write(w32 *w, const char *app, const char *key, const char *val,
+                  const char *file) {
+    char path[4096];
+    ini_host(w, 0, 0, path, sizeof path);        /* the default location... */
+    if (file && *file) {                          /* ...unless one was named */
+        if (!strchr(file, '\\') && !strchr(file, '/')) {
+            char q[1200];
+            snprintf(q, sizeof q, "C:\\Windows\\%.*s", (int)sizeof q - 12, file);
+            host_path(w, q, path, sizeof path);
+        } else host_path(w, file, path, sizeof path);
+    }
+    if (!app || !app[0]) return 0;
+    const int has_key = key != 0, has_val = val != 0;
+    if (!key) key = "";
+    if (!val) val = "";
 
     size_t tlen = 0;
     char *text = ini_read(path, &tlen);
@@ -1282,13 +1341,13 @@ static void k_WritePrivateProfileStringA(w32 *w) {
     if (!text) {
         struct stat st;
         if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
-            w32_set_last_error(w, ERROR_ACCESS_DENIED); RET(0); return;
+            w32_set_last_error(w, ERROR_ACCESS_DENIED); return 0;
         }
     }
     const char *src = text ? text : "";
     size_t cap = tlen + strlen(key) + strlen(val) + strlen(app) + 64;
     char *out = (char *)malloc(cap);
-    if (!out) { free(text); w32_set_last_error(w, ERROR_NOT_ENOUGH_MEMORY); RET(0); return; }
+    if (!out) { free(text); w32_set_last_error(w, ERROR_NOT_ENOUGH_MEMORY); return 0; }
     size_t o = 0;
     int in_sec = 0, wrote = 0, seen_sec = 0;
     /* snprintf returns what it *would* have written, so adding that to the
@@ -1325,42 +1384,50 @@ static void k_WritePrivateProfileStringA(w32 *w) {
         if (trimmed[0] == '[') {
             /* Leaving the section we wanted without having written the key:
              * it goes here, before the next header. */
-            if (in_sec && !wrote && ARG(1)) { EMIT("%s=%s\n", key, val); wrote = 1; }
+            if (in_sec && !wrote && has_key) { EMIT("%s=%s\n", key, val); wrote = 1; }
             char name[256]; snprintf(name, sizeof name, "%.*s", (int)sizeof name - 1, trimmed + 1);
             char *close = strchr(name, ']'); if (close) *close = 0;
             ini_trim(name);
             in_sec = !strcasecmp(name, app);
             if (in_sec) seen_sec = 1;
             /* A null key with a null value deletes the whole section. */
-            if (in_sec && !ARG(1) && !ARG(2)) { wrote = 1; continue; }
+            if (in_sec && !has_key && !has_val) { wrote = 1; continue; }
             EMIT("%.*s\n", linelen, line);
             continue;
         }
-        if (in_sec && ARG(1)) {
+        if (in_sec && has_key) {
             char k2[2048]; snprintf(k2, sizeof k2, "%s", trimmed);
             char *eq = strchr(k2, '='); if (eq) *eq = 0;
             ini_trim(k2);
             if (!strcasecmp(k2, key)) {
-                if (ARG(2)) { EMIT("%s=%s\n", key, val); }   /* replace */
+                if (has_val) { EMIT("%s=%s\n", key, val); }   /* replace */
                 wrote = 1;                                    /* null value deletes */
                 continue;
             }
         }
-        if (in_sec && !ARG(1) && !ARG(2)) continue;           /* dropping the section */
+        if (in_sec && !has_key && !has_val) continue;         /* dropping the section */
         EMIT("%.*s\n", linelen, line);
     }
-    if (!wrote && ARG(1) && ARG(2)) {
+    if (!wrote && has_key && has_val) {
         if (!seen_sec) EMIT("[%s]\n", app);
         EMIT("%s=%s\n", key, val);
     }
     #undef EMIT
     free(text);
     FILE *f = fopen(path, "wb");
-    if (!f) { free(out); w32_set_last_error(w, ERROR_ACCESS_DENIED); RET(0); return; }
+    if (!f) { free(out); w32_set_last_error(w, ERROR_ACCESS_DENIED); return 0; }
     size_t put = fwrite(out, 1, o, f);
     int ok = (put == o) && (fclose(f) == 0);
     free(out);
-    RET(bool_(ok));
+    return ok;
+}
+
+/* The two entry points, which are now only argument marshalling. */
+static void k_WritePrivateProfileStringA(w32 *w) {
+    RET(bool_(w32_ini_write(w, ARG(0) ? GSTR(ARG(0)) : "",
+                            ARG(1) ? GSTR(ARG(1)) : 0,
+                            ARG(2) ? GSTR(ARG(2)) : 0,
+                            ARG(3) ? GSTR(ARG(3)) : "")));
 }
 
 /* ---- where DLLs are looked for --------------------------------------------
@@ -1429,6 +1496,233 @@ static void k_lstrcatW(w32 *w) {
     RET(ARG(0));
 }
 
+/* ---- the wide half, which is what an installer actually calls --------------
+ *
+ * NSIS is a Unicode program: every path it touches goes through the W forms.
+ * The A forms were here and the W forms were not, so a silent install stopped
+ * on GetSystemDirectoryW and then, one function later, on wsprintfW -- two
+ * calls, in a list that looked from the outside like seventy-five.
+ *
+ * (It looked like seventy-five because importing the installer *as a game*
+ * reports everything in its import table, and most of that table is the
+ * dialog it draws. /S never opens a window, so none of comctl32, the gdi32
+ * font and brush calls, or the thirty-odd user32 dialog functions is ever
+ * reached. The number that matters is what a run actually calls.)
+ */
+
+/* Write a narrow string into a guest wide buffer, bounded by `cch`
+ * characters. Returns what the API family returns: the length written, or the
+ * length needed when it does not fit. */
+static uint32_t put_wide(w32 *w, uint64_t buf, uint32_t cch, const char *s) {
+    size_t l = strlen(s);
+    if (!buf || cch <= l) return (uint32_t)l + 1;      /* needed, including the NUL */
+    uint16_t *d = W32P(w, buf);
+    if (!d) return 0;
+    for (size_t i = 0; i < l; i++) d[i] = (uint8_t)s[i];
+    d[l] = 0;
+    return (uint32_t)l;
+}
+
+static void k_GetSystemDirectoryW(w32 *w) {
+    RET(put_wide(w, ARG(0), (uint32_t)ARG(1), "C:\\Windows\\System32"));
+}
+static void k_GetWindowsDirectoryW(w32 *w) {
+    RET(put_wide(w, ARG(0), (uint32_t)ARG(1), "C:\\Windows"));
+}
+static void k_GetSystemWow64DirectoryW(w32 *w) {
+    RET(put_wide(w, ARG(0), (uint32_t)ARG(1), "C:\\Windows\\SysWOW64"));
+}
+
+/* GetFullPathNameW(name, cch, buf, &filepart). Relative names resolve against
+ * the current directory, which is real now. */
+static void k_GetFullPathNameW(w32 *w) {
+    char s[1024]; w32_wtoa(w, ARG(0), s, sizeof s);
+    char full[2400];
+    if (s[1] == ':') snprintf(full, sizeof full, "%.*s", (int)sizeof full - 1, s);
+    else snprintf(full, sizeof full, "%.*s\\%.*s", P_DIR,
+                  g_cwd_win[0] ? g_cwd_win : "C:\\xcore", P_REST, s);
+    uint32_t n = put_wide(w, ARG(2), (uint32_t)ARG(1), full);
+    /* The file part points *into* the caller's buffer, after the last
+     * separator -- a pointer to our own copy would dangle the moment we
+     * returned. */
+    if (ARG(3) && n && n <= (uint32_t)ARG(1)) {
+        const char *slash = strrchr(full, '\\');
+        uint64_t fp = slash ? ARG(2) + 2u * (uint32_t)(slash + 1 - full) : ARG(2);
+        w32_write(w, ARG(3), w->is32 ? 4 : 8, fp);
+    }
+    RET(n);
+}
+
+/* SearchPathW(path, file, ext, cch, buf, &filepart). An installer uses it to
+ * find a helper next to itself or in the system directory. */
+static void k_SearchPathW(w32 *w) {
+    char file[512], ext[64] = "";
+    w32_wtoa(w, ARG(1), file, sizeof file);
+    if (ARG(2)) w32_wtoa(w, ARG(2), ext, sizeof ext);
+    char name[640];
+    snprintf(name, sizeof name, "%.*s%.*s", (int)sizeof file - 1, file, (int)sizeof ext - 1,
+             (strchr(file, '.') || !ext[0]) ? "" : ext);
+
+    /* Where the real one looks, in order: the directory given, then the
+     * program's own, then the system directory. */
+    const char *dirs[3];
+    char given[512] = "";
+    int n = 0;
+    if (ARG(0)) { w32_wtoa(w, ARG(0), given, sizeof given); dirs[n++] = given; }
+    dirs[n++] = "C:\\xcore";
+    dirs[n++] = "C:\\Windows\\System32";
+    for (int i = 0; i < n; i++) {
+        char win[1400], host[4096];
+        snprintf(win, sizeof win, "%.*s\\%.*s", P_DIR, dirs[i],
+                 (int)sizeof win - P_DIR - 2, name);
+        host_path(w, win, host, sizeof host);
+        struct stat st;
+        if (stat(host, &st) || !S_ISREG(st.st_mode)) continue;
+        uint32_t got = put_wide(w, ARG(4), (uint32_t)ARG(3), win);
+        if (ARG(5) && got && got <= (uint32_t)ARG(3)) {
+            const char *slash = strrchr(win, '\\');
+            uint64_t fp = slash ? ARG(4) + 2u * (uint32_t)(slash + 1 - win) : ARG(4);
+            w32_write(w, ARG(5), w->is32 ? 4 : 8, fp);
+        }
+        RET(got); return;
+    }
+    w32_set_last_error(w, ERROR_FILE_NOT_FOUND);
+    RET(0);
+}
+
+/* ExpandEnvironmentStringsW: %NAME% substitution. An installer builds its
+ * default directory out of %PROGRAMFILES%, so getting this wrong is how an
+ * install lands somewhere strange. Unknown names are left as they are, which
+ * is what the real one does. */
+static void k_ExpandEnvironmentStringsW(w32 *w) {
+    char src[2048]; w32_wtoa(w, ARG(0), src, sizeof src);
+    char out[4096]; size_t o = 0;
+    for (size_t i = 0; src[i] && o + 1 < sizeof out; ) {
+        if (src[i] != '%') { out[o++] = src[i++]; continue; }
+        const char *close = strchr(src + i + 1, '%');
+        if (!close) { out[o++] = src[i++]; continue; }
+        char name[128];
+        size_t len = (size_t)(close - (src + i + 1));
+        if (len >= sizeof name) { out[o++] = src[i++]; continue; }
+        memcpy(name, src + i + 1, len); name[len] = 0;
+        const char *val = w32_env_lookup(w, name);
+        if (!val) { out[o++] = src[i++]; continue; }
+        o += (size_t)snprintf(out + o, sizeof out - o, "%.*s", (int)(sizeof out - o - 1), val);
+        i += len + 2;
+    }
+    out[o] = 0;
+    RET(put_wide(w, ARG(1), (uint32_t)ARG(2), out));
+}
+
+static void k_SetEnvironmentVariableW(w32 *w) {
+    char name[256], val[2048] = "";
+    w32_wtoa(w, ARG(0), name, sizeof name);
+    if (ARG(1)) w32_wtoa(w, ARG(1), val, sizeof val);
+    RET(bool_(w32_env_set(name, ARG(1) ? val : 0)));
+}
+
+/* lstrcmp compares as strings; lstrcmpi ignores case. Wide, so compared a
+ * code unit at a time -- these are used on paths, which are ASCII in
+ * practice, and a full collation would be a different function. */
+static void k_lstrcmpW(w32 *w) {
+    const uint16_t *a = ARG(0) ? W32P(w, ARG(0)) : 0, *b = ARG(1) ? W32P(w, ARG(1)) : 0;
+    if (!a || !b) { RET(0); return; }
+    size_t i = 0;
+    for (; a[i] && a[i] == b[i]; i++) { }
+    RET((uint64_t)(int64_t)(a[i] < b[i] ? -1 : a[i] > b[i] ? 1 : 0));
+}
+static void k_lstrcmpiW(w32 *w) {
+    const uint16_t *a = ARG(0) ? W32P(w, ARG(0)) : 0, *b = ARG(1) ? W32P(w, ARG(1)) : 0;
+    if (!a || !b) { RET(0); return; }
+    size_t i = 0;
+    for (;;) {
+        uint16_t x = a[i], y = b[i];
+        if (x >= 'A' && x <= 'Z') x = (uint16_t)(x + 32);
+        if (y >= 'A' && y <= 'Z') y = (uint16_t)(y + 32);
+        if (!x || x != y) { RET((uint64_t)(int64_t)(x < y ? -1 : x > y ? 1 : 0)); return; }
+        i++;
+    }
+}
+/* lstrcpyn copies at most cch-1 characters and always terminates -- the
+ * always-terminates part is the difference from strncpy and the reason it is
+ * used. */
+static void k_lstrcpynW(w32 *w) {
+    uint32_t cch = (uint32_t)ARG(2);
+    if (!ARG(0) || !cch) { RET(0); return; }
+    uint16_t *d = W32P(w, ARG(0));
+    const uint16_t *s = ARG(1) ? W32P(w, ARG(1)) : 0;
+    if (!d) { RET(0); return; }
+    uint32_t i = 0;
+    if (s) for (; i + 1 < cch && s[i]; i++) d[i] = s[i];
+    d[i] = 0;
+    RET(ARG(0));
+}
+static void k_lstrcpynA(w32 *w) {
+    uint32_t cch = (uint32_t)ARG(2);
+    if (!ARG(0) || !cch) { RET(0); return; }
+    char *d = W32P(w, ARG(0));
+    const char *s = ARG(1) ? GSTR(ARG(1)) : 0;
+    if (!d) { RET(0); return; }
+    uint32_t i = 0;
+    if (s) for (; i + 1 < cch && s[i]; i++) d[i] = s[i];
+    d[i] = 0;
+    RET(ARG(0));
+}
+
+/* CompareFileTime: -1, 0 or 1. An installer uses it to decide whether the
+ * file it is about to write is newer than the one already there. */
+static void k_CompareFileTime(w32 *w) {
+    uint64_t a = ARG(0) ? w32_read(w, ARG(0), 8) : 0;
+    uint64_t b = ARG(1) ? w32_read(w, ARG(1), 8) : 0;
+    RET((uint64_t)(int64_t)(a < b ? -1 : a > b ? 1 : 0));
+}
+static void k_SetFileTime(w32 *w) {
+    w32_handle *h = w32_handle_get(w, ARG(0));
+    if (!h || h->type != H_FILE) { w32_set_last_error(w, ERROR_INVALID_HANDLE); RET(0); return; }
+    /* Only the write time is representable here, and only to the second.
+     * Accepting the call and setting what can be set is right: an installer
+     * that cannot stamp a file carries on, one that gets a failure may not. */
+    uint64_t ft = ARG(3) ? w32_read(w, ARG(3), 8) : 0;
+    if (ft) {
+        struct timespec ts[2];
+        ts[0].tv_sec = 0; ts[0].tv_nsec = UTIME_OMIT;
+        ts[1].tv_sec = (time_t)(ft / 10000000ull - 11644473600ull);
+        ts[1].tv_nsec = (long)((ft % 10000000ull) * 100);
+        (void)futimens(h->fd, ts);
+    }
+    RET(1);
+}
+
+/* MulDiv(a, b, c) = a*b/c with rounding, in 64 bits so it cannot overflow
+ * on the way. It is in kernel32 because 16-bit Windows had no 64-bit
+ * arithmetic; installers still use it to scale dialog units. */
+static void k_MulDiv(w32 *w) {
+    int64_t a = (int32_t)ARG(0), b = (int32_t)ARG(1), c = (int32_t)ARG(2);
+    if (!c) { RET((uint64_t)(int64_t)-1); return; }
+    int64_t n = a * b;
+    int64_t half = (c > 0) == (n >= 0) ? c / 2 : -(c / 2);
+    RET((uint64_t)(int64_t)(int32_t)((n + half) / c));
+}
+
+/* GlobalLock/GlobalUnlock. Handles from GlobalAlloc here are already
+ * pointers -- there is no moveable memory to pin -- so locking one is the
+ * identity and unlocking it succeeds. */
+static void k_GlobalLock(w32 *w)   { RET(ARG(0)); }
+static void k_GlobalUnlock(w32 *w) { (void)w; RET(1); }
+static void k_GlobalSize(w32 *w)   { RET(ARG(0) ? w32_heap_size(w, ARG(0)) : 0); }
+
+static void k_WritePrivateProfileStringW(w32 *w) {
+    /* The same work as the A form on narrowed arguments: an .ini is bytes on
+     * disk either way, and having two implementations of the rewrite would
+     * mean two chances to get the section-insert case wrong. */
+    char app[256] = "", key[256] = "", val[1024] = "", file[1024] = "";
+    if (ARG(0)) w32_wtoa(w, ARG(0), app, sizeof app);
+    if (ARG(1)) w32_wtoa(w, ARG(1), key, sizeof key);
+    if (ARG(2)) w32_wtoa(w, ARG(2), val, sizeof val);
+    if (ARG(3)) w32_wtoa(w, ARG(3), file, sizeof file);
+    RET(bool_(w32_ini_write(w, app, ARG(1) ? key : 0, ARG(2) ? val : 0, file)));
+}
+
 static void k_GetCurrentProcessorNumber(w32 *w) { RET(0); }
 
 #define F(n, a)        { #n, a, 0, k_##n, 0 }
@@ -1481,6 +1775,17 @@ const w32_api w32_kernel32[] = {
     F(CreateProcessA, 10), FN(CreateProcessW, 10, k_CreateProcessA),
     /* Where DLLs are searched for. SetDefaultDllDirectories is what an NSIS
      * installer calls before anything else. */
+    /* The wide half. NSIS is a Unicode program: every path it touches goes
+     * through these, which is why a silent install stopped on
+     * GetSystemDirectoryW with the A form sitting right beside it. */
+    F(GetSystemDirectoryW, 2), F(GetWindowsDirectoryW, 2), F(GetSystemWow64DirectoryW, 2),
+    F(GetFullPathNameW, 4), F(SearchPathW, 6),
+    F(ExpandEnvironmentStringsW, 3), F(SetEnvironmentVariableW, 2),
+    F(SetEnvironmentVariableA, 2),
+    F(lstrcmpW, 2), F(lstrcmpiW, 2), F(lstrcpynW, 3), F(lstrcpynA, 3),
+    F(CompareFileTime, 2), F(SetFileTime, 4), F(MulDiv, 3),
+    F(GlobalLock, 1), F(GlobalUnlock, 1), F(GlobalSize, 1),
+    F(WritePrivateProfileStringW, 4),
     F(SetDefaultDllDirectories, 1), F(SetDllDirectoryA, 1), F(SetDllDirectoryW, 1),
     F(AddDllDirectory, 1), F(RemoveDllDirectory, 1),
     F(lstrcatA, 2), F(lstrcatW, 2),

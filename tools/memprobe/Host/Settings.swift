@@ -1,4 +1,4 @@
-import Foundation
+import UIKit
 
 /// The handful of things worth letting someone change, and where they live.
 ///
@@ -20,17 +20,38 @@ enum Settings {
 
     /// Offered modes, widest first. All 16:9 so nothing is letterboxed twice,
     /// and all modes a Windows game from the D3D9 era will recognise.
-    static let displayModes: [(w: Int, h: Int, label: String)] = [
-        (1280, 720, "1280 × 720 — sharpest, slowest"),
-        (1024, 576, "1024 × 576"),
-        (848,  480, "848 × 480"),
-        (640,  360, "640 × 360 — fastest, softest"),
-    ]
+    /// The device's own panel, in pixels, landscape. Offered because it is
+    /// the one resolution where nothing is being scaled: the guest draws
+    /// exactly the pixels the display has. It is also the slowest, which is
+    /// the trade -- on a modern phone it is three or four times the pixels of
+    /// 720p through a software rasterizer.
+    static var nativeMode: (w: Int, h: Int) {
+        let b = UIScreen.main.nativeBounds          // always portrait-oriented
+        let w = Int(max(b.width, b.height)), h = Int(min(b.width, b.height))
+        return (w, h)
+    }
+
+    static var displayModes: [(w: Int, h: Int, label: String)] {
+        let n = nativeMode
+        return [
+            (n.w, n.h, "\(n.w) × \(n.h) — native, nothing scaled, slowest"),
+            (1920, 1080, "1920 × 1080"),
+            (1280, 720, "1280 × 720"),
+            (1024, 576, "1024 × 576"),
+            (848,  480, "848 × 480"),
+            (640,  360, "640 × 360 — fastest, softest"),
+        ]
+    }
+
+    /// 1280x720 by default rather than native: it is a mode every game from
+    /// the D3D9 era recognises, and half the pixels of 1080p. Someone who
+    /// wants native can pick it.
+    private static let defaultDisplayIndex = 2
 
     static var displayIndex: Int {
         get {
-            let i = store.object(forKey: "displayIndex") as? Int ?? 0
-            return displayModes.indices.contains(i) ? i : 0
+            let i = store.object(forKey: "displayIndex") as? Int ?? defaultDisplayIndex
+            return displayModes.indices.contains(i) ? i : defaultDisplayIndex
         }
         set { store.set(newValue, forKey: "displayIndex") }
     }
@@ -80,10 +101,9 @@ enum Settings {
         w32_set_screen_size(Int32(m.w), Int32(m.h))
     }
 
-    /// Whether the dynarec can actually be used, which on iOS is not a
-    /// question about the build: the JIT needs an executable arena that a
-    /// debugger has authorised, once per launch, and `xc_jit_available()`
-    /// reports 0 until one has been handed over. So this is the truth about
-    /// this launch and not a capability flag.
-    static var jitReady: Bool { xc_jit_available() != 0 }
+    /// Whether the dynarec can actually be used. See JIT.swift -- this used
+    /// to read xc_jit_available() directly, which reports 0 on iOS until an
+    /// arena has been handed over, so it said "disabled" on devices where the
+    /// JIT was perfectly usable and nobody had pressed the button.
+    static var jitReady: Bool { JIT.isReady }
 }

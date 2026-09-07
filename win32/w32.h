@@ -229,6 +229,18 @@ void     w32_drive_init(void);
  * user32.c and d3d9.c have to agree, or a game picks a mode the device then
  * reports differently; they used to agree by having the same constant typed
  * into both, kept in step by a comment. */
+/* user32's wsprintfA/W, implemented in msvcrt.c next to the formatter and the
+ * guest-memory variadic walk they share with sprintf. */
+void     w32_do_wsprintf(w32 *w, int wide);
+
+/* The environment, and the .ini rewrite. Both are shared between the A and W
+ * entry points and between DLLs, so they live where the implementation is
+ * rather than being written twice. */
+const char *w32_env_lookup(w32 *w, const char *name);
+int      w32_env_set(const char *name, const char *val);   /* NULL removes */
+int      w32_ini_write(w32 *w, const char *app, const char *key,
+                       const char *val, const char *file);
+
 void     w32_set_screen_size(int cx, int cy);
 void     w32_screen_size(int *cx, int *cy);
 

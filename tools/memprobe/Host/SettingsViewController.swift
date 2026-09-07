@@ -226,13 +226,9 @@ final class SettingsViewController: UIViewController {
         let on = Settings.jitReady
         jit.text = on ? "JIT enabled" : "JIT disabled"
         jit.textColor = on ? .systemGreen : .systemRed
-        jitNote.text = on
-            ? "Guest code is compiled to ARM64. This is the fast path — roughly "
-            + "a hundred times the interpreter."
-            : "Guest code is being interpreted, which is far slower. The dynarec "
-            + "needs an executable memory region that a debugger has authorised, "
-            + "once per launch: open Diagnostics and run step 4, \"JIT: attach "
-            + "StikDebug\"."
+        // The real reason, from the probe, rather than one guess for every
+        // way this can be off.
+        jitNote.text = JIT.explanation
         jitNote.textColor = on ? .secondaryLabel : .systemRed
     }
 }

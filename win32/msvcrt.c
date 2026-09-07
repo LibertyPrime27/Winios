@@ -484,6 +484,36 @@ static void do_printf(w32 *w, int fd, char *buf, size_t cap, const char *fmt, co
     if (buf) { size_t t = o.len < cap ? o.len : (cap ? cap - 1 : 0); if (cap) buf[t] = 0; }
     RET((uint64_t)(int64_t)n);
 }
+/* user32's wsprintf, implemented here because this is where the formatter and
+ * the guest-memory variadic walk already are. It is the same job as sprintf
+ * with a different name and DLL -- growing a second formatter in user32.c so
+ * that the two could disagree about %s would be the wrong kind of tidy.
+ *
+ * NSIS uses it to build every path it reports, so an installer stops on it
+ * almost immediately. Cdecl and variadic: the caller pops, so the argument
+ * count in the table does not matter.
+ */
+void w32_do_wsprintf(w32 *w, int wide) {
+    uint64_t out = ARG(0);
+    uint64_t ap = vararg_start(w, 2);
+    if (!out) { RET(0); return; }
+    /* 1024 is the documented ceiling for wsprintf's output, and a caller has
+     * sized its buffer for that -- so writing more would overrun the guest's
+     * buffer, not ours. */
+    char tmp[1024];
+    if (wide) {
+        const uint16_t *wf = ARG(1) ? W32P(w, ARG(1)) : 0;
+        do_printf(w, -1, tmp, sizeof tmp, 0, wf, ap);
+        uint16_t *d = W32P(w, out);
+        if (d) { size_t i = 0; for (; tmp[i]; i++) d[i] = (uint8_t)tmp[i]; d[i] = 0; }
+    } else {
+        do_printf(w, -1, tmp, sizeof tmp, ARG(1) ? GSTR(ARG(1)) : "", 0, ap);
+        char *d = W32P(w, out);
+        if (d) memcpy(d, tmp, strlen(tmp) + 1);
+    }
+    /* do_printf already set the return value to the length. */
+}
+
 static void m_printf(w32 *w)   { do_printf(w, 1, 0, 0, GSTR(ARG(0)), 0, vararg_start(w, 1)); }
 static void m_vprintf(w32 *w)  { do_printf(w, 1, 0, 0, GSTR(ARG(0)), 0, ARG(1)); }
 static void m_fprintf(w32 *w)  { do_printf(w, gfile_fd(w, ARG(0)), 0, 0, GSTR(ARG(1)), 0, vararg_start(w, 2)); }

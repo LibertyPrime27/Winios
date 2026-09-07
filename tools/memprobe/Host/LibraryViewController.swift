@@ -42,6 +42,11 @@ final class LibraryViewController: UITableViewController {
 
         // The display setting has to be in the emulator before anything runs.
         Settings.apply()
+        // And the JIT, if this launch can have one. People launch through
+        // StikDebug with LiveContainer, where JIT is already enabled before
+        // the app's own code runs -- the arena only has to be created and
+        // handed over, which nothing was doing.
+        JIT.ensure()
 
         jitBanner.font = .preferredFont(forTextStyle: .subheadline)
         jitBanner.numberOfLines = 0
@@ -77,10 +82,13 @@ final class LibraryViewController: UITableViewController {
     }
 
     private func refreshJITBanner() {
+        // Try again on every appearance: a launch that came up without the
+        // JIT can gain one if StikDebug attaches while the app is running.
+        JIT.ensure()
         let on = Settings.jitReady
         jitBanner.text = on
             ? "JIT enabled — guest code is compiled to ARM64"
-            : "JIT disabled — running interpreted. Tap to turn it on."
+            : "JIT disabled — running interpreted. Tap for why."
         jitBanner.textColor = on ? .systemGreen : .systemRed
         jitBannerHost.backgroundColor = (on ? UIColor.systemGreen : UIColor.systemRed)
             .withAlphaComponent(0.12)
