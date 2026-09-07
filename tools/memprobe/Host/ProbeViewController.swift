@@ -117,7 +117,17 @@ final class ProbeViewController: UIViewController {
         guard !running else { return }
         running = true
         title = "running \(label)…"
-        DispatchQueue.global(qos: .userInitiated).async {
+        // .userInteractive, not .userInitiated. Every probe here is a
+        // measurement of this chip, and a global concurrent queue at a lower
+        // QoS is eligible for the efficiency cores -- which costs an
+        // interpreter (an unpredictable indirect branch per guest
+        // instruction) far more than it costs straight-line JIT-emitted code.
+        // CI's macOS runner interprets at 73 MIPS where the M3 iPad reported
+        // 9.4, while the iPad's *dynarec* was the faster of the two; a core
+        // difference that lopsided is the shape an E-core makes. Asking for
+        // the foreground band is both the honest thing to measure on and the
+        // thing an app doing this work should have asked for anyway.
+        DispatchQueue.global(qos: .userInteractive).async {
             body()
             DispatchQueue.main.async {
                 self.running = false

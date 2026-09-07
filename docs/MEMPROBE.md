@@ -216,6 +216,19 @@ the ladder just to see the GPU result again.
   screen the rate the *emulator* managed rather than the rate the screen
   refreshed at.
 - **6 · Memory ladder** — the ladder on its own.
+
+  A note on what the numbers are measured on: every probe runs at
+  `.userInteractive` QoS, not `.userInitiated`. A global concurrent queue at a
+  lower band is eligible for the **efficiency cores**, and that costs an
+  interpreter — an unpredictable indirect branch per guest instruction — far
+  more than it costs the straight-line code the dynarec emits. The symptom is
+  lopsided: CI's macOS runner interprets the integer loop at 73 MIPS where the
+  M3 iPad reported 9.4, while the same iPad's *dynarec* was the faster of the
+  two at 4034 against 2393. A core difference cannot be 8× in one direction
+  and 1.7× in the other; a P/E split can. If a future report shows the
+  interpreter figure jumping while the dynarec barely moves, that is what
+  happened, and every "×" ratio recorded before it was measured against an
+  E-core baseline.
 - **Copy report** puts the whole screen on the clipboard. **Reset results**
   clears everything, including the JIT crash marker.
 

@@ -82,7 +82,9 @@ final class GuestViewController: UIViewController {
             return
         }
         let exe = dir.appendingPathComponent(exeName).path
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        // Foreground band: a guest drawing frames is exactly the work this
+        // app exists to do, and the efficiency cores would halve it.
+        DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             var out = [CChar](repeating: 0, count: 4096)
             var ns: UInt64 = 0
             xc_jit_enable(1)
