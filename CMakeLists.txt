@@ -75,7 +75,7 @@ endif()
 if(NOT WIN32)
     # The same sources twice: once as the command-line tool, once as a library
     # the device build links (tools/memprobe) so an iPad can run a .exe.
-    add_library(winrun_lib STATIC tools/winrun/winrun.c win32/pe.c win32/kernel32.c win32/msvcrt.c win32/com.c win32/d3d9.c)
+    add_library(winrun_lib STATIC tools/winrun/winrun.c win32/pe.c win32/kernel32.c win32/msvcrt.c win32/com.c win32/d3d9.c win32/raster.c)
     target_link_libraries(winrun_lib PUBLIC xcore)
     if(NOT APPLE)
         target_link_libraries(winrun_lib PUBLIC m)
@@ -85,7 +85,7 @@ if(NOT WIN32)
     set_property(TARGET winrun_lib PROPERTY C_STANDARD 11)
     target_compile_options(winrun_lib PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
-    add_executable(winrun tools/winrun/winrun.c win32/pe.c win32/kernel32.c win32/msvcrt.c win32/com.c win32/d3d9.c)
+    add_executable(winrun tools/winrun/winrun.c win32/pe.c win32/kernel32.c win32/msvcrt.c win32/com.c win32/d3d9.c win32/raster.c)
     target_link_libraries(winrun PRIVATE xcore m)
     target_include_directories(winrun PRIVATE win32)
     set_property(TARGET winrun PROPERTY C_STANDARD 11)

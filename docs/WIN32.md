@@ -1,6 +1,6 @@
 # The Win32 layer: Windows executables on xcore
 
-**Where:** `win32/` (`pe.c` loader, `kernel32.c`, `msvcrt.c`, `com.c`, `d3d9.c`, `w32.h`),
+**Where:** `win32/` (`pe.c` loader, `kernel32.c`, `msvcrt.c`, `com.c`, `d3d9.c`, `raster.c`, `w32.h`),
 `tools/winrun/winrun.c` (runtime and command-line driver),
 `tests/win32/` (mingw-built .exe guests with recorded output).
 
@@ -113,9 +113,36 @@ everything after it was one out, and what came back was
 `call to unimplemented IDirect3DDevice9::slot 57` — the guest asking for
 `SetRenderState` at 57 while the table had it at 56.
 
-Drawing is the part that is not here. `DrawPrimitive` and the shader entry
-points are unimplemented slots. d12mt already compiles D3D9 SM3 shaders to
-MSL and passes 27/27 on both devices; joining the two is the next step.
+### Drawing
+
+`CreateVertexBuffer` gives the guest a buffer in **guest memory** that it
+locks and fills itself, `SetStreamSource` and `SetFVF` bind it, and
+`DrawPrimitive` / `DrawPrimitiveUP` assemble triangles from it — lists, strips
+and fans. One vertex format is accepted: `D3DFVF_XYZRHW | D3DFVF_DIFFUSE`,
+a position already in screen space plus a colour. That is deliberate: it
+isolates the parts that had never run before (vertex fetch, primitive
+assembly, rasterization, writing the render target) from the parts that do not
+exist yet (the world/view/projection matrices, lighting, texture stages).
+Anything else is refused with a message rather than drawn wrong.
+
+The pixels come from `raster.c`, a **reference rasterizer** — not the renderer.
+Its job is to make a draw call checkable without a GPU: the same guest that
+draws a triangle on the iPad draws it on a Linux runner and under qemu, and
+the frame checksums have to match. Every other layer here is verified that way
+and a GPU-only draw path would have been the first with no coverage at all.
+Determinism is therefore designed in rather than hoped for: vertex positions
+become 28.4 fixed point by multiplying by 16 (exact for a float, being a power
+of two) and everything after that is integer edge functions and integer
+barycentric colour, so there is no floating-point rounding to differ between
+an x86 runner, qemu on aarch64 and an M3, and nothing a compiler can contract
+into an fma. `d3ddraw.exe` produces checksum `acde04d16c79039c` in all of
+them, and identically as PE32 and PE32+.
+
+What is still missing is the GPU. d12mt already compiles D3D9 SM3 shaders to
+MSL and passes 27/27 on both devices; pointing the draw path at it, so the
+back buffer becomes a Metal render target instead of memory the CPU writes, is
+the next step. The rasterizer stays as the reference the GPU path is checked
+against, and as the fallback where no GPU path is available.
 
 ## Both bitnesses, one implementation
 
@@ -164,12 +191,12 @@ compiled code for pages that become writable.
 
 ## Verified
 
-`tests/win32/run.sh` runs fourteen executables and compares stdout and exit code
+`tests/win32/run.sh` runs sixteen executables and compares stdout and exit code
 with recordings: the three-import `hello`, the full mingw-w64 CRT program
 (`crt.c`: TLS callbacks, `__getmainargs`, `_initterm`, malloc/free, `sqrt`,
 `printf`, `snprintf`, exit code), the n-body benchmark, the loader test
-`dlltest`, and the three Direct3D 9 programs `d3dtest`, `d3dframe` and
-`d3dloop`, each as PE32 and PE32+.
+`dlltest`, and the four Direct3D 9 programs `d3dtest`, `d3dframe`,
+`d3dloop` and `d3ddraw`, each as PE32 and PE32+.
 
 `d3dtest` calls Direct3D 9 the way a game starts up — `Direct3DCreate9`,
 `GetAdapterIdentifier`, `CreateDevice`, `Clear`, `Present`, then

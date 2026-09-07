@@ -7,9 +7,10 @@ Run 32-bit and 64-bit Windows games on iOS. Sideloaded, JIT-enabled, maximum per
 ## Status
 
 Running real Windows executables on an iPad, through a from-scratch x86 core
-and dynarec, with Direct3D shaders compiled to Metal. Not a game yet — no threads,
-and nothing draws geometry — but a Windows program now creates a Direct3D 9
-device, presents a frame, and that frame appears on the iPad.
+and dynarec, with Direct3D shaders compiled to Metal. Not a game yet — no threads, and
+the GPU is not drawing yet — but a Windows program creates a Direct3D 9 device,
+fills a vertex buffer, draws triangles from it, and the frame appears on the
+iPad.
 
 | Piece | State |
 |---|---|
@@ -47,8 +48,8 @@ link (iPad on `7397729`, iPhone on `f0fe2ce`).
 | Dynarec: the same vectors through JIT-emitted ARM64 in the blessed arena | **2388/2388 match** — 436 blocks, 89 KB | **identical to the digit**: 436 blocks, 89 KB, same callout count |
 | JIT (TXM bless protocol) | **working** | **working** |
 | GPU: D3D9 / D3D11 / D3D12 binding model on Metal | **27/27 PASS** | **27/27 PASS** |
-| **Windows executables** (PE loader, DLL loading, kernel32/msvcrt/d3d9, dynarec) | **14/14 PASS** | last full run 6/6 |
-| **Direct3D 9**: a guest creates a device and presents frames | **full screen, live, in the app** | — |
+| **Windows executables** (PE loader, DLL loading, kernel32/msvcrt/d3d9, dynarec) | **16/16 PASS** | last full run 6/6 |
+| **Direct3D 9**: a guest creates a device, draws geometry, presents frames | **full screen, live, in the app** | — |
 | x87 lowered onto NEON, `nbody32.exe` | **455 of 472** (96%) | **455 of 472** (96%) |
 | **Dynarec speed** (`xc_bench`) | integer **4034 MIPS**, sse2 **864**, x87 **675** | integer **4353 MIPS**, sse2 **891**, x87 **665** |
 | Interpreter, same loops | 9.4 / 12.2 / 11.8 MIPS | 7.7 / 11.9 / 12.5 MIPS |

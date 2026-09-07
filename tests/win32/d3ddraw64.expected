@@ -1,0 +1,8 @@
+CreateVertexBuffer: ok
+Lock: ok
+buffer: 120 bytes, fvf 0x44
+DrawPrimitive (2 triangles from a buffer): ok
+DrawPrimitiveUP (1 triangle): ok
+pixels covered by geometry: 15380
+centre of the quad: ff117874
+checksum acde04d16c79039c

@@ -30,5 +30,7 @@ check d3dframe64.exe 0
 check d3dframe32.exe 0
 check d3dloop64.exe 0 12
 check d3dloop32.exe 0 12
+check d3ddraw64.exe 0
+check d3ddraw32.exe 0
 rm -f /tmp/winrun_err.$$
 exit $fail

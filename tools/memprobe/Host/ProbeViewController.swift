@@ -327,6 +327,7 @@ final class ProbeViewController: UIViewController {
             ("nbody64.exe", [], 0),         ("nbody32.exe", [], 0),
             ("dlltest64.exe", [], 0),       ("dlltest32.exe", [], 0),
             ("d3dtest64.exe", [], 0),       ("d3dtest32.exe", [], 0),
+            ("d3ddraw64.exe", [], 0),       ("d3ddraw32.exe", [], 0),
         ]
         let cases = single.map { s in all.filter { $0.0 == s } } ?? all
 

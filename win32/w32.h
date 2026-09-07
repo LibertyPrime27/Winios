@@ -194,6 +194,14 @@ void w32_set_present(w32_present_fn fn, void *ctx);
 void w32_d3d9_device_lost(int on);
 void w32_d3d9_reset(void);
 
+/* raster.c: the reference rasterizer d3d9 draws through when no GPU backend
+ * has taken over. Deterministic by construction (see the file), so a drawn
+ * frame has one checksum everywhere. */
+void w32_raster_triangle(void *target, int width, int height, int pitch,
+                         const float *xy0, uint32_t c0,
+                         const float *xy1, uint32_t c1,
+                         const float *xy2, uint32_t c2);
+
 /* msvcrt.c: drop every cached guest address, so a second process can start
  * in the same host process (see winrun_main). */
 void w32_reset_statics(void);

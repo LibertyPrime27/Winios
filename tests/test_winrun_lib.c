@@ -49,6 +49,7 @@ int main(int argc, char **argv) {
         { "d3dtest64.exe", 0 },  { "d3dtest32.exe", 0 },
         { "d3dframe64.exe", 0 }, { "d3dframe32.exe", 0 },
         { "d3dloop64.exe", 0 },  { "d3dloop32.exe", 0 },
+        { "d3ddraw64.exe", 0 },  { "d3ddraw32.exe", 0 },
     };
     const int n = (int)(sizeof G / sizeof G[0]);
     int bad = 0;

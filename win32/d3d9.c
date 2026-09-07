@@ -33,6 +33,10 @@ enum { S_OK_ = 0, E_FAIL_ = (int)0x80004005, D3DERR_INVALIDCALL = (int)0x8876086
        D3DERR_DEVICELOST = (int)0x88760868 };
 enum { D3DCLEAR_TARGET = 1, D3DCLEAR_ZBUFFER = 2, D3DCLEAR_STENCIL = 4 };
 enum { FMT_X8R8G8B8 = 22, FMT_A8R8G8B8 = 21 };
+/* the flexible vertex format bits we understand, and the primitive types */
+enum { FVF_XYZ = 0x002, FVF_XYZRHW = 0x004, FVF_DIFFUSE = 0x040, FVF_TEX1 = 0x100,
+       FVF_POSITION_MASK = 0x400E };
+enum { PT_POINTLIST = 1, PT_LINELIST, PT_LINESTRIP, PT_TRIANGLELIST, PT_TRIANGLESTRIP, PT_TRIANGLEFAN };
 
 /* where a presented frame goes */
 static w32_present_fn g_present;
@@ -49,12 +53,17 @@ void w32_d3d9_device_lost(int on) { g_lost = on ? 1 : 0; }
 
 /* object fields (64-bit slots after the header) */
 enum { D3D_NDEV = 0 };                                        /* IDirect3D9 */
-enum { DEV_PARENT = 0, DEV_FB, DEV_W, DEV_H, DEV_PITCH, DEV_BBSURF, DEV_FRAMES, DEV_HWND };
+enum { DEV_PARENT = 0, DEV_FB, DEV_W, DEV_H, DEV_PITCH, DEV_BBSURF, DEV_FRAMES, DEV_HWND,
+       DEV_FVF, DEV_STREAM, DEV_STREAM_OFF, DEV_STREAM_STRIDE, DEV_NFIELDS };
 enum { SURF_DEV = 0, SURF_BITS, SURF_W, SURF_H, SURF_PITCH };
-enum { TAG_D3D9 = 1, TAG_DEVICE, TAG_SURFACE };
+enum { VB_DEV = 0, VB_BITS, VB_BYTES, VB_FVF, VB_NFIELDS };
+enum { TAG_D3D9 = 1, TAG_DEVICE, TAG_SURFACE, TAG_VERTEXBUFFER };
 
-static w32_com_class cls_d3d9, cls_device, cls_surface;
-void w32_d3d9_reset(void) { cls_d3d9.vtable = cls_device.vtable = cls_surface.vtable = 0; g_lost = 0; }
+static w32_com_class cls_d3d9, cls_device, cls_surface, cls_vbuf;
+void w32_d3d9_reset(void) {
+    cls_d3d9.vtable = cls_device.vtable = cls_surface.vtable = cls_vbuf.vtable = 0;
+    g_lost = 0;
+}
 
 /* The display we claim to be. A game picks a back-buffer size from this when
  * it asks for a windowed device without saying how big. */
@@ -113,6 +122,46 @@ static const w32_api surface_methods[17] = {
     [14] = { "UnlockRect",     1, 0, s_UnlockRect,           0 },
 };
 
+/* ------------------------------------------------- IDirect3DVertexBuffer9 */
+
+/* The vertices live in guest memory: the guest locks the buffer and writes
+ * them itself, and the rasterizer reads the same bytes. Nothing is copied,
+ * and a Metal backend later uploads from exactly this pointer. */
+static void vb_Lock(w32 *w) {
+    uint64_t self = ARG(0), offset = ARG(1), size = ARG(2), out = ARG(3);
+    uint64_t bytes = w32_com_get(w, self, VB_BYTES), bits = w32_com_get(w, self, VB_BITS);
+    if (!out || offset > bytes || (size && offset + size > bytes)) { RET(D3DERR_INVALIDCALL); return; }
+    w32_write(w, out, w32_ptrsize(w), bits + offset);
+    RET(S_OK_);
+}
+static void vb_Unlock(w32 *w) { RET(S_OK_); }
+static void vb_GetType(w32 *w) { RET(1); }                    /* D3DRTYPE_VERTEXBUFFER is 1 in D3DRESOURCETYPE */
+static void vb_GetDevice(w32 *w) {
+    uint64_t out = ARG(1);
+    if (out) w32_write(w, out, w32_ptrsize(w), w32_com_get(w, ARG(0), VB_DEV));
+    RET(S_OK_);
+}
+/* D3DVERTEXBUFFER_DESC: Format, Type, Usage, Pool, Size, FVF */
+static void vb_GetDesc(w32 *w) {
+    uint64_t self = ARG(0), d = ARG(1);
+    if (!d) { RET(D3DERR_INVALIDCALL); return; }
+    memset(W32P(w, d), 0, 24);
+    w32_write(w, d + 4, 4, 1);                                /* Type */
+    w32_write(w, d + 16, 4, w32_com_get(w, self, VB_BYTES));
+    w32_write(w, d + 20, 4, w32_com_get(w, self, VB_FVF));
+    RET(S_OK_);
+}
+static const w32_api vbuf_methods[14] = {
+    [0]  = { "QueryInterface", 3, 0, w32_com_QueryInterface, 0 },
+    [1]  = { "AddRef",         1, 0, w32_com_AddRef,         0 },
+    [2]  = { "Release",        1, 0, w32_com_Release,        0 },
+    [3]  = { "GetDevice",      2, 0, vb_GetDevice,           0 },
+    [10] = { "GetType",        1, 0, vb_GetType,             0 },
+    [11] = { "Lock",           5, 0, vb_Lock,                0 },
+    [12] = { "Unlock",         1, 0, vb_Unlock,              0 },
+    [13] = { "GetDesc",        2, 0, vb_GetDesc,             0 },
+};
+
 /* ------------------------------------------------------- IDirect3DDevice9 */
 
 static void d_GetDirect3D(w32 *w) {
@@ -159,6 +208,124 @@ static void d_Present(w32 *w) {
     int pitch = (int)w32_com_get(w, self, DEV_PITCH);
     w32_com_set(w, self, DEV_FRAMES, w32_com_get(w, self, DEV_FRAMES) + 1);
     if (g_present) g_present(g_present_ctx, W32P(w, fb), width, h, pitch);
+    RET(S_OK_);
+}
+
+/* --- drawing ---
+ *
+ * One vertex format for now: D3DFVF_XYZRHW | D3DFVF_DIFFUSE, which is a
+ * position already in screen space and a colour. That is deliberately the
+ * format with no transform pipeline behind it -- it isolates the parts that
+ * have never run before (vertex fetch, primitive assembly, rasterization,
+ * the render target) from the parts that have not been written yet (the
+ * world/view/projection matrices, lighting, texture stages). Anything else
+ * is refused rather than drawn wrong.
+ */
+static int vertex_stride_for(uint32_t fvf) {
+    /* the position bits are their own field (D3DFVF_POSITION_MASK); masking
+     * with 0xFF instead would have swallowed D3DFVF_DIFFUSE and never matched */
+    if ((fvf & FVF_POSITION_MASK) == FVF_XYZRHW && (fvf & FVF_DIFFUSE)) return 20;
+    return 0;
+}
+
+/* Read vertex i out of guest memory. Returns 0 if it is not somewhere we can
+ * read, which a guest can arrange by handing us a bad pointer. */
+static int fetch_vertex(w32 *w, uint64_t base, int stride, int i, float *xy, uint32_t *color) {
+    uint64_t at = base + (uint64_t)stride * (unsigned)i;
+    const void *p = W32P(w, at);
+    if (!p) return 0;
+    uint32_t bits[5];
+    memcpy(bits, p, 20);
+    memcpy(&xy[0], &bits[0], 4);
+    memcpy(&xy[1], &bits[1], 4);
+    *color = bits[4];
+    return 1;
+}
+
+static void draw_from(w32 *w, uint64_t self, uint64_t base, int stride, uint32_t fvf,
+                      int prim_type, int prim_count) {
+    if (!vertex_stride_for(fvf)) {
+        static int warned;
+        if (!warned) { warned = 1; fprintf(stderr, "winrun: d3d9 draw with FVF %#x: only XYZRHW|DIFFUSE is drawn\n", (unsigned)fvf); }
+        return;
+    }
+    if (stride <= 0) stride = vertex_stride_for(fvf);
+    void *target = W32P(w, w32_com_get(w, self, DEV_FB));
+    int width = (int)w32_com_get(w, self, DEV_W), h = (int)w32_com_get(w, self, DEV_H);
+    int pitch = (int)w32_com_get(w, self, DEV_PITCH);
+    if (!target) return;
+
+    for (int i = 0; i < prim_count; i++) {
+        int a, b, c;
+        switch (prim_type) {
+        case PT_TRIANGLELIST:  a = 3 * i;     b = 3 * i + 1; c = 3 * i + 2; break;
+        /* a strip alternates winding; the rasterizer accepts either, so the
+         * vertices go in order and the fill is the same shape either way */
+        case PT_TRIANGLESTRIP: a = i;         b = i + 1;     c = i + 2;     break;
+        case PT_TRIANGLEFAN:   a = 0;         b = i + 1;     c = i + 2;     break;
+        default: {
+            static int warned;
+            if (!warned) { warned = 1; fprintf(stderr, "winrun: d3d9 primitive type %d is not drawn yet\n", prim_type); }
+            return;
+        }
+        }
+        float p0[2], p1[2], p2[2]; uint32_t c0, c1, c2;
+        if (!fetch_vertex(w, base, stride, a, p0, &c0)) return;
+        if (!fetch_vertex(w, base, stride, b, p1, &c1)) return;
+        if (!fetch_vertex(w, base, stride, c, p2, &c2)) return;
+        w32_raster_triangle(target, width, h, pitch, p0, c0, p1, c1, p2, c2);
+    }
+}
+
+static void d_SetFVF(w32 *w) { w32_com_set(w, ARG(0), DEV_FVF, ARG(1)); RET(S_OK_); }
+static void d_GetFVF(w32 *w) {
+    uint64_t out = ARG(1);
+    if (out) w32_write(w, out, 4, w32_com_get(w, ARG(0), DEV_FVF));
+    RET(S_OK_);
+}
+/* SetStreamSource(StreamNumber, pStreamData, OffsetInBytes, Stride) */
+static void d_SetStreamSource(w32 *w) {
+    uint64_t self = ARG(0), vb = ARG(2);
+    if (ARG(1) != 0) { RET(D3DERR_INVALIDCALL); return; }      /* one stream is enough for now */
+    w32_com_set(w, self, DEV_STREAM, vb ? w32_com_get(w, vb, VB_BITS) : 0);
+    w32_com_set(w, self, DEV_STREAM_OFF, ARG(3));
+    w32_com_set(w, self, DEV_STREAM_STRIDE, ARG(4));
+    RET(S_OK_);
+}
+/* DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount) */
+static void d_DrawPrimitive(w32 *w) {
+    uint64_t self = ARG(0);
+    uint64_t base = w32_com_get(w, self, DEV_STREAM);
+    int stride = (int)w32_com_get(w, self, DEV_STREAM_STRIDE);
+    if (!base) { RET(D3DERR_INVALIDCALL); return; }
+    base += w32_com_get(w, self, DEV_STREAM_OFF) + (uint64_t)stride * ARG(2);
+    draw_from(w, self, base, stride, (uint32_t)w32_com_get(w, self, DEV_FVF), (int)ARG(1), (int)ARG(3));
+    RET(S_OK_);
+}
+/* DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, Stride) */
+static void d_DrawPrimitiveUP(w32 *w) {
+    uint64_t self = ARG(0);
+    if (!ARG(3)) { RET(D3DERR_INVALIDCALL); return; }
+    draw_from(w, self, ARG(3), (int)ARG(4), (uint32_t)w32_com_get(w, self, DEV_FVF),
+              (int)ARG(1), (int)ARG(2));
+    RET(S_OK_);
+}
+
+/* CreateVertexBuffer(Length, Usage, FVF, Pool, ppVertexBuffer, pSharedHandle) */
+static void d_CreateVertexBuffer(w32 *w) {
+    uint64_t self = ARG(0), length = ARG(1), fvf = ARG(3), out = ARG(5);
+    if (!out || !length) { RET(D3DERR_INVALIDCALL); return; }
+    uint64_t bits = w32_alloc(w, length, 0);
+    if (!bits) { RET(E_FAIL_); return; }
+    uint64_t vb = w32_com_new(w, &cls_vbuf, VB_NFIELDS);
+    if (!vb) { RET(E_FAIL_); return; }
+    w32_com_set(w, vb, VB_DEV, self);
+    w32_com_set(w, vb, VB_BITS, bits);
+    w32_com_set(w, vb, VB_BYTES, length);
+    w32_com_set(w, vb, VB_FVF, fvf);
+    w32_write(w, out, w32_ptrsize(w), vb);
+    if (w->verbose) fprintf(stderr, "winrun: d3d9 vertex buffer %llu bytes at %#llx\n",
+                            (unsigned long long)length, (unsigned long long)bits);
     RET(S_OK_);
 }
 
@@ -224,7 +391,12 @@ static const w32_api device_methods[119] = {
     [67]  = { "SetTextureStageState",   4, 0, d_ok,                   0 },
     [69]  = { "SetSamplerState",        4, 0, d_ok,                   0 },
     [77]  = { "SetSoftwareVertexProcessing", 2, 0, d_ok,              0 },
-    [89]  = { "SetFVF",                 2, 0, d_ok,                   0 },
+    [26]  = { "CreateVertexBuffer",     7, 0, d_CreateVertexBuffer,   0 },
+    [81]  = { "DrawPrimitive",          4, 0, d_DrawPrimitive,        0 },
+    [83]  = { "DrawPrimitiveUP",        5, 0, d_DrawPrimitiveUP,      0 },
+    [89]  = { "SetFVF",                 2, 0, d_SetFVF,               0 },
+    [90]  = { "GetFVF",                 2, 0, d_GetFVF,               0 },
+    [100] = { "SetStreamSource",        5, 0, d_SetStreamSource,      0 },
 };
 
 /* ------------------------------------------------------------ IDirect3D9 */
@@ -291,7 +463,7 @@ static void i_CreateDevice(w32 *w) {
     uint64_t fb = w32_alloc(w, (uint64_t)pitch * bh, 0);
     if (!fb) { fprintf(stderr, "winrun: d3d9: no memory for a %ux%u back buffer\n", bw, bh); RET(E_FAIL_); return; }
 
-    uint64_t dev = w32_com_new(w, &cls_device, 8);
+    uint64_t dev = w32_com_new(w, &cls_device, DEV_NFIELDS);
     if (!dev) { RET(E_FAIL_); return; }
     w32_com_set(w, dev, DEV_PARENT, self);
     w32_com_set(w, dev, DEV_FB, fb);
@@ -328,6 +500,7 @@ static const w32_api d3d9_methods[17] = {
 static w32_com_class cls_d3d9    = { "IDirect3D9",        d3d9_methods,    17,  TAG_D3D9,    0, {0,0,0} };
 static w32_com_class cls_device  = { "IDirect3DDevice9",  device_methods,  119, TAG_DEVICE,  0, {0,0,0} };
 static w32_com_class cls_surface = { "IDirect3DSurface9", surface_methods, 17,  TAG_SURFACE, 0, {0,0,0} };
+static w32_com_class cls_vbuf    = { "IDirect3DVertexBuffer9", vbuf_methods, 14, TAG_VERTEXBUFFER, 0, {0,0,0} };
 
 /* --------------------------------------------------------- the export */
 
