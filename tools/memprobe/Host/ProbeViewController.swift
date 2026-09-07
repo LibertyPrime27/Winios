@@ -361,6 +361,9 @@ final class ProbeViewController: UIViewController {
             ("dlltest64.exe", [], 0),       ("dlltest32.exe", [], 0),
             ("d3dtest64.exe", [], 0),       ("d3dtest32.exe", [], 0),
             ("d3ddraw64.exe", [], 0),       ("d3ddraw32.exe", [], 0),
+            ("d3dframe64.exe", [], 0),      ("d3dframe32.exe", [], 0),
+            // the loop guests take a frame count, or they never return
+            ("d3dloop64.exe", ["12"], 0),   ("d3dloop32.exe", ["12"], 0),
         ]
         let cases = single.map { s in all.filter { $0.0 == s } } ?? all
 
@@ -638,7 +641,7 @@ final class ProbeViewController: UIViewController {
             _ = withUnsafeBytes(of: &code) { raw in
                 markerPath.withCString { jit_arena_run(arena, raw.baseAddress, 4, &r, $0) }
             }
-            arenaReport = describe(r) + "\n    (debugger was attached — blessed \(arenaKB >> 10) KB and executed directly)"
+            arenaReport = describe(r) + "\n    (debugger was attached — blessed \(arenaKB >= 1024 ? "\(arenaKB >> 10) MB" : "\(arenaKB) KB") and executed directly)"
                         + "\n    " + arenaStatus()
         } else if arenaReport.isEmpty {
             // Reusing an arena blessed earlier this launch: jit_arena_shared

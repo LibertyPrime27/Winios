@@ -34,6 +34,8 @@
 
 enum { ARENA_SZ = 1u << 20, CODE_AT = 0x1000, DATA_AT = 0x2000, STACK_AT = 0x8000 };
 
+static uint64_t now_ns_fwd(void);
+
 /*  add rax, rbx ; xor rdx, rax ; imul rax, rbx ; sub rcx, 1 ; jne ; hlt  */
 static const uint8_t BENCH_INT[] = {
     0x48,0x01,0xD8, 0x48,0x31,0xC2, 0x48,0x0F,0xAF,0xC3, 0x48,0x83,0xE9,0x01, 0x75,0xF0, 0xF4 };
@@ -59,11 +61,43 @@ static const bench_case CASES[] = {
 };
 #define NCASES ((int)(sizeof CASES / sizeof CASES[0]))
 
+/* A calibration constant: the same shape of work, in plain C, not emulated.
+ *
+ * Without it the guest figures cannot be compared across machines, because a
+ * MIPS number folds together how fast the host is and how good the emulator
+ * is. With it they separate. It earned its place immediately: the macOS CI
+ * runner interprets at 73 MIPS, an x86 cloud container at 48, and both iOS
+ * devices at 9 -- while the same devices run *dynarec* output at 4000 against
+ * the runner's 2400. An M3 that is fine at executing JIT code and five times
+ * slower than a shared cloud VM at executing C is not a story about core
+ * speed, and this line is what will say whether the C around the interpreter
+ * is slow on device or whether the interpreter itself is.
+ *
+ * `volatile` on the sink so the loop cannot be optimised away, and nothing
+ * else in it that a compiler can hoist. */
+static uint64_t bench_native(void) {
+    volatile uint64_t sink = 0;
+    uint64_t a = 3, b = 5, d = 0;
+    const uint64_t iters = 20000000;
+    uint64_t t0 = now_ns_fwd();
+    for (uint64_t i = 0; i < iters; i++) {
+        a = a + b;
+        d = d ^ a;
+        a = a * b;
+    }
+    uint64_t t1 = now_ns_fwd();
+    sink = a ^ d;
+    (void)sink;
+    uint64_t ns = t1 - t0;
+    return ns ? iters * 3ull * 1000ull / ns : 0;     /* millions of C operations per second */
+}
+
 static uint64_t now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
+static uint64_t now_ns_fwd(void) { return now_ns(); }
 
 /* One case, one engine. Returns nanoseconds, or 0 if the guest did not stop
  * at its HLT (which would make the timing meaningless). */
@@ -127,6 +161,10 @@ int xc_bench(char *report, size_t report_len, uint64_t iters) {
     off += (size_t)snprintf(report + off, report_len - off,
         "%llu iterations per case%s\n", (unsigned long long)iters,
         have_jit ? "" : "   (no dynarec on this host: interpreter only)");
+    off += (size_t)snprintf(report + off, report_len - off,
+        "  native C reference (same work, not emulated): %llu M ops/s\n"
+        "      -- compare this across machines before comparing anything below it\n",
+        (unsigned long long)bench_native());
 
     for (int i = 0; i < NCASES && off < report_len; i++) {
         const bench_case *b = &CASES[i];

@@ -249,17 +249,26 @@ to see the GPU result again.
 - **6 · Memory ladder** — the ladder on its own.
 
   A note on what the numbers are measured on: every probe runs at
-  `.userInteractive` QoS, not `.userInitiated`. A global concurrent queue at a
-  lower band is eligible for the **efficiency cores**, and that costs an
-  interpreter — an unpredictable indirect branch per guest instruction — far
-  more than it costs the straight-line code the dynarec emits. The symptom is
-  lopsided: CI's macOS runner interprets the integer loop at 73 MIPS where the
-  M3 iPad reported 9.4, while the same iPad's *dynarec* was the faster of the
-  two at 4034 against 2393. A core difference cannot be 8× in one direction
-  and 1.7× in the other; a P/E split can. If a future report shows the
-  interpreter figure jumping while the dynarec barely moves, that is what
-  happened, and every "×" ratio recorded before it was measured against an
-  E-core baseline.
+  `.userInteractive` QoS, not `.userInitiated`, because a global concurrent
+  queue at a lower band is eligible for the efficiency cores. That is the right
+  thing for an app whose job is measuring this chip — but it did **not** explain
+  the thing it was meant to.
+
+  **The open question.** CI's macOS runner interprets the integer loop at 73
+  MIPS; an x86 cloud container does 48; both iOS devices do 9. Meanwhile the
+  same devices run *dynarec* output at ~4100 against the runner's 2393. An M3
+  that is faster than a desktop runner at executing JIT code and five times
+  slower than a shared cloud VM at executing C is not a story about core speed.
+  Raising the QoS changed nothing (9.4 → 9.6 on the iPad), so scheduling is not
+  it either.
+
+  Until that is explained, **the "×" ratios in section 2 are not comparable
+  across machines** — the absolute dynarec MIPS are. The `native C reference`
+  line now printed above them is the instrument for settling it: it times the
+  same arithmetic in plain C, not emulated, on whatever machine is running. If
+  the device's native figure is also ~5× below the runner's, everything the app
+  executes is slow there and the interpreter is fine; if it is not, the problem
+  is specific to the interpreter's code and worth hunting.
 - **Copy report** puts the whole screen on the clipboard. **Reset results**
   clears everything, including the JIT crash marker.
 

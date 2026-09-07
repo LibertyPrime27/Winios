@@ -39,22 +39,19 @@ The emulator core is kept platform-independent so most of it builds and tests on
 
 ## Measured on hardware (Sept 2026)
 
-Both devices, after the change that carries guest registers across a chained
-link (iPad on `7397729`, iPhone on `f0fe2ce`).
+Both devices on build `d8af0a5`.
 
 | | iPad Air 11" (M3), iPadOS 26.3.1 | iPhone Air (A19 Pro), iOS 27.0 |
 |---|---|---|
 | CPU core vs x86 silicon (integer, SSE2, x87; 64- and 32-bit mode replayed on ARM64) | **2388/2388 match** | **2388/2388 match** |
-| Dynarec: the same vectors through JIT-emitted ARM64 in the blessed arena | **2388/2388 match** — 436 blocks, 89 KB | **identical to the digit**: 436 blocks, 89 KB, same callout count |
-| JIT (TXM bless protocol) | **working** | **working** |
+| Dynarec: the same vectors through JIT-emitted ARM64 in the blessed arena | **2388/2388** — 436 blocks, 87 KB | **identical to the digit**: 436 blocks, 87 KB, same callout count |
+| JIT (TXM bless protocol) | **working**, 4 MB arena blessed | **working**, 1 MB so far |
 | GPU: D3D9 / D3D11 / D3D12 binding model on Metal | **27/27 PASS** | **27/27 PASS** |
-| **Windows executables** (PE loader, DLL loading, kernel32/msvcrt/d3d9, dynarec) | **16/16 PASS** | last full run 6/6 |
-| **Direct3D 9**: a guest creates a device, draws geometry, presents frames | **full screen, live, in the app** | — |
+| **Windows executables** (PE loader, DLL loading, kernel32/msvcrt/d3d9, dynarec) | **12/12 PASS** | **12/12 PASS** |
+| **Direct3D 9**: device, vertex buffer, DrawPrimitive, Present | **both frames match the recorded checksums** | **both match** |
 | x87 lowered onto NEON, `nbody32.exe` | **455 of 472** (96%) | **455 of 472** (96%) |
-| **Dynarec speed** (`xc_bench`) | integer **4034 MIPS**, sse2 **864**, x87 **675** | integer **4353 MIPS**, sse2 **891**, x87 **665** |
-| Interpreter, same loops | 9.4 / 12.2 / 11.8 MIPS | 7.7 / 11.9 / 12.5 MIPS |
-| Dynarec ÷ interpreter | **429× / 71× / 57×** | **565× / 75× / 53×** |
-| Usable memory, app process | **≈8163 MB** (ladder held 7872 MB) | **≈6117 MB** (ladder held 5824 MB) |
+| **Dynarec speed** (`xc_bench`) | integer **4060 MIPS**, sse2 **868**, x87 **675** | integer **4162 MIPS**, sse2 **919**, x87 **682** |
+| Usable memory, app process | **≈8161 MB** | **≈6117 MB** |
 | Physical RAM | 7.5 GB | 11.5 GB |
 
 The headline: **real Windows executables run on both devices**, one of them
@@ -63,21 +60,29 @@ dynarec retires around four billion guest instructions per second doing it.
 
 Three more things that table says.
 
-**Carrying registers across a chained link was worth far more on real silicon
-than under emulation.** qemu measured +62% on the integer loop; the iPad went
-1659 → 4034 MIPS (+143%) and the iPhone 1924 → 4353 (+126%). A store-and-reload
-per loop iteration costs a deeply out-of-order Apple core much more than it
-costs qemu's own interpreter.
-
 **The dynarec compiles bit-for-bit identically on A-series and M-series** —
-same block count, code size and callout count on an M3 under iPadOS 26 and an
-A19 Pro under iOS 27. What it emits depends on the guest code and nothing else,
-which is what makes one set of golden vectors meaningful across the matrix.
+same block count, same code size, same callout count, on an M3 under iPadOS 26
+and an A19 Pro under iOS 27. What it emits depends on the guest code and
+nothing else, which is what makes one set of golden vectors meaningful across
+the whole device matrix.
+
+**A drawn frame is identical everywhere.** `d3ddraw.exe` fills a vertex buffer,
+calls `DrawPrimitive`, and its frame checksums `acde04d16c79039c` on x86 with
+the JIT, on x86 without it, under qemu-aarch64, on the M3 and on the A19 Pro —
+and as both PE32 and PE32+. The rasterizer is integer by construction for
+exactly this reason.
 
 **The memory ceiling is OS policy, not RAM.** The phone has 4 GB more physical
 memory than the iPad and a ~2 GB lower per-app limit, so the phone is what the
-guest heap has to be sized against — and, on the integer loop, it is also the
-faster machine.
+guest heap has to be sized against.
+
+One number in that table is *not* comparable between the two columns or against
+CI: the interpreter's MIPS, and therefore the dynarec-to-interpreter ratios.
+Both devices interpret at ~9 MIPS where a macOS CI runner does 73 and a cloud
+x86 container does 48, while the same devices out-run the CI runner on dynarec
+output. That is unexplained — raising the thread QoS did not change it — and
+`xc_bench` now prints a plain-C reference figure alongside the guest ones so the
+next report can separate "this machine is slow" from "this emulator is slow".
 
 ## Inspiration and prior art
 
