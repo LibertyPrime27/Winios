@@ -3015,8 +3015,229 @@ static void u_MessageBoxW(w32 *w) {
     fprintf(stderr, "[MessageBox] %s: %s\n", t, b);
     RET(1);
 }
-static void u_CharUpperA(w32 *w) { uint64_t p = ARG(0); if (p < 0x10000) { int c = (int)p; RET(c >= 'a' && c <= 'z' ? c - 32 : c); return; } RET(p); }
-static void u_CharNextA(w32 *w) { uint64_t p = ARG(0); RET(p && *w32_str(w, p) ? p + 1 : p); }
+/* ---- walking a string, one character at a time ---------------------------
+ *
+ * These look like helpers nobody would bother importing, and they are what a
+ * Unicode installer stops on. NSIS built for Unicode -- which is every NSIS
+ * installer made this decade -- walks every path it handles with CharNextW,
+ * so an installer gets as far as its first path and no further. There was a
+ * CharNextA here and no CharNextW, which is why one function was the whole
+ * distance between "nothing was installed" and a working install.
+ *
+ * The wide ones are not the narrow ones with the step doubled. A UTF-16
+ * character can be a surrogate pair, and CharNextW is defined to step over
+ * the pair rather than into the middle of it. Getting that wrong does not
+ * crash: it silently corrupts a path that happens to contain a character
+ * outside the BMP, which is a far worse failure than the one being fixed.
+ *
+ * Case mapping is ASCII only. Anything above 0x7F is left alone, which is
+ * wrong for accented Latin and for Greek and Cyrillic -- doing it properly
+ * needs Unicode case tables, and quietly getting é wrong is better than
+ * pretending a locale exists. Paths compare case-insensitively on the ASCII
+ * range, which is what the drive does.
+ */
+static int up_ascii(int c)   { return c >= 'a' && c <= 'z' ? c - 32 : c; }
+static int down_ascii(int c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
+
+static int is_high_surrogate(unsigned c) { return c >= 0xD800 && c <= 0xDBFF; }
+static int is_low_surrogate(unsigned c)  { return c >= 0xDC00 && c <= 0xDFFF; }
+
+/* CharNextA: the next byte, unless we are already at the terminator -- in
+ * which case the terminator is returned, so a loop that forgot to check
+ * stops instead of running off the end. */
+static void u_CharNextA(w32 *w) {
+    uint64_t p = ARG(0);
+    if (!p) { RET(0); return; }
+    RET(w32_read(w, p, 1) ? p + 1 : p);
+}
+static void u_CharNextExA(w32 *w) {
+    /* (codepage, string, flags) -- one code page here, so the first argument
+     * makes no difference. */
+    uint64_t p = ARG(1);
+    if (!p) { RET(0); return; }
+    RET(w32_read(w, p, 1) ? p + 1 : p);
+}
+static void u_CharNextW(w32 *w) {
+    uint64_t p = ARG(0);
+    if (!p) { RET(0); return; }
+    unsigned c = (unsigned)w32_read(w, p, 2);
+    if (!c) { RET(p); return; }
+    if (is_high_surrogate(c) && is_low_surrogate((unsigned)w32_read(w, p + 2, 2))) { RET(p + 4); return; }
+    RET(p + 2);
+}
+/* CharPrev takes the start of the string as well, so it can refuse to go
+ * back past it -- which is the only thing making it safe to call in a loop. */
+static void u_CharPrevA(w32 *w) {
+    uint64_t start = ARG(0), p = ARG(1);
+    if (!p || !start || p <= start) { RET(start ? start : p); return; }
+    RET(p - 1);
+}
+static void u_CharPrevExA(w32 *w) {
+    uint64_t start = ARG(1), p = ARG(2);
+    if (!p || !start || p <= start) { RET(start ? start : p); return; }
+    RET(p - 1);
+}
+static void u_CharPrevW(w32 *w) {
+    uint64_t start = ARG(0), p = ARG(1);
+    if (!p || !start || p <= start) { RET(start ? start : p); return; }
+    uint64_t q = p - 2;
+    /* Back over a whole surrogate pair, not into the middle of one. */
+    if (q >= start + 2 && is_low_surrogate((unsigned)w32_read(w, q, 2))
+                       && is_high_surrogate((unsigned)w32_read(w, q - 2, 2))) q -= 2;
+    RET(q < start ? start : q);
+}
+
+/* CharUpper and CharLower take either a pointer or a single character packed
+ * into the low word -- the same trick MAKEINTRESOURCE uses, and a caller
+ * genuinely uses both forms. A pointer is uppercased in place and returned;
+ * a character is returned uppercased. */
+static void char_case(w32 *w, int wide, int up) {
+    uint64_t p = ARG(0);
+    if (p < 0x10000) {
+        int c = (int)p;
+        RET((uint64_t)(uint32_t)(up ? up_ascii(c) : down_ascii(c)));
+        return;
+    }
+    int step = wide ? 2 : 1;
+    for (uint64_t at = p;; at += (unsigned)step) {
+        uint64_t c = w32_read(w, at, step);
+        if (!c) break;
+        if (c < 0x80) w32_write(w, at, step, (uint64_t)(uint32_t)(up ? up_ascii((int)c) : down_ascii((int)c)));
+    }
+    RET(p);
+}
+static void u_CharUpperA(w32 *w) { char_case(w, 0, 1); }
+static void u_CharUpperW(w32 *w) { char_case(w, 1, 1); }
+static void u_CharLowerA(w32 *w) { char_case(w, 0, 0); }
+static void u_CharLowerW(w32 *w) { char_case(w, 1, 0); }
+
+/* The Buff forms take a count instead of relying on a terminator, and the
+ * count is in *characters* -- so the wide one steps two bytes per unit. A
+ * caller that passes a byte count to the wide form would corrupt memory past
+ * its buffer, which is its bug, not ours; we honour the documented meaning. */
+static void char_case_buff(w32 *w, int wide, int up) {
+    uint64_t p = ARG(0);
+    uint64_t n = ARG(1);
+    if (!p) { RET(0); return; }
+    if (n > (1u << 24)) n = 1u << 24;              /* a count this large is a bug, not a string */
+    int step = wide ? 2 : 1;
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t at = p + i * (unsigned)step;
+        uint64_t c = w32_read(w, at, step);
+        if (c && c < 0x80) w32_write(w, at, step, (uint64_t)(uint32_t)(up ? up_ascii((int)c) : down_ascii((int)c)));
+    }
+    RET(n);
+}
+static void u_CharUpperBuffA(w32 *w) { char_case_buff(w, 0, 1); }
+static void u_CharUpperBuffW(w32 *w) { char_case_buff(w, 1, 1); }
+static void u_CharLowerBuffA(w32 *w) { char_case_buff(w, 0, 0); }
+static void u_CharLowerBuffW(w32 *w) { char_case_buff(w, 1, 0); }
+
+/* The Is* family takes a character, never a pointer. */
+static int alpha_ascii(unsigned c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'); }
+static void u_IsCharAlphaA(w32 *w)        { RET(alpha_ascii((unsigned)ARG(0) & 0xFF) ? 1 : 0); }
+static void u_IsCharAlphaW(w32 *w)        { RET(alpha_ascii((unsigned)ARG(0) & 0xFFFF) ? 1 : 0); }
+static void u_IsCharAlphaNumericA(w32 *w) { unsigned c = (unsigned)ARG(0) & 0xFF;   RET(alpha_ascii(c) || (c >= '0' && c <= '9') ? 1 : 0); }
+static void u_IsCharAlphaNumericW(w32 *w) { unsigned c = (unsigned)ARG(0) & 0xFFFF; RET(alpha_ascii(c) || (c >= '0' && c <= '9') ? 1 : 0); }
+static void u_IsCharUpperA(w32 *w)        { unsigned c = (unsigned)ARG(0) & 0xFF;   RET(c >= 'A' && c <= 'Z' ? 1 : 0); }
+static void u_IsCharUpperW(w32 *w)        { unsigned c = (unsigned)ARG(0) & 0xFFFF; RET(c >= 'A' && c <= 'Z' ? 1 : 0); }
+static void u_IsCharLowerA(w32 *w)        { unsigned c = (unsigned)ARG(0) & 0xFF;   RET(c >= 'a' && c <= 'z' ? 1 : 0); }
+static void u_IsCharLowerW(w32 *w)        { unsigned c = (unsigned)ARG(0) & 0xFFFF; RET(c >= 'a' && c <= 'z' ? 1 : 0); }
+
+/* wvsprintf: wsprintf given a va_list. Implemented in msvcrt.c beside the
+ * formatter, for the same reason wsprintf is. */
+static void u_wvsprintfA(w32 *w) { w32_do_wvsprintf(w, 0); }
+static void u_wvsprintfW(w32 *w) { w32_do_wvsprintf(w, 1); }
+
+/* ---- the clipboard ------------------------------------------------------
+ *
+ * One clipboard, no other process to share it with, so it is a buffer. An
+ * installer offers to copy its log to the clipboard; a game copies a crash
+ * id. Both work, and what is copied can be read back by the same program,
+ * which is all either of them does with it. It does not reach the iOS
+ * clipboard -- doing that would mean a Windows program could put anything
+ * into the pasteboard of the device it is running on, which is not a
+ * decision this layer should make on its own. */
+enum { CF_TEXT_ = 1, CF_UNICODETEXT_ = 13 };
+static int      g_clip_open;
+static uint64_t g_clip_mem;
+static uint32_t g_clip_fmt;
+
+static void u_OpenClipboard(w32 *w)  { (void)w; g_clip_open = 1; RET(1); }
+static void u_CloseClipboard(w32 *w) { (void)w; g_clip_open = 0; RET(1); }
+static void u_EmptyClipboard(w32 *w) {
+    if (!g_clip_open) { RET(0); return; }
+    g_clip_mem = 0; g_clip_fmt = 0;
+    RET(1);
+}
+/* SetClipboardData takes ownership of the handle, which here is the guest
+ * pointer GlobalAlloc returned -- so it is kept, not copied, and not freed. */
+static void u_SetClipboardData(w32 *w) {
+    if (!g_clip_open) { RET(0); return; }
+    g_clip_fmt = (uint32_t)ARG(0);
+    g_clip_mem = ARG(1);
+    RET(ARG(1));
+}
+static void u_GetClipboardData(w32 *w) {
+    if (!g_clip_open) { RET(0); return; }
+    RET(g_clip_fmt == (uint32_t)ARG(0) ? g_clip_mem : 0);
+}
+static void u_IsClipboardFormatAvailable(w32 *w) { RET(g_clip_mem && g_clip_fmt == (uint32_t)ARG(0) ? 1 : 0); }
+
+/* ---- the odds and ends an installer's last page calls ------------------- */
+
+/* ExitWindowsEx: a reboot, which cannot happen and must not be pretended.
+ * An installer asks at the end of a run that replaced a file in use; saying
+ * no leaves it to report that a restart is needed, which is true. */
+static void u_ExitWindowsEx(w32 *w) {
+    w32_note_refused(w, "user32!ExitWindowsEx (nothing here can restart the device)");
+    w32_set_last_error(w, 1314);                 /* ERROR_PRIVILEGE_NOT_HELD */
+    RET(0);
+}
+
+/* Class longs. The one that matters is GCL_HICON/HICONSM, which a program
+ * sets so its window has an icon; there is no title bar to put one in, and
+ * the call has to succeed anyway or the program treats it as a failure. */
+static void u_GetClassLongA(w32 *w) { (void)w; RET(0); }
+static void u_GetClassLongW(w32 *w) { (void)w; RET(0); }
+static void u_SetClassLongA(w32 *w) { (void)w; RET(0); }
+static void u_SetClassLongW(w32 *w) { (void)w; RET(0); }
+static void u_GetClassLongPtrA(w32 *w) { w32_ret64(w, 0); }
+static void u_GetClassLongPtrW(w32 *w) { w32_ret64(w, 0); }
+static void u_SetClassLongPtrA(w32 *w) { w32_ret64(w, 0); }
+static void u_SetClassLongPtrW(w32 *w) { w32_ret64(w, 0); }
+
+static void u_LoadImageW(w32 *w) { (void)w; RET(0x9003); }
+static void u_LoadBitmapA(w32 *w) { (void)w; RET(0); }
+static void u_LoadBitmapW(w32 *w) { (void)w; RET(0); }
+static void u_DestroyIcon(w32 *w) { (void)w; RET(1); }
+static void u_DestroyCursor(w32 *w) { (void)w; RET(1); }
+static void u_GetKeyboardLayout(w32 *w) { (void)w; RET(0x04090409u); }   /* en-US */
+
+/* MessageBoxIndirect takes a MSGBOXPARAMS struct instead of arguments. The
+ * text is at a fixed offset and the offset differs by bitness, because the
+ * three fields before it are a size, an HWND and an HINSTANCE. */
+static void u_MessageBoxIndirectW(w32 *w) {
+    uint64_t p = ARG(0);
+    if (!p) { RET(0); return; }
+    int ps = (int)w32_ptrsize(w);
+    uint64_t text = w32_read(w, p + 4u + 2u * (unsigned)ps, ps);
+    uint64_t cap  = w32_read(w, p + 4u + 3u * (unsigned)ps, ps);
+    char t[256] = "", b[512] = "";
+    if (cap)  w32_wtoa(w, cap, t, sizeof t);
+    if (text) w32_wtoa(w, text, b, sizeof b);
+    fprintf(stderr, "[MessageBox] %s: %s\n", t, b);
+    RET(1);                                       /* IDOK */
+}
+static void u_MessageBoxIndirectA(w32 *w) {
+    uint64_t p = ARG(0);
+    if (!p) { RET(0); return; }
+    int ps = (int)w32_ptrsize(w);
+    uint64_t text = w32_read(w, p + 4u + 2u * (unsigned)ps, ps);
+    uint64_t cap  = w32_read(w, p + 4u + 3u * (unsigned)ps, ps);
+    fprintf(stderr, "[MessageBox] %s: %s\n", cap ? w32_str(w, cap) : "", text ? w32_str(w, text) : "");
+    RET(1);
+}
 #define F(n, a)  { #n, a, 0, u_##n, 0 }
 const w32_api w32_user32[] = {
     /* classes and windows */
@@ -3099,6 +3320,27 @@ const w32_api w32_user32[] = {
     F(ChildWindowFromPoint, 3), F(EnumChildWindows, 3),
     { "SetWindowTextW", 2, 0, u_SetWindowTextW_real, 0 },
     F(SetTimer, 4), F(KillTimer, 2), F(SystemParametersInfoA, 4), F(SetProcessDPIAware, 0),
-    F(MessageBoxA, 4), F(MessageBoxW, 4), F(CharUpperA, 1), F(CharNextA, 1),
+    F(MessageBoxA, 4), F(MessageBoxW, 4),
+    F(MessageBoxIndirectA, 1), F(MessageBoxIndirectW, 1),
+    /* Walking a string. A Unicode installer walks every path it touches
+     * through CharNextW, so these are not optional for it. */
+    F(CharNextA, 1), F(CharNextW, 1), F(CharNextExA, 3),
+    F(CharPrevA, 2), F(CharPrevW, 2), F(CharPrevExA, 4),
+    F(CharUpperA, 1), F(CharUpperW, 1), F(CharLowerA, 1), F(CharLowerW, 1),
+    F(CharUpperBuffA, 2), F(CharUpperBuffW, 2), F(CharLowerBuffA, 2), F(CharLowerBuffW, 2),
+    F(IsCharAlphaA, 1), F(IsCharAlphaW, 1),
+    F(IsCharAlphaNumericA, 1), F(IsCharAlphaNumericW, 1),
+    F(IsCharUpperA, 1), F(IsCharUpperW, 1), F(IsCharLowerA, 1), F(IsCharLowerW, 1),
+    /* Cdecl like wsprintf, but given a va_list rather than the stack. */
+    { "wvsprintfA", 3, 0, u_wvsprintfA, 0 },
+    { "wvsprintfW", 3, 0, u_wvsprintfW, 0 },
+    F(OpenClipboard, 1), F(CloseClipboard, 0), F(EmptyClipboard, 0),
+    F(SetClipboardData, 2), F(GetClipboardData, 1), F(IsClipboardFormatAvailable, 1),
+    F(ExitWindowsEx, 2),
+    F(GetClassLongA, 2), F(GetClassLongW, 2), F(SetClassLongA, 3), F(SetClassLongW, 3),
+    F(GetClassLongPtrA, 2), F(GetClassLongPtrW, 2),
+    F(SetClassLongPtrA, 3), F(SetClassLongPtrW, 3),
+    F(LoadImageW, 6), F(LoadBitmapA, 2), F(LoadBitmapW, 2),
+    F(DestroyIcon, 1), F(DestroyCursor, 1), F(GetKeyboardLayout, 1),
     { 0, 0, 0, 0, 0 },
 };

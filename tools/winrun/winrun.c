@@ -521,7 +521,37 @@ static void dispatch(w32 *w, int i) {
             c->rip = w32_read(w, rsp, 8);
             c->gpr[XC_RSP] = rsp + 8;
         }
-        c->gpr[XC_RAX] = 0;          /* the most common "no" -- see the caveat in WIN32.md */
+        /* What to return from a function we do not have.
+         *
+         * Zero is the obvious answer and it is the wrong one. For anything
+         * returning a pointer, zero is a null the caller immediately walks:
+         * a Unicode installer that called CharNextW went straight into
+         *
+         *     movzx ecx, word ptr [eax]      ; eax = 0
+         *
+         * and faulted. The fault is not the bug -- the missing function is --
+         * but it ends the run at the first lie, which destroys the only thing
+         * keep-going is for: getting the *whole* list of what a program needs
+         * in one pass instead of one name per rebuild.
+         *
+         * So the answer is a pointer to a page of zeros. It is non-null, so a
+         * dereference reads rather than faults; the zeros read as an empty
+         * string in either width and as a zeroed structure; and a caller that
+         * writes through it writes somewhere harmless.
+         *
+         * This is a bigger lie than zero, not a smaller one. Non-zero means
+         * "success" to everything returning a BOOL, and means "there is
+         * another item" to an enumeration -- so a keep-going run can loop
+         * until the deadline stops it, and anything it managed to write was
+         * written by a program being deceived. Which is why keep-going is a
+         * diagnostic mode whose output is never trusted and never added to
+         * the library: see the note where the importer runs it twice. */
+        if (!w->fake_page) {
+            w->fake_page = w32_alloc(w, 0x10000, 0);
+            if (w->fake_page) memset(W32P(w, w->fake_page), 0, 0x10000);
+        }
+        c->gpr[XC_RAX] = w->fake_page;
+        w->faked_returns++;
         return;
     }
     if (w->verbose > 1) fprintf(stderr, "winrun: %s!%s(%#llx, %#llx, %#llx, %#llx)\n",
@@ -1403,6 +1433,19 @@ int w32_crash_report(w32 *w, char *out, size_t out_len) {
         for (int k = 0; k < w->nunimpl; k++)
             P("    %6u x  %s\n", w->unimpl[k].calls, w->unimpl[k].name);
         if (w->unimpl_dropped) P("    (and %u more distinct)\n", w->unimpl_dropped);
+    }
+    /* A keep-going run that ended badly almost always ended badly *because*
+     * of the lie, not beside it -- so say so, rather than leaving a fault
+     * address in a program that has done nothing wrong looking like a
+     * separate bug to chase. */
+    if (w->keep_going && w->faked_returns) {
+        P("\n  %u call%s above returned a made-up answer, because -k was given.\n",
+          w->faked_returns, w->faked_returns == 1 ? "" : "s");
+        if (w->stop_reason)
+            P("  This run ended in %s, which is the expected outcome of that: a\n"
+              "  program handed a made-up answer usually goes wrong shortly\n"
+              "  afterwards. The list above is the finding; the fault is not.\n",
+              w->stop_reason);
     }
     #undef P
     return (int)n;

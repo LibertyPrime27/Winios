@@ -433,6 +433,13 @@ static void a_RegDeleteValueA(w32 *w) { reg_delete_value(w, 0); }
 static void a_RegDeleteValueW(w32 *w) { reg_delete_value(w, 1); }
 static void a_RegDeleteKeyA(w32 *w)  { reg_delete_key(w, 0); }
 static void a_RegDeleteKeyW(w32 *w)  { reg_delete_key(w, 1); }
+/* RegDeleteKeyEx adds a samDesired argument, which on 64-bit Windows picks
+ * between the 32- and 64-bit views of the registry. There is one view here,
+ * so it deletes the same key -- and an installer that calls the Ex form is
+ * asking to be explicit about which view, not asking for different
+ * behaviour. */
+static void a_RegDeleteKeyExA(w32 *w) { reg_delete_key(w, 0); }
+static void a_RegDeleteKeyExW(w32 *w) { reg_delete_key(w, 1); }
 static void a_RegEnumKeyA(w32 *w) { reg_enum_key_plain(w, 0); }
 static void a_RegEnumKeyW(w32 *w) { reg_enum_key_plain(w, 1); }
 
@@ -585,6 +592,7 @@ const w32_api w32_advapi32[] = {
     F(RegQueryInfoKeyA, 12),
     F(RegEnumValueW, 8), F(RegEnumKeyExW, 8), F(RegEnumKeyA, 4), F(RegEnumKeyW, 4),
     F(RegDeleteValueW, 2), F(RegDeleteKeyW, 2),
+    F(RegDeleteKeyExA, 4), F(RegDeleteKeyExW, 4),
     F(RegCloseKey, 1),
     F(GetUserNameA, 2),
     /* What an installer asks before it writes somewhere privileged */

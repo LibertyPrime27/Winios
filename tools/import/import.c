@@ -584,8 +584,15 @@ int wi_import_installer(const char *setup, const char *drive_c,
     for (int i = 0; i < ns; i++) argv[argc++] = (char *)sargs[i];
     argv[argc] = 0;
 
+    /* From the setup program onwards, not from a fixed index: `-k` adds an
+     * argument ahead of it, and a hardcoded start printed the C: drive's
+     * basename as though it were the program being run. The path is long and
+     * uninteresting, so the program is shown by name and its arguments in
+     * full -- those are the part worth reading. */
     addf(out, "\nRunning:");
-    for (int i = 5; i < argc; i++) addf(out, " %s", i == 5 ? base_of(argv[i]) : argv[i]);
+    int first = 0;
+    for (int i = 0; i < argc; i++) if (argv[i] == setup) { first = i; break; }
+    for (int i = first; i < argc; i++) addf(out, " %s", i == first ? base_of(argv[i]) : argv[i]);
     addf(out, "\n");
 
     if (cb) cb(ctx, visible ? "waiting for the installer" : "installing", 0, 0);

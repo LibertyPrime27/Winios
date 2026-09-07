@@ -146,7 +146,10 @@ struct w32 {
     const char *dll_dir;         /* extra directory to search for guest DLLs (-L) */
     int        imports_only;     /* -imports: load, report what is missing, do not run */
     int        dump_frame;      /* -frame: print what was drawn on the way out */
-    int        keep_going;       /* -k: an unimplemented import returns 0 instead of ending the run */
+    int        keep_going;       /* -k: an unimplemented import returns a lie instead of ending the run */
+    uint64_t   fake_page;        /* zero-filled, handed back by an unimplemented function so a
+                                  * caller that dereferences the result reads rather than faults */
+    uint32_t   faked_returns;    /* how many times that happened, for the report */
 
     /* what was called that we do not implement, and how often. A run in
      * keep_going mode produces this whole list instead of stopping at the
@@ -235,6 +238,7 @@ void     w32_drive_init(void);
 /* user32's wsprintfA/W, implemented in msvcrt.c next to the formatter and the
  * guest-memory variadic walk they share with sprintf. */
 void     w32_do_wsprintf(w32 *w, int wide);
+void     w32_do_wvsprintf(w32 *w, int wide);   /* the same, given a va_list */
 
 /* The environment, and the .ini rewrite. Both are shared between the A and W
  * entry points and between DLLs, so they live where the implementation is

@@ -896,6 +896,44 @@ static void k_GetUserNameA(w32 *w) { const char *n = "xcore"; memcpy(W32P(w, ARG
 static void k_lstrlenA(w32 *w) { RET(strlen(GSTR(ARG(0)))); }
 static void k_lstrlenW(w32 *w) { RET(w32_wcslen(w, ARG(0))); }
 static void k_lstrcpyA(w32 *w) { strcpy(W32P(w, ARG(0)), GSTR(ARG(1))); RET(ARG(0)); }
+/* The wide one copies UTF-16 units, terminator included. A Unicode installer
+ * builds every path with it, and copying it as bytes would truncate at the
+ * first character whose high byte is zero -- which is every ASCII one. */
+static void k_lstrcpyW(w32 *w) {
+    uint64_t d = ARG(0), s = ARG(1);
+    if (!d || !s) { RET(0); return; }
+    uint64_t i = 0;
+    for (;; i += 2) {
+        uint64_t c = w32_read(w, s + i, 2);
+        w32_write(w, d + i, 2, c);
+        if (!c) break;
+        if (i > (1u << 20)) break;               /* an unterminated string is not a string */
+    }
+    RET(d);
+}
+
+/* GetFileTime, the read half of the pair whose write half was already here.
+ * An installer compares the file it is about to replace against the one it
+ * is carrying, and with no way to read a time it either always overwrites or
+ * always skips -- both wrong, and both silent. */
+static void k_GetFileTime(w32 *w) {
+    w32_handle *h = w32_handle_get(w, ARG(0));
+    if (!h || h->type != H_FILE || h->fd < 0) { w32_set_last_error(w, 6); RET(0); return; }
+    struct stat st;
+    if (fstat(h->fd, &st)) { w32_set_last_error(w, 5); RET(0); return; }
+    /* FILETIME is 100-nanosecond ticks since 1601; the Unix epoch is
+     * 11644473600 seconds later. */
+    struct { uint64_t p; time_t t; } want[3] = {
+        { ARG(1), st.st_ctime }, { ARG(2), st.st_atime }, { ARG(3), st.st_mtime },
+    };
+    for (int i = 0; i < 3; i++) {
+        if (!want[i].p) continue;
+        uint64_t ft = ((uint64_t)want[i].t + 11644473600ull) * 10000000ull;
+        w32_write(w, want[i].p, 4, ft & 0xFFFFFFFFu);
+        w32_write(w, want[i].p + 4, 4, ft >> 32);
+    }
+    RET(1);
+}
 static void k_lstrcmpiA(w32 *w) { RET((uint64_t)(int64_t)strcasecmp(GSTR(ARG(0)), GSTR(ARG(1)))); }
 static void k_GetSystemDirectoryA(w32 *w) { const char *d = "C:\\Windows\\System32"; if ((uint32_t)ARG(1) > strlen(d)) memcpy(W32P(w, ARG(0)), d, strlen(d) + 1); RET(strlen(d)); }
 static void k_GetWindowsDirectoryA(w32 *w) { const char *d = "C:\\Windows"; if ((uint32_t)ARG(1) > strlen(d)) memcpy(W32P(w, ARG(0)), d, strlen(d) + 1); RET(strlen(d)); }
@@ -1839,7 +1877,7 @@ const w32_api w32_kernel32[] = {
     F(ExpandEnvironmentStringsW, 3), F(SetEnvironmentVariableW, 2),
     F(SetEnvironmentVariableA, 2),
     F(lstrcmpW, 2), F(lstrcmpiW, 2), F(lstrcpynW, 3), F(lstrcpynA, 3),
-    F(CompareFileTime, 2), F(SetFileTime, 4), F(MulDiv, 3),
+    F(CompareFileTime, 2), F(SetFileTime, 4), F(GetFileTime, 4), F(MulDiv, 3),
     F(GlobalLock, 1), F(GlobalUnlock, 1), F(GlobalSize, 1),
     F(WritePrivateProfileStringW, 4),
     F(SetDefaultDllDirectories, 1), F(SetDllDirectoryA, 1), F(SetDllDirectoryW, 1),
@@ -1853,7 +1891,7 @@ const w32_api w32_kernel32[] = {
      * which is not implemented. */
     F(RtlPcToFileHeader, 2), F(RtlLookupFunctionEntry, 3), F(RtlVirtualUnwind, 8), F(RtlUnwindEx, 6),
     F(EncodePointer, 1), F(DecodePointer, 1), F(InitializeSListHead, 1), F(SetHandleCount, 1), F(GetLogicalDrives, 0), F(GetDriveTypeA, 1),
-    F(GetComputerNameA, 2), F(GetUserNameA, 2), F(lstrlenA, 1), F(lstrlenW, 1), F(lstrcpyA, 2), F(lstrcmpiA, 2),
+    F(GetComputerNameA, 2), F(GetUserNameA, 2), F(lstrlenA, 1), F(lstrlenW, 1), F(lstrcpyA, 2), F(lstrcpyW, 2), F(lstrcmpiA, 2),
     F(GetSystemDirectoryA, 2), F(GetWindowsDirectoryA, 2), F(IsProcessorFeaturePresent, 1), F(GetCurrentProcessorNumber, 0),
     FN(SetConsoleTitleA, 1, k_nop_true), FN(FlushInstructionCache, 3, k_nop_true), FN(GetProcessTimes, 5, k_nop_true), FN(SwitchToThread, 0, k_nop_zero),
     FN(SetThreadAffinityMask, 2, k_nop_true), FN(SetPriorityClass, 2, k_nop_true), FN(GetPriorityClass, 1, k_nop_zero), FN(DisableThreadLibraryCalls, 1, k_nop_true),

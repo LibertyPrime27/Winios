@@ -100,6 +100,38 @@ unset XCORE_JIT
 # recording of the tester's reflexes is not a test.
 check inputtest64.exe 0 6 -- -input inputtest.script
 check inputtest32.exe 0 6 -- -input inputtest.script
+# What -k returns from a function we do not have.
+#
+# Its own block rather than one of the helpers above, because the two runs
+# want opposite outcomes from the same guest: without -k it must stop at the
+# first missing function (127), and with -k it must get past three of them,
+# use the result of one as a pointer, and exit 0.
+#
+# The report is not compared, because it contains registers -- what is
+# checked is the exit code and that all three names reached the list. A run
+# that returned zero from a pointer-returning function faulted on the first
+# one, which is what this exists to stop happening again.
+for b in 64 32; do
+    rcs=$("$winrun" "./keepgoing$b.exe" >/dev/null 2>&1; echo $?)
+    if [ "$rcs" = "127" ]; then echo "ok   keepgoing$b.exe stops at the first missing function"
+    else echo "FAIL keepgoing$b.exe without -k exited $rcs, want 127"; fail=1; fi
+
+    outk=$("$winrun" -k "./keepgoing$b.exe" 2>&1); rck=$?
+    missing=$(printf '%s\n' "$outk" | grep -c 'user32.dll!\(SwitchDesktop\|LockWorkStation\|CreateDesktopW\)')
+    if [ "$rck" = "0" ] && [ "$missing" = "3" ] && printf '%s\n' "$outk" | grep -q '0 failures'; then
+        echo "ok   keepgoing$b.exe -k names all three and the guest survives the answers"
+    else
+        echo "FAIL keepgoing$b.exe -k exited $rck, listed $missing of 3"; fail=1
+        printf '%s\n' "$outk" | head -12 | sed 's/^/  | /'
+    fi
+done
+# Walking and casing strings. Small functions, and one of them missing was
+# the whole distance between "nothing was installed" and an install: a
+# Unicode installer walks every path through CharNextW. The surrogate cases
+# are the ones worth having a test for -- a wrong step there corrupts a path
+# quietly instead of failing.
+check chartest64.exe 0
+check chartest32.exe 0
 # A dialog, from a real RT_DIALOG resource in the guest's own image, drawn.
 # The guest checks what a guest can check -- controls found by id, text set
 # and read back, a click coming back as WM_COMMAND -- and `-frame` checks

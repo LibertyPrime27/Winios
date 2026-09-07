@@ -23,6 +23,10 @@ for a in 32 64; do
     $CC -O2 -s -DSUBDLL=\"sub$a.dll\" -DLATEDLL=\"late$a.dll\" \
         -o dlltest$a.exe dlltest.c -L. -l:libmid$a.a -l:libsub$a.a
     rm -f dlllate$a.def libsub$a.a libmid$a.a
+    # What -k returns from a function we do not have.
+    $CC -O2 -s -o keepgoing$a.exe keepgoing.c -luser32
+    # The string walking and casing an installer does on every path.
+    $CC -O2 -s -o chartest$a.exe chartest.c -luser32
     # A dialog with a real resource. windres compiles the .rc into an
     # RT_DIALOG the loader has to walk -- writing the template by hand in C
     # would test the parser against our own idea of the format rather than

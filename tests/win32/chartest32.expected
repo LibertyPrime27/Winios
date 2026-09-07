@@ -1,0 +1,32 @@
+ok   CharNextA steps one byte
+ok   CharNextA at the terminator stays there
+ok   CharPrevA steps back one byte
+ok   CharPrevA at the start stays there
+ok   CharNextW steps one UTF-16 unit
+ok   CharNextW at the terminator stays there
+ok   CharPrevW steps back one unit
+ok   CharPrevW at the start stays there
+ok   CharNextW steps over a whole surrogate pair
+ok   and one unit for the character after it
+ok   CharPrevW steps back over a whole pair
+ok   an unpaired surrogate is one unit
+ok   CharUpperA uppercases in place and returns the pointer
+ok   CharLowerA lowercases in place
+ok   CharUpperW uppercases the wide string
+ok   CharLowerW lowercases the wide string
+ok   CharUpperA on a packed character returns the character
+ok   CharLowerA on a packed character returns the character
+ok   CharUpperBuffA touches exactly the count it was given
+ok   CharLowerBuffW counts characters, not bytes
+ok   and stops at the count
+ok   IsCharAlphaA
+ok   IsCharAlphaW
+ok   IsCharAlphaNumericA
+ok   IsCharUpperA
+ok   IsCharLowerA
+ok   CharNextW finds the last path component
+ok   CharNextA finds the last path component
+ok   wsprintfW builds a path
+ok   lstrcpyW copies the whole wide string
+ok   and lstrlenW agrees about its length
+31 checks, 0 failures

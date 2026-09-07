@@ -493,9 +493,18 @@ static void do_printf(w32 *w, int fd, char *buf, size_t cap, const char *fmt, co
  * almost immediately. Cdecl and variadic: the caller pops, so the argument
  * count in the table does not matter.
  */
-void w32_do_wsprintf(w32 *w, int wide) {
+/* wsprintf and wvsprintf differ in one thing: where the arguments are. The
+ * first is variadic and they are on the guest's stack; the second is handed a
+ * va_list, which on both bitnesses is a pointer to them. NSIS uses the
+ * va_list form for every message it builds, so the two have to share the
+ * formatter or they will disagree about %s. */
+static void wsprintf_common(w32 *w, int wide, uint64_t ap);
+
+void w32_do_wsprintf(w32 *w, int wide)  { wsprintf_common(w, wide, vararg_start(w, 2)); }
+void w32_do_wvsprintf(w32 *w, int wide) { wsprintf_common(w, wide, ARG(2)); }
+
+static void wsprintf_common(w32 *w, int wide, uint64_t ap) {
     uint64_t out = ARG(0);
-    uint64_t ap = vararg_start(w, 2);
     if (!out) { RET(0); return; }
     /* 1024 is the documented ceiling for wsprintf's output, and a caller has
      * sized its buffer for that -- so writing more would overrun the guest's
