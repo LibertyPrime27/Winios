@@ -1,0 +1,11 @@
+RegOpenKeyEx on a key written by the previous run: 0
+InstallPath: 0, type 1, "C:\Games\Fallout"
+Version: 0, type 4, 4
+Scratch (deleted last run): 2 (2 = not found)
+  value InstallPath type 1, 17 bytes
+  value Version type 4, 4 bytes
+  value enum ended with 259 (259 = no more items)
+  subkey Sub
+  subkey enum ended with 259
+delete the tree: 0
+reopen after delete: 2 (2 = not found)

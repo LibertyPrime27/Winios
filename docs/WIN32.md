@@ -191,12 +191,14 @@ compiled code for pages that become writable.
 
 ## Verified
 
-`tests/win32/run.sh` runs eighteen executables and compares stdout and exit code
-with recordings: the three-import `hello`, the full mingw-w64 CRT program
-(`crt.c`: TLS callbacks, `__getmainargs`, `_initterm`, malloc/free, `sqrt`,
-`printf`, `snprintf`, exit code), the n-body benchmark, the loader test
-`dlltest`, and the four Direct3D 9 programs `d3dtest`, `d3dframe`,
-`d3dloop` and `d3ddraw`, each as PE32 and PE32+.
+`tests/win32/run.sh` runs twenty-four checks over twelve programs and compares
+stdout and exit code with recordings: the three-import `hello`, the full
+mingw-w64 CRT program (`crt.c`: TLS callbacks, `__getmainargs`, `_initterm`,
+malloc/free, `sqrt`, `printf`, `snprintf`, exit code), the n-body benchmark,
+the loader test `dlltest`, the four Direct3D 9 programs `d3dtest`, `d3dframe`,
+`d3dloop` and `d3ddraw`, the file-layer tests `pathtest` and `filetest`, and
+the registry test `regtest` — each as PE32 and PE32+, and `regtest` twice over
+in each bitness because what it is testing is what survives between two runs.
 
 `d3dtest` calls Direct3D 9 the way a game starts up — `Direct3DCreate9`,
 `GetAdapterIdentifier`, `CreateDevice`, `Clear`, `Present`, then
@@ -263,6 +265,70 @@ game cannot find its own data.
 there — "not found" is a result too, and a file layer that cheerfully opens
 anything would pass a weaker test.
 
+### Finding files, and mapping them
+
+A game does not open its data by name. It walks a directory for `*.bsa` and
+then maps what it finds, because an archive is larger than it wants to read.
+Both of those now work.
+
+`FindFirstFile`/`FindNextFile`/`FindClose` walk a directory against a wildcard
+and fill `WIN32_FIND_DATA` — name, size, attributes, times — with the two
+failure shapes callers actually branch on: `INVALID_HANDLE_VALUE` and error 2
+when the pattern matches nothing at all, and error 18 (`ERROR_NO_MORE_FILES`)
+when the walk runs out. Matching is `*`/`?` against the host directory,
+case-insensitively, since that is what a Windows program expects.
+
+`CreateFileMapping`/`MapViewOfFile` place the file's bytes in guest memory.
+Where the offset is host-page aligned and the host agrees, that is a real
+`mmap(MAP_FIXED)` over the guest pages — the file is not copied, which is the
+entire point on a device with an 8 GB archive and 6 GB of RAM. Where it is not
+(an unaligned offset, or the host refuses), the anonymous pages stay and the
+range is filled with `pread`. A guest cannot tell which happened, which is why
+`filetest.exe` reads the same file both ways and requires the bytes to agree:
+that equality is the only property of a mapping that matters.
+
+Host pages are 16 KB on Apple silicon and 4 KB on the x86 runner, so the
+alignment arithmetic goes through `w32_host_page()` rather than a constant, and
+the suite runs on both.
+
+## The registry
+
+An installer writes it and the program it installed reads it back, so the only
+interesting property is that it survives the process that wrote it: a game asks
+`HKEY_LOCAL_MACHINE` where it was installed and takes the answer as gospel.
+`advapi32.dll` is therefore a real store, not stubs that return success.
+
+It is deliberately flat. A registry is a tree, but every operation a program
+performs names a key by its full path, so a sorted list of
+`(key, name) -> (type, bytes)` answers all of them and "does this key exist"
+becomes "is any entry at this path or below it". There are no node objects and
+no parent pointers, so there is nothing to keep consistent; subkey enumeration
+derives the immediate children on demand instead. An empty key gets one empty
+unnamed value to mark that it exists, the same trick a filesystem plays with an
+empty directory.
+
+On disk it is `registry.txt` in the drive root, one line per value as
+`path|name|type|hex`. Text, because being able to read and fix it by hand is
+worth more than the bytes, and because a corrupt binary blob would take a
+game's install path with it.
+
+Open/create/query/set/enumerate/delete are there for values and keys, in both
+`A` and `W` forms where a program uses them, plus `RegQueryInfoKey`. Two details
+that callers depend on and stubs usually get wrong: a query with a null buffer
+reports the size rather than failing (every caller does this first), and one
+with a buffer too small returns `ERROR_MORE_DATA` with the size it wanted
+rather than truncating. A wide string is stored narrow, so a program that
+writes `W` and reads `A` — installers do both — sees the same value.
+
+`regtest.exe` is two programs in one: `regtest write` creates a key, writes
+`REG_SZ`, `REG_DWORD` and `REG_BINARY` values, creates an empty subkey,
+enumerates, and deletes one value; `regtest read` opens that key without ever
+creating it, reads the values back, confirms the deleted one is gone, and then
+deletes the tree so the next run starts clean. The second half is only right if
+the store reached the disk. The device build runs the same pair, and because
+every run begins by throwing the whole in-memory store away, a value the second
+run can see came back off disk and nowhere else.
+
 ## What a program needs that we do not have
 
     winrun -imports program.exe
@@ -279,21 +345,20 @@ a thread, takes a lock, reads the registry, walks a directory, memory-maps a
 file, times a frame, queries the display. It is deliberately not in the test
 suite, because it cannot run yet. What it reports today:
 
-    59 imports resolved, 17 missing
-      advapi32.dll (1)   RegOpenKeyExA
-      kernel32.dll (6)   CreateThread, CreateFileMappingA, MapViewOfFile,
-                         FindFirstFileA, FindNextFileA, FindClose
+    65 imports resolved, 11 missing
+      kernel32.dll (1)   CreateThread
       user32.dll   (9)   RegisterClassA, CreateWindowExA, ShowWindow,
                          PeekMessageA, TranslateMessage, DispatchMessageA,
                          DefWindowProcA, GetSystemMetrics, EnumDisplaySettingsA
       winmm.dll    (1)   timeGetTime
 
-Worth reading closely, because it corrects the obvious assumption. "No threads"
-is not quite right: `EnterCriticalSection`, `CreateEventA`, `SetEvent`,
-`InterlockedIncrement`, `WaitForSingleObject`, `QueryPerformanceCounter` and
-`CreateFileA` all resolve already — only `CreateThread` itself is absent. The
-window and its message pump are the larger hole, and file enumeration and
-memory-mapped files are what a game reaches for to load its archives.
+It was 17 missing before the registry, file enumeration and memory mapping
+landed, which is what the number is for. Worth reading closely, because it
+corrects the obvious assumption. "No threads" is not quite right:
+`EnterCriticalSection`, `CreateEventA`, `SetEvent`, `InterlockedIncrement`,
+`WaitForSingleObject`, `QueryPerformanceCounter` and `CreateFileA` all resolve
+already — only `CreateThread` itself is absent. What is left is a window and
+its message pump, one thread call and one timer.
 
 ## Carrying on past what we do not have
 
@@ -346,8 +411,11 @@ the app.
 ## What is deliberately not here yet
 
 Threads (`CreateThread`/`_beginthreadex` report failure), structured
-exception handling (a guest fault ends the run), the registry, and everything
-user32/gdi32 beyond `MessageBoxA`.
+exception handling (a guest fault ends the run rather than reaching the
+guest's own handler, so MSVC code faults where real Windows would not), audio,
+and everything user32/gdi32 beyond `MessageBoxA` — which means no window and no
+message pump, and so no installer either. Drawing reaches the screen but goes
+through the reference rasterizer rather than Metal.
 
 Within the loader specifically: `DLL_PROCESS_DETACH` is never sent (nothing is
 ever unloaded and the process exits without unwinding), `DLL_THREAD_ATTACH`

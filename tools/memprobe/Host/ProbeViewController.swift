@@ -348,6 +348,19 @@ final class ProbeViewController: UIViewController {
     /// walk (dlltest -> mid.dll -> sub.dll), DllMain ordering across it, and
     /// LoadLibrary/GetProcAddress at run time -- the machinery a game's own
     /// DLLs, and eventually our d3d9.dll, arrive through.
+    /// A writable copy of the bundled C:\ fixtures. The bundle cannot be
+    /// written to and the registry guest writes registry.txt to the drive
+    /// root, so the diagnostics guests get their own throwaway drive rather
+    /// than the user's. Rebuilt each run, so nothing carries over.
+    private func scratchDrive(_ dir: URL) -> URL? {
+        let fm = FileManager.default
+        guard let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask).first else { return nil }
+        let dest = caches.appendingPathComponent("probe-c")
+        try? fm.removeItem(at: dest)
+        try? fm.copyItem(at: dir.appendingPathComponent("cdrive"), to: dest)
+        return fm.fileExists(atPath: dest.path) ? dest : nil
+    }
+
     private func windowsProbe(single: String?) {
         DispatchQueue.main.async { self.winLine = "running…"; self.refresh() }
         guard let dir = Bundle.main.resourceURL?.appendingPathComponent("win32") else {
@@ -356,23 +369,44 @@ final class ProbeViewController: UIViewController {
         }
         if let arena = ensureArena() { _ = handArenaToXcore(arena) }
 
-        // name, arguments, expected exit code
-        let all: [(String, [String], Int32)] = [
-            ("hello64.exe", ["a", "b"], 7), ("hello32.exe", ["a", "b"], 7),
-            ("crt64.exe", [], 3),           ("crt32.exe", [], 3),
-            ("nbody64.exe", [], 0),         ("nbody32.exe", [], 0),
-            ("dlltest64.exe", [], 0),       ("dlltest32.exe", [], 0),
-            ("d3dtest64.exe", [], 0),       ("d3dtest32.exe", [], 0),
-            ("d3ddraw64.exe", [], 0),       ("d3ddraw32.exe", [], 0),
-            ("d3dframe64.exe", [], 0),      ("d3dframe32.exe", [], 0),
+        // name, arguments, expected exit code, expectation file. The last
+        // field is separate because one guest run twice with different
+        // arguments has two outputs and only one name.
+        let all: [(String, [String], Int32, String)] = [
+            ("hello64.exe", ["a", "b"], 7, "hello64"), ("hello32.exe", ["a", "b"], 7, "hello32"),
+            ("crt64.exe", [], 3, "crt64"),             ("crt32.exe", [], 3, "crt32"),
+            ("nbody64.exe", [], 0, "nbody64"),         ("nbody32.exe", [], 0, "nbody32"),
+            ("dlltest64.exe", [], 0, "dlltest64"),     ("dlltest32.exe", [], 0, "dlltest32"),
+            ("d3dtest64.exe", [], 0, "d3dtest64"),     ("d3dtest32.exe", [], 0, "d3dtest32"),
+            ("d3ddraw64.exe", [], 0, "d3ddraw64"),     ("d3ddraw32.exe", [], 0, "d3ddraw32"),
+            ("d3dframe64.exe", [], 0, "d3dframe64"),   ("d3dframe32.exe", [], 0, "d3dframe32"),
             // the loop guests take a frame count, or they never return
-            ("d3dloop64.exe", ["12"], 0),   ("d3dloop32.exe", ["12"], 0),
+            ("d3dloop64.exe", ["12"], 0, "d3dloop64"), ("d3dloop32.exe", ["12"], 0, "d3dloop32"),
+            // C:\ guests. mapping a file is the one of these that is really
+            // device-specific: MAP_FIXED over guest pages, on 16 KB host pages.
+            ("pathtest64.exe", [], 0, "pathtest64"),   ("pathtest32.exe", [], 0, "pathtest32"),
+            ("filetest64.exe", [], 0, "filetest64"),   ("filetest32.exe", [], 0, "filetest32"),
+            // written in one run, read back in the next: the second run is
+            // only right if the store reached the disk.
+            ("regtest32.exe", ["write"], 0, "regtest_write32"),
+            ("regtest32.exe", ["read"], 0, "regtest_read32"),
+            ("regtest64.exe", ["write"], 0, "regtest_write64"),
+            ("regtest64.exe", ["read"], 0, "regtest_read64"),
         ]
         let cases = single.map { s in all.filter { $0.0 == s } } ?? all
 
+        // The C:\ guests need a drive with the fixtures on it, and the
+        // registry guest has to write to its root -- the bundle is read-only,
+        // so they get a scratch copy. The user's own C: goes back afterwards:
+        // a diagnostics run must not leave test files in the drive their
+        // programs installed into.
+        let scratch = scratchDrive(dir)
+        if let s = scratch { s.path.withCString { w32_set_drive_c($0) } }
+        defer { if let c = ExeBrowser.driveC { c.path.withCString { w32_set_drive_c($0) } } }
+
         var text = ""
         var failed = 0
-        for (name, args, wantRC) in cases {
+        for (name, args, wantRC, expName) in cases {
             let exe = dir.appendingPathComponent(name).path
             var out = [CChar](repeating: 0, count: 16384)
             var ns: UInt64 = 0, x87n: UInt64 = 0, x87c: UInt64 = 0
@@ -388,13 +422,13 @@ final class ProbeViewController: UIViewController {
             if a1 != nil { free(a1) }
             if a2 != nil { free(a2) }
             let got = String(cString: out)
-            let want = (try? String(contentsOf: dir.appendingPathComponent(
-                            name.replacingOccurrences(of: ".exe", with: ".expected")),
+            let want = (try? String(contentsOf: dir.appendingPathComponent(expName + ".expected"),
                             encoding: .utf8)) ?? ""
             let ok = rc == wantRC && got.trimmingCharacters(in: .whitespacesAndNewlines)
                                      == want.trimmingCharacters(in: .whitespacesAndNewlines)
             if !ok { failed += 1 }
-            text += "  \(ok ? "PASS" : "FAIL")  \(name)  exit \(rc) (want \(wantRC))  \(ns / 1_000_000) ms"
+            let label = args.isEmpty ? name : "\(name) \(args.joined(separator: " "))"
+            text += "  \(ok ? "PASS" : "FAIL")  \(label)  exit \(rc) (want \(wantRC))  \(ns / 1_000_000) ms"
             if x87n + x87c > 0 { text += "   x87 \(x87n) lowered / \(x87c) called out" }
             text += "\n"
             if !ok {

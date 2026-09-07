@@ -29,6 +29,10 @@ for a in 32 64; do
     $CC -O2 -s -o d3dloop$a.exe  d3dloop.c  -ld3d9
     $CC -O2 -s -o d3ddraw$a.exe  d3ddraw.c  -ld3d9
     $CC -O2 -s -o pathtest$a.exe pathtest.c
+    # finding files, mapping them, and the registry -- how a game finds its
+    # archives and how it finds out where it was installed
+    $CC -O2 -s -o filetest$a.exe filetest.c
+    $CC -O2 -s -o regtest$a.exe  regtest.c -ladvapi32
 done
 
 # Not run by the suite: it calls things we do not implement, on purpose.

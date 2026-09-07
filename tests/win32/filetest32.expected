@@ -1,0 +1,10 @@
+FindFirstFile(*.bsa): found something
+FindNextFile ended with error 18 (18 = no more files)
+2 matched:
+  one.bsa (12 bytes, attr 0x80)
+  two.bsa (12 bytes, attr 0x80)
+a pattern matching nothing: INVALID_HANDLE_VALUE (error 2)
+CreateFileMapping: ok
+MapViewOfFile: ok
+mapped bytes match the read bytes: yes
+first line through the mapping: archive one

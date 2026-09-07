@@ -38,6 +38,33 @@ static int test_device_lost(const char *dir) {
     return 0;
 }
 
+/* The registry is the one thing here that is supposed to outlive the process
+ * that wrote it, and winrun_main() begins with a reset that throws the whole
+ * in-memory store away -- so a value the second run can see came back off
+ * disk and nowhere else. That is the property an installer depends on.
+ * The read half deletes what it found, so this leaves nothing behind. */
+static int test_registry(const char *dir) {
+    char reg[600];
+    snprintf(reg, sizeof reg, "%s/cdrive/registry.txt", dir);
+    remove(reg);                              /* start from nothing, twice over */
+    char path[512];
+    snprintf(path, sizeof path, "%s/regtest32.exe", dir);
+    int bad = 0;
+    for (int a = 0; a < 2; a++) {
+        char *av[3] = { (char *)"winrun", path, (char *)(a ? "read" : "write") };
+        fflush(stdout);
+        int rc = winrun_main(3, av);
+        fflush(stdout);
+        if (rc != 0) {
+            printf("FAIL registry %s half exited %d, want 0\n", a ? "read" : "write", rc);
+            bad++;
+        }
+    }
+    remove(reg);
+    if (!bad) printf("ok   regtest32.exe wrote the registry in one run and read it back in the next\n");
+    return bad;
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : "tests/win32";
     /* C:\ for pathtest, and a check that the setting survives winrun_reset --
@@ -55,6 +82,7 @@ int main(int argc, char **argv) {
         { "d3dloop64.exe", 0 },  { "d3dloop32.exe", 0 },
         { "pathtest64.exe", 0 }, { "pathtest32.exe", 0 },
         { "d3ddraw64.exe", 0 },  { "d3ddraw32.exe", 0 },
+        { "filetest64.exe", 0 }, { "filetest32.exe", 0 },
     };
     const int n = (int)(sizeof G / sizeof G[0]);
     int bad = 0;
@@ -81,6 +109,7 @@ int main(int argc, char **argv) {
         }
     }
     bad += test_device_lost(dir);
+    bad += test_registry(dir);
     printf("test_winrun_lib: %d runs, %d failed\n", 2 * n, bad);
     return bad != 0;
 }

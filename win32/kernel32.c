@@ -14,6 +14,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
+#include <ctype.h>
 #include <strings.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -38,6 +40,7 @@ static uint64_t ticks_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTON
  * tool's default) keeps the older behaviour, which the test suite relies on. */
 static char g_drive_c[1024];
 void w32_set_drive_c(const char *path) { snprintf(g_drive_c, sizeof g_drive_c, "%s", path ? path : ""); }
+const char *w32_drive_c(void) { return g_drive_c; }
 
 /* The directory the executable lives in, which is also the guest's working
  * directory: a Windows program is normally started in its own install folder
@@ -82,6 +85,184 @@ static void host_path(w32 *w, const char *win, char *out, size_t n) {
     exe_dir(w, dir, sizeof dir);
     snprintf(out, n, "%.*s/%.*s", P_DIR, dir, P_REST, tmp);
 }
+
+/* ---- finding files, and mapping them ----
+ *
+ * How a game opens its data. FindFirstFile walks a directory against a
+ * wildcard; MapViewOfFile puts a file in the address space so a multi-gigabyte
+ * archive does not have to be read to be used. Both were on the list of things
+ * a game-shaped program asked for and got nothing.
+ */
+enum { FA_READONLY = 0x01, FA_DIRECTORY = 0x10, FA_NORMAL = 0x80 };
+enum { ERR_FILE_NOT_FOUND = 2, ERR_NO_MORE_FILES = 18, ERR_INVALID_HANDLE = 6 };
+
+/* DOS wildcards: * any run, ? any one, case-insensitive. Recursive because a
+ * pattern is short and the alternative is an explicit backtracking stack for
+ * no gain. */
+static int wild_match(const char *pat, const char *name) {
+    while (*pat) {
+        if (*pat == '*') {
+            pat++;
+            if (!*pat) return 1;
+            for (const char *n = name; ; n++) {
+                if (wild_match(pat, n)) return 1;
+                if (!*n) return 0;
+            }
+        }
+        if (!*name) return 0;
+        if (*pat != '?' && tolower((unsigned char)*pat) != tolower((unsigned char)*name)) return 0;
+        pat++; name++;
+    }
+    return !*name;
+}
+
+static uint64_t filetime_of(time_t t) { return ((uint64_t)t + 11644473600ull) * 10000000ull; }
+
+/* One directory entry into a WIN32_FIND_DATA. The A and W forms differ only in
+ * the name at offset 44, and the layout is the same in both bitnesses (there
+ * are no pointers in it), which is why one function does both. */
+static void fill_find_data(w32 *w, uint64_t out, int wide, const char *dir, const char *name) {
+    memset(W32P(w, out), 0, wide ? 592 : 320);
+    char full[4096];
+    snprintf(full, sizeof full, "%.*s/%.*s", 2000, dir, 1000, name);
+    struct stat st;
+    uint32_t attr = FA_NORMAL;
+    if (stat(full, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) attr = FA_DIRECTORY;
+        else if (!(st.st_mode & S_IWUSR)) attr |= FA_READONLY;
+        w32_write(w, out + 20, 8, filetime_of(st.st_mtime));      /* ftLastWriteTime */
+        w32_write(w, out + 4,  8, filetime_of(st.st_mtime));      /* ftCreationTime */
+        w32_write(w, out + 12, 8, filetime_of(st.st_atime));      /* ftLastAccessTime */
+        if (!S_ISDIR(st.st_mode)) {
+            w32_write(w, out + 28, 4, (uint64_t)st.st_size >> 32);
+            w32_write(w, out + 32, 4, (uint32_t)st.st_size);
+        }
+    }
+    w32_write(w, out + 0, 4, attr);
+    if (wide) {
+        uint16_t *d = W32P(w, out + 44);
+        size_t i = 0;
+        for (; name[i] && i < 259; i++) d[i] = (uint8_t)name[i];
+        d[i] = 0;
+    } else {
+        char *d = W32P(w, out + 44);
+        snprintf(d, 260, "%s", name);
+    }
+}
+
+/* The next entry matching this handle's pattern, or 0 at the end. "." and ".."
+ * are reported, because Windows reports them and code that walks a tree
+ * expects to have to skip them. */
+static int find_step(w32 *w, w32_handle *h, uint64_t out, int wide) {
+    DIR *d = (DIR *)h->p;
+    if (!d) return 0;
+    const char *pat = (const char *)(uintptr_t)h->u1;
+    const char *dir = (const char *)(uintptr_t)h->u2;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!wild_match(pat, e->d_name)) continue;
+        fill_find_data(w, out, wide, dir, e->d_name);
+        return 1;
+    }
+    return 0;
+}
+
+/* FindFirstFile(pattern, out). The pattern's last component is the wildcard;
+ * everything before it is the directory to walk. */
+static uint64_t find_first(w32 *w, const char *winpat, uint64_t out, int wide) {
+    char path[4096];
+    host_path(w, winpat, path, sizeof path);
+    char *slash = strrchr(path, '/');
+    char *dir, *pat;
+    if (slash) { *slash = 0; dir = path; pat = slash + 1; }
+    else { dir = (char *)"."; pat = path; }
+    if (!*pat) pat = (char *)"*";
+
+    DIR *d = opendir(dir);
+    if (!d) { w32_set_last_error(w, ERR_FILE_NOT_FOUND); return w->is32 ? 0xFFFFFFFFu : ~0ull; }
+
+    uint64_t hv = w32_handle_new(w, H_FIND, -1);
+    w32_handle *h = w32_handle_get(w, hv);
+    if (!h) { closedir(d); w32_set_last_error(w, ERR_FILE_NOT_FOUND); return w->is32 ? 0xFFFFFFFFu : ~0ull; }
+    h->p = d;
+    h->u1 = (uint64_t)(uintptr_t)strdup(pat);
+    h->u2 = (uint64_t)(uintptr_t)strdup(dir);
+
+    if (!find_step(w, h, out, wide)) {
+        w32_handle_close(w, hv);
+        w32_set_last_error(w, ERR_FILE_NOT_FOUND);
+        return w->is32 ? 0xFFFFFFFFu : ~0ull;            /* INVALID_HANDLE_VALUE */
+    }
+    return hv;
+}
+static void k_FindFirstFileA(w32 *w) { RET(find_first(w, GSTR(ARG(0)), ARG(1), 0)); }
+static void k_FindFirstFileW(w32 *w) { char b[1024]; w32_wtoa(w, ARG(0), b, sizeof b); RET(find_first(w, b, ARG(1), 1)); }
+static void find_next(w32 *w, int wide) {
+    w32_handle *h = w32_handle_get(w, ARG(0));
+    if (!h || h->type != H_FIND) { w32_set_last_error(w, ERR_INVALID_HANDLE); RET(0); return; }
+    if (!find_step(w, h, ARG(1), wide)) { w32_set_last_error(w, ERR_NO_MORE_FILES); RET(0); return; }
+    RET(1);
+}
+static void k_FindNextFileA(w32 *w) { find_next(w, 0); }
+static void k_FindNextFileW(w32 *w) { find_next(w, 1); }
+static void k_FindClose(w32 *w) { w32_handle_close(w, ARG(0)); RET(1); }
+
+/* CreateFileMapping(hFile, sa, protect, sizeHigh, sizeLow, name). A mapping is
+ * a handle over a descriptor and a length; nothing is in the address space
+ * until MapViewOfFile. INVALID_HANDLE_VALUE for the file means anonymous,
+ * which is how a program asks for shared memory. */
+enum { PAGE_READONLY_ = 0x02, PAGE_READWRITE_ = 0x04 };
+static void k_CreateFileMappingA(w32 *w) {
+    uint64_t hfile = ARG(0), prot = ARG(2);
+    uint64_t size = ((uint64_t)(uint32_t)ARG(3) << 32) | (uint32_t)ARG(4);
+    int fd = -1;
+    w32_handle *f = w32_handle_get(w, hfile);
+    if (f && f->type == H_FILE) {
+        fd = f->fd;
+        if (!size) { struct stat st; if (fstat(fd, &st) == 0) size = (uint64_t)st.st_size; }
+    }
+    if (!size) { w32_set_last_error(w, 87 /* ERROR_INVALID_PARAMETER */); RET(0); return; }
+    uint64_t hv = w32_handle_new(w, H_MAPPING, fd);
+    w32_handle *h = w32_handle_get(w, hv);
+    if (!h) { RET(0); return; }
+    h->u1 = size;
+    h->flags = (int)prot;
+    RET(hv);
+}
+static void k_CreateFileMappingW(w32 *w) { k_CreateFileMappingA(w); }
+
+/* MapViewOfFile(hMap, access, offHigh, offLow, bytes) */
+enum { FILE_MAP_WRITE_ = 2 };
+static void k_MapViewOfFile(w32 *w) {
+    w32_handle *h = w32_handle_get(w, ARG(0));
+    if (!h || h->type != H_MAPPING) { w32_set_last_error(w, ERR_INVALID_HANDLE); RET(0); return; }
+    uint64_t off = ((uint64_t)(uint32_t)ARG(2) << 32) | (uint32_t)ARG(3);
+    uint64_t want = ARG(4);
+    if (!want) want = h->u1 > off ? h->u1 - off : 0;
+    if (!want) { w32_set_last_error(w, 87); RET(0); return; }
+    int writable = (h->flags == PAGE_READWRITE_) && (ARG(1) & FILE_MAP_WRITE_);
+    int mapped = 0;
+    uint64_t a = w32_map_file(w, h->fd, off, want, writable, &mapped);
+    if (!a) { w32_set_last_error(w, 8 /* ERROR_NOT_ENOUGH_MEMORY */); RET(0); return; }
+    if (!mapped && h->fd >= 0) {
+        /* the pages are ordinary memory: fill them so the guest sees the file */
+        uint8_t *dst = W32P(w, a);
+        uint64_t done = 0;
+        while (done < want) {
+            ssize_t n = pread(h->fd, dst + done, (size_t)(want - done), (off_t)(off + done));
+            if (n <= 0) break;
+            done += (uint64_t)n;
+        }
+    }
+    if (w->verbose) fprintf(stderr, "winrun: mapped %llu bytes at %#llx (%s)\n",
+                            (unsigned long long)want, (unsigned long long)a, mapped ? "mmap" : "read");
+    RET(a);
+}
+static void k_MapViewOfFileEx(w32 *w) { k_MapViewOfFile(w); }
+/* Nothing is unmapped: an address the guest may still hold is safer left
+ * readable than returned to the allocator, and the process is about to end. */
+static void k_UnmapViewOfFile(w32 *w) { RET(1); }
+static void k_FlushViewOfFile(w32 *w) { RET(1); }
 
 /* ---- process ---- */
 static void k_ExitProcess(w32 *w) { w32_exit(w, (int)(uint32_t)ARG(0)); }
@@ -635,6 +816,9 @@ const w32_api w32_kernel32[] = {
     FN(InitializeConditionVariable, 1, k_nop_void), FN(WakeAllConditionVariable, 1, k_nop_void), FN(WakeConditionVariable, 1, k_nop_void),
     F(GetStdHandle, 1), F(SetStdHandle, 2), F(WriteFile, 5), F(WriteConsoleA, 5), F(WriteConsoleW, 5), F(ReadFile, 5),
     F(CreateFileA, 7), F(CreateFileW, 7), F(CloseHandle, 1), F(GetFileType, 1), F(GetFileSize, 2), F(GetFileSizeEx, 2),
+    F(FindFirstFileA, 2), F(FindFirstFileW, 2), F(FindNextFileA, 2), F(FindNextFileW, 2), F(FindClose, 1),
+    F(CreateFileMappingA, 6), F(CreateFileMappingW, 6), F(MapViewOfFile, 5), F(MapViewOfFileEx, 6),
+    F(UnmapViewOfFile, 1), F(FlushViewOfFile, 2),
     F(SetFilePointer, 4), F(SetFilePointerEx, 5), F(FlushFileBuffers, 1), F(GetConsoleMode, 2), F(SetConsoleMode, 2), F(GetConsoleScreenBufferInfo, 2), F(SetConsoleCtrlHandler, 2),
     F(GetFileAttributesA, 1), F(DeleteFileA, 1), F(GetCurrentDirectoryA, 2), F(SetCurrentDirectoryA, 1), F(GetTempPathA, 2), F(GetFullPathNameA, 4), F(FormatMessageA, 7),
     F(GetThreadPriority, 1), F(SetThreadPriority, 2), F(GetExitCodeProcess, 2), F(CreateEventA, 4), F(CreateEventW, 4), F(CreateMutexA, 3), F(SetEvent, 1), F(ResetEvent, 1),

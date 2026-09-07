@@ -1,0 +1,16 @@
+RegCreateKeyEx: 0, disposition 1 (1 = created new)
+set InstallPath: 0
+set Version: 0
+set Scratch: 0
+create subkey: 0
+size-only query: 0, type 1, 17 bytes
+query into 4 bytes: 234 (234 = more data), wants 17
+RegQueryInfoKey: 0, 1 subkeys, 3 values
+  value InstallPath type 1, 17 bytes
+  value Scratch type 3, 4 bytes
+  value Version type 4, 4 bytes
+  value enum ended with 259 (259 = no more items)
+  subkey Sub
+  subkey enum ended with 259
+delete Scratch: 0
+delete Scratch again: 2 (2 = not found)

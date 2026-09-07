@@ -18,6 +18,7 @@
 #include <strings.h>
 #include <sys/mman.h>
 #include <time.h>
+#include <dirent.h>
 #include <unistd.h>
 
 #define PAGE 4096ull
@@ -101,6 +102,32 @@ uint64_t w32_alloc_at(w32 *w, uint64_t addr, uint64_t size, int exec) {
     track_map(p, size);
     return addr;
 }
+/* Guest pages backed by a file.
+ *
+ * A game opens its archives with MapViewOfFile precisely so the whole thing
+ * does not have to be resident, so this maps rather than reads: guest space is
+ * reserved the ordinary way and the file is mapped over it. If that cannot be
+ * done -- an offset that is not host-page aligned, or a kernel that refuses --
+ * the anonymous pages are still there and the caller reads into them instead,
+ * which is slower and uses real memory but is never wrong. */
+uint64_t w32_map_file(w32 *w, int fd, uint64_t offset, uint64_t size, int writable, int *mapped) {
+    if (mapped) *mapped = 0;
+    uint64_t a = w32_alloc(w, size, 0);
+    if (!a) return 0;
+    uint64_t hp = w32_host_page();
+    if (fd < 0 || (offset & (hp - 1))) return a;          /* caller fills it */
+    void *host = W32P(w, a);
+    void *p = mmap(host, (size_t)size, writable ? (PROT_READ | PROT_WRITE) : PROT_READ,
+                   MAP_FIXED | (writable ? MAP_SHARED : MAP_PRIVATE), fd, (off_t)offset);
+    if (p == MAP_FAILED) {
+        if (w->verbose) fprintf(stderr, "winrun: mmap of %llu bytes at offset %llu: %s\n",
+                                (unsigned long long)size, (unsigned long long)offset, strerror(errno));
+        return a;                                        /* anonymous pages remain; caller fills */
+    }
+    if (mapped) *mapped = 1;
+    return a;
+}
+
 uint64_t w32_alloc(w32 *w, uint64_t size, int exec) {
     size = HP_UP(PAGE_UP(size));
     if (w->is32) {
@@ -280,7 +307,13 @@ void w32_handle_close(w32 *w, uint64_t h) {
     w32_handle *e = w32_handle_get(w, h);
     if (!e) return;
     if (e->type == H_FILE && e->fd > 2) close(e->fd);
-    e->type = H_NONE;
+    if (e->type == H_FIND) {
+        if (e->p) closedir((DIR *)e->p);
+        free((void *)(uintptr_t)e->u1);
+        free((void *)(uintptr_t)e->u2);
+    }
+    /* a mapping does not own its descriptor: the file handle does */
+    memset(e, 0, sizeof *e);
 }
 
 /* --------------------------------------------------------------- stubs */
@@ -291,6 +324,7 @@ static const w32_dll g_dlls[] = {
     { "ntdll.dll",    w32_ntdll,    0 },
     { "user32.dll",   w32_user32,   0 },
     { "d3d9.dll",     w32_d3d9,     0 },
+    { "advapi32.dll", w32_advapi32, 0 },
 };
 enum { NDLLS = sizeof g_dlls / sizeof g_dlls[0], STUB_RETURN = 0, STUB_EXIT = 1, STUB_FIRST = 2 };
 
@@ -616,6 +650,7 @@ static void winrun_reset(void) {
     g_bump32 = 0x10000000u;
     g_stop_request = 0;
     w32_reset_statics();
+    w32_registry_reset();
     w32_com_reset();
     w32_d3d9_reset();
     xc_cache_flush();

@@ -74,8 +74,15 @@ typedef struct {
     w32_dll        dll;          /* so the dispatcher can name the method */
 } w32_com_class;
 
-typedef enum { H_NONE = 0, H_FILE, H_PROCESS, H_THREAD, H_HEAP, H_EVENT, H_MUTEX } w32_htype;
-typedef struct { w32_htype type; int fd; int flags; } w32_handle;
+typedef enum { H_NONE = 0, H_FILE, H_PROCESS, H_THREAD, H_HEAP, H_EVENT, H_MUTEX,
+               H_FIND,        /* a directory walk: FindFirstFile/FindNextFile */
+               H_MAPPING      /* a file mapping: CreateFileMapping/MapViewOfFile */
+             } w32_htype;
+/* `p` and `u1`/`u2` are for the handle kinds that need more than a descriptor:
+ * a directory walk carries its DIR* and the pattern it is matching, a mapping
+ * carries its size. Kept in the handle rather than a side table so closing one
+ * is still just closing one. */
+typedef struct { w32_htype type; int fd; int flags; void *p; uint64_t u1, u2; } w32_handle;
 
 struct w32 {
     xc_cpu   *c;
@@ -134,6 +141,11 @@ struct w32 {
 void    *W32P(w32 *w, uint64_t addr);                      /* guest -> host, NULL for guest NULL */
 uint64_t w32_alloc(w32 *w, uint64_t size, int exec);        /* fresh zeroed pages */
 uint64_t w32_alloc_at(w32 *w, uint64_t addr, uint64_t size, int exec);   /* 0 on failure */
+/* Guest pages backed by a file. Falls back to ordinary pages the caller can
+ * read into when the offset is not host-page aligned or mmap refuses, so it
+ * never fails outright -- returns 0 only when there is no guest space. `mapped`
+ * says whether the file is really mapped or the caller must fill it. */
+uint64_t w32_map_file(w32 *w, int fd, uint64_t offset, uint64_t size, int writable, int *mapped);
 uint64_t w32_host_page(void);                               /* host page size (16 KB on Apple silicon) */
 uint64_t w32_heap_alloc(w32 *w, uint64_t size);
 uint64_t w32_heap_realloc(w32 *w, uint64_t addr, uint64_t size);
@@ -194,6 +206,12 @@ extern const w32_api w32_msvcrt[];
 extern const w32_api w32_ntdll[];
 extern const w32_api w32_user32[];
 extern const w32_api w32_d3d9[];
+extern const w32_api w32_advapi32[];
+
+/* advapi32.c: the registry is persisted next to the guest's C: drive. Called
+ * when a run ends so an installer's writes survive to the next launch. */
+void w32_registry_flush(void);
+void w32_registry_reset(void);
 
 /* d3d9.c: where a presented frame goes. NULL simply drops it, which is what
  * the headless test and CI want; the iOS app sets it to a Metal blit. */
@@ -222,6 +240,7 @@ int w32_stdcall_bytes(const char *name);
  * behaviour (absolute guest paths become relative); the app sets it to its own
  * storage so a program copied in from Files finds its data. */
 void w32_set_drive_c(const char *path);
+const char *w32_drive_c(void);      /* "" when unset */
 
 /* msvcrt.c: drop every cached guest address, so a second process can start
  * in the same host process (see winrun_main). */
