@@ -132,6 +132,7 @@ final class ProgramViewController: UIViewController {
             let dll = ProgramStore.dllDirURL(self.program)?.path ?? ""
             let rc = exe.path.withCString { p in
                 dll.withCString { d in
+                    AudioSession.activate()
                     win_probe_run_dir(p, dll.isEmpty ? nil : d, keepGoing ? 1 : 0,
                                       120, &out, out.count, &ns)
                 }

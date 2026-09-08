@@ -67,7 +67,8 @@ targets:
         # first. -lz is zlib from the SDK, for the zip reader's inflate.
         # $(inherited) keeps the core libraries from the shared settings, and
         # they have to come after these.
-        OTHER_LDFLAGS: -limport_lib -lwinrun_lib $(inherited) -lz
+        # AudioToolbox is the AudioQueue in audio_out.c: the guest's sound.
+        OTHER_LDFLAGS: -limport_lib -lwinrun_lib $(inherited) -lz -framework AudioToolbox
     dependencies:
       - target: WiniosProbe
         embed: true

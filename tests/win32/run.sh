@@ -4,6 +4,9 @@
 # checked by hand / against the Linux build of the same source).
 #   run.sh <winrun> <dir>
 winrun=$(cd "$(dirname "$1")" && pwd)/$(basename "$1"); cd "$2" || exit 2; fail=0
+# The guests that play sound must not reach a speaker from a test run; the
+# mixer still tracks every buffer, only the device is skipped.
+WINRUN_NO_AUDIO=1; export WINRUN_NO_AUDIO
 # When winrun was cross-compiled -- the aarch64 build, which is the one that
 # matches the device -- it cannot be exec'd here, so CMake passes the
 # emulator to put in front of it. Empty for a native build.

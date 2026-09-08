@@ -287,6 +287,32 @@ void     w32_set_cwd_win(w32 *w, const char *win);                 /* the curren
  * own CLSIDs and returns 1 if it made the object. */
 int      w32_com_create(w32 *w, const uint8_t clsid[16], const uint8_t iid[16], uint64_t out);
 int      w32_dsound_create_class(w32 *w, const uint8_t clsid[16], const uint8_t iid[16], uint64_t out);
+void     w32_dsound_tick(w32 *w);                                  /* fire the position notifications that are due; guest thread */
+void     w32_event_set(w32 *w, uint64_t h);                        /* thread.c: SetEvent from host code on the guest thread */
+
+/* audio_out.c: host audio output. A source is PCM the mixer reads in place;
+ * DirectSound buffers, PlaySound clips and XAudio2 voices are all sources. */
+typedef struct {
+    const void *mem;             /* the samples, host pointer; guest memory unless `owner` is set */
+    void       *owner;           /* a malloc'd block to free with the source, or NULL */
+    uint32_t    size;            /* bytes */
+    uint32_t    freq, channels, bits;
+    int         is_float;        /* 32-bit IEEE samples */
+    int         playing, looping;
+    int32_t     vol_mB, pan_mB;  /* DirectSound units: hundredths of a decibel, 0 is full, -10000 silent */
+    uint64_t    play_ns;         /* CLOCK_MONOTONIC at Play, for syncing to the guest-visible cursor; 0 = none */
+    uint32_t    start_byte;      /* the cursor at Play */
+    uint32_t    bps;             /* bytes per second the guest-visible cursor moves at */
+} w32_audio_src;
+int  w32_audio_open(void);                                 /* start the device; 1 if sound will be heard */
+void w32_audio_close(void);                                /* stop the device and drop every source -- before guest memory goes */
+int  w32_audio_device_on(void);
+int  w32_audio_src_add(const w32_audio_src *s);            /* an id >= 0, or -1 */
+void w32_audio_src_set(int id, const w32_audio_src *s);    /* refresh; the read position survives unless play (re)starts */
+void w32_audio_src_remove(int id);
+int  w32_audio_src_playing(int id);                        /* a one-shot ends by itself */
+void w32_audio_mix(int16_t *out, int frames);              /* render stereo 44.1 kHz frames: what the device calls */
+int  w32_audio_parse_wav(const uint8_t *p, size_t n, w32_audio_src *out);   /* RIFF/WAVE -> a source over p's data */
 /* A GUID as the 16 bytes it occupies in memory, from the eleven numbers a
  * DEFINE_GUID line spells it with -- so a header can be copied, not hand-swapped. */
 #define W32_GUID(l,a,b,c,d,e,f,g,h,i,j) { (uint8_t)((l)&0xff),(uint8_t)(((l)>>8)&0xff),(uint8_t)(((l)>>16)&0xff),(uint8_t)(((l)>>24)&0xff), \

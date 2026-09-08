@@ -1009,6 +1009,7 @@ static void on_crash(int sig, siginfo_t *si, void *uctx) {
 static void present_hook(void *ctx, const void *px, int w, int h, int pitch);
 
 static void winrun_reset(void) {
+    w32_audio_close();                 /* the mixer reads guest memory; stop it before that goes */
     if (g_w.is32 && g_w.base) munmap(g_w.base, 1ull << 32);
     for (int i = 0; i < g_nmaps; i++) munmap(g_maps[i].p, g_maps[i].n);
     g_nmaps = 0;

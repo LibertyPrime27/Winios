@@ -124,13 +124,19 @@ if(NOT WIN32)
         win32/advapi32.c win32/seh.c win32/thread.c
         win32/user32.c win32/gdi32.c win32/gdifont.c win32/truetype.c
         win32/fontdata.c win32/image.c win32/comctl32.c
-        win32/dsound.c win32/xinput.c win32/shell32.c win32/ole32.c
+        win32/dsound.c win32/audio_out.c win32/xinput.c win32/shell32.c win32/ole32.c
         win32/misc_dlls.c win32/net_dlls.c
         win32/d3d11.c win32/d3d11_raster.c win32/dxbc.c)
 
     add_library(winrun_lib STATIC ${WINRUN_SOURCES})
     target_link_libraries(winrun_lib PUBLIC xcore)
-    if(NOT APPLE)
+    if(APPLE)
+        # audio_out.c: the AudioQueue that plays the guest's sound, on macOS and
+        # iOS alike. Found as a library so every executable that links
+        # winrun_lib gets it, which a bare -framework flag does not guarantee.
+        find_library(WINIOS_AUDIOTOOLBOX AudioToolbox REQUIRED)
+        target_link_libraries(winrun_lib PUBLIC ${WINIOS_AUDIOTOOLBOX})
+    else()
         target_link_libraries(winrun_lib PUBLIC m)
     endif()
     target_include_directories(winrun_lib PUBLIC win32 tools/winrun)
@@ -138,8 +144,14 @@ if(NOT WIN32)
     set_property(TARGET winrun_lib PROPERTY C_STANDARD 11)
     target_compile_options(winrun_lib PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
+    # The mixer, to the sample: format conversion, rate, looping, volume, clipping.
+    add_executable(test_audio tests/test_audio.c)
+    target_link_libraries(test_audio winrun_lib)
+    set_property(TARGET test_audio PROPERTY C_STANDARD 11)
+    add_test(NAME audio COMMAND test_audio)
+
     add_executable(winrun ${WINRUN_SOURCES})
-    target_link_libraries(winrun PRIVATE xcore m)
+    target_link_libraries(winrun PRIVATE xcore m ${WINIOS_AUDIOTOOLBOX})   # the framework is empty off Apple
     target_include_directories(winrun PRIVATE win32)
     set_property(TARGET winrun PROPERTY C_STANDARD 11)
     target_compile_options(winrun PRIVATE -Wall -Wextra -Wno-unused-parameter)

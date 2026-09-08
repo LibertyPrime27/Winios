@@ -44,7 +44,9 @@ enum { DSSCL_NORMAL = 1, DSSCL_PRIORITY = 2, DSSCL_EXCLUSIVE = 3, DSSCL_WRITEPRI
 enum { DS_NBUF = 0, DS_COOP = 1, DS_NFIELDS = 4 };
 enum { B_MEM = 0, B_SIZE = 1, B_FLAGS = 2, B_FREQ = 3, B_BYTES_PER_SEC = 4,
        B_STATUS = 5, B_PLAY_NS = 6, B_WRITE = 7, B_VOL = 8, B_PAN = 9,
-       B_LOCKED = 10, B_NFIELDS = 12 };
+       B_LOCKED = 10, B_CHANNELS = 11, B_BITS = 12 /* | B_FLOAT */, B_SRC = 13 /* mixer source id + 1 */,
+       B_NFIELDS = 14 };
+enum { B_FLOAT = 0x100 };
 enum { TAG_DS = 0x44530000, TAG_DSBUF, TAG_DS3L, TAG_DS3B, TAG_DSNOTIFY };
 
 static w32_com_class cls_ds, cls_buf, cls_3dl, cls_3db, cls_notify;
@@ -62,14 +64,30 @@ static uint64_t now_ns(void) {
  * its writes, so it has to move, and it has to move at the buffer's own rate
  * rather than at some arbitrary speed -- a cursor that runs fast starves the
  * game's mixer and one that runs slow makes it spin. */
+static void notify_stopped(w32 *w, uint64_t buf);
+static void src_sync(w32 *w, uint64_t self);
 static uint32_t play_cursor(w32 *w, uint64_t self) {
     uint32_t size = (uint32_t)w32_com_get(w, self, B_SIZE);
     uint32_t bps = (uint32_t)w32_com_get(w, self, B_BYTES_PER_SEC);
     if (!size || !bps) return 0;
-    if (!(w32_com_get(w, self, B_STATUS) & DSBSTATUS_PLAYING)) return (uint32_t)w32_com_get(w, self, B_WRITE);
+    uint32_t st = (uint32_t)w32_com_get(w, self, B_STATUS);
+    uint32_t start = (uint32_t)w32_com_get(w, self, B_WRITE) % size;
+    if (!(st & DSBSTATUS_PLAYING)) return start;
     uint64_t started = w32_com_get(w, self, B_PLAY_NS);
     uint64_t elapsed = now_ns() - started;
-    return (uint32_t)((elapsed * bps / 1000000000ull) % size);
+    uint64_t byte = start + elapsed / 1000 * bps / 1000000ull;
+    /* A buffer played once ends: the status clears and the cursor rests at
+     * the start, which is what a game polling GetStatus to know when a sound
+     * effect has finished is waiting for. Discovered here, at the next look,
+     * because there is no thread whose job it is to notice. */
+    if (byte >= size && !(st & DSBSTATUS_LOOPING)) {
+        w32_com_set(w, self, B_STATUS, 0);
+        w32_com_set(w, self, B_WRITE, 0);
+        notify_stopped(w, self);
+        src_sync(w, self);
+        return 0;
+    }
+    return (uint32_t)(byte % size);
 }
 
 static void b_GetCaps(w32 *w) {
@@ -89,6 +107,7 @@ static void b_GetCaps(w32 *w) {
  * is about to play. */
 static void b_GetCurrentPosition(w32 *w) {
     uint64_t self = ARG(0);
+    w32_dsound_tick(w);
     uint32_t size = (uint32_t)w32_com_get(w, self, B_SIZE);
     uint32_t play = play_cursor(w, self);
     uint32_t bps = (uint32_t)w32_com_get(w, self, B_BYTES_PER_SEC);
@@ -98,8 +117,9 @@ static void b_GetCurrentPosition(w32 *w) {
     RET(S_OK_);
 }
 static void b_SetCurrentPosition(w32 *w) {
-    w32_com_set(w, ARG(0), B_WRITE, ARG(1));
+    w32_com_set(w, ARG(0), B_WRITE, (uint32_t)ARG(1));
     w32_com_set(w, ARG(0), B_PLAY_NS, now_ns());
+    src_sync(w, ARG(0));
     RET(S_OK_);
 }
 /* GetFormat(pwfx, size, written): a WAVEFORMATEX describing what we accepted. */
@@ -111,35 +131,60 @@ static void b_GetFormat(w32 *w) {
     if (ARG(3)) w32_write(w, ARG(3), 4, 18);
     if (!p) { RET(S_OK_); return; }
     if (cap < 18) { RET(DSERR_INVALIDPARAM); return; }
-    w32_write(w, p + 0, 2, 1);                  /* WAVE_FORMAT_PCM */
-    w32_write(w, p + 2, 2, 2);                  /* stereo */
+    uint32_t ch = (uint32_t)w32_com_get(w, ARG(0), B_CHANNELS), bits = (uint32_t)w32_com_get(w, ARG(0), B_BITS);
+    if (!ch) ch = 2;
+    int isf = (bits & B_FLOAT) != 0; bits &= 0xFF; if (!bits) bits = 16;
+    uint32_t align = ch * bits / 8;
+    w32_write(w, p + 0, 2, isf ? 3 : 1);        /* WAVE_FORMAT_IEEE_FLOAT / WAVE_FORMAT_PCM */
+    w32_write(w, p + 2, 2, ch);
     w32_write(w, p + 4, 4, freq);
-    w32_write(w, p + 8, 4, freq * 4);           /* nAvgBytesPerSec */
-    w32_write(w, p + 12, 2, 4);                 /* nBlockAlign */
-    w32_write(w, p + 14, 2, 16);                /* wBitsPerSample */
+    w32_write(w, p + 8, 4, freq * align);       /* nAvgBytesPerSec */
+    w32_write(w, p + 12, 2, align);             /* nBlockAlign */
+    w32_write(w, p + 14, 2, bits);              /* wBitsPerSample */
     w32_write(w, p + 16, 2, 0);                 /* cbSize */
     RET(S_OK_);
 }
+/* The parts of a WAVEFORMATEX a buffer keeps: rate, channels, sample width,
+ * and whether the samples are floats. Shared by CreateSoundBuffer, SetFormat
+ * and the primary buffer. */
+static void take_format(w32 *w, uint64_t self, uint64_t fmt) {
+    if (!fmt || !w32_mem_ok(w, fmt, 16)) return;
+    uint32_t tag = (uint32_t)w32_read(w, fmt, 2);
+    uint32_t ch = (uint32_t)w32_read(w, fmt + 2, 2);
+    uint32_t f = (uint32_t)w32_read(w, fmt + 4, 4);
+    uint32_t a = (uint32_t)w32_read(w, fmt + 8, 4);
+    uint32_t bits = (uint32_t)w32_read(w, fmt + 14, 2);
+    if (tag == 0xFFFE && w32_mem_ok(w, fmt, 40)) tag = (uint32_t)w32_read(w, fmt + 24, 2);   /* extensible: the subformat */
+    if (f) w32_com_set(w, self, B_FREQ, f);
+    if (ch) w32_com_set(w, self, B_CHANNELS, ch);
+    if (bits) w32_com_set(w, self, B_BITS, bits | (tag == 3 ? B_FLOAT : 0));
+    if (!a) { ch = ch ? ch : 2; bits = bits ? bits : 16; f = f ? f : 44100; a = f * ch * bits / 8; }
+    w32_com_set(w, self, B_BYTES_PER_SEC, a);
+}
 static void b_SetFormat(w32 *w) {
-    uint64_t p = ARG(1);
-    if (p) {
-        uint32_t freq = (uint32_t)w32_read(w, p + 4, 4);
-        uint32_t bps = (uint32_t)w32_read(w, p + 8, 4);
-        if (freq) w32_com_set(w, ARG(0), B_FREQ, freq);
-        if (bps) w32_com_set(w, ARG(0), B_BYTES_PER_SEC, bps);
-    }
+    take_format(w, ARG(0), ARG(1));
+    src_sync(w, ARG(0));
     RET(S_OK_);
 }
 static void b_GetVolume(w32 *w) { if (ARG(1)) w32_write(w, ARG(1), 4, (uint32_t)w32_com_get(w, ARG(0), B_VOL)); RET(S_OK_); }
-static void b_SetVolume(w32 *w) { w32_com_set(w, ARG(0), B_VOL, ARG(1)); RET(S_OK_); }
+static void b_SetVolume(w32 *w) { w32_com_set(w, ARG(0), B_VOL, (uint32_t)ARG(1)); src_sync(w, ARG(0)); RET(S_OK_); }
 static void b_GetPan(w32 *w) { if (ARG(1)) w32_write(w, ARG(1), 4, (uint32_t)w32_com_get(w, ARG(0), B_PAN)); RET(S_OK_); }
-static void b_SetPan(w32 *w) { w32_com_set(w, ARG(0), B_PAN, ARG(1)); RET(S_OK_); }
+static void b_SetPan(w32 *w) { w32_com_set(w, ARG(0), B_PAN, (uint32_t)ARG(1)); src_sync(w, ARG(0)); RET(S_OK_); }
 static void b_GetFrequency(w32 *w) { if (ARG(1)) w32_write(w, ARG(1), 4, (uint32_t)w32_com_get(w, ARG(0), B_FREQ)); RET(S_OK_); }
 static void b_SetFrequency(w32 *w) {
-    if (ARG(1)) { w32_com_set(w, ARG(0), B_FREQ, ARG(1)); w32_com_set(w, ARG(0), B_BYTES_PER_SEC, ARG(1) * 4); }
+    if (ARG(1)) {
+        uint32_t ch = (uint32_t)w32_com_get(w, ARG(0), B_CHANNELS), bits = (uint32_t)w32_com_get(w, ARG(0), B_BITS) & 0xFF;
+        if (!ch) ch = 2; if (!bits) bits = 16;
+        /* the cursor keeps its place: the rate changes from here, not from the start */
+        w32_com_set(w, ARG(0), B_WRITE, play_cursor(w, ARG(0)));
+        w32_com_set(w, ARG(0), B_PLAY_NS, now_ns());
+        w32_com_set(w, ARG(0), B_FREQ, (uint32_t)ARG(1));
+        w32_com_set(w, ARG(0), B_BYTES_PER_SEC, (uint32_t)ARG(1) * ch * bits / 8);
+        src_sync(w, ARG(0));
+    }
     RET(S_OK_);
 }
-static void b_GetStatus(w32 *w) { if (ARG(1)) w32_write(w, ARG(1), 4, (uint32_t)w32_com_get(w, ARG(0), B_STATUS)); RET(S_OK_); }
+static void b_GetStatus(w32 *w) { w32_dsound_tick(w); (void)play_cursor(w, ARG(0)); if (ARG(1)) w32_write(w, ARG(1), 4, (uint32_t)w32_com_get(w, ARG(0), B_STATUS)); RET(S_OK_); }
 
 /* Lock(offset, bytes, pp1, pn1, pp2, pn2, flags). A lock can wrap the end of
  * a circular buffer, which is why there are two pointers; a game that asks
@@ -169,14 +214,29 @@ static void b_Unlock(w32 *w) { w32_com_set(w, ARG(0), B_LOCKED, 0); RET(S_OK_); 
 static void b_Play(w32 *w) {
     uint32_t flags = (uint32_t)ARG(3);
     uint32_t st = DSBSTATUS_PLAYING | ((flags & 1) ? DSBSTATUS_LOOPING : 0);
+    /* Play on a playing buffer only changes the flags; the cursor keeps going. */
+    if (w32_com_get(w, ARG(0), B_STATUS) & DSBSTATUS_PLAYING) w32_com_set(w, ARG(0), B_WRITE, play_cursor(w, ARG(0)));
     w32_com_set(w, ARG(0), B_STATUS, st);
     w32_com_set(w, ARG(0), B_PLAY_NS, now_ns());
+    src_sync(w, ARG(0));
     RET(S_OK_);
 }
 static void b_Stop(w32 *w) {
+    uint32_t was = (uint32_t)w32_com_get(w, ARG(0), B_STATUS);
     w32_com_set(w, ARG(0), B_WRITE, play_cursor(w, ARG(0)));
     w32_com_set(w, ARG(0), B_STATUS, 0);
+    if (was & DSBSTATUS_PLAYING) notify_stopped(w, ARG(0));
+    src_sync(w, ARG(0));
     RET(S_OK_);
+}
+/* Release, and when it was the last reference, the mixer forgets the buffer.
+ * The guest memory stays, as every COM object's does here. */
+static void b_Release(w32 *w) {
+    uint64_t self = ARG(0);
+    uint32_t before = (uint32_t)w32_read(w, self + w32_ptrsize(w), 4);
+    int id = (int)w32_com_get(w, self, B_SRC) - 1;
+    w32_com_Release(w);
+    if (before <= 1 && id >= 0) { w32_audio_src_remove(id); w32_com_set(w, self, B_SRC, 0); }
 }
 /* A buffer is never lost here: there is no device to lose it to. */
 static void b_Restore(w32 *w) { w32_com_set(w, ARG(0), B_STATUS, (uint32_t)w32_com_get(w, ARG(0), B_STATUS) & ~(uint64_t)DSBSTATUS_BUFFERLOST); RET(S_OK_); }
@@ -212,7 +272,7 @@ static void ds_CreateSoundBuffer(w32 *w) {
     uint64_t fmt = w32_read(w, desc + 16, (int)w32_ptrsize(w));
 
     uint32_t freq = 44100, bps = 44100 * 4;
-    if (fmt) {
+    if (fmt && w32_mem_ok(w, fmt, 16)) {
         uint32_t f = (uint32_t)w32_read(w, fmt + 4, 4);
         uint32_t a = (uint32_t)w32_read(w, fmt + 8, 4);
         if (f) freq = f;
@@ -238,6 +298,9 @@ static void ds_CreateSoundBuffer(w32 *w) {
     w32_com_set(w, b, B_FREQ, freq);
     w32_com_set(w, b, B_BYTES_PER_SEC, bps);
     w32_com_set(w, b, B_VOL, 0);                 /* DSBVOLUME_MAX */
+    w32_com_set(w, b, B_CHANNELS, 2); w32_com_set(w, b, B_BITS, 16);
+    take_format(w, b, fmt);
+    src_sync(w, b);
     w32_com_set(w, ARG(0), DS_NBUF, w32_com_get(w, ARG(0), DS_NBUF) + 1);
     w32_write(w, out, (int)w32_ptrsize(w), b);
     if (w->verbose)
@@ -272,6 +335,8 @@ static void ds_DuplicateSoundBuffer(w32 *w) {
     if (!b) { RET(E_FAIL_); return; }
     for (int i = 0; i < B_NFIELDS; i++) w32_com_set(w, b, i, w32_com_get(w, src, i));
     w32_com_set(w, b, B_STATUS, 0);
+    w32_com_set(w, b, B_SRC, 0);                 /* its own cursor, so its own source */
+    src_sync(w, b);
     w32_write(w, out, (int)w32_ptrsize(w), b);
     RET(S_OK_);
 }
@@ -279,6 +344,113 @@ static void ds_SetCooperativeLevel(w32 *w) { w32_com_set(w, ARG(0), DS_COOP, ARG
 static void ds_GetSpeakerConfig(w32 *w) { if (ARG(1)) w32_write(w, ARG(1), 4, 6); RET(S_OK_); }   /* DSSPEAKER_STEREO */
 static void ds_SetSpeakerConfig(w32 *w) { (void)w; RET(S_OK_); }
 static void ds_VerifyCertification(w32 *w) { if (ARG(1)) w32_write(w, ARG(1), 4, 0); RET(S_OK_); }
+
+/* --- the mixer's view of a buffer ----------------------------------------- */
+
+/* Everything the mixer needs to play this buffer, refreshed whenever the
+ * guest changes any of it. The source is created on the first sync, so a
+ * duplicate -- which shares the samples but not the cursor -- gets its own. */
+static void src_sync(w32 *w, uint64_t self) {
+    uint64_t mem = w32_com_get(w, self, B_MEM);
+    uint32_t size = (uint32_t)w32_com_get(w, self, B_SIZE);
+    if (!mem || !size) return;
+    w32_audio_src s; memset(&s, 0, sizeof s);
+    s.mem = W32PN(w, mem, size); if (!s.mem) return;
+    s.size = size;
+    s.freq = (uint32_t)w32_com_get(w, self, B_FREQ);
+    s.channels = (uint32_t)w32_com_get(w, self, B_CHANNELS);
+    uint32_t bits = (uint32_t)w32_com_get(w, self, B_BITS);
+    s.bits = bits & 0xFF; s.is_float = (bits & B_FLOAT) != 0;
+    s.bps = (uint32_t)w32_com_get(w, self, B_BYTES_PER_SEC);
+    uint32_t st = (uint32_t)w32_com_get(w, self, B_STATUS);
+    s.playing = (st & DSBSTATUS_PLAYING) != 0;
+    s.looping = (st & DSBSTATUS_LOOPING) != 0;
+    s.vol_mB = (int32_t)(uint32_t)w32_com_get(w, self, B_VOL);
+    s.pan_mB = (int32_t)(uint32_t)w32_com_get(w, self, B_PAN);
+    s.play_ns = w32_com_get(w, self, B_PLAY_NS);
+    s.start_byte = (uint32_t)w32_com_get(w, self, B_WRITE) % size;
+    int id = (int)w32_com_get(w, self, B_SRC) - 1;
+    if (id < 0) { id = w32_audio_src_add(&s); if (id < 0) return; w32_com_set(w, self, B_SRC, (uint64_t)id + 1); }
+    else w32_audio_src_set(id, &s);
+    if (s.playing) w32_audio_open();
+}
+
+/* --- position notifications ------------------------------------------------
+ *
+ * A streaming game sets events at points in its buffer and waits on them to
+ * know when to write the next block; a buffer whose events never fire is a
+ * game that never writes again -- or, waiting INFINITE, never draws again.
+ * There is no thread here whose job is the mixer, so the events are fired
+ * from the guest thread: at every wait (see thread.c), and at every look at
+ * the cursor. Nothing is missed by that: a position not yet crossed is fired
+ * at the next tick after it is, and a program that waits is in a wait. */
+enum { MAX_NBUF = 32, MAX_NPOS = 32, DSBPN_OFFSETSTOP = 0xFFFFFFFFu };
+static struct {
+    uint64_t buf;
+    int      n;
+    uint32_t last;                            /* the cursor at the previous tick */
+    struct { uint32_t off; uint64_t ev; } p[MAX_NPOS];
+} g_notify[MAX_NBUF];
+
+static int notify_slot(uint64_t buf, int make) {
+    int free_i = -1;
+    for (int i = 0; i < MAX_NBUF; i++) {
+        if (g_notify[i].buf == buf) return i;
+        if (!g_notify[i].buf && free_i < 0) free_i = i;
+    }
+    if (make && free_i >= 0) { memset(&g_notify[free_i], 0, sizeof g_notify[free_i]); g_notify[free_i].buf = buf; }
+    return make ? free_i : -1;
+}
+static void notify_stopped(w32 *w, uint64_t buf) {
+    int i = notify_slot(buf, 0);
+    if (i < 0) return;
+    for (int k = 0; k < g_notify[i].n; k++) if (g_notify[i].p[k].off == DSBPN_OFFSETSTOP) w32_event_set(w, g_notify[i].p[k].ev);
+    g_notify[i].last = 0;
+}
+/* DSBPOSITIONNOTIFY { DWORD dwOffset; HANDLE hEventNotify; }: 8 bytes in a
+ * 32-bit program, 16 in a 64-bit one (the handle is aligned to 8). */
+static void n_SetNotificationPositions(w32 *w) {
+    uint64_t buf = w32_com_get(w, ARG(0), 0);
+    uint32_t count = (uint32_t)ARG(1); uint64_t arr = ARG(2);
+    int psz = (int)w32_ptrsize(w), stride = psz == 4 ? 8 : 16;
+    if (!buf) { RET(E_FAIL_); return; }
+    if (count && (!arr || !w32_mem_ok(w, arr, (uint64_t)stride * count))) { RET(DSERR_INVALIDPARAM); return; }
+    if (count > MAX_NPOS) count = MAX_NPOS;
+    int i = notify_slot(buf, 1);
+    if (i < 0) { RET(E_FAIL_); return; }
+    g_notify[i].n = 0;
+    for (uint32_t k = 0; k < count; k++) {
+        g_notify[i].p[k].off = (uint32_t)w32_read(w, arr + (uint64_t)stride * k, 4);
+        g_notify[i].p[k].ev  = w32_read(w, arr + (uint64_t)stride * k + (psz == 4 ? 4 : 8), psz);
+        g_notify[i].n++;
+    }
+    g_notify[i].last = play_cursor(w, buf);
+    RET(S_OK_);
+}
+void w32_dsound_tick(w32 *w) {
+    static int inside;                        /* play_cursor below can call back in through a stop */
+    if (inside) return;
+    inside = 1;
+    for (int i = 0; i < MAX_NBUF; i++) {
+        uint64_t buf = g_notify[i].buf;
+        if (!buf || !g_notify[i].n) continue;
+        if (!(w32_com_get(w, buf, B_STATUS) & DSBSTATUS_PLAYING)) { g_notify[i].last = (uint32_t)w32_com_get(w, buf, B_WRITE); continue; }
+        uint32_t size = (uint32_t)w32_com_get(w, buf, B_SIZE);
+        uint32_t last = g_notify[i].last, cur = play_cursor(w, buf);
+        if (!(w32_com_get(w, buf, B_STATUS) & DSBSTATUS_PLAYING)) {      /* ended just now: everything past `last` fired with the stop */
+            for (int k = 0; k < g_notify[i].n; k++) { uint32_t o = g_notify[i].p[k].off; if (o != DSBPN_OFFSETSTOP && o > last && o < size) w32_event_set(w, g_notify[i].p[k].ev); }
+            g_notify[i].last = 0; continue;
+        }
+        for (int k = 0; k < g_notify[i].n; k++) {
+            uint32_t o = g_notify[i].p[k].off;
+            if (o == DSBPN_OFFSETSTOP) continue;
+            int crossed = cur >= last ? (o > last && o <= cur) : (o > last || o <= cur);   /* wrapped */
+            if (crossed) w32_event_set(w, g_notify[i].p[k].ev);
+        }
+        g_notify[i].last = cur;
+    }
+    inside = 0;
+}
 
 /* --- the vtables, indexed by generated slot name ------------------------ */
 
@@ -319,7 +491,7 @@ static void build_tables(void) {
 
     M(buf_methods, DSB8_QueryInterface, "QueryInterface", 3, b_QueryInterface);
     M(buf_methods, DSB8_AddRef, "AddRef", 1, w32_com_AddRef);
-    M(buf_methods, DSB8_Release, "Release", 1, w32_com_Release);
+    M(buf_methods, DSB8_Release, "Release", 1, b_Release);
     M(buf_methods, DSB8_GetCaps, "GetCaps", 2, b_GetCaps);
     M(buf_methods, DSB8_GetCurrentPosition, "GetCurrentPosition", 3, b_GetCurrentPosition);
     M(buf_methods, DSB8_GetFormat, "GetFormat", 4, b_GetFormat);
@@ -368,7 +540,7 @@ static void build_tables(void) {
     M(notify_methods, DSN_QueryInterface, "QueryInterface", 3, w32_com_QueryInterface);
     M(notify_methods, DSN_AddRef, "AddRef", 1, w32_com_AddRef);
     M(notify_methods, DSN_Release, "Release", 1, w32_com_Release);
-    M(notify_methods, DSN_SetNotificationPositions, "SetNotificationPositions", 3, ok0);
+    M(notify_methods, DSN_SetNotificationPositions, "SetNotificationPositions", 3, n_SetNotificationPositions);
 
     cls_ds     = (w32_com_class){ "IDirectSound8",          ds_methods,     DS8_NSLOTS,  TAG_DS,       0, {0} };
     cls_buf    = (w32_com_class){ "IDirectSoundBuffer8",    buf_methods,    DSB8_NSLOTS, TAG_DSBUF,    0, {0} };
@@ -411,6 +583,7 @@ static void b_QueryInterface(w32 *w) {
                                : BUF_IIDS[i].which == 2 ? &cls_notify : &cls_3dl;
             uint64_t o = w32_com_new(w, cls, 2);
             if (!o) { RET(E_FAIL_); return; }
+            w32_com_set(w, o, 0, ARG(0));               /* the buffer it speaks for */
             w32_write(w, out, (int)w32_ptrsize(w), o);
             if (w->verbose) fprintf(stderr, "winrun: dsound: buffer asked for %s\n", cls->name);
             RET(S_OK_);
@@ -480,7 +653,7 @@ static void d_GetDeviceID(w32 *w) {
 static void d_DllGetClassObject(w32 *w) { (void)w; RET(0x80040111u); }    /* CLASS_E_CLASSNOTAVAILABLE */
 static void d_DllCanUnloadNow(w32 *w) { (void)w; RET(1); }
 
-void w32_dsound_reset(void) { g_built = 0; }
+void w32_dsound_reset(void) { g_built = 0; memset(g_notify, 0, sizeof g_notify); }
 
 #define F(n, a)  { #n, a, 0, d_##n, 0 }
 const w32_api w32_dsound[] = {

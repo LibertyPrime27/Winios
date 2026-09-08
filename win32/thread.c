@@ -357,6 +357,7 @@ static int handle_ready(w32 *w, uint64_t hv, int consume) {
 static uint32_t wait_one(w32 *w, uint64_t hv, uint32_t ms) {
     uint64_t deadline = ms == INFINITE_ ? 0 : now_ms() + ms;
     for (;;) {
+        w32_dsound_tick(w);                 /* a wait is where a sound's position event is noticed */
         int r = handle_ready(w, hv, 1);
         if (r < 0) return WAIT_FAILED_;
         if (r) return WAIT_OBJECT_0_;
@@ -391,6 +392,7 @@ static void k_WaitForMultipleObjects(w32 *w) {
 
     uint64_t deadline = ms == INFINITE_ ? 0 : now_ms() + ms;
     for (;;) {
+        w32_dsound_tick(w);
         if (all) {
             /* Every one has to be ready *before* any is consumed, or a
              * partial wait eats a signal it is not going to act on. */
@@ -430,6 +432,13 @@ static void ev_create(w32 *w, int wide) {
 }
 static void k_CreateEventA(w32 *w) { ev_create(w, 0); }
 static void k_CreateEventW(w32 *w) { ev_create(w, 1); }
+/* SetEvent from host code: dsound.c signals a buffer's position events from
+ * the guest thread, where a program waiting on one is in the loop below. */
+void w32_event_set(w32 *w, uint64_t h) {
+    w32_handle *hh = w32_handle_get(w, h);
+    if (hh) hh->flags |= 1u;
+    pthread_cond_broadcast(&g_change);
+}
 static void k_SetEvent(w32 *w) {
     w32_handle *h = w32_handle_get(w, ARG(0));
     if (h) h->flags |= 1u;

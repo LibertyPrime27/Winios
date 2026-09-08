@@ -2689,8 +2689,56 @@ static void m_joyGetDevCapsA(w32 *w) { (void)w; RET(JOYERR_UNPLUGGED_); }
 static void m_joyGetDevCapsW(w32 *w) { (void)w; RET(JOYERR_UNPLUGGED_); }
 static void m_joySetCapture(w32 *w) { (void)w; RET(JOYERR_UNPLUGGED_); }
 static void m_joyReleaseCapture(w32 *w) { (void)w; RET(JOYERR_UNPLUGGED_); }
-static void m_PlaySoundW(w32 *w) { (void)w; RET(0); }
-static void m_PlaySoundA(w32 *w) { (void)w; RET(0); }
+/* PlaySound(sound, hmod, flags): a WAV from memory or a file, through the
+ * mixer. One at a time, as on Windows -- a new one stops the last -- and
+ * without SND_ASYNC the call waits for it to finish, bounded. A sound kept in
+ * the program's resources (SND_RESOURCE) is not looked up yet, and says so. */
+enum { SND_ASYNC_ = 1, SND_MEMORY_ = 4, SND_LOOP_ = 8, SND_PURGE_ = 0x40, SND_RESOURCE_ = 0x40004 };
+static int g_playsound = -1;
+static void play_sound(w32 *w, int wide) {
+    uint64_t p = ARG(0); uint32_t fl = (uint32_t)ARG(2);
+    if (g_playsound >= 0) { w32_audio_src_remove(g_playsound); g_playsound = -1; }
+    if (!p || (fl & SND_PURGE_)) { RET(1); return; }
+    if ((fl & SND_RESOURCE_) == SND_RESOURCE_) {
+        w32_note_refused(w, "winmm!PlaySound (SND_RESOURCE: a sound from the program's own resources is not looked up yet)");
+        RET(0); return;
+    }
+    uint8_t *data = 0; size_t n = 0;
+    if (fl & SND_MEMORY_) {
+        const uint8_t *h = W32PN(w, p, 12);
+        if (!h || memcmp(h, "RIFF", 4) || memcmp(h + 8, "WAVE", 4)) { RET(0); return; }
+        uint32_t len = ((uint32_t)h[4] | (uint32_t)h[5] << 8 | (uint32_t)h[6] << 16 | (uint32_t)h[7] << 24) + 8;
+        const uint8_t *all = len < (64u << 20) ? W32PN(w, p, len) : 0;
+        if (!all) { RET(0); return; }
+        data = malloc(len); if (!data) { RET(0); return; }
+        memcpy(data, all, len); n = len;
+    } else {
+        char name[1024], host[4096];
+        if (wide) w32_wtoa(w, p, name, sizeof name); else snprintf(name, sizeof name, "%s", w32_str(w, p));
+        host_path(w, name, host, sizeof host);
+        FILE *f = fopen(host, "rb");
+        if (!f) { w32_set_last_error(w, ERROR_FILE_NOT_FOUND); RET(0); return; }
+        fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
+        if (len <= 0 || len > (64L << 20) || !(data = malloc((size_t)len))) { fclose(f); RET(0); return; }
+        n = fread(data, 1, (size_t)len, f); fclose(f);
+    }
+    w32_audio_src s;
+    if (!w32_audio_parse_wav(data, n, &s)) { free(data); RET(0); return; }
+    s.owner = data; s.playing = 1; s.looping = (fl & SND_LOOP_) != 0;
+    g_playsound = w32_audio_src_add(&s);
+    if (g_playsound < 0) { free(data); RET(0); return; }
+    w32_audio_open();
+    if (!(fl & SND_ASYNC_) && !s.looping) {
+        uint64_t ms = (uint64_t)s.size * 1000 / (s.bps ? s.bps : 1);
+        if (ms > 30000) ms = 30000;
+        for (uint64_t t = 0; t < ms && w32_audio_src_playing(g_playsound); t += 10) {
+            struct timespec ts = { 0, 10 * 1000000L }; nanosleep(&ts, 0);
+        }
+    }
+    RET(1);
+}
+static void m_PlaySoundW(w32 *w) { play_sound(w, 1); }
+static void m_PlaySoundA(w32 *w) { play_sound(w, 0); }
 static void m_mciSendStringW(w32 *w) { (void)w; RET(1); }
 static void m_mciSendStringA(w32 *w) { (void)w; RET(1); }
 

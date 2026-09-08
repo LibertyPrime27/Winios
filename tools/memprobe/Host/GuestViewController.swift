@@ -241,6 +241,7 @@ final class GuestViewController: UIViewController {
             // game loads its own libraries here too.
             let rc = exe.withCString { p in
                 dll.withCString { d in
+                    AudioSession.activate()
                     win_probe_run_dir(p, dll.isEmpty ? nil : d, 0, 0, &out, out.count, &ns)
                 }
             }
