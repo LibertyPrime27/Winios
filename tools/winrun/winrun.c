@@ -537,6 +537,11 @@ uint64_t w32_module_handle(w32 *w, const char *name) {
     return 0;
 }
 
+const char *w32_builtin_dll_name(w32 *w, uint64_t h) {
+    for (int d = 0; d < NDLLS; d++) if (h == w->stub_base + 0x10000u * (d + 1)) return g_dlls[d].name;
+    return 0;
+}
+
 uint64_t w32_stub_for(w32 *w, const char *dll, const char *name) {
     int d = -1;
     for (int k = 0; k < NDLLS; k++) if (!strcmp(g_dlls[k].name, dll)) d = k;
@@ -626,9 +631,28 @@ static void note_unimplemented(w32 *w, const char *name) {
     w->nunimpl++;
 }
 
+/* The last calls into the API layer, for the report. A fault at rip 0 says
+ * nothing; the same fault after "FlsGetValue2 -> made-up 0, then
+ * RtlAllocateHeap, then ..." says what the program was doing. Names and four
+ * arguments, no formatting until a report is written, so it costs a few
+ * stores per call. */
+enum { TRACE_N = 48 };
+typedef struct { const char *dll, *name; uint64_t a[4]; int missing; } trace_ent;
+static trace_ent g_trace[TRACE_N];
+static unsigned g_trace_n;
+static void trace_call(w32 *w, int i) {
+    trace_ent *t = &g_trace[g_trace_n++ % TRACE_N];
+    const w32_api *api = w->stubs[i].api;
+    t->dll = w->stubs[i].dll ? w->stubs[i].dll->name : 0;
+    t->name = api ? api->name : (w->stubs[i].missing ? w->stubs[i].missing : "?");
+    t->missing = !api;
+    for (int k = 0; k < 4; k++) t->a[k] = w32_arg(w, k);
+}
+
 static void dispatch(w32 *w, int i) {
     xc_cpu *c = w32_cpu(w);
     const w32_api *a = w->stubs[i].api;
+    trace_call(w, i);
     if (!a) {
         const char *full = w->stubs[i].missing;
         const char *bang = full ? strchr(full, '!') : 0;
@@ -1032,6 +1056,7 @@ static void winrun_reset(void) {
     w32_xinput_reset();
     w32_thread_reset();
     g_nscript = 0; g_frame = 0;
+    g_trace_n = 0;
     /* Undo *our* hook, not whoever's is there. When winrun is a library --
      * which it is inside the app -- the embedder installs the present
      * callback that puts frames on the screen before it calls in, and
@@ -1560,6 +1585,24 @@ int w32_crash_report(w32 *w, char *out, size_t out_len) {
             P("\n  rip is in %s, at +%#llx\n", w->mods[i].name,
               (unsigned long long)(c->rip - w->mods[i].base));
 
+    if (g_trace_n) {
+        P("\n  last calls into the API layer (oldest first):\n");
+        unsigned from = g_trace_n > TRACE_N ? g_trace_n - TRACE_N : 0;
+        for (unsigned k = from; k < g_trace_n; k++) {
+            const trace_ent *t = &g_trace[k % TRACE_N];
+            P("    %s%s%s(%#llx, %#llx, %#llx, %#llx)%s\n", t->dll && !t->missing ? t->dll : "", t->dll && !t->missing ? "!" : "",
+              t->name, (unsigned long long)t->a[0], (unsigned long long)t->a[1], (unsigned long long)t->a[2], (unsigned long long)t->a[3],
+              t->missing ? "   <- not implemented" : "");
+        }
+    }
+    {
+        int ns = w32_audio_src_count(), nd = w32_dinput_device_count();
+        P("\n  subsystems:\n");
+        P("    audio      %s, %d sound source%s\n", w32_audio_device_on() ? "device open" : "no device (silent)", ns, ns == 1 ? "" : "s");
+        P("    dinput     %d device%s created\n", nd, nd == 1 ? "" : "s");
+        P("    jit        %s\n", xc_jit_enabled() ? "on" : "off (interpreted)");
+    }
+
     if (w->nunimpl) {
         P("\n  called but not implemented (%d):\n", w->nunimpl);
         for (int k = 0; k < w->nunimpl; k++)
@@ -1645,6 +1688,8 @@ static int winrun_once(int argc, char **argv) {
                           "              program.exe [args...]\n"); return 2; }
     w->exe_path = argv[ai];
     g_prog_index = ai;
+    /* The app has no command line; its "detailed run log" switch sets this. */
+    { const char *v = getenv("WINRUN_VERBOSE"); if (v && *v && *v != '0') w->verbose += atoi(v) > 1 ? 2 : 1; }
 
     /* bitness decides the memory model, so peek at the header first */
     { FILE *f = fopen(argv[ai], "rb"); uint8_t h[0x200] = {0};

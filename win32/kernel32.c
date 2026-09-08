@@ -471,8 +471,12 @@ static void k_GetProcAddress(w32 *w) {
     if (w32_module_at(w, h)) {
         a = w32_module_export(w, h, nm, ordinal);
     } else {
-        static const char *names[] = { "kernel32.dll", "msvcrt.dll", "ntdll.dll", "user32.dll" };
-        for (int d = 0; d < 4; d++) if (h == w->stub_base + 0x10000u * (d + 1) && nm) a = w32_stub_for(w, names[d], nm);
+        /* A built-in DLL's handle: any of them, by name or by ordinal -- a game
+         * that loads dsound or xinput lazily asks this way, and used to get
+         * NULL for everything but the first four. */
+        const char *dn = w32_builtin_dll_name(w, h);
+        if (dn && nm) a = w32_stub_for(w, dn, nm);
+        else if (dn) { const char *o = w32_ordinal_name(dn, ordinal); if (o) a = w32_stub_for(w, dn, o); }
     }
     if (w->verbose) {
         char ob[16]; if (!nm) snprintf(ob, sizeof ob, "#%d", ordinal);

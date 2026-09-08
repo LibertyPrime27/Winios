@@ -141,6 +141,17 @@ enum Settings {
         set { store.set(newValue, forKey: "recordCrashes") }
     }
 
+    /// A detailed run log: winrun's own -v narration -- every module loaded
+    /// and from where, every DLL search, every GetProcAddress, the COM
+    /// objects a game creates -- folded into the run report. Off by default
+    /// because it is long and costs a little time; on when something is
+    /// being chased, because "it stopped" with this is usually "it stopped
+    /// after loading X and asking for Y".
+    static var verboseLogs: Bool {
+        get { store.object(forKey: "verboseLogs") as? Bool ?? false }
+        set { store.set(newValue, forKey: "verboseLogs") }
+    }
+
     /// Send the display setting into the emulator. Called before a guest
     /// starts rather than when the setting changes: a game reads the mode
     /// once, at startup, so changing it mid-run would have no effect and
@@ -148,6 +159,8 @@ enum Settings {
     static func apply() {
         let m = displayMode
         w32_set_screen_size(Int32(m.w), Int32(m.h))
+        // winrun has no command line here; its -v is an environment variable.
+        setenv("WINRUN_VERBOSE", verboseLogs ? "1" : "0", 1)
         // A dialog is laid out from the DPI, so this has to be set before
         // one is created -- changing it later would move nothing.
         w32_set_ui_dpi(Int32(96 * dialogScale / 100))

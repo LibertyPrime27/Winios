@@ -83,6 +83,9 @@ final class SettingsViewController: UIViewController {
         let logs = UISwitch()
         logs.isOn = Logs.isEnabled
         logs.addTarget(self, action: #selector(logsChanged(_:)), for: .valueChanged)
+        let verbose = UISwitch()
+        verbose.isOn = Settings.verboseLogs
+        verbose.addTarget(self, action: #selector(verboseChanged(_:)), for: .valueChanged)
 
         // --- crash reports
         let crashes = UISwitch()
@@ -138,6 +141,12 @@ final class SettingsViewController: UIViewController {
                  + "the difference between a report you can act on and one you "
                  + "cannot. Nothing leaves the device on its own."),
             switchRow("Record logs", logs),
+            note("Detailed adds winrun's own narration to every run report: "
+                 + "each module loaded and from where, each DLL search, each "
+                 + "GetProcAddress, the sound and input objects a game creates. "
+                 + "Long, and slightly slower — turn it on for a program that "
+                 + "is being chased, off for playing."),
+            switchRow("Detailed run log", verbose),
             row([("View log", #selector(viewLog)), ("Copy", #selector(copyLog)),
                  ("Clear", #selector(clearLog))]),
             heading("Crash reports"),
@@ -258,6 +267,7 @@ final class SettingsViewController: UIViewController {
     }
 
     @objc private func logsChanged(_ sw: UISwitch) { Logs.isEnabled = sw.isOn }
+    @objc private func verboseChanged(_ sw: UISwitch) { Settings.verboseLogs = sw.isOn }
 
     @objc private func viewLog() {
         let text = Logs.text()

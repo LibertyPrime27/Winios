@@ -285,3 +285,10 @@ void w32_audio_close(void) {
     pthread_mutex_unlock(&g_lock);
 }
 int w32_audio_device_on(void) { return g_device_on; }
+int w32_audio_src_count(void) {
+    int n = 0;
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < MAX_SRC; i++) n += g_src[i].used;
+    pthread_mutex_unlock(&g_lock);
+    return n;
+}

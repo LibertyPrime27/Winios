@@ -281,7 +281,10 @@ void     w32_thread_notify(w32 *w, int reason);                    /* DllMain(DL
  * runs after this one ends; see CreateProcess in kernel32.c and the loop in
  * winrun_main. Returns the queue index, or -1 when the queue is full. */
 int      w32_launch_queue(w32 *w, const char *host_exe, const char *args, const char *cwd_win, const char *who);
-uint64_t w32_process_handle_new(w32 *w);                           /* a process handle that is already signalled */
+uint64_t w32_process_handle_new(w32 *w);
+const char *w32_builtin_dll_name(w32 *w, uint64_t h);          /* the DLL a fake module handle stands for, or NULL */
+int      w32_audio_src_count(void);
+int      w32_dinput_device_count(void);                           /* a process handle that is already signalled */
 void     w32_set_cwd_win(w32 *w, const char *win);                 /* the current directory, as a Windows path */
 /* CoCreateInstance for the classes that exist here: each DLL answers for its
  * own CLSIDs and returns 1 if it made the object. */

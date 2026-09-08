@@ -378,15 +378,19 @@ static int with_capture(cap_fn body, void *ctx, char *out, size_t out_len) {
     char tmp[1024];
     snprintf(tmp, sizeof tmp, "%swinprobe.%d.out", tmpdir && *tmpdir ? tmpdir : "/tmp/", (int)getpid());
 
-    fflush(stdout);
-    int saved = dup(STDOUT_FILENO);
+    /* Both streams into the file, in order: winrun's own notes -- which DLL
+     * was loaded from where, what a call refused and why -- go to stderr, and
+     * a report without them is a report with the reasons missing. */
+    fflush(stdout); fflush(stderr);
+    int saved = dup(STDOUT_FILENO), saved_err = dup(STDERR_FILENO);
     int fd = open(tmp, O_RDWR | O_CREAT | O_TRUNC, 0600);
-    if (fd >= 0) { dup2(fd, STDOUT_FILENO); close(fd); }
+    if (fd >= 0) { dup2(fd, STDOUT_FILENO); dup2(fd, STDERR_FILENO); close(fd); }
 
     int rc = body(ctx);
 
-    fflush(stdout);
+    fflush(stdout); fflush(stderr);
     if (saved >= 0) { dup2(saved, STDOUT_FILENO); close(saved); }
+    if (saved_err >= 0) { dup2(saved_err, STDERR_FILENO); close(saved_err); }
 
     if (out && out_len) {
         out[0] = 0;
@@ -430,10 +434,10 @@ int win_probe_run(const char *exe_path, const char *arg1, const char *arg2,
     uint64_t n0 = 0, c0 = 0;
     xc_jit_x87_stats(&n0, &c0);
 
-    fflush(stdout);
-    int saved = dup(STDOUT_FILENO);
+    fflush(stdout); fflush(stderr);
+    int saved = dup(STDOUT_FILENO), saved_err = dup(STDERR_FILENO);
     int fd = open(tmp, O_RDWR | O_CREAT | O_TRUNC, 0600);
-    if (fd >= 0) { dup2(fd, STDOUT_FILENO); close(fd); }
+    if (fd >= 0) { dup2(fd, STDOUT_FILENO); dup2(fd, STDERR_FILENO); close(fd); }
 
     char *argv[4];
     int argc = 0;
@@ -446,8 +450,9 @@ int win_probe_run(const char *exe_path, const char *arg1, const char *arg2,
     int rc = winrun_main(argc, argv);
     uint64_t t1 = now_ns();
 
-    fflush(stdout);
+    fflush(stdout); fflush(stderr);
     if (saved >= 0) { dup2(saved, STDOUT_FILENO); close(saved); }
+    if (saved_err >= 0) { dup2(saved_err, STDERR_FILENO); close(saved_err); }
 
     if (ns) *ns = t1 - t0;
     uint64_t n1 = 0, c1 = 0;

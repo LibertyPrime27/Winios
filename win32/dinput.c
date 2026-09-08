@@ -692,6 +692,7 @@ int w32_dinput_create_class(w32 *w, const uint8_t clsid[16], const uint8_t iid[1
     return 1;
 }
 
+int w32_dinput_device_count(void) { int n = 0; for (int i = 0; i < MAX_DEV; i++) n += g_dev[i].used; return n; }
 void w32_dinput_reset(void) { g_built = 0; memset(g_dev, 0, sizeof g_dev); }
 
 #define F(n, a)  { #n, a, 0, d_##n, 0 }

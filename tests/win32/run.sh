@@ -228,6 +228,12 @@ check dlgtest32.exe 0 -- -frame -screen 640x400
 # keyboard reaches XInput.
 check audiotest64.exe 0 -- -input audiotest.script
 check audiotest32.exe 0 -- -input audiotest.script
+# A program that starts programs: the children run after it, in order.
+check spawntest64.exe 0
+check spawntest32.exe 0
+# DirectInput: keyboard, relative mouse and the keyboard-as-gamepad, from injected input.
+checkx dinputtest64.exe dinputtest64.expected 0 -- -input dinputtest.script
+checkx dinputtest32.exe dinputtest32.expected 0 -- -input dinputtest.script
 # Threads. Every line of the expected output is true under every interleaving
 # -- "four threads each added 400, so the total is 1600" -- so a pass means
 # the locking held, not that the scheduler happened to be kind. Run twice for
