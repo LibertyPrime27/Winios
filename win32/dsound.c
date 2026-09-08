@@ -436,6 +436,22 @@ static void d_DirectSoundCreate8(w32 *w) {
 }
 static void d_DirectSoundCreate(w32 *w) { d_DirectSoundCreate8(w); }
 
+/* CLSID_DirectSound and CLSID_DirectSound8, for a program that goes through
+ * CoCreateInstance rather than DirectSoundCreate8 -- which is what one that
+ * loads dsound lazily does. Same object either way. */
+static const uint8_t CLSID_DirectSound_[16]  = W32_GUID(0x47d4d946, 0x62e8, 0x11cf, 0x93,0xbc,0x44,0x45,0x53,0x54,0x00,0x00);
+static const uint8_t CLSID_DirectSound8_[16] = W32_GUID(0x3901cc3f, 0x84b5, 0x4fa4, 0xba,0x35,0xaa,0x81,0x72,0xb8,0xa0,0x9b);
+int w32_dsound_create_class(w32 *w, const uint8_t clsid[16], const uint8_t iid[16], uint64_t out) {
+    (void)iid;
+    if (memcmp(clsid, CLSID_DirectSound_, 16) && memcmp(clsid, CLSID_DirectSound8_, 16)) return 0;
+    build_tables();
+    uint64_t ds = w32_com_new(w, &cls_ds, DS_NFIELDS);
+    if (!ds) return 0;
+    w32_write(w, out, (int)w32_ptrsize(w), ds);
+    if (w->verbose) fprintf(stderr, "winrun: dsound: device created through CoCreateInstance (silent)\n");
+    return 1;
+}
+
 /* DirectSoundEnumerate(callback, context): one device, so the callback is
  * called once. It runs on the guest's side, so this goes through
  * w32_call_guest -- and a callback returning FALSE means "stop", which with

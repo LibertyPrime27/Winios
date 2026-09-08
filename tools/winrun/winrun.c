@@ -537,6 +537,10 @@ uint64_t w32_stub_for(w32 *w, const char *dll, const char *name) {
     int d = -1;
     for (int k = 0; k < NDLLS; k++) if (!strcmp(g_dlls[k].name, dll)) d = k;
     if (d < 0 && !strncmp(dll, "api-ms-win-crt", 14)) d = 1;       /* UCRT forwarders -> msvcrt */
+    /* The C runtimes a game imports by name and may not ship. Only reached when
+     * no such file was beside the executable: a shipped vcruntime140.dll is
+     * loaded as itself, and is a better vcruntime140 than this table. */
+    if (d < 0 && (!strncmp(dll, "vcruntime", 9) || !strncmp(dll, "ucrtbase", 8) || !strncmp(dll, "msvcr", 5))) d = 1;
     if (d < 0 && !strncmp(dll, "api-ms-win", 10)) d = 0;
     if (d >= 0) {
         /* already have a stub? */
@@ -592,6 +596,23 @@ void w32_exit(w32 *w, int code) {
  * why" is worth more in it than a silent zero. */
 static void note_unimplemented(w32 *w, const char *name);
 void w32_note_refused(w32 *w, const char *name) { note_unimplemented(w, name); }
+
+/* Programs this one asked to start. There is one process at a time, so a
+ * child runs after its parent, from the loop in winrun_main; the queue lives
+ * outside the w32 because winrun_once resets that for every program. */
+enum { MAX_LAUNCH = 8 };
+static struct { char exe[1024], args[2048], cwd[512], who[24]; } g_launch[MAX_LAUNCH];
+static int g_nlaunch, g_launch_next;
+int w32_launch_queue(w32 *w, const char *host_exe, const char *args, const char *cwd_win, const char *who) {
+    if (g_nlaunch >= MAX_LAUNCH) return -1;
+    int i = g_nlaunch++;
+    snprintf(g_launch[i].exe, sizeof g_launch[i].exe, "%s", host_exe);
+    snprintf(g_launch[i].args, sizeof g_launch[i].args, "%s", args ? args : "");
+    snprintf(g_launch[i].cwd, sizeof g_launch[i].cwd, "%s", cwd_win ? cwd_win : "");
+    snprintf(g_launch[i].who, sizeof g_launch[i].who, "%s", who);
+    if (w->verbose) fprintf(stderr, "winrun: %s queued %s %s\n", who, host_exe, g_launch[i].args);
+    return i;
+}
 static void note_unimplemented(w32 *w, const char *name) {
     for (int k = 0; k < w->nunimpl; k++)
         if (w->unimpl[k].name == name) { w->unimpl[k].calls++; return; }
@@ -1488,6 +1509,13 @@ int w32_crash_report(w32 *w, char *out, size_t out_len) {
     P("  program   %s (%d-bit)\n", w->exe_path ? w->exe_path : "?", w->is32 ? 32 : 64);
     P("  ended     %s\n", w->stop_reason ? w->stop_reason : "normally");
     P("  exit code %d\n", w->exit_code);
+    for (int i = 0; i < g_nlaunch; i++)
+        P("  %-9s %s started %s%s%s\n", i < g_launch_next ? "ran next" : "runs next", g_launch[i].who,
+          g_launch[i].exe, g_launch[i].args[0] ? " " : "", g_launch[i].args);
+    for (int i = 0; i < w->nstubs; i++)
+        if (w->stubs[i].missing && !strncasecmp(w->stubs[i].missing, "mscoree.dll!", 12)) {
+            P("  this is a .NET program: it needs the .NET runtime, which is not here\n"); break;
+        }
 
     P("\n  rip %016llx  rsp %016llx  rbp %016llx\n",
       (unsigned long long)c->rip, (unsigned long long)c->gpr[XC_RSP], (unsigned long long)c->gpr[XC_RBP]);
@@ -1549,8 +1577,11 @@ int w32_crash_report(w32 *w, char *out, size_t out_len) {
     return (int)n;
 }
 
-int winrun_main(int argc, char **argv) {
+static int g_prog_index;
+static const char *g_child_cwd;
+static int winrun_once(int argc, char **argv) {
     winrun_reset();
+    g_child_cwd = 0;
     w32 *w = &g_w;
     { struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_sigaction = on_crash; sa.sa_flags = SA_SIGINFO;
       sigaction(SIGSEGV, &sa, 0); sigaction(SIGBUS, &sa, 0); }
@@ -1562,6 +1593,7 @@ int winrun_main(int argc, char **argv) {
         else if (!strcmp(argv[ai], "-survey") && ai + 1 < argc) return survey(argv[ai + 1]);
         else if (!strcmp(argv[ai], "-input") && ai + 1 < argc) { if (script_load(argv[++ai])) return 2; }
         else if (!strcmp(argv[ai], "-k")) w->keep_going = 1;
+        else if (!strcmp(argv[ai], "-cd") && ai + 1 < argc) { g_child_cwd = argv[ai + 1]; ai++; }   /* a child's starting directory */
         else if (!strcmp(argv[ai], "-t") && ai + 1 < argc) { w->deadline_ns = now_ns_host() + (uint64_t)atoll(argv[ai + 1]) * 1000000000ull; ai++; }
         else if (!strcmp(argv[ai], "-C") && ai + 1 < argc) { w32_set_drive_c(argv[ai + 1]); ai++; }
         /* What the guest is told the display is. A game reads it before it
@@ -1606,6 +1638,7 @@ int winrun_main(int argc, char **argv) {
                                       "              [-C drive_c] [-L dlldir] [-input script] [-screen WxH] [-frame] [-dpi n]\n"
                           "              program.exe [args...]\n"); return 2; }
     w->exe_path = argv[ai];
+    g_prog_index = ai;
 
     /* bitness decides the memory model, so peek at the header first */
     { FILE *f = fopen(argv[ai], "rb"); uint8_t h[0x200] = {0};
@@ -1647,6 +1680,7 @@ int winrun_main(int argc, char **argv) {
      * arena's bump allocator or host mmap, neither of which lands on a PE32+
      * preferred base (0x140000000) or a PE32 one (0x400000) */
     process_init(w, argc - ai, argv + ai);
+    if (g_child_cwd && g_child_cwd[0]) w32_set_cwd_win(w, g_child_cwd);
     if (w32_load_pe(w, argv[ai])) return 2;
     if (w->imports_only) {
         if (g_surveying) sv_collect(w); else report_imports(w);
@@ -1729,6 +1763,50 @@ int winrun_main(int argc, char **argv) {
                 (unsigned long long)jco, (unsigned long long)jl, (unsigned long long)jlw, (unsigned long long)jls);
     }
     return code;
+}
+
+/* Run the program, then whatever it started, each in turn. A child gets the
+ * flags its parent was run with (not its input script or frame dump, which
+ * belong to the parent alone), its own program and arguments, and the
+ * directory it asked for. The exit code returned is the first program's:
+ * that is what an importer or a launcher's caller is asking about. */
+static int split_args(char *s, char **out, int max) {
+    int n = 0;
+    while (*s && n < max) {
+        while (*s == ' ') s++;
+        if (!*s) break;
+        if (*s == '"') { s++; out[n++] = s; while (*s && *s != '"') s++; }
+        else { out[n++] = s; while (*s && *s != ' ') s++; }
+        if (*s) *s++ = 0;
+    }
+    return n;
+}
+int winrun_main(int argc, char **argv) {
+    g_nlaunch = 0; g_launch_next = 0;
+    int rc = winrun_once(argc, argv);
+    while (g_launch_next < g_nlaunch) {
+        int i = g_launch_next++;
+        static char exe[1024], args[2048], cwd[512];
+        snprintf(exe, sizeof exe, "%s", g_launch[i].exe);
+        snprintf(args, sizeof args, "%s", g_launch[i].args);
+        snprintf(cwd, sizeof cwd, "%s", g_launch[i].cwd);
+        char *cargv[96]; int cargc = 0;
+        for (int k = 0; k < g_prog_index && cargc < 64; k++) {
+            if (!strcmp(argv[k], "-input")) { k++; continue; }
+            if (!strcmp(argv[k], "-frame") || !strcmp(argv[k], "-imports")) continue;
+            cargv[cargc++] = argv[k];
+        }
+        if (cwd[0]) { cargv[cargc++] = (char *)"-cd"; cargv[cargc++] = cwd; }
+        cargv[cargc++] = exe;
+        cargc += split_args(args, cargv + cargc, 16);
+        cargv[cargc] = 0;
+        const char *base = strrchr(exe, '/'); base = base ? base + 1 : exe;
+        printf("\n================ %s started %s%s%s; running it now ================\n\n",
+               g_launch[i].who, base, args[0] ? " " : "", args);
+        fflush(stdout);
+        winrun_once(cargc, cargv);
+    }
+    return rc;
 }
 
 #ifndef WINRUN_NO_MAIN

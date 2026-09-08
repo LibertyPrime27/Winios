@@ -38,6 +38,7 @@ typedef struct {
     sk_info    setup;        /* what kind of installer, if it is one */
     int        looks_like_installer;
     int        is32;         /* -1 when there is no single executable to ask */
+    int        managed;      /* a .NET program: there is no runtime for it here */
     char       suggested_name[256];
 } wi_probe_result;
 

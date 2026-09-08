@@ -54,7 +54,7 @@ targets:
     entitlements: { path: Host/Host.entitlements }
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: winios.app
+        PRODUCT_BUNDLE_IDENTIFIER: com.winios.libertyprime27
         # The home-screen icon. iOS icons carry no alpha channel, which is why
         # the asset is the full-bleed gradient version rather than the one on
         # white -- a transparent corner is rejected at submission and looks
@@ -86,4 +86,4 @@ targets:
     entitlements: { path: Probe/Probe.entitlements }
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: winios.app.probe
+        PRODUCT_BUNDLE_IDENTIFIER: com.winios.libertyprime27.probe

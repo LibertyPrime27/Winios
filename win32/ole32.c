@@ -56,14 +56,33 @@ static void o_CoUninitialize(w32 *w) { (void)w; if (g_co_depth) g_co_depth--; RE
 /* Nothing here can create a class object. Saying so is better than handing
  * back a null pointer with S_OK, which is how a program ends up faulting
  * somewhere unrelated. */
+/* The CLSID spelled the way the registry spells it, so a report names the
+ * class rather than "a class" -- which is the difference between knowing
+ * what to implement next and guessing. A small pool, because the report
+ * counts calls by the pointer it was given. */
+static const char *class_note(const uint8_t *g, const char *what) {
+    static char pool[16][128]; static int n;
+    char s[128];
+    if (!g) snprintf(s, sizeof s, "ole32!%s (no such COM class here)", what);
+    else snprintf(s, sizeof s, "ole32!%s {%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x} (no such COM class here)",
+                  what, g[3], g[2], g[1], g[0], g[5], g[4], g[7], g[6], g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
+    for (int i = 0; i < n; i++) if (!strcmp(pool[i], s)) return pool[i];
+    if (n < 16) { snprintf(pool[n], sizeof pool[n], "%s", s); return pool[n++]; }
+    return "ole32!CoCreateInstance (no such COM class here; more distinct classes than this report lists)";
+}
 static void o_CoCreateInstance(w32 *w) {
-    w32_note_refused(w, "ole32!CoCreateInstance (no COM class factory here)");
-    if (ARG(4)) w32_write(w, ARG(4), w->is32 ? 4 : 8, 0);   /* *ppv = NULL */
+    const uint8_t *clsid = W32PN(w, ARG(0), 16), *iid = W32PN(w, ARG(3), 16);
+    uint64_t out = ARG(4);
+    if (!out) { RET((uint64_t)(uint32_t)0x80004003u); return; }               /* E_POINTER */
+    w32_write(w, out, w->is32 ? 4 : 8, 0);                                      /* *ppv = NULL */
+    if (clsid && w32_com_create(w, clsid, iid, out)) { RET(0); return; }
+    w32_note_refused(w, class_note(clsid, "CoCreateInstance"));
     RET((uint64_t)(uint32_t)REGDB_E_CLASSNOTREG_);
 }
 static void o_CoGetClassObject(w32 *w) {
-    w32_note_refused(w, "ole32!CoCreateInstance (no COM class factory here)");
+    const uint8_t *clsid = W32PN(w, ARG(0), 16);
     if (ARG(4)) w32_write(w, ARG(4), w->is32 ? 4 : 8, 0);
+    w32_note_refused(w, class_note(clsid, "CoGetClassObject"));
     RET((uint64_t)(uint32_t)REGDB_E_CLASSNOTREG_);
 }
 

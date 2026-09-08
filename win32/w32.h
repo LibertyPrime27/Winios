@@ -88,6 +88,7 @@ typedef struct {
     int      is_exe;
     int      refs;               /* LoadLibrary count; nothing is ever unmapped */
     int      attached;           /* DllMain(DLL_PROCESS_ATTACH) has run */
+    int      no_thread_calls;    /* DisableThreadLibraryCalls: no DLL_THREAD_ATTACH/DETACH */
     int      seq;                /* order this image *finished* loading: dependency order */
 } w32_module;
 
@@ -275,6 +276,21 @@ w32_module *w32_module_at(w32 *w, uint64_t base);                   /* the loade
 uint64_t w32_module_export(w32 *w, uint64_t hmodule, const char *name, int ordinal);
 uint64_t w32_import_addr(w32 *w, const char *dll, const char *name, int ordinal, int depth);
 void     w32_attach_modules(w32 *w);                                /* DllMain(DLL_PROCESS_ATTACH) for every new DLL */
+void     w32_thread_notify(w32 *w, int reason);                    /* DllMain(DLL_THREAD_ATTACH=2 / DETACH=3) for every attached DLL */
+/* A program this one asked to start. There is one process at a time, so it
+ * runs after this one ends; see CreateProcess in kernel32.c and the loop in
+ * winrun_main. Returns the queue index, or -1 when the queue is full. */
+int      w32_launch_queue(w32 *w, const char *host_exe, const char *args, const char *cwd_win, const char *who);
+uint64_t w32_process_handle_new(w32 *w);                           /* a process handle that is already signalled */
+void     w32_set_cwd_win(w32 *w, const char *win);                 /* the current directory, as a Windows path */
+/* CoCreateInstance for the classes that exist here: each DLL answers for its
+ * own CLSIDs and returns 1 if it made the object. */
+int      w32_com_create(w32 *w, const uint8_t clsid[16], const uint8_t iid[16], uint64_t out);
+int      w32_dsound_create_class(w32 *w, const uint8_t clsid[16], const uint8_t iid[16], uint64_t out);
+/* A GUID as the 16 bytes it occupies in memory, from the eleven numbers a
+ * DEFINE_GUID line spells it with -- so a header can be copied, not hand-swapped. */
+#define W32_GUID(l,a,b,c,d,e,f,g,h,i,j) { (uint8_t)((l)&0xff),(uint8_t)(((l)>>8)&0xff),(uint8_t)(((l)>>16)&0xff),(uint8_t)(((l)>>24)&0xff), \
+    (uint8_t)((a)&0xff),(uint8_t)(((a)>>8)&0xff), (uint8_t)((b)&0xff),(uint8_t)(((b)>>8)&0xff), (c),(d),(e),(f),(g),(h),(i),(j) }
 
 /* COM (com.c) */
 uint64_t w32_com_vtable(w32 *w, w32_com_class *cls);

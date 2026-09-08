@@ -572,6 +572,18 @@ static void k_GetCPInfo(w32 *w) { uint64_t p = ARG(1); void *d = W32PN(w, p, 20)
     if (!d) { w32_set_last_error(w, ERROR_INVALID_PARAMETER); RET(0); return; }
     memset(d, 0, 20); w32_write(w, p, 4, 1); w32_write(w, p + 4, 1, '?'); RET(1); }
 static void k_GetUserDefaultLCID(w32 *w) { RET(0x409); }
+static void k_AreFileApisANSI(w32 *w) { (void)w; RET(1); }
+/* GetUserDefaultLocaleName(buf, cch): "en-US", which is what every other
+ * locale answer here agrees with. Returns the length including the
+ * terminator, as Windows does. */
+static void k_GetUserDefaultLocaleName(w32 *w) {
+    static const char name[] = "en-US";
+    uint32_t cch = (uint32_t)ARG(1), need = (uint32_t)sizeof name;
+    if (cch < need) { w32_set_last_error(w, 122); RET(0); return; }          /* ERROR_INSUFFICIENT_BUFFER */
+    if (!w32_mem_ok(w, ARG(0), 2ull * need)) { w32_set_last_error(w, ERROR_NOACCESS); RET(0); return; }
+    for (uint32_t i = 0; i < need; i++) w32_write(w, ARG(0) + 2ull * i, 2, (uint8_t)name[i]);
+    RET(need);
+}
 static void k_GetUserDefaultLangID(w32 *w) { RET(0x409); }
 static void k_GetSystemDefaultLCID(w32 *w) { RET(0x409); }
 static void k_GetThreadLocale(w32 *w) { RET(0x409); }
@@ -779,6 +791,20 @@ static void k_FlsAlloc(w32 *w) { k_TlsAlloc(w); }
 static void k_FlsFree(w32 *w) { k_TlsFree(w); }
 static void k_FlsGetValue(w32 *w) { k_TlsGetValue(w); }
 static void k_FlsSetValue(w32 *w) { k_TlsSetValue(w); }
+/* FlsGetValue2 is FlsGetValue that leaves the last error alone. The 2022
+ * UCRT reaches its per-thread data through it on every call that has any,
+ * so a made-up zero here is a null pointer a few instructions later -- which
+ * is how a GameMaker game died at rip 0 after 222,476 calls. */
+static void k_FlsGetValue2(w32 *w) {
+    uint32_t i = (uint32_t)ARG(0); int psz = (int)w32_ptrsize(w);
+    if (i >= W32_MAX_TLS) { RET(0); return; }
+    RET(w32_read(w, w32_self()->teb + (w->is32 ? TEB32_TLS : TEB64_TLS) + (uint64_t)psz * i, psz));
+}
+static void k_DisableThreadLibraryCalls(w32 *w) {
+    w32_module *m = w32_module_at(w, ARG(0));
+    if (m) m->no_thread_calls = 1;
+    RET(m ? 1 : 0);
+}
 static void k_nop_true(w32 *w) { RET(1); }
 static void k_nop_void(w32 *w) { (void)w; }
 static void k_nop_zero(w32 *w) { RET(0); }
@@ -911,12 +937,12 @@ static void k_GetCurrentDirectoryW(w32 *w) {
 /* Really change directory, and fail when the directory is not there. The
  * guest-visible form is kept alongside the host one because a program that
  * sets a directory and then asks for it expects its own spelling back. */
-static void set_cwd(w32 *w, const char *win) {
+static int cwd_change(w32 *w, const char *win) {
     char host[4096];
     host_path(w, win, host, sizeof host);
     struct stat st;
     if (stat(host, &st) || !S_ISDIR(st.st_mode)) {
-        w32_set_last_error(w, ERROR_FILE_NOT_FOUND); RET(0); return;
+        w32_set_last_error(w, ERROR_FILE_NOT_FOUND); return 0;
     }
     snprintf(g_cwd_host, sizeof g_cwd_host, "%.*s", (int)sizeof g_cwd_host - 1, host);
     /* An absolute Windows path is reported verbatim; a relative one is
@@ -929,11 +955,13 @@ static void set_cwd(w32 *w, const char *win) {
     /* Truncating a path is worse than refusing one: the caller would go on to
      * open something it did not name. Nothing real is this long. */
     if (n < 0 || (size_t)n >= sizeof next) {
-        w32_set_last_error(w, ERROR_FILENAME_EXCED_RANGE); RET(0); return;
+        w32_set_last_error(w, ERROR_FILENAME_EXCED_RANGE); return 0;
     }
     memcpy(g_cwd_win, next, (size_t)n + 1);
-    RET(1);
+    return 1;
 }
+static void set_cwd(w32 *w, const char *win) { RET(cwd_change(w, win)); }
+void w32_set_cwd_win(w32 *w, const char *win) { cwd_change(w, win); }
 static void k_SetCurrentDirectoryA(w32 *w) { set_cwd(w, GSTR(ARG(0))); }
 static void k_SetCurrentDirectoryW(w32 *w) {
     char s[1024]; w32_wtoa(w, ARG(0), s, sizeof s); set_cwd(w, s);
@@ -1343,17 +1371,83 @@ static void k_GetShortPathNameW(w32 *w) { path_identity(w, 1); }
 static void k_GetLongPathNameA(w32 *w)  { path_identity(w, 0); }
 static void k_GetLongPathNameW(w32 *w)  { path_identity(w, 1); }
 
-/* There is one process, and there will be one process: the runtime's globals
- * -- the block cache, the code arena, the handle table -- are per process and
- * a second guest process would need a second set of all of them. So this
- * fails, and says so in the report rather than returning a handle that goes
- * nowhere. An installer that re-launches itself elevated stops here; one that
- * shells out to a redistributable carries on without it, which is usually
- * what you want anyway. */
-static void k_CreateProcessA(w32 *w) {
-    w32_note_refused(w, "kernel32!CreateProcess (one guest process at a time)");
-    w32_set_last_error(w, ERROR_CALL_NOT_IMPLEMENTED); RET(0);
+/* There is one process at a time: the runtime's globals -- the block cache,
+ * the code arena, the handle table -- are per process. What there can be is
+ * a *next* process. CreateProcess records the program and winrun runs it after
+ * this one ends, in the order they were asked for. The caller gets a process
+ * handle that is already signalled and an exit code of 0, which is the truth
+ * for the two shapes this exists for: an installer that runs a redistributable
+ * and carries on, and a launcher that starts the game and quits. A parent that
+ * needs the child's output while it is still running is not served, and the
+ * run report lists what was queued so that is visible rather than guessed at. */
+uint64_t w32_process_handle_new(w32 *w) {
+    uint64_t h = w32_handle_new(w, H_PROCESS, -1);
+    w32_handle *hh = w32_handle_get(w, h);
+    if (hh) hh->flags = 1 | 2;                      /* signalled, and stays so */
+    return h;
 }
+static int program_exists(w32 *w, const char *win, char *host, size_t hn) {
+    w32_host_path(w, win, host, hn);
+    if (access(host, R_OK) == 0) return 1;
+    char withexe[1100];
+    snprintf(withexe, sizeof withexe, "%s.exe", win);
+    w32_host_path(w, withexe, host, hn);
+    return access(host, R_OK) == 0;
+}
+/* The program a command line names: the quoted first token, or, unquoted,
+ * the shortest prefix ending at a space that names a file -- "C:\Program
+ * Files\Game\game.exe" without quotes is legal and common. */
+static int resolve_program(w32 *w, const char *app, const char *cmd, char *host, size_t hn, const char **args_out) {
+    char cand[1024];
+    *args_out = "";
+    if (app[0]) { *args_out = cmd; return program_exists(w, app, host, hn); }
+    const char *p = cmd;
+    while (*p == ' ') p++;
+    if (*p == '"') {
+        const char *e = strchr(p + 1, '"');
+        size_t n = e ? (size_t)(e - p - 1) : strlen(p + 1);
+        if (n >= sizeof cand) return 0;
+        memcpy(cand, p + 1, n); cand[n] = 0;
+        *args_out = e ? e + 1 : "";
+        return program_exists(w, cand, host, hn);
+    }
+    for (const char *e = p; ; e++) {
+        if (*e && *e != ' ') continue;
+        size_t n = (size_t)(e - p);
+        if (n >= sizeof cand) return 0;
+        memcpy(cand, p, n); cand[n] = 0;
+        if (program_exists(w, cand, host, hn)) { *args_out = e; return 1; }
+        if (!*e) return 0;
+    }
+}
+static uint32_t g_child_pid = 4300;
+static void create_process(w32 *w, int wide) {
+    char app[1024] = "", cmd[4096] = "", cwd[1024] = "", host[4096];
+    if (ARG(0)) { if (wide) w32_wtoa(w, ARG(0), app, sizeof app); else snprintf(app, sizeof app, "%s", w32_str(w, ARG(0))); }
+    if (ARG(1)) { if (wide) w32_wtoa(w, ARG(1), cmd, sizeof cmd); else snprintf(cmd, sizeof cmd, "%s", w32_str(w, ARG(1))); }
+    if (ARG(7)) { if (wide) w32_wtoa(w, ARG(7), cwd, sizeof cwd); else snprintf(cwd, sizeof cwd, "%s", w32_str(w, ARG(7))); }
+    const char *args = "";
+    if (!resolve_program(w, app, cmd, host, sizeof host, &args)) {
+        if (w->verbose) fprintf(stderr, "winrun: CreateProcess: no such program: %s%s%s\n", app, app[0] ? " " : "", cmd);
+        w32_set_last_error(w, ERROR_FILE_NOT_FOUND); RET(0); return;
+    }
+    while (*args == ' ') args++;
+    if (w32_launch_queue(w, host, args, cwd[0] ? cwd : g_cwd_win, "CreateProcess") < 0) {
+        w32_set_last_error(w, 8); RET(0); return;     /* ERROR_NOT_ENOUGH_MEMORY: the queue is full */
+    }
+    /* PROCESS_INFORMATION: hProcess, hThread, dwProcessId, dwThreadId */
+    uint64_t pi = ARG(9); int psz = (int)w32_ptrsize(w);
+    if (pi && w32_mem_ok(w, pi, (uint64_t)psz * 2 + 8)) {
+        uint32_t pid = ++g_child_pid;
+        w32_write(w, pi, psz, w32_process_handle_new(w));
+        w32_write(w, pi + psz, psz, w32_process_handle_new(w));
+        w32_write(w, pi + 2 * psz, 4, pid);
+        w32_write(w, pi + 2 * psz + 4, 4, pid + 1);
+    }
+    RET(1);
+}
+static void k_CreateProcessA(w32 *w) { create_process(w, 0); }
+static void k_CreateProcessW(w32 *w) { create_process(w, 1); }
 
 /* ---- .ini files ------------------------------------------------------------
  *
@@ -2458,12 +2552,13 @@ const w32_api w32_kernel32[] = {
     F(GetTickCount, 0), F(GetTickCount64, 0), F(QueryPerformanceCounter, 1), F(QueryPerformanceFrequency, 1),
     F(GetSystemTimeAsFileTime, 1), F(GetSystemTimePreciseAsFileTime, 1), F(GetLocalTime, 1), F(GetSystemTime, 1), F(GetTimeZoneInformation, 1),
     F(GetACP, 0), F(GetOEMCP, 0), F(GetConsoleCP, 0), F(GetConsoleOutputCP, 0), F(IsValidCodePage, 1), F(GetCPInfo, 2),
+    F(GetUserDefaultLocaleName, 2), FN(GetSystemDefaultLocaleName, 2, k_GetUserDefaultLocaleName), F(AreFileApisANSI, 0),
     F(GetUserDefaultLCID, 0), F(GetUserDefaultLangID, 0), F(GetSystemDefaultLCID, 0), F(GetThreadLocale, 0),
     F(IsDBCSLeadByteEx, 2), F(IsDBCSLeadByte, 1), F(MultiByteToWideChar, 6), F(WideCharToMultiByte, 8), F(GetStringTypeW, 4), F(LCMapStringW, 6), F(CompareStringW, 6),
     F(VirtualAlloc, 4), F(VirtualAllocEx, 5), F(VirtualFree, 3), F(VirtualProtect, 4), F(VirtualQuery, 3),
     F(GetProcessHeap, 0), F(HeapCreate, 3), F(HeapDestroy, 1), F(HeapAlloc, 3), F(HeapReAlloc, 4), F(HeapFree, 3), F(HeapSize, 3), F(HeapValidate, 3), F(HeapSetInformation, 4),
     F(LocalAlloc, 2), F(LocalFree, 1), F(GlobalAlloc, 2), F(GlobalFree, 1),
-    F(TlsAlloc, 0), F(TlsFree, 1), F(TlsGetValue, 1), F(TlsSetValue, 2), F(FlsAlloc, 1), F(FlsFree, 1), F(FlsGetValue, 1), F(FlsSetValue, 2),
+    F(TlsAlloc, 0), F(TlsFree, 1), F(TlsGetValue, 1), F(TlsSetValue, 2), F(FlsAlloc, 1), F(FlsFree, 1), F(FlsGetValue, 1), F(FlsSetValue, 2), F(FlsGetValue2, 1), F(DisableThreadLibraryCalls, 1),
     FN(InitializeSRWLock, 1, k_nop_void), FN(AcquireSRWLockExclusive, 1, k_nop_void), FN(ReleaseSRWLockExclusive, 1, k_nop_void),
     FN(AcquireSRWLockShared, 1, k_nop_void), FN(ReleaseSRWLockShared, 1, k_nop_void), FN(InitOnceExecuteOnce, 4, k_nop_true),
     FN(InitializeConditionVariable, 1, k_nop_void), FN(WakeAllConditionVariable, 1, k_nop_void), FN(WakeConditionVariable, 1, k_nop_void),
@@ -2491,7 +2586,7 @@ const w32_api w32_kernel32[] = {
     /* Implemented, and refuses: there is one guest process and the runtime's
      * globals are per process. It reports itself in the run report so a
      * program that needed a child is not a silent mystery. */
-    F(CreateProcessA, 10), FN(CreateProcessW, 10, k_CreateProcessA),
+    F(CreateProcessA, 10), F(CreateProcessW, 10),
     /* Where DLLs are searched for. SetDefaultDllDirectories is what an NSIS
      * installer calls before anything else. */
     /* The wide half. NSIS is a Unicode program: every path it touches goes

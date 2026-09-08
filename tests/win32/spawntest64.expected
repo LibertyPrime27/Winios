@@ -1,0 +1,17 @@
+64-bit parent
+FlsGetValue2: reads back what was set
+GetUserDefaultLocaleName: 6 chars, en-US
+AreFileApisANSI: 1
+DisableThreadLibraryCalls: 1
+CreateProcess: ok
+wait: signalled, exit code 0
+CreateProcess(missing): refused, error 2
+ShellExecuteEx: ok, hInstApp 42, process handle given
+
+================ CreateProcess started spawntest64.exe first; running it now ================
+
+child first: argc 2, cwd C:\xcore
+
+================ ShellExecute started spawntest64.exe second; running it now ================
+
+child second: argc 2, cwd C:\xcore

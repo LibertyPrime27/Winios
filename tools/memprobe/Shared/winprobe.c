@@ -276,6 +276,12 @@ int win_probe_look(const char *path, int *is32, int *is_installer,
     if (is_installer) *is_installer = p.looks_like_installer;
     put(family, family_len, p.setup.name);
     put(note, note_len, p.setup.note);
+    /* Said before anything is copied: a .NET program imports one function and
+     * would otherwise look nearly ready, when it needs a whole other runtime. */
+    if (p.managed && note && note_len) {
+        size_t l = strlen(note);
+        snprintf(note + l, note_len - l, "%sThis is a .NET program. Winios has no .NET runtime, so it cannot run it.", l ? "\n" : "");
+    }
     switch (p.src) {
     case WI_SRC_FOLDER: return WIN_LOOK_FOLDER;
     case WI_SRC_ZIP:    return WIN_LOOK_ARCHIVE;

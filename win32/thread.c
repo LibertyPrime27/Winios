@@ -184,8 +184,10 @@ static void *thread_body(void *arg) {
                              : ((t->stack_base - 0x100) & ~15ull);
     t->running = 1;
 
+    w32_thread_notify(w, 2);                          /* DLL_THREAD_ATTACH, before the body */
     uint64_t args[1] = { t->param };
     uint64_t rc = w32_call_guest(w, t->entry, 1, args);
+    if (!w->exited) w32_thread_notify(w, 3);          /* DLL_THREAD_DETACH, after it */
 
     t->exit_code = (uint32_t)rc;
     t->running = 0;

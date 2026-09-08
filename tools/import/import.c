@@ -207,6 +207,7 @@ wi_probe_result wi_probe(const char *path) {
             char first[4096];
             snprintf(first, sizeof first, "%s/%s", path, e[0].rel);
             p.setup = sk_identify(first);
+            p.managed = dd_pe_is_managed(first);
             p.looks_like_installer = p.setup.kind != SK_PLAIN && p.setup.kind != SK_NOT_PE;
         }
         return p;
@@ -227,6 +228,7 @@ wi_probe_result wi_probe(const char *path) {
     p.setup = sk_identify(path);
     p.src = p.setup.kind == SK_NOT_PE ? WI_SRC_UNKNOWN : WI_SRC_EXE;
     p.is32 = dd_pe_is32(path);
+    p.managed = p.src == WI_SRC_EXE && dd_pe_is_managed(path);
     p.looks_like_installer = p.setup.kind != SK_PLAIN && p.setup.kind != SK_NOT_PE;
     return p;
 }
