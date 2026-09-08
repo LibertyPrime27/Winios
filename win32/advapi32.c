@@ -26,6 +26,7 @@
 enum {
     ERROR_SUCCESS_ = 0, ERROR_FILE_NOT_FOUND_ = 2, ERROR_MORE_DATA_ = 234,
     ERROR_NO_MORE_ITEMS_ = 259, ERROR_INVALID_HANDLE_ = 6,
+    ERROR_INVALID_PARAMETER_ = 87,
 };
 enum { REG_NONE_ = 0, REG_SZ_ = 1, REG_EXPAND_SZ_ = 2, REG_BINARY_ = 3, REG_DWORD_ = 4 };
 
@@ -259,7 +260,11 @@ static void reg_query(w32 *w, int wide) {
     if (pcb) w32_write(w, pcb, 4, len);
     if (!ARG(4)) { RET(ERROR_SUCCESS_); return; }              /* size query */
     if (room < len) { RET(ERROR_MORE_DATA_); return; }
-    if (len) memcpy(W32P(w, ARG(4)), data, len);
+    if (len) {
+        void *d = W32PN(w, ARG(4), len);
+        if (!d) { RET(ERROR_INVALID_PARAMETER_); return; }
+        memcpy(d, data, len);
+    }
     RET(ERROR_SUCCESS_);
 }
 static void a_RegQueryValueExA(w32 *w) { reg_query(w, 0); }
@@ -272,7 +277,11 @@ static void reg_set(w32 *w, int wide) {
     reg_load();
     if (!key_path(w, ARG(0), "", path, sizeof path)) { RET(ERROR_INVALID_HANDLE_); return; }
     uint32_t type = (uint32_t)ARG(3), len = (uint32_t)ARG(5);
-    const uint8_t *src = ARG(4) ? W32P(w, ARG(4)) : 0;
+    /* The value's bytes are the caller's, and cbData is the caller's word for
+     * how many there are -- a registry write is one of the few places a game
+     * hands over a length it computed rather than one it was given. */
+    const uint8_t *src = ARG(4) ? W32PN(w, ARG(4), len) : 0;
+    if (ARG(4) && !src) { RET(ERROR_INVALID_PARAMETER_); return; }
     /* a wide string is stored narrow, so a program that writes W and reads A
      * (or the reverse -- installers do both) sees the same value */
     uint8_t nbuf[2048];
@@ -305,7 +314,8 @@ static void put_name(w32 *w, uint64_t out, uint64_t pcount, const char *name, in
     if (out && room > nl) {
         if (wide) {
             for (uint32_t i = 0; i <= nl; i++) w32_write(w, out + (uint64_t)i * 2, 2, (uint8_t)name[i]);
-        } else memcpy(W32P(w, out), name, nl + 1);
+        } else { void *d = W32PN(w, out, (uint64_t)nl + 1);
+                 if (d) memcpy(d, name, nl + 1); }
     }
     if (pcount) w32_write(w, pcount, 4, nl);
 }
@@ -324,8 +334,11 @@ static void reg_enum_value(w32 *w, int wide) {
         uint64_t pcb = ARG(7);
         uint32_t cap = pcb ? (uint32_t)w32_read(w, pcb, 4) : 0;
         if (pcb) w32_write(w, pcb, 4, g_vals[i].len);
-        if (ARG(6) && cap >= g_vals[i].len && g_vals[i].len)
-            memcpy(W32P(w, ARG(6)), g_vals[i].data, g_vals[i].len);
+        if (ARG(6) && cap >= g_vals[i].len && g_vals[i].len) {
+            void *d = W32PN(w, ARG(6), g_vals[i].len);
+            if (!d) { RET(ERROR_INVALID_PARAMETER_); return; }
+            memcpy(d, g_vals[i].data, g_vals[i].len);
+        }
         RET(ERROR_SUCCESS_);
         return;
     }
@@ -385,7 +398,9 @@ static void reg_enum_key_plain(w32 *w, int wide) {
     uint32_t nl = (uint32_t)strlen(name);
     if (!out || cap <= nl) { RET(ERROR_MORE_DATA_); return; }
     if (wide) for (uint32_t i = 0; i <= nl; i++) w32_write(w, out + (uint64_t)i * 2, 2, (uint8_t)name[i]);
-    else memcpy(W32P(w, out), name, nl + 1);
+    else { void *d = W32PN(w, out, (uint64_t)nl + 1);
+           if (!d) { RET(ERROR_INVALID_PARAMETER_); return; }
+           memcpy(d, name, nl + 1); }
     RET(ERROR_SUCCESS_);
 }
 
@@ -594,7 +609,7 @@ static void a_CryptReleaseContext(w32 *w) { (void)w; RET(1); }
 static void a_CryptGenRandom(w32 *w) {
     uint64_t n = ARG(1), buf = ARG(2);
     if (!buf || !n || n > (1u << 20)) { RET(0); return; }
-    unsigned char *p = W32P(w, buf);
+    unsigned char *p = W32PN(w, buf, n);
     if (!p) { RET(0); return; }
     FILE *f = fopen("/dev/urandom", "rb");
     if (f) {
@@ -614,7 +629,11 @@ static void a_GetUserNameA(w32 *w) {
     const char *u = "xcore";
     uint32_t room = ARG(1) ? (uint32_t)w32_read(w, ARG(1), 4) : 0;
     if (ARG(1)) w32_write(w, ARG(1), 4, (uint32_t)strlen(u) + 1);
-    if (ARG(0) && room > strlen(u)) memcpy(W32P(w, ARG(0)), u, strlen(u) + 1);
+    if (ARG(0) && room > strlen(u)) {
+        void *d = W32PN(w, ARG(0), strlen(u) + 1);
+        if (!d) { RET(0); return; }
+        memcpy(d, u, strlen(u) + 1);
+    }
     RET(room > strlen(u));
 }
 

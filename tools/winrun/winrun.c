@@ -96,6 +96,60 @@ static void track_map(void *p, size_t n) {
     if (g_nmaps < W32_MAX_MAPS) { g_maps[g_nmaps].p = p; g_maps[g_nmaps].n = n; g_nmaps++; }
 }
 
+/* Is a guest range actually mapped?
+ *
+ * This exists because a 64-bit guest's addresses *are* host addresses, so
+ * until now any number a program handed to an API became a raw pointer the
+ * host then wrote through. One wrong pointer from one program killed the
+ * whole process, and on a phone it did so without a signal anything could
+ * report -- a game "crashed" and left nothing behind but a breadcrumb.
+ *
+ * The list is the mappings the loader made, and there are a few dozen of
+ * them, so a linear scan with a one-entry cache costs nothing at the rate the
+ * API layer calls it. The interpreter and the dynarec do not come through
+ * here -- they have their own bounds handling and their own recovery stubs --
+ * so this is not on the instruction path.
+ *
+ * A 32-bit guest needs none of it: an address is base + a 32-bit offset, and
+ * the whole 4 GB is one reservation, so every possible value lands inside it.
+ */
+static int g_map_cache = -1;
+static int range_mapped(uint64_t addr, uint64_t len) {
+    uintptr_t a = (uintptr_t)addr, e;
+    if (!len) len = 1;
+    if (a + len < a) return 0;                    /* wrapped: not a range at all */
+    e = a + (uintptr_t)len;
+    if (g_map_cache >= 0 && g_map_cache < g_nmaps) {
+        uintptr_t lo = (uintptr_t)g_maps[g_map_cache].p;
+        if (a >= lo && e <= lo + g_maps[g_map_cache].n) return 1;
+    }
+    for (int i = 0; i < g_nmaps; i++) {
+        uintptr_t lo = (uintptr_t)g_maps[i].p;
+        if (a >= lo && e <= lo + g_maps[i].n) { g_map_cache = i; return 1; }
+    }
+    return 0;
+}
+
+int w32_mem_ok(w32 *w, uint64_t addr, uint64_t len) {
+    if (!addr) return 0;
+    if (w->is32) return 1;                        /* the whole arena is reserved */
+    return range_mapped(addr, len);
+}
+
+/* Said once per address, and only when asked for. A program that walks off
+ * the end of something does it in a loop, and a line per iteration is the log
+ * flood that got the process killed for CPU in the first place. */
+static void note_bad_pointer(w32 *w, uint64_t addr, uint64_t len, const char *what) {
+    static uint64_t seen[16];
+    static int n;
+    if (!w->verbose) return;
+    for (int i = 0; i < n; i++) if (seen[i] == addr) return;
+    if (n < 16) seen[n++] = addr;
+    fprintf(stderr, "winrun: %s of %llu bytes at %#llx is not mapped guest memory; "
+                    "ignored rather than faulting the host\n",
+            what, (unsigned long long)len, (unsigned long long)addr);
+}
+
 /* Guest memory is never executed by the host -- the interpreter reads it and
  * the dynarec translates it -- so it is always mapped RW, whatever the guest
  * asked for. That matters: Apple silicon refuses RWX mappings that are not
@@ -256,14 +310,45 @@ void w32_wtoa_n(w32 *w, uint64_t wp, int chars, char *out, size_t n) {
         out[i] = s[i] && s[i] < 128 ? (char)s[i] : s[i] ? '?' : ' ';
     out[i] = 0;
 }
+/* Reading and writing guest memory on behalf of an API call.
+ *
+ * Both are now checked. An out-parameter pointer that a program got wrong --
+ * or that was never initialised, which is the common case -- used to be
+ * written through as a raw host address; the crash that led here was
+ * VirtualProtect storing its old-protection word into 0x16d08be0 on a 64-bit
+ * guest whose image starts at 0x140000000. Ignoring the write is what Windows
+ * effectively does too, in the sense that the program gets an error rather
+ * than taking the system down with it. */
 uint64_t w32_read(w32 *w, uint64_t addr, int bytes) {
-    uint64_t v = 0; const void *p = W32P(w, addr);
-    if (p) memcpy(&v, p, bytes);
+    uint64_t v = 0;
+    if (!w32_mem_ok(w, addr, (uint64_t)bytes)) {
+        if (addr) note_bad_pointer(w, addr, (uint64_t)bytes, "read");
+        return 0;
+    }
+    memcpy(&v, W32P(w, addr), (size_t)bytes);
     return v;
 }
 void w32_write(w32 *w, uint64_t addr, int bytes, uint64_t v) {
-    void *p = W32P(w, addr);
-    if (p) memcpy(p, &v, bytes);
+    if (!w32_mem_ok(w, addr, (uint64_t)bytes)) {
+        if (addr) note_bad_pointer(w, addr, (uint64_t)bytes, "write");
+        return;
+    }
+    memcpy(W32P(w, addr), &v, (size_t)bytes);
+}
+
+/* A guest pointer, or NULL when that many bytes are not there.
+ *
+ * The API layer memsets and memcpys through guest pointers in a hundred
+ * places -- a GetDesc filling a structure, a Lock handing back a buffer --
+ * and every one of them was a way for a bad pointer to reach the host. This
+ * is the checked form to use at those sites; plain W32P stays for addresses
+ * this side computed and therefore already trusts. */
+void *W32PN(w32 *w, uint64_t addr, uint64_t len) {
+    if (!w32_mem_ok(w, addr, len)) {
+        if (addr) note_bad_pointer(w, addr, len, "access");
+        return 0;
+    }
+    return W32P(w, addr);
 }
 uint64_t w32_ptrsize(w32 *w) { return w->is32 ? 4 : 8; }
 

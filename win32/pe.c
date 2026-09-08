@@ -303,7 +303,12 @@ static void setup_tls(w32 *w, w32_module *m, const uint8_t *t, int plus,
 
     uint64_t size = raw_end > raw_start ? raw_end - raw_start : 0;
     uint64_t block = w32_alloc(w, size + zero_fill + 16, 0);
-    if (size) memcpy(W32P(w, block), W32P(w, raw_start), size);
+    /* raw_start comes out of the image's TLS directory, so it is the file's
+     * word rather than ours; a directory that points outside the image would
+     * otherwise be read as a host address. */
+    const void *tls_raw = size ? W32PN(w, raw_start, size) : 0;
+    if (size && !tls_raw) { fprintf(stderr, "winrun: %s has a TLS template outside its image\n", m->name); return; }
+    if (size) memcpy(W32P(w, block), tls_raw, size);
     w32_write(w, idx_addr, 4, index);
     /* ThreadLocalStoragePointer -> the array of per-module blocks */
     if (!w32_self()->tls_array) {

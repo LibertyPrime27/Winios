@@ -36,7 +36,14 @@ final class GuestViewController: UIViewController {
     private let hud = UILabel()
     private var link: CADisplayLink?
     private var seq: UInt64 = 0
-    private var scratch = [UInt8](repeating: 0, count: 4 * 1920 * 1080)
+    /// Where a presented frame is copied to on its way to Metal.
+    ///
+    /// Grown to fit rather than fixed. It was a fixed 1920x1080, and
+    /// win_probe_copy_frame refuses a buffer that is too small without saying
+    /// so — which on an iPad running at its native 2360x1640 meant every
+    /// frame was dropped and the screen stayed black, at every setting except
+    /// the ones that happened to fit.
+    private var scratch = [UInt8](repeating: 0, count: 4 * 1280 * 720)
     private var running = false
     private var framesSeen = 0
     private var started = CFAbsoluteTimeGetCurrent()
@@ -293,6 +300,12 @@ final class GuestViewController: UIViewController {
 
     @objc private func tick() {
         var w: Int32 = 0, h: Int32 = 0, pitch: Int32 = 0
+        // Make room before asking, or the copy is refused and the frame is
+        // lost with nothing to show for it.
+        let need = win_probe_frame_bytes()
+        if need > scratch.count {
+            scratch = [UInt8](repeating: 0, count: need)
+        }
         let got = scratch.withUnsafeMutableBytes { buf -> Int32 in
             guard let base = buf.baseAddress else { return 0 }
             return win_probe_copy_frame(&seq, base, buf.count, &w, &h, &pitch)

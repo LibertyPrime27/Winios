@@ -346,7 +346,18 @@ static void m_getenv(w32 *w) {
 
 /* ---- memory ---- */
 static void m_malloc(w32 *w) { uint64_t p = w32_heap_alloc(w, ARG(0)); if (!p) set_errno(w, ENOMEM); RET(p); }
-static void m_calloc(w32 *w) { uint64_t n = ARG(0) * ARG(1); uint64_t p = w32_heap_alloc(w, n); if (p) memset(W32P(w, p), 0, n); RET(p); }
+/* calloc's two factors are multiplied in the caller's own arithmetic on
+ * Windows too, but here the product decides how much host memory is cleared,
+ * so a pair that wraps has to fail rather than allocate a byte and zero four
+ * gigabytes. The block itself is ours, so the memset needs no check. */
+static void m_calloc(w32 *w) {
+    uint64_t a = ARG(0), b = ARG(1);
+    if (a && b > UINT64_MAX / a) { set_errno(w, ENOMEM); RET(0); return; }
+    uint64_t n = a * b;
+    uint64_t p = w32_heap_alloc(w, n);
+    if (p) memset(W32P(w, p), 0, n);
+    RET(p);
+}
 static void m_realloc(w32 *w) { RET(w32_heap_realloc(w, ARG(0), ARG(1))); }
 static void m_free(w32 *w) { w32_heap_free(w, ARG(0)); }
 static void m__msize(w32 *w) { RET(w32_heap_size(w, ARG(0))); }
@@ -360,17 +371,71 @@ static void m__aligned_malloc(w32 *w) {
 static void m__aligned_free(w32 *w) { uint64_t p = ARG(0); if (p) w32_heap_free(w, w32_read(w, p - 8, 8)); }
 
 /* ---- strings (on guest memory) ---- */
-static void m_memcpy(w32 *w) { memcpy(W32P(w, ARG(0)), W32P(w, ARG(1)), ARG(2)); RET(ARG(0)); }
-static void m_memmove(w32 *w) { memmove(W32P(w, ARG(0)), W32P(w, ARG(1)), ARG(2)); RET(ARG(0)); }
-static void m_memset(w32 *w) { memset(W32P(w, ARG(0)), (int)ARG(1), ARG(2)); RET(ARG(0)); }
-static void m_memcmp(w32 *w) { RET((uint64_t)(int64_t)memcmp(W32P(w, ARG(0)), W32P(w, ARG(1)), ARG(2))); }
-static void m_memchr(w32 *w) { const void *p = W32P(w, ARG(0)); const void *r = memchr(p, (int)ARG(1), ARG(2)); RET(r ? ARG(0) + (uint64_t)((const uint8_t *)r - (const uint8_t *)p) : 0); }
+/* The block functions all carry their own length, so the whole range is
+ * checked and a bad one returns NULL -- which is not what the CRT does (it
+ * faults) but is the closest thing to it that leaves the host standing. */
+static void m_memcpy(w32 *w) {
+    void *d = W32PN(w, ARG(0), ARG(2)); const void *s = W32PN(w, ARG(1), ARG(2));
+    if (!d || !s) { RET(0); return; }
+    memcpy(d, s, ARG(2)); RET(ARG(0));
+}
+static void m_memmove(w32 *w) {
+    void *d = W32PN(w, ARG(0), ARG(2)); const void *s = W32PN(w, ARG(1), ARG(2));
+    if (!d || !s) { RET(0); return; }
+    memmove(d, s, ARG(2)); RET(ARG(0));
+}
+static void m_memset(w32 *w) {
+    void *d = W32PN(w, ARG(0), ARG(2));
+    if (!d) { RET(0); return; }
+    memset(d, (int)ARG(1), ARG(2)); RET(ARG(0));
+}
+/* memcmp has no value that means "I could not look", so an unreadable operand
+ * reports equal: a caller that branches on it takes the same path it would
+ * have taken for two identical buffers, which is the least surprising of the
+ * three answers available. */
+static void m_memcmp(w32 *w) {
+    const void *a = W32PN(w, ARG(0), ARG(2)), *b = W32PN(w, ARG(1), ARG(2));
+    if (!a || !b) { RET(0); return; }
+    RET((uint64_t)(int64_t)memcmp(a, b, ARG(2)));
+}
+static void m_memchr(w32 *w) {
+    const void *p = W32PN(w, ARG(0), ARG(2));
+    if (!p) { RET(0); return; }
+    const void *r = memchr(p, (int)ARG(1), ARG(2));
+    RET(r ? ARG(0) + (uint64_t)((const uint8_t *)r - (const uint8_t *)p) : 0);
+}
 static void m_strlen(w32 *w) { RET(strlen(GSTR(ARG(0)))); }
 static void m_strnlen(w32 *w) { RET(strnlen(GSTR(ARG(0)), ARG(1))); }
-static void m_strcpy(w32 *w) { strcpy(W32P(w, ARG(0)), GSTR(ARG(1))); RET(ARG(0)); }
-static void m_strncpy(w32 *w) { strncpy(W32P(w, ARG(0)), GSTR(ARG(1)), ARG(2)); RET(ARG(0)); }
-static void m_strcat(w32 *w) { strcat(W32P(w, ARG(0)), GSTR(ARG(1))); RET(ARG(0)); }
-static void m_strncat(w32 *w) { strncat(W32P(w, ARG(0)), GSTR(ARG(1)), ARG(2)); RET(ARG(0)); }
+/* The string functions have no destination size, so the amount about to be
+ * written is worked out from the source (and, for the cat forms, from where
+ * the destination's existing terminator turns out to be) and the destination
+ * is checked for exactly that. strncpy is the exception: it writes the full
+ * count whether the source is that long or not. */
+static void m_strcpy(w32 *w) {
+    const char *s = GSTR(ARG(1));
+    char *d = W32PN(w, ARG(0), strlen(s) + 1);
+    if (!d) { RET(0); return; }
+    strcpy(d, s); RET(ARG(0));
+}
+static void m_strncpy(w32 *w) {
+    char *d = W32PN(w, ARG(0), ARG(2));
+    if (!d) { RET(0); return; }
+    strncpy(d, GSTR(ARG(1)), ARG(2)); RET(ARG(0));
+}
+static void m_strcat(w32 *w) {
+    char *d = W32PN(w, ARG(0), 1);
+    const char *s = GSTR(ARG(1));
+    if (!d || !W32PN(w, ARG(0), strlen(d) + strlen(s) + 1)) { RET(0); return; }
+    strcat(d, s); RET(ARG(0));
+}
+static void m_strncat(w32 *w) {
+    char *d = W32PN(w, ARG(0), 1);
+    const char *s = GSTR(ARG(1));
+    if (!d) { RET(0); return; }
+    size_t add = strnlen(s, ARG(2));
+    if (!W32PN(w, ARG(0), strlen(d) + add + 1)) { RET(0); return; }
+    strncat(d, s, ARG(2)); RET(ARG(0));
+}
 static void m_strcmp(w32 *w) { RET((uint64_t)(int64_t)strcmp(GSTR(ARG(0)), GSTR(ARG(1)))); }
 static void m_strncmp(w32 *w) { RET((uint64_t)(int64_t)strncmp(GSTR(ARG(0)), GSTR(ARG(1)), ARG(2))); }
 static void m__stricmp(w32 *w) { RET((uint64_t)(int64_t)strcasecmp(GSTR(ARG(0)), GSTR(ARG(1)))); }
@@ -396,14 +461,31 @@ static void m_isupper(w32 *w) { RET((uint64_t)(isupper((int)ARG(0)) != 0)); }
 static void m_islower(w32 *w) { RET((uint64_t)(islower((int)ARG(0)) != 0)); }
 static void m_isprint(w32 *w) { RET((uint64_t)(isprint((int)ARG(0)) != 0)); }
 static void m_wcslen(w32 *w) { RET(w32_wcslen(w, ARG(0))); }
-static void m_wcscpy(w32 *w) { size_t n = w32_wcslen(w, ARG(1)); memcpy(W32P(w, ARG(0)), W32P(w, ARG(1)), 2 * (n + 1)); RET(ARG(0)); }
-static void m_wcscmp(w32 *w) { const uint16_t *a = W32P(w, ARG(0)), *b = W32P(w, ARG(1)); while (*a && *a == *b) { a++; b++; } RET((uint64_t)(int64_t)((int)*a - (int)*b)); }
+static void m_wcscpy(w32 *w) {
+    if (!W32PN(w, ARG(1), 2)) { RET(0); return; }
+    size_t n = w32_wcslen(w, ARG(1));
+    void *d = W32PN(w, ARG(0), 2 * ((uint64_t)n + 1));
+    if (!d) { RET(0); return; }
+    memcpy(d, W32P(w, ARG(1)), 2 * (n + 1)); RET(ARG(0));
+}
+static void m_wcscmp(w32 *w) {
+    const uint16_t *a = W32PN(w, ARG(0), 2), *b = W32PN(w, ARG(1), 2);
+    if (!a || !b) { RET(0); return; }
+    while (*a && *a == *b) { a++; b++; }
+    RET((uint64_t)(int64_t)((int)*a - (int)*b));
+}
 static void m_strerror(w32 *w) { static uint64_t p; if (!p) p = w32_heap_alloc(w, 128); snprintf(W32P(w, p), 128, "%s", strerror((int)ARG(0))); RET(p); }
 static void m_qsort(w32 *w) {
     /* (base, n, size, cmp): the comparator is guest code */
     uint64_t base = ARG(0), n = ARG(1), size = ARG(2), cmp = ARG(3);
+    /* The array is n elements of `size` bytes and every one of them is read
+     * and written below, so the product is what has to be there -- computed
+     * with an overflow test first, because n * size is exactly the pair a
+     * program gets wrong. */
+    if (!size || (n && size > UINT64_MAX / n) || !W32PN(w, base, n * size)) { RET(0); return; }
     /* insertion sort through w32_call_guest -- n is small in CRT use */
     uint8_t *tmp = malloc(size);
+    if (!tmp) { RET(0); return; }
     for (uint64_t i = 1; i < n && !w->exited; i++) {
         memcpy(tmp, (uint8_t *)W32P(w, base) + i * size, size);
         /* insertion step */
@@ -428,12 +510,21 @@ static void m_puts(w32 *w) { const char *s = GSTR(ARG(0)); wr(1, s, strlen(s)); 
 static void m_putchar(w32 *w) { char c = (char)ARG(0); wr(1, &c, 1); RET((uint8_t)c); }
 static void m_fputs(w32 *w) { int fd = file_fd(w, ARG(1)); const char *s = GSTR(ARG(0)); if (fd < 0) { RET((uint64_t)-1); return; } wr(fd, s, strlen(s)); RET(0); }
 static void m_fputc(w32 *w) { int fd = file_fd(w, ARG(1)); char c = (char)ARG(0); if (fd < 0) { RET((uint64_t)-1); return; } wr(fd, &c, 1); RET((uint8_t)c); }
-static void m_fwrite(w32 *w) { int fd = file_fd(w, ARG(3)); uint64_t n = ARG(1) * ARG(2); if (fd < 0) { RET(0); return; } wr(fd, W32P(w, ARG(0)), n); RET(ARG(2)); }
+static void m_fwrite(w32 *w) {
+    int fd = file_fd(w, ARG(3));
+    uint64_t sz = ARG(1), cnt = ARG(2);
+    if (fd < 0 || (sz && cnt > UINT64_MAX / sz)) { RET(0); return; }
+    const void *p = W32PN(w, ARG(0), sz * cnt);
+    if (!p) { RET(0); return; }
+    wr(fd, p, sz * cnt); RET(cnt);
+}
 static void m_fflush(w32 *w) { RET(0); }
 static void m_fgetc(w32 *w) { int fd = file_fd(w, ARG(0)); unsigned char c; if (fd < 0 || read(fd, &c, 1) != 1) { RET((uint64_t)-1); return; } RET(c); }
 static void m_fgets(w32 *w) {
-    int fd = file_fd(w, ARG(2)); char *buf = W32P(w, ARG(0)); int n = (int)ARG(1);
+    int fd = file_fd(w, ARG(2)); int n = (int)ARG(1);
     if (fd < 0 || n <= 0) { RET(0); return; }
+    char *buf = W32PN(w, ARG(0), (uint64_t)n);
+    if (!buf) { RET(0); return; }
     int i = 0; while (i < n - 1) { char c; if (read(fd, &c, 1) != 1) break; buf[i++] = c; if (c == '\n') break; }
     buf[i] = 0; RET(i ? ARG(0) : 0);
 }
@@ -454,7 +545,15 @@ static void m_fopen(w32 *w) {
 }
 static int gfile_fd(w32 *w, uint64_t gf) { int fd = file_fd(w, gf); if (fd >= 0) return fd; return (int)(int32_t)w32_read(w, gf + (uint64_t)file_off(w), 4); }
 static void m_fclose(w32 *w) { int fd = gfile_fd(w, ARG(0)); if (fd > 2) close(fd); RET(0); }
-static void m_fread(w32 *w) { int fd = gfile_fd(w, ARG(3)); uint64_t n = ARG(1) * ARG(2); ssize_t r = read(fd, W32P(w, ARG(0)), n); RET(r <= 0 || !ARG(1) ? 0 : (uint64_t)r / ARG(1)); }
+static void m_fread(w32 *w) {
+    int fd = gfile_fd(w, ARG(3));
+    uint64_t sz = ARG(1), cnt = ARG(2);
+    if (sz && cnt > UINT64_MAX / sz) { RET(0); return; }
+    void *p = W32PN(w, ARG(0), sz * cnt);
+    if (!p) { RET(0); return; }
+    ssize_t r = read(fd, p, sz * cnt);
+    RET(r <= 0 || !sz ? 0 : (uint64_t)r / sz);
+}
 static void m_fseek(w32 *w) { int fd = gfile_fd(w, ARG(0)); RET(lseek(fd, (int64_t)(int32_t)ARG(1), (int)ARG(2)) < 0 ? (uint64_t)-1 : 0); }
 static void m_ftell(w32 *w) { int fd = gfile_fd(w, ARG(0)); RET((uint64_t)(int64_t)lseek(fd, 0, SEEK_CUR)); }
 static void m_feof(w32 *w) { RET(0); }
@@ -462,8 +561,18 @@ static void m_ferror(w32 *w) { RET(0); }
 static void m_setvbuf(w32 *w) { RET(0); }
 static void m__fileno(w32 *w) { RET((uint64_t)gfile_fd(w, ARG(0))); }
 static void m__isatty(w32 *w) { RET((uint64_t)isatty((int)ARG(0))); }
-static void m__write(w32 *w) { ssize_t r = write((int)ARG(0), W32P(w, ARG(1)), (uint32_t)ARG(2)); RET((uint64_t)(int64_t)r); }
-static void m__read(w32 *w) { ssize_t r = read((int)ARG(0), W32P(w, ARG(1)), (uint32_t)ARG(2)); RET((uint64_t)(int64_t)r); }
+static void m__write(w32 *w) {
+    uint32_t n = (uint32_t)ARG(2);
+    const void *p = W32PN(w, ARG(1), n);
+    if (!p) { set_errno(w, EFAULT); RET((uint64_t)(int64_t)-1); return; }
+    RET((uint64_t)(int64_t)write((int)ARG(0), p, n));
+}
+static void m__read(w32 *w) {
+    uint32_t n = (uint32_t)ARG(2);
+    void *p = W32PN(w, ARG(1), n);
+    if (!p) { set_errno(w, EFAULT); RET((uint64_t)(int64_t)-1); return; }
+    RET((uint64_t)(int64_t)read((int)ARG(0), p, n));
+}
 
 /* the printf family: the va_list is either the argument list itself (variadic
  * entry points -- the arguments follow the fixed ones in memory / registers) or
@@ -511,13 +620,13 @@ static void wsprintf_common(w32 *w, int wide, uint64_t ap) {
      * buffer, not ours. */
     char tmp[1024];
     if (wide) {
-        const uint16_t *wf = ARG(1) ? W32P(w, ARG(1)) : 0;
+        const uint16_t *wf = ARG(1) ? W32PN(w, ARG(1), 2) : 0;
         do_printf(w, -1, tmp, sizeof tmp, 0, wf, ap);
-        uint16_t *d = W32P(w, out);
+        uint16_t *d = W32PN(w, out, 2 * (strlen(tmp) + 1));
         if (d) { size_t i = 0; for (; tmp[i]; i++) d[i] = (uint8_t)tmp[i]; d[i] = 0; }
     } else {
         do_printf(w, -1, tmp, sizeof tmp, ARG(1) ? GSTR(ARG(1)) : "", 0, ap);
-        char *d = W32P(w, out);
+        char *d = W32PN(w, out, strlen(tmp) + 1);
         if (d) memcpy(d, tmp, strlen(tmp) + 1);
     }
     /* do_printf already set the return value to the length. */
@@ -527,20 +636,40 @@ static void m_printf(w32 *w)   { do_printf(w, 1, 0, 0, GSTR(ARG(0)), 0, vararg_s
 static void m_vprintf(w32 *w)  { do_printf(w, 1, 0, 0, GSTR(ARG(0)), 0, ARG(1)); }
 static void m_fprintf(w32 *w)  { do_printf(w, gfile_fd(w, ARG(0)), 0, 0, GSTR(ARG(1)), 0, vararg_start(w, 2)); }
 static void m_vfprintf(w32 *w) { do_printf(w, gfile_fd(w, ARG(0)), 0, 0, GSTR(ARG(1)), 0, ARG(2)); }
-static void m_sprintf(w32 *w)  { char tmp[65536]; do_printf(w, -1, tmp, sizeof tmp, GSTR(ARG(1)), 0, vararg_start(w, 2)); strcpy(W32P(w, ARG(0)), tmp); }
-static void m_vsprintf(w32 *w) { char tmp[65536]; do_printf(w, -1, tmp, sizeof tmp, GSTR(ARG(1)), 0, ARG(2)); strcpy(W32P(w, ARG(0)), tmp); }
+/* sprintf has no destination size at all, so the only length there is to
+ * check is the one that was just formatted. do_printf has already set the
+ * return value to that length; a destination that cannot take it leaves the
+ * count reported and nothing written, which is the same shape of lie either
+ * way and the one that does not fault. */
+static void m_sprintf(w32 *w)  { char tmp[65536]; do_printf(w, -1, tmp, sizeof tmp, GSTR(ARG(1)), 0, vararg_start(w, 2));
+    char *d = W32PN(w, ARG(0), strlen(tmp) + 1); if (d) strcpy(d, tmp); }
+static void m_vsprintf(w32 *w) { char tmp[65536]; do_printf(w, -1, tmp, sizeof tmp, GSTR(ARG(1)), 0, ARG(2));
+    char *d = W32PN(w, ARG(0), strlen(tmp) + 1); if (d) strcpy(d, tmp); }
+static void snprintf_put(w32 *w, uint64_t buf, uint64_t n, const char *tmp) {
+    if (!n) return;
+    size_t l = strlen(tmp);
+    void *d = W32PN(w, buf, l >= n ? n : l + 1);
+    if (!d) { RET((uint64_t)-1); return; }
+    if (l >= n) { memcpy(d, tmp, n); RET((uint64_t)-1); }
+    else memcpy(d, tmp, l + 1);
+}
 static void m__snprintf(w32 *w) { char tmp[65536]; uint64_t n = ARG(1); do_printf(w, -1, tmp, sizeof tmp, GSTR(ARG(2)), 0, vararg_start(w, 3));
-    if (n) { size_t l = strlen(tmp); if (l >= n) { memcpy(W32P(w, ARG(0)), tmp, n); RET((uint64_t)-1); } else memcpy(W32P(w, ARG(0)), tmp, l + 1); } }
+    snprintf_put(w, ARG(0), n, tmp); }
 static void m__vsnprintf(w32 *w) { char tmp[65536]; uint64_t n = ARG(1); do_printf(w, -1, tmp, sizeof tmp, GSTR(ARG(2)), 0, ARG(3));
-    if (n) { size_t l = strlen(tmp); if (l >= n) { memcpy(W32P(w, ARG(0)), tmp, n); RET((uint64_t)-1); } else memcpy(W32P(w, ARG(0)), tmp, l + 1); } }
+    snprintf_put(w, ARG(0), n, tmp); }
 static void m__vscprintf(w32 *w) { do_printf(w, -1, 0, 0, GSTR(ARG(0)), 0, ARG(1)); }
 static void m___stdio_common_vfprintf(w32 *w) { /* (options64, FILE*, fmt, locale, va_list) */
     int a = w->is32 ? 2 : 1; do_printf(w, gfile_fd(w, ARG(a)), 0, 0, GSTR(ARG(a + 1)), 0, ARG(a + 3)); }
 static void m___stdio_common_vsprintf(w32 *w) { /* (options64, buf, len, fmt, locale, va_list) */
     int a = w->is32 ? 2 : 1; char tmp[65536]; uint64_t buf = ARG(a), n = ARG(a + 1);
     do_printf(w, -1, tmp, sizeof tmp, GSTR(ARG(a + 2)), 0, ARG(a + 4));
-    size_t l = strlen(tmp); if (buf && n) { if (l >= n) { memcpy(W32P(w, buf), tmp, n - 1); w32_write(w, buf + n - 1, 1, 0); } else memcpy(W32P(w, buf), tmp, l + 1); } }
-static void m_wprintf(w32 *w) { do_printf(w, 1, 0, 0, 0, W32P(w, ARG(0)), vararg_start(w, 1)); }
+    size_t l = strlen(tmp);
+    if (buf && n) {
+        char *d = W32PN(w, buf, l >= n ? n : l + 1);
+        if (!d) return;
+        if (l >= n) { memcpy(d, tmp, n - 1); d[n - 1] = 0; } else memcpy(d, tmp, l + 1);
+    } }
+static void m_wprintf(w32 *w) { do_printf(w, 1, 0, 0, 0, W32PN(w, ARG(0), 2), vararg_start(w, 1)); }
 
 /* ---- math (x87 return on x86, xmm0 on x64) ---- */
 #define M1(n) static void m_##n(w32 *w) { w32_fret(w, n(w32_farg(w, 0))); }

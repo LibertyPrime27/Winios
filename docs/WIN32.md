@@ -522,6 +522,96 @@ fiction on Apple silicon, whose kernel maps in 16 KB units and rejects
 `WINRUN_HOST_PAGE=16384` so the 16 KB path is exercised on every push, not
 only on the Mac.
 
+## Pointers the guest supplied, and where they are checked
+
+The identity mapping has a consequence the arena does not. A PE32 guest's
+address is `base + zext32`, so every number it can produce lands somewhere
+inside one 4 GB reservation and there is nowhere else for it to point. A PE32+
+guest's addresses *are* host addresses. `W32P()` is the identity map for them,
+which means any number a program hands to an API becomes a raw host pointer,
+and the host then writes through it.
+
+That is not a theoretical hole. A crash report from a device showed
+
+    _platform_memmove -> w32_write -> k_VirtualProtect -> run_loop
+    (Data Abort) byte write Translation fault, far = 0x16d08be0
+
+on a guest whose image starts at `0x140000000`. `VirtualProtect` was storing
+its old-protection word through an out-parameter the program had never
+initialised, and `0x16d08be0` was whatever had been on the stack. On a desktop
+that is a segfault and a core file. On a phone it is the whole app vanishing,
+with no signal handler in a position to say which of the guest's several
+thousand API calls did it — the run report cannot be written, because there is
+nothing left to write it with.
+
+The boundary is `w32_mem_ok()` in `tools/winrun/winrun.c`: is this guest range
+actually mapped? It answers from the list of mappings the loader made, which
+is a few dozen entries, so a linear scan with a one-entry cache costs nothing
+at the rate the API layer asks. For a 32-bit guest it is always yes, because
+the whole arena is one reservation. `W32PN(w, addr, len)` is `W32P` with that
+question asked first and NULL for an answer when it fails, and `w32_read` /
+`w32_write` go through it already.
+
+Everything in `win32/` that memsets, memcpys or indexes through an address the
+*guest* supplied now goes through `W32PN` — roughly seventy call sites: every
+`GetDesc` and `GetCaps` that clears a structure, `Map` and `Lock` and
+`UpdateSubresource` on the d3d paths, the CRT's block and string functions,
+`ReadFile`/`WriteFile`, the registry value copies, `MultiByteToWideChar` in
+both directions. Where the length is variable the whole range is checked
+rather than the first byte, and the arithmetic is done in 64 bits: a
+`SysMemPitch` times a height, or a `PrimitiveCount` times three, is exactly
+the product that wraps in 32 bits to something small and plausible.
+
+Addresses this side computed are still plain `W32P`. A buffer that came back
+from `w32_alloc` or `w32_heap_alloc` a moment earlier, a texture's pixels read
+out of a COM object we made — checking those would buy nothing and would put a
+scan on the inside of the rasterizer's loops.
+
+A failed check does not fault and does not silently succeed: each call site
+returns what that API returns when it cannot use a pointer. `E_INVALIDARG` and
+`D3DERR_INVALIDCALL` for the Direct3D structures, `ERROR_NOACCESS` for a Win32
+output buffer, `ERROR_INVALID_USER_BUFFER` for a file read or write,
+`ERROR_INVALID_ADDRESS` for a range `VirtualProtect` or `VirtualFree` was
+asked to operate on, `TIME_ZONE_ID_INVALID` from `GetTimeZoneInformation`,
+NULL from the CRT's `memcpy`. Where the function returns void — `GetDesc` on a
+D3D11 texture, `GetSystemInfo`, `UpdateSubresource` — there is no status word,
+so the write is simply not done.
+
+`VirtualProtect` and `VirtualFree` needed more than their out-parameters
+checked. Their `mprotect`, `munmap` and `MAP_FIXED` calls act on whatever is at
+the address, and for a 64-bit guest that is a host address: a guest could have
+made the host's own text writable, or unmapped libc, by passing a plausible
+number. Those now refuse a range that is not the guest's. `IsBadReadPtr` and
+`IsBadWritePtr` used to answer from `W32P`, which says yes to every non-zero
+number — so a program using them precisely to avoid a fault was told to go
+ahead and fault. They answer from the mapping table now.
+
+Four things are deliberately still unchecked.
+
+The guest's own instructions. A program that dereferences a wild pointer in
+code the compiler inlined — the `memcpy` that mingw turns into a `rep movsb`
+rather than a call — faults inside the interpreter or the dynarec, which have
+their own bounds handling and their own recovery stubs. This layer defends the
+calls a program makes into the host, not the loads and stores it issues
+itself, and the two failure modes look quite different in a report.
+
+C strings with no count. `w32_str`, `GSTR` and `w32_wcslen` scan to a
+terminator, and there is no length to check before the scan finds one. Those
+sites check a single byte, which establishes that the pointer is in guest
+memory at all and catches the uninitialised-local case that motivated all of
+this; a pointer that lands inside some *other* mapping and runs off the end of
+it is still a fault. A properly bounded scan belongs in the loader next to
+`w32_mem_ok`, where the extent of the containing mapping is known.
+
+Fields read back out of the objects we make. A COM object's state lives in
+guest memory, so a program can scribble on its own texture's width — and then
+the rasterizer walks off the end of a buffer whose size it thought it knew.
+That is a different problem from a wrong pointer and wants a different answer,
+probably validating the field rather than the address.
+
+And 32-bit guests, where every check compiles to the same `return 1` and the
+arena makes the question meaningless.
+
 ## What the process looks like from inside
 
 TEB (gs on x64, fs on x86) with stack limits, Self, ClientId, LastErrorValue,

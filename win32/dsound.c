@@ -252,7 +252,9 @@ static void ds_GetCaps(w32 *w) {
     /* DSCAPS is large and mostly counters; the fields a game branches on are
      * dwFlags and the buffer limits. Zeroed first so nothing is left to
      * whatever the guest had there. */
-    memset(W32P(w, c), 0, 96);
+    void *p = W32PN(w, c, 96);
+    if (!p) { RET(DSERR_INVALIDPARAM); return; }
+    memset(p, 0, 96);
     w32_write(w, c + 0, 4, 96);
     w32_write(w, c + 4, 4, 0x00000E3F);          /* primary/secondary, all formats */
     w32_write(w, c + 8, 4, 200000);              /* dwMinSecondarySampleRate */
@@ -402,7 +404,7 @@ static void b_QueryInterface(w32 *w) {
     uint64_t iid = ARG(1), out = ARG(2);
     if (!out) { RET(E_NOINTERFACE_); return; }
     if (iid) {
-        const uint8_t *g = W32P(w, iid);
+        const uint8_t *g = W32PN(w, iid, 16);
         for (size_t i = 0; g && i < sizeof BUF_IIDS / sizeof BUF_IIDS[0]; i++) {
             if (memcmp(g, BUF_IIDS[i].iid, 16)) continue;
             w32_com_class *cls = BUF_IIDS[i].which == 1 ? &cls_3db
@@ -452,7 +454,9 @@ static void d_DirectSoundEnumerateW(w32 *w) { enumerate(w, 1); }
 static void d_DirectSoundCaptureCreate8(w32 *w) { (void)w; RET(E_FAIL_); }   /* no microphone */
 static void d_DirectSoundCaptureEnumerateA(w32 *w) { (void)w; RET(S_OK_); }
 static void d_GetDeviceID(w32 *w) {
-    if (ARG(1) && ARG(0)) memcpy(W32P(w, ARG(1)), W32P(w, ARG(0)), 16);
+    void *d = W32PN(w, ARG(1), 16);
+    const void *s = W32PN(w, ARG(0), 16);
+    if (d && s) memcpy(d, s, 16);
     RET(S_OK_);
 }
 /* dsound exports DllGetClassObject/DllCanUnloadNow for CoCreateInstance; a

@@ -1561,7 +1561,12 @@ static void u_GetKeyboardState(w32 *w) {
     uint64_t p = ARG(0);
     if (!p) { RET(0); return; }
     pthread_mutex_lock(&g_lock);
-    memcpy(W32P(w, p), g_keys, 256);
+    /* GetKeyboardState fills 256 bytes through a pointer the program chose.
+     * A game that passes a stale one used to write over whatever the host had
+     * there instead. */
+    void *dst = W32PN(w, p, 256);
+    if (!dst) { RET(0); return; }
+    memcpy(dst, g_keys, 256);
     pthread_mutex_unlock(&g_lock);
     RET(1);
 }
@@ -1843,7 +1848,8 @@ static void u_GetKeyNameTextA(w32 *w) {
     if (vk >= 'A' && vk <= 'Z') snprintf(buf, sizeof buf, "%c", vk);
     else snprintf(buf, sizeof buf, "0x%02X", vk);
     uint32_t n = (uint32_t)strlen(buf);
-    if (p && cap > n) memcpy(W32P(w, p), buf, n + 1);
+    void *dst = p && cap > n ? W32PN(w, p, (uint64_t)n + 1) : 0;
+    if (dst) memcpy(dst, buf, (size_t)n + 1);
     RET(p && cap > n ? n : 0);
 }
 
@@ -1877,8 +1883,11 @@ static void u_EnumDisplaySettingsA(w32 *w) {
     uint64_t p = ARG(2);
     if (!p) { RET(0); return; }
     if (mode != 0 && mode != 0xFFFFFFFFu) { RET(0); return; }   /* one mode, and ENUM_CURRENT */
-    memset(W32P(w, p), 0, 156);
-    memcpy(W32P(w, p), "Winios", 7);   /* dmDeviceName: the display we claim to be */
+    /* DEVMODE is 156 bytes and the program supplies the room for it. */
+    void *devmode = W32PN(w, p, 156);
+    if (!devmode) { RET(0); return; }
+    memset(devmode, 0, 156);
+    memcpy(devmode, "Winios", 7);           /* dmDeviceName: the display we claim to be */
     w32_write(w, p + 32, 2, 0x0401);               /* dmSpecVersion */
     dm = 0x0004 | 0x0008 | 0x0010 | 0x0400;
     w32_write(w, p + 40, 4, dm);
@@ -4258,7 +4267,9 @@ static void u_BeginPaint(w32 *w) {
     uint64_t hdc = w32_dc_for_window(w, hwnd, 0);
     if (ps) {
         int ptr = (int)w32_ptrsize(w);
-        memset(W32P(w, ps), 0, w->is32 ? 64 : 72);
+        size_t psn = w->is32 ? 64u : 72u;
+        void *pp = W32PN(w, ps, psn);
+        if (pp) memset(pp, 0, psn);
         w32_write(w, ps, ptr, hdc);
         w32_write(w, ps + (unsigned)ptr, 4, 1);                 /* fErase */
         put_rect(w, ps + (unsigned)ptr + 4, 0, 0, cw, ch);

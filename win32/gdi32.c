@@ -638,7 +638,10 @@ static void logfont(w32 *w, uint64_t p, int wide) {
     if (!p) { RET(0); return; }
     char face[32];
     if (wide) w32_wtoa(w, p + 28, face, sizeof face);
-    else snprintf(face, sizeof face, "%.31s", (const char *)W32P(w, p + 28));
+    /* lfFaceName is 32 bytes inside the LOGFONT whether or not the program
+     * filled all of them, so that is the range, not the string's length. */
+    else { const char *fn = W32PN(w, p + 28, 32);
+           snprintf(face, sizeof face, "%.31s", fn ? fn : ""); }
     gobj *o = mk_font((int)(int32_t)(uint32_t)w32_read(w, p, 4),
                       (int)(int32_t)(uint32_t)w32_read(w, p + 16, 4), face);
     if (!o) { RET(0); return; }
@@ -802,7 +805,9 @@ static void g_TextOutA(w32 *w) {
     gdc *d = dc_of(ARG(0));
     if (!d || !ARG(3)) { RET(0); return; }
     int len = (int)(int32_t)(uint32_t)ARG(4);
-    const char *s = (const char *)W32P(w, ARG(3));
+    /* A negative count means "to the terminator", and there is no length to
+     * check then; one byte still says the run is in guest memory. */
+    const char *s = (const char *)W32PN(w, ARG(3), len < 0 ? 1 : (uint64_t)len);
     if (!s) { RET(0); return; }
     if (len < 0) len = (int)strlen(s);
     text_out(d, (int)(int32_t)(uint32_t)ARG(1), (int)(int32_t)(uint32_t)ARG(2), s, len);
@@ -829,8 +834,8 @@ static void g_ExtTextOutA(w32 *w) {
         if (opt & 2) fill(d, l, t, r, b, px(d->bkcolor));
     }
     if (!ARG(5)) { RET(1); return; }
-    const char *s = (const char *)W32P(w, ARG(5));
     int len = (int)(int32_t)(uint32_t)ARG(6);
+    const char *s = (const char *)W32PN(w, ARG(5), len < 0 ? 1 : (uint64_t)len);
     if (!s) { RET(1); return; }
     if (len < 0) len = (int)strlen(s);
     int saved = d->bkmode;
@@ -865,8 +870,8 @@ static void extent(w32 *w, const char *s, int len, uint64_t hdc, uint64_t out) {
     RET(1);
 }
 static void g_GetTextExtentPoint32A(w32 *w) {
-    const char *s = ARG(1) ? (const char *)W32P(w, ARG(1)) : "";
     int len = (int)(int32_t)(uint32_t)ARG(2);
+    const char *s = ARG(1) ? (const char *)W32PN(w, ARG(1), len < 0 ? 1 : (uint64_t)len) : "";
     extent(w, s ? s : "", len, ARG(0), ARG(3));
 }
 static void g_GetTextExtentPoint32W(w32 *w) {

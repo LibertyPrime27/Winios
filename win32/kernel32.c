@@ -27,7 +27,11 @@
 enum { ERROR_FILE_NOT_FOUND = 2, ERROR_ACCESS_DENIED = 5, ERROR_INVALID_HANDLE = 6, ERROR_NOT_ENOUGH_MEMORY = 8,
        ERROR_INVALID_PARAMETER = 87, ERROR_PROC_NOT_FOUND = 127, ERROR_MOD_NOT_FOUND = 126, ERROR_ALREADY_EXISTS = 183,
        ERROR_INSUFFICIENT_BUFFER = 122, ERROR_CALL_NOT_IMPLEMENTED = 120,
-       ERROR_FILENAME_EXCED_RANGE = 206 };
+       ERROR_FILENAME_EXCED_RANGE = 206,
+       /* The three Windows uses for "the caller gave me a pointer I cannot
+        * use": a buffer that cannot be read or written, a range that is not
+        * the caller's to free or protect, and everything else. */
+       ERROR_INVALID_ADDRESS = 487, ERROR_NOACCESS = 998, ERROR_INVALID_USER_BUFFER = 1784 };
 
 static uint64_t bool_(int b) { return b ? 1 : 0; }
 static uint64_t filetime_now(void) {
@@ -168,8 +172,14 @@ static uint64_t filetime_of(time_t t) { return ((uint64_t)t + 11644473600ull) * 
 /* One directory entry into a WIN32_FIND_DATA. The A and W forms differ only in
  * the name at offset 44, and the layout is the same in both bitnesses (there
  * are no pointers in it), which is why one function does both. */
-static void fill_find_data(w32 *w, uint64_t out, int wide, const char *dir, const char *name) {
-    memset(W32P(w, out), 0, wide ? 592 : 320);
+static int fill_find_data(w32 *w, uint64_t out, int wide, const char *dir, const char *name) {
+    /* The whole structure is checked once here rather than field by field:
+     * everything below writes into it at a fixed offset, and a caller that
+     * cannot receive it is better told the enumeration ended than handed a
+     * half-filled record. */
+    size_t fdsz = wide ? 592 : 320;
+    if (!W32PN(w, out, fdsz)) { w32_set_last_error(w, ERROR_NOACCESS); return 0; }
+    memset(W32P(w, out), 0, fdsz);
     char full[4096];
     snprintf(full, sizeof full, "%.*s/%.*s", 2000, dir, 1000, name);
     struct stat st;
@@ -195,6 +205,7 @@ static void fill_find_data(w32 *w, uint64_t out, int wide, const char *dir, cons
         char *d = W32P(w, out + 44);
         snprintf(d, 260, "%s", name);
     }
+    return 1;
 }
 
 /* The next entry matching this handle's pattern, or 0 at the end. "." and ".."
@@ -208,8 +219,7 @@ static int find_step(w32 *w, w32_handle *h, uint64_t out, int wide) {
     struct dirent *e;
     while ((e = readdir(d))) {
         if (!wild_match(pat, e->d_name)) continue;
-        fill_find_data(w, out, wide, dir, e->d_name);
-        return 1;
+        return fill_find_data(w, out, wide, dir, e->d_name);
     }
     return 0;
 }
@@ -323,7 +333,11 @@ static void k_SetLastError(w32 *w) { w32_set_last_error(w, (uint32_t)ARG(0)); }
 static void k_GetStartupInfoA(w32 *w) {
     uint64_t p = ARG(0); int psz = (int)w32_ptrsize(w);
     uint64_t size = w->is32 ? 68 : 104;
-    memset(W32P(w, p), 0, size);
+    /* GetStartupInfo returns void, so an unusable pointer leaves the caller's
+     * structure as it found it -- which is the only thing left to do. */
+    void *si = W32PN(w, p, size);
+    if (!si) return;
+    memset(si, 0, size);
     w32_write(w, p, 4, size);
     /* hStdInput/Output/Error at the end */
     uint64_t h = p + size - 3 * psz;
@@ -382,7 +396,9 @@ static void k_GetEnvironmentVariableA(w32 *w) {
     if (!v) { w32_set_last_error(w, 203 /* ERROR_ENVVAR_NOT_FOUND */); RET(0); return; }
     size_t vl = strlen(v);
     if (vl + 1 > n || !buf) { RET(vl + 1); return; }
-    memcpy(W32P(w, buf), v, vl + 1);
+    void *d = W32PN(w, buf, vl + 1);
+    if (!d) { w32_set_last_error(w, ERROR_NOACCESS); RET(0); return; }
+    memcpy(d, v, vl + 1);
     RET(vl);
 }
 static void k_SetEnvironmentVariableA(w32 *w) {
@@ -479,14 +495,17 @@ static void k_GetModuleFileNameA(w32 *w) {
     uint64_t buf = ARG(1); uint32_t n = (uint32_t)ARG(2);
     char s[300]; module_file_name(w, ARG(0), s, sizeof s);
     size_t l = strlen(s); if (l + 1 > n) l = n ? n - 1 : 0;
-    if (n) { memcpy(W32P(w, buf), s, l); w32_write(w, buf + l, 1, 0); }
+    char *d = n ? W32PN(w, buf, l + 1) : 0;
+    if (n && !d) { w32_set_last_error(w, ERROR_NOACCESS); RET(0); return; }
+    if (d) { memcpy(d, s, l); d[l] = 0; }
     RET(l);
 }
 static void k_GetModuleFileNameW(w32 *w) {
     uint64_t buf = ARG(1); uint32_t n = (uint32_t)ARG(2);
     char s[300]; module_file_name(w, ARG(0), s, sizeof s);
     size_t l = strlen(s); if (l + 1 > n) l = n ? n - 1 : 0;
-    uint16_t *d = W32P(w, buf);
+    uint16_t *d = n ? W32PN(w, buf, 2 * ((uint64_t)l + 1)) : 0;
+    if (n && !d) { w32_set_last_error(w, ERROR_NOACCESS); RET(0); return; }
     if (d) { for (size_t i = 0; i < l; i++) d[i] = (uint8_t)s[i]; d[l] = 0; }
     RET(l);
 }
@@ -503,7 +522,9 @@ static void k_OutputDebugStringA(w32 *w) {
 }
 static void k_GetSystemInfo(w32 *w) {
     uint64_t p = ARG(0); int psz = (int)w32_ptrsize(w);
-    memset(W32P(w, p), 0, w->is32 ? 36 : 48);
+    void *si = W32PN(w, p, w->is32 ? 36 : 48);
+    if (!si) return;                        /* returns void: nothing to report */
+    memset(si, 0, w->is32 ? 36 : 48);
     w32_write(w, p + 4, 4, 4096);                                   /* dwPageSize */
     w32_write(w, p + 8, psz, 0x10000);                               /* lpMinimumApplicationAddress */
     w32_write(w, p + 8 + psz, psz, w->is32 ? 0x7FFEFFFF : 0x7FFFFFFEFFFFull);
@@ -530,16 +551,26 @@ static void k_GetSystemTimePreciseAsFileTime(w32 *w) { k_GetSystemTimeAsFileTime
 static void k_GetLocalTime(w32 *w) {
     time_t t = time(0); struct tm tm; localtime_r(&t, &tm); uint64_t p = ARG(0);
     uint16_t f[8] = { (uint16_t)(tm.tm_year + 1900), (uint16_t)(tm.tm_mon + 1), (uint16_t)tm.tm_wday, (uint16_t)tm.tm_mday, (uint16_t)tm.tm_hour, (uint16_t)tm.tm_min, (uint16_t)tm.tm_sec, 0 };
-    memcpy(W32P(w, p), f, sizeof f);
+    void *d = W32PN(w, p, sizeof f);
+    if (d) memcpy(d, f, sizeof f);
 }
 static void k_GetSystemTime(w32 *w) { k_GetLocalTime(w); }
-static void k_GetTimeZoneInformation(w32 *w) { memset(W32P(w, ARG(0)), 0, 172); RET(0); }
+/* TIME_ZONE_ID_UNKNOWN is 0 and TIME_ZONE_ID_INVALID is 0xFFFFFFFF, which is
+ * the documented answer when the structure cannot be filled in. */
+static void k_GetTimeZoneInformation(w32 *w) {
+    void *p = W32PN(w, ARG(0), 172);
+    if (!p) { RET(0xFFFFFFFFu); return; }
+    memset(p, 0, 172);
+    RET(0);
+}
 static void k_GetACP(w32 *w) { RET(1252); }
 static void k_GetOEMCP(w32 *w) { RET(437); }
 static void k_GetConsoleCP(w32 *w) { RET(437); }
 static void k_GetConsoleOutputCP(w32 *w) { RET(437); }
 static void k_IsValidCodePage(w32 *w) { RET(1); }
-static void k_GetCPInfo(w32 *w) { uint64_t p = ARG(1); memset(W32P(w, p), 0, 20); w32_write(w, p, 4, 1); w32_write(w, p + 4, 1, '?'); RET(1); }
+static void k_GetCPInfo(w32 *w) { uint64_t p = ARG(1); void *d = W32PN(w, p, 20);
+    if (!d) { w32_set_last_error(w, ERROR_INVALID_PARAMETER); RET(0); return; }
+    memset(d, 0, 20); w32_write(w, p, 4, 1); w32_write(w, p + 4, 1, '?'); RET(1); }
 static void k_GetUserDefaultLCID(w32 *w) { RET(0x409); }
 static void k_GetUserDefaultLangID(w32 *w) { RET(0x409); }
 static void k_GetSystemDefaultLCID(w32 *w) { RET(0x409); }
@@ -548,9 +579,15 @@ static void k_IsDBCSLeadByteEx(w32 *w) { RET(0); }
 static void k_IsDBCSLeadByte(w32 *w) { RET(0); }
 static void k_MultiByteToWideChar(w32 *w) {
     /* (cp, flags, str, cb, wstr, cch): ASCII/Latin-1, UTF-8 for cp 65001 */
-    uint32_t cp = (uint32_t)ARG(0); const uint8_t *s = W32P(w, ARG(2)); int cb = (int)(int32_t)ARG(3);
-    uint16_t *d = W32P(w, ARG(4)); int cch = (int)(int32_t)ARG(5);
-    if (!s) { w32_set_last_error(w, ERROR_INVALID_PARAMETER); RET(0); return; }
+    uint32_t cp = (uint32_t)ARG(0); int cb = (int)(int32_t)ARG(3);
+    int cch = (int)(int32_t)ARG(5);
+    /* A negative cb means "to the terminator", and there is no length to
+     * check then -- one byte establishes that the string is in guest memory
+     * at all, which is what separates a real pointer from an uninitialised
+     * local. The destination has a count, so it is checked in full. */
+    const uint8_t *s = W32PN(w, ARG(2), cb < 0 ? 1 : (uint64_t)cb);
+    uint16_t *d = cch > 0 ? W32PN(w, ARG(4), 2 * (uint64_t)cch) : 0;
+    if (!s || (cch > 0 && !d)) { w32_set_last_error(w, ERROR_INVALID_PARAMETER); RET(0); return; }
     int n = cb < 0 ? (int)strlen((const char *)s) + 1 : cb, out = 0;
     for (int i = 0; i < n; ) {
         uint32_t ch = s[i++];
@@ -565,9 +602,11 @@ static void k_MultiByteToWideChar(w32 *w) {
 }
 static void k_WideCharToMultiByte(w32 *w) {
     /* (cp, flags, wstr, cch, str, cb, defchar, useddef) */
-    uint32_t cp = (uint32_t)ARG(0); const uint16_t *s = W32P(w, ARG(2)); int cch = (int)(int32_t)ARG(3);
-    uint8_t *d = W32P(w, ARG(4)); int cb = (int)(int32_t)ARG(5);
-    if (!s) { w32_set_last_error(w, ERROR_INVALID_PARAMETER); RET(0); return; }
+    uint32_t cp = (uint32_t)ARG(0); int cch = (int)(int32_t)ARG(3);
+    int cb = (int)(int32_t)ARG(5);
+    const uint16_t *s = W32PN(w, ARG(2), cch < 0 ? 2 : 2 * (uint64_t)cch);
+    uint8_t *d = cb > 0 ? W32PN(w, ARG(4), (uint64_t)cb) : 0;
+    if (!s || (cb > 0 && !d)) { w32_set_last_error(w, ERROR_INVALID_PARAMETER); RET(0); return; }
     int n = cch; if (n < 0) { n = 0; while (s[n]) n++; n++; }
     int out = 0;
     for (int i = 0; i < n; i++) {
@@ -587,8 +626,12 @@ static void k_WideCharToMultiByte(w32 *w) {
 }
 static void k_GetStringTypeW(w32 *w) {
     /* (type, wstr, cch, out): C1 flags, ASCII only */
-    const uint16_t *s = W32P(w, ARG(1)); int n = (int)(int32_t)ARG(2); uint16_t *o = W32P(w, ARG(3));
+    int n = (int)(int32_t)ARG(2);
+    const uint16_t *s = W32PN(w, ARG(1), n < 0 ? 2 : 2 * (uint64_t)n);
+    if (!s) { w32_set_last_error(w, ERROR_INVALID_PARAMETER); RET(0); return; }
     if (n < 0) { n = 0; while (s[n]) n++; }
+    uint16_t *o = W32PN(w, ARG(3), 2 * (uint64_t)n);
+    if (!o) { w32_set_last_error(w, ERROR_INVALID_PARAMETER); RET(0); return; }
     for (int i = 0; i < n; i++) {
         uint32_t c = s[i], t = 0;
         if (c >= 'A' && c <= 'Z') t |= 0x1 | 0x100;
@@ -615,7 +658,12 @@ static uint64_t valloc_(w32 *w, uint64_t addr, uint64_t size, uint32_t type) {
          * pages RW already (we do not do reserve-without-commit), so leave them be --
          * a fresh MAP_FIXED would zero them and, on a 16 KB host, their neighbours */
         uint64_t hp = hpage(), ha = a & ~(hp - 1), he = (end + hp - 1) & ~(hp - 1);
-        if ((type & 0x1000) && msync(W32P(w, ha), he - ha, MS_ASYNC) == 0) r = a;
+        /* msync answers "is something mapped here?", and for a 64-bit guest
+         * something is mapped at a great many host addresses that are not the
+         * guest's. Asking the loader's table first keeps a commit at a host
+         * address from being reported back as a successful allocation. */
+        if ((type & 0x1000) && w32_mem_ok(w, ha, he - ha)
+            && msync(W32P(w, ha), he - ha, MS_ASYNC) == 0) r = a;
         else r = w32_alloc_at(w, a, end - a, 1) ? a : (type & 0x1000 ? a : 0);
     } else r = w32_alloc(w, size, 1);
     if (!r) w32_set_last_error(w, ERROR_NOT_ENOUGH_MEMORY);
@@ -625,6 +673,13 @@ static void k_VirtualAlloc(w32 *w) { RET(valloc_(w, ARG(0), ARG(1), (uint32_t)AR
 static void k_VirtualAllocEx(w32 *w) { RET(valloc_(w, ARG(1), ARG(2), (uint32_t)ARG(3))); }
 static void k_VirtualFree(w32 *w) {
     uint64_t addr = ARG(0), size = ARG(1); uint32_t type = (uint32_t)ARG(2);
+    /* munmap and a MAP_FIXED mmap both take effect on whatever is at the
+     * address, and for a 64-bit guest the address is a host address: freeing
+     * a range that is not the guest's would take the host's own heap or a
+     * loaded library out from under it. */
+    if (size && !w32_mem_ok(w, addr, size)) {
+        w32_set_last_error(w, ERROR_INVALID_ADDRESS); RET(0); return;
+    }
     if (type == 0x8000 /* MEM_RELEASE */ || !w->is32) {
         /* we do not track sizes for VirtualAlloc; releasing a whole region without a
          * size is only possible for the last allocation -- accept and leak otherwise */
@@ -648,6 +703,16 @@ static int prot_of(uint32_t p) {
 }
 static void k_VirtualProtect(w32 *w) {
     uint64_t addr = ARG(0), size = ARG(1); uint32_t np = (uint32_t)ARG(2), old = ARG(3);
+    /* This is the call the crash report came from. The old-protection
+     * out-parameter is written through w32_write, which is checked; the range
+     * itself is checked here, because mprotect on a 64-bit guest's address is
+     * mprotect on a host address, and making the host's own text writable is
+     * not something a guest should be able to ask for. Mappings begin and end
+     * on host page boundaries, so a range inside one stays inside it once it
+     * is rounded out below. */
+    if (!w32_mem_ok(w, addr, size ? size : 1)) {
+        w32_set_last_error(w, ERROR_INVALID_ADDRESS); RET(0); return;
+    }
     uint64_t a = addr & ~(hpage() - 1), e = (addr + size + hpage() - 1) & ~(hpage() - 1);
     /* the JIT keeps code in the interpreter's block cache: a page that becomes writable may change */
     xc_cache_invalidate(a, e);
@@ -662,7 +727,9 @@ static void k_VirtualQuery(w32 *w) {
     if (addr >= w->image_base && addr < w->image_base + w->image_size) { base = w->image_base; size = w->image_size; }
     else if (addr >= w32_self()->stack_limit && addr < w32_self()->stack_base) { base = w32_self()->stack_limit; size = w32_self()->stack_base - w32_self()->stack_limit; prot = 0x04; }
     /* MEMORY_BASIC_INFORMATION: BaseAddress, AllocationBase, AllocationProtect, [pad], RegionSize, State, Protect, Type */
-    memset(W32P(w, out), 0, w->is32 ? 28 : 48);
+    void *mbi = W32PN(w, out, w->is32 ? 28 : 48);
+    if (!mbi) { w32_set_last_error(w, ERROR_NOACCESS); RET(0); return; }
+    memset(mbi, 0, w->is32 ? 28 : 48);
     w32_write(w, out, psz, base); w32_write(w, out + psz, psz, base); w32_write(w, out + 2 * psz, 4, prot);
     uint64_t rs = w->is32 ? 12 : 24;
     w32_write(w, out + rs, psz, size); w32_write(w, out + rs + psz, 4, state); w32_write(w, out + rs + psz + 4, 4, prot);
@@ -724,8 +791,12 @@ static void k_GetStdHandle(w32 *w) {
 static void k_SetStdHandle(w32 *w) { RET(1); }
 static void k_WriteFile(w32 *w) {
     w32_handle *h = w32_handle_get(w, ARG(0));
-    const void *buf = W32P(w, ARG(1)); uint32_t n = (uint32_t)ARG(2); uint64_t written = ARG(3);
+    uint32_t n = (uint32_t)ARG(2); uint64_t written = ARG(3);
+    const void *buf = n ? W32PN(w, ARG(1), n) : 0;
     if (!h || h->type != H_FILE) { w32_set_last_error(w, ERROR_INVALID_HANDLE); RET(0); return; }
+    /* ERROR_INVALID_USER_BUFFER is what Windows returns for a buffer it
+     * cannot read, and it is the one the caller can act on. */
+    if (n && !buf) { w32_set_last_error(w, ERROR_INVALID_USER_BUFFER); RET(0); return; }
     ssize_t r = n ? write(h->fd, buf, n) : 0;
     if (r < 0) { w32_set_last_error(w, ERROR_ACCESS_DENIED); RET(0); return; }
     if (written) w32_write(w, written, 4, (uint64_t)r);
@@ -733,18 +804,22 @@ static void k_WriteFile(w32 *w) {
 }
 static void k_WriteConsoleA(w32 *w) { k_WriteFile(w); }
 static void k_WriteConsoleW(w32 *w) {
-    w32_handle *h = w32_handle_get(w, ARG(0)); const uint16_t *s = W32P(w, ARG(1)); uint32_t n = (uint32_t)ARG(2);
+    w32_handle *h = w32_handle_get(w, ARG(0)); uint32_t n = (uint32_t)ARG(2);
+    const uint16_t *s = W32PN(w, ARG(1), 2 * (uint64_t)n);
     if (!h) { RET(0); return; }
-    char *buf = malloc(n * 3 + 1); size_t o = 0;
+    if (n && !s) { w32_set_last_error(w, ERROR_INVALID_USER_BUFFER); RET(0); return; }
+    char *buf = malloc((size_t)n * 3 + 1); size_t o = 0;
     for (uint32_t i = 0; i < n; i++) { uint32_t c = s[i]; if (c < 0x80) buf[o++] = (char)c; else if (c < 0x800) { buf[o++] = (char)(0xC0 | c >> 6); buf[o++] = (char)(0x80 | (c & 0x3F)); } else { buf[o++] = (char)(0xE0 | c >> 12); buf[o++] = (char)(0x80 | ((c >> 6) & 0x3F)); buf[o++] = (char)(0x80 | (c & 0x3F)); } }
     if (write(h->fd, buf, o) < 0) { /* console gone */ } free(buf);
     if (ARG(3)) w32_write(w, ARG(3), 4, n);
     RET(1);
 }
 static void k_ReadFile(w32 *w) {
-    w32_handle *h = w32_handle_get(w, ARG(0)); void *buf = W32P(w, ARG(1)); uint32_t n = (uint32_t)ARG(2); uint64_t got = ARG(3);
+    w32_handle *h = w32_handle_get(w, ARG(0)); uint32_t n = (uint32_t)ARG(2); uint64_t got = ARG(3);
+    void *buf = n ? W32PN(w, ARG(1), n) : 0;
     if (!h || h->type != H_FILE) { w32_set_last_error(w, ERROR_INVALID_HANDLE); RET(0); return; }
-    ssize_t r = read(h->fd, buf, n);
+    if (n && !buf) { w32_set_last_error(w, ERROR_INVALID_USER_BUFFER); RET(0); return; }
+    ssize_t r = n ? read(h->fd, buf, n) : 0;
     if (r < 0) { w32_set_last_error(w, ERROR_ACCESS_DENIED); RET(0); return; }
     if (got) w32_write(w, got, 4, (uint64_t)r);
     RET(1);
@@ -818,15 +893,19 @@ static void k_GetCurrentDirectoryA(w32 *w) {
     uint32_t n = (uint32_t)ARG(0); uint64_t buf = ARG(1);
     const char *d = g_cwd_win[0] ? g_cwd_win : "C:\\xcore";
     if (n <= strlen(d)) { RET(strlen(d) + 1); return; }
-    memcpy(W32P(w, buf), d, strlen(d) + 1); RET(strlen(d));
+    void *o = W32PN(w, buf, strlen(d) + 1);
+    if (!o) { w32_set_last_error(w, ERROR_NOACCESS); RET(0); return; }
+    memcpy(o, d, strlen(d) + 1); RET(strlen(d));
 }
 static void k_GetCurrentDirectoryW(w32 *w) {
     uint32_t n = (uint32_t)ARG(0); uint64_t buf = ARG(1);
     const char *d = g_cwd_win[0] ? g_cwd_win : "C:\\xcore";
     size_t l = strlen(d);
     if (n <= l) { RET(l + 1); return; }
-    uint16_t *o = W32P(w, buf);
-    if (o) { for (size_t i = 0; i < l; i++) o[i] = (uint8_t)d[i]; o[l] = 0; }
+    uint16_t *o = W32PN(w, buf, 2 * (l + 1));
+    if (!o) { w32_set_last_error(w, ERROR_NOACCESS); RET(0); return; }
+    for (size_t i = 0; i < l; i++) o[i] = (uint8_t)d[i];
+    o[l] = 0;
     RET(l);
 }
 /* Really change directory, and fail when the directory is not there. The
@@ -859,12 +938,18 @@ static void k_SetCurrentDirectoryA(w32 *w) { set_cwd(w, GSTR(ARG(0))); }
 static void k_SetCurrentDirectoryW(w32 *w) {
     char s[1024]; w32_wtoa(w, ARG(0), s, sizeof s); set_cwd(w, s);
 }
-static void k_GetTempPathA(w32 *w) { uint32_t n = (uint32_t)ARG(0); const char *d = "C:\\Temp\\"; if (n > strlen(d)) memcpy(W32P(w, ARG(1)), d, strlen(d) + 1); RET(strlen(d)); }
+static void k_GetTempPathA(w32 *w) { uint32_t n = (uint32_t)ARG(0); const char *d = "C:\\Temp\\";
+    if (n > strlen(d)) { void *o = W32PN(w, ARG(1), strlen(d) + 1);
+                         if (!o) { w32_set_last_error(w, ERROR_NOACCESS); RET(0); return; }
+                         memcpy(o, d, strlen(d) + 1); }
+    RET(strlen(d)); }
 static void k_GetFullPathNameA(w32 *w) {
     const char *s = GSTR(ARG(0)); uint32_t n = (uint32_t)ARG(1); uint64_t buf = ARG(2);
     char full[4096]; if (s[1] == ':') snprintf(full, sizeof full, "%s", s); else snprintf(full, sizeof full, "C:\\xcore\\%s", s);
     if (n <= strlen(full)) { RET(strlen(full) + 1); return; }
-    memcpy(W32P(w, buf), full, strlen(full) + 1);
+    void *o = W32PN(w, buf, strlen(full) + 1);
+    if (!o) { w32_set_last_error(w, ERROR_NOACCESS); RET(0); return; }
+    memcpy(o, full, strlen(full) + 1);
     if (ARG(3)) { const char *b = strrchr(full, '\\'); w32_write(w, ARG(3), (int)w32_ptrsize(w), buf + (b ? (uint64_t)(b - full + 1) : 0)); }
     RET(strlen(full));
 }
@@ -872,7 +957,8 @@ static void k_FormatMessageA(w32 *w) {
     /* (flags, source, msgid, langid, buf, size, args) -> a generic text */
     uint64_t buf = ARG(4); uint32_t n = (uint32_t)ARG(5);
     char s[64]; snprintf(s, sizeof s, "Error %u", (unsigned)ARG(2));
-    if (n > strlen(s)) { memcpy(W32P(w, buf), s, strlen(s) + 1); RET(strlen(s)); } else RET(0);
+    void *o = n > strlen(s) ? W32PN(w, buf, strlen(s) + 1) : 0;
+    if (o) { memcpy(o, s, strlen(s) + 1); RET(strlen(s)); } else RET(0);
 }
 
 /* ---- threads: one, this one ---- */
@@ -887,17 +973,32 @@ static void k_RtlVirtualUnwind(w32 *w) { RET(0); }
 static void k_RtlUnwindEx(w32 *w) { fprintf(stderr, "winrun: RtlUnwindEx: exception unwinding is not supported\n"); w32_exit(w, 129); }
 static void k_EncodePointer(w32 *w) { RET(ARG(0)); }
 static void k_DecodePointer(w32 *w) { RET(ARG(0)); }
-static void k_InitializeSListHead(w32 *w) { memset(W32P(w, ARG(0)), 0, 16); }
+static void k_InitializeSListHead(w32 *w) { void *p = W32PN(w, ARG(0), 16); if (p) memset(p, 0, 16); }
 static void k_GetStartupInfoW(w32 *w) { k_GetStartupInfoA(w); }
 static void k_SetHandleCount(w32 *w) { RET(ARG(0)); }
 static void k_GetEnvironmentVariableW(w32 *w) { RET(0); }
 static void k_GetLogicalDrives(w32 *w) { RET(4); }
 static void k_GetDriveTypeA(w32 *w) { RET(3); }
-static void k_GetComputerNameA(w32 *w) { const char *n = "XCORE"; memcpy(W32P(w, ARG(0)), n, 6); w32_write(w, ARG(1), 4, 5); RET(1); }
-static void k_GetUserNameA(w32 *w) { const char *n = "xcore"; memcpy(W32P(w, ARG(0)), n, 6); w32_write(w, ARG(1), 4, 6); RET(1); }
+/* Both of these write a fixed six bytes and trust the caller's size word,
+ * which is what they did before; the pointer is now the part that has to be
+ * real. */
+static void k_GetComputerNameA(w32 *w) { void *p = W32PN(w, ARG(0), 6);
+    if (!p) { w32_set_last_error(w, ERROR_NOACCESS); RET(0); return; }
+    memcpy(p, "XCORE", 6); w32_write(w, ARG(1), 4, 5); RET(1); }
+static void k_GetUserNameA(w32 *w) { void *p = W32PN(w, ARG(0), 6);
+    if (!p) { w32_set_last_error(w, ERROR_NOACCESS); RET(0); return; }
+    memcpy(p, "xcore", 6); w32_write(w, ARG(1), 4, 6); RET(1); }
 static void k_lstrlenA(w32 *w) { RET(strlen(GSTR(ARG(0)))); }
 static void k_lstrlenW(w32 *w) { RET(w32_wcslen(w, ARG(0))); }
-static void k_lstrcpyA(w32 *w) { strcpy(W32P(w, ARG(0)), GSTR(ARG(1))); RET(ARG(0)); }
+/* lstrcpy has no count, so the length comes from the source string and the
+ * destination is checked for exactly that much. */
+static void k_lstrcpyA(w32 *w) {
+    const char *s = GSTR(ARG(1));
+    char *d = W32PN(w, ARG(0), strlen(s) + 1);
+    if (!d) { RET(0); return; }
+    strcpy(d, s);
+    RET(ARG(0));
+}
 /* The wide one copies UTF-16 units, terminator included. A Unicode installer
  * builds every path with it, and copying it as bytes would truncate at the
  * first character whose high byte is zero -- which is every ASCII one. */
@@ -937,8 +1038,16 @@ static void k_GetFileTime(w32 *w) {
     RET(1);
 }
 static void k_lstrcmpiA(w32 *w) { RET((uint64_t)(int64_t)strcasecmp(GSTR(ARG(0)), GSTR(ARG(1)))); }
-static void k_GetSystemDirectoryA(w32 *w) { const char *d = "C:\\Windows\\System32"; if ((uint32_t)ARG(1) > strlen(d)) memcpy(W32P(w, ARG(0)), d, strlen(d) + 1); RET(strlen(d)); }
-static void k_GetWindowsDirectoryA(w32 *w) { const char *d = "C:\\Windows"; if ((uint32_t)ARG(1) > strlen(d)) memcpy(W32P(w, ARG(0)), d, strlen(d) + 1); RET(strlen(d)); }
+static void put_narrow_dir(w32 *w, const char *d) {
+    if ((uint32_t)ARG(1) > strlen(d)) {
+        void *o = W32PN(w, ARG(0), strlen(d) + 1);
+        if (!o) { w32_set_last_error(w, ERROR_NOACCESS); RET(0); return; }
+        memcpy(o, d, strlen(d) + 1);
+    }
+    RET(strlen(d));
+}
+static void k_GetSystemDirectoryA(w32 *w) { put_narrow_dir(w, "C:\\Windows\\System32"); }
+static void k_GetWindowsDirectoryA(w32 *w) { put_narrow_dir(w, "C:\\Windows"); }
 static void k_IsProcessorFeaturePresent(w32 *w) { uint32_t f = (uint32_t)ARG(0); RET(bool_(f == 6 || f == 10 || f == 13 || f == 17 || f == 23)); }   /* SSE, SSE2, SSE3, SSE4, fastfail */
 /* ---- what an installer does ------------------------------------------------
  *
@@ -1138,11 +1247,12 @@ static void k_GetDiskFreeSpaceW(w32 *w) { disk_free_old(w); }
 static void volume_info(w32 *w, int wide) {
     const char *label = "Winios", *fs = "NTFS";
     #define PUT(a, n, s) do { if ((a) && (uint32_t)(n) > strlen(s)) { \
-        if (wide) { uint16_t *d = W32P(w, (a)); \
+        if (wide) { uint16_t *d = W32PN(w, (a), 2 * (strlen(s) + 1)); \
                     if (d) { size_t i = 0; \
                              while (s[i]) { d[i] = (uint8_t)s[i]; i++; } \
                              d[i] = 0; } } \
-        else memcpy(W32P(w, (a)), s, strlen(s) + 1); } } while (0)
+        else { void *d = W32PN(w, (a), strlen(s) + 1); \
+               if (d) memcpy(d, s, strlen(s) + 1); } } } while (0)
     PUT(ARG(1), ARG(2), label);
     PUT(ARG(6), ARG(7), fs);
     #undef PUT
@@ -1178,9 +1288,14 @@ static void temp_name(w32 *w, int wide) {
              * microsecond apart get the same one. */
             if (!unique) { FILE *f = fopen(host, "wb"); if (!f) continue; fclose(f); }
             if (ARG(3)) {
-                if (wide) { uint16_t *d = W32P(w, ARG(3));
+                /* MAX_PATH is what the caller is documented to provide, but
+                 * the name is what is actually written, so that is what is
+                 * checked. */
+                size_t wl = strlen(win);
+                if (wide) { uint16_t *d = W32PN(w, ARG(3), 2 * (wl + 1));
                             if (d) { size_t i = 0; for (; win[i]; i++) d[i] = (uint8_t)win[i]; d[i] = 0; } }
-                else memcpy(W32P(w, ARG(3)), win, strlen(win) + 1);
+                else { void *d = W32PN(w, ARG(3), wl + 1);
+                       if (d) memcpy(d, win, wl + 1); }
             }
             RET(u); return;
         }
@@ -1191,7 +1306,7 @@ static void k_GetTempFileNameA(w32 *w) { temp_name(w, 0); }
 static void k_GetTempFileNameW(w32 *w) { temp_name(w, 1); }
 static void k_GetTempPathW(w32 *w) {
     const char *d = "C:\\Temp\\"; size_t l = strlen(d);
-    if ((uint32_t)ARG(0) > l) { uint16_t *o = W32P(w, ARG(1));
+    if ((uint32_t)ARG(0) > l) { uint16_t *o = W32PN(w, ARG(1), 2 * (l + 1));
         if (o) { for (size_t i = 0; i < l; i++) o[i] = (uint8_t)d[i]; o[l] = 0; } }
     RET(l);
 }
@@ -1212,9 +1327,13 @@ static void path_identity(w32 *w, int wide) {
     size_t l = strlen(s);
     uint32_t n = (uint32_t)ARG(2);
     if (n > l && ARG(1)) {
-        if (wide) { uint16_t *d = W32P(w, ARG(1));
-                    if (d) { for (size_t i = 0; i < l; i++) d[i] = (uint8_t)s[i]; d[l] = 0; } }
-        else memcpy(W32P(w, ARG(1)), s, l + 1);
+        if (wide) { uint16_t *d = W32PN(w, ARG(1), 2 * (l + 1));
+                    if (!d) { w32_set_last_error(w, ERROR_NOACCESS); RET(0); return; }
+                    for (size_t i = 0; i < l; i++) d[i] = (uint8_t)s[i];
+                    d[l] = 0; }
+        else { void *d = W32PN(w, ARG(1), l + 1);
+               if (!d) { w32_set_last_error(w, ERROR_NOACCESS); RET(0); return; }
+               memcpy(d, s, l + 1); }
         RET(l); return;
     }
     RET(l + 1);
@@ -1329,9 +1448,13 @@ static void profile_string(w32 *w, int wide) {
     uint32_t n = (uint32_t)ARG(4);
     if (!n || !ARG(3)) { RET(0); return; }
     if (l + 1 > n) l = n - 1;
-    if (wide) { uint16_t *d = W32P(w, ARG(3));
-                if (d) { for (size_t i = 0; i < l; i++) d[i] = (uint8_t)out[i]; d[l] = 0; } }
-    else { memcpy(W32P(w, ARG(3)), out, l); w32_write(w, ARG(3) + l, 1, 0); }
+    if (wide) { uint16_t *d = W32PN(w, ARG(3), 2 * (l + 1));
+                if (!d) { RET(0); return; }
+                for (size_t i = 0; i < l; i++) d[i] = (uint8_t)out[i];
+                d[l] = 0; }
+    else { char *d = W32PN(w, ARG(3), l + 1);
+           if (!d) { RET(0); return; }
+           memcpy(d, out, l); d[l] = 0; }
     RET(l);
 }
 static void k_GetPrivateProfileStringA(w32 *w) { profile_string(w, 0); }
@@ -1521,18 +1644,24 @@ static void k_RemoveDllDirectory(w32 *w) { g_extra_dll_dir[0] = 0; w->dll_dir = 
 static void k_lstrcatA(w32 *w) {
     uint64_t dst = ARG(0);
     const char *src = ARG(1) ? GSTR(ARG(1)) : "";
-    char *d = W32P(w, dst);
+    /* One byte first, to establish that the destination is guest memory at
+     * all; the length of what will be written is only known once its existing
+     * terminator has been found, so the range is checked again after that. */
+    char *d = W32PN(w, dst, 1);
     if (!d) { RET(0); return; }
     size_t at = strlen(d);
+    if (!W32PN(w, dst, at + strlen(src) + 1)) { RET(0); return; }
     memcpy(d + at, src, strlen(src) + 1);
     RET(dst);
 }
 static void k_lstrcatW(w32 *w) {
-    uint16_t *d = W32P(w, ARG(0));
+    uint16_t *d = W32PN(w, ARG(0), 2);
     if (!d) { RET(0); return; }
     size_t at = 0; while (d[at]) at++;
-    const uint16_t *sp = ARG(1) ? W32P(w, ARG(1)) : 0;
-    if (sp) { size_t i = 0; for (; sp[i]; i++) d[at + i] = sp[i]; d[at + i] = 0; }
+    const uint16_t *sp = ARG(1) ? W32PN(w, ARG(1), 2) : 0;
+    size_t sl = 0; if (sp) while (sp[sl]) sl++;
+    if (!W32PN(w, ARG(0), 2 * (at + sl + 1))) { RET(0); return; }
+    if (sp) { size_t i = 0; for (; i < sl; i++) d[at + i] = sp[i]; d[at + i] = 0; }
     RET(ARG(0));
 }
 
@@ -1556,7 +1685,7 @@ static void k_lstrcatW(w32 *w) {
 static uint32_t put_wide(w32 *w, uint64_t buf, uint32_t cch, const char *s) {
     size_t l = strlen(s);
     if (!buf || cch <= l) return (uint32_t)l + 1;      /* needed, including the NUL */
-    uint16_t *d = W32P(w, buf);
+    uint16_t *d = W32PN(w, buf, 2 * (l + 1));
     if (!d) return 0;
     for (size_t i = 0; i < l; i++) d[i] = (uint8_t)s[i];
     d[l] = 0;
@@ -1665,14 +1794,14 @@ static void k_SetEnvironmentVariableW(w32 *w) {
  * code unit at a time -- these are used on paths, which are ASCII in
  * practice, and a full collation would be a different function. */
 static void k_lstrcmpW(w32 *w) {
-    const uint16_t *a = ARG(0) ? W32P(w, ARG(0)) : 0, *b = ARG(1) ? W32P(w, ARG(1)) : 0;
+    const uint16_t *a = W32PN(w, ARG(0), 2), *b = W32PN(w, ARG(1), 2);
     if (!a || !b) { RET(0); return; }
     size_t i = 0;
     for (; a[i] && a[i] == b[i]; i++) { }
     RET((uint64_t)(int64_t)(a[i] < b[i] ? -1 : a[i] > b[i] ? 1 : 0));
 }
 static void k_lstrcmpiW(w32 *w) {
-    const uint16_t *a = ARG(0) ? W32P(w, ARG(0)) : 0, *b = ARG(1) ? W32P(w, ARG(1)) : 0;
+    const uint16_t *a = W32PN(w, ARG(0), 2), *b = W32PN(w, ARG(1), 2);
     if (!a || !b) { RET(0); return; }
     size_t i = 0;
     for (;;) {
@@ -1689,8 +1818,8 @@ static void k_lstrcmpiW(w32 *w) {
 static void k_lstrcpynW(w32 *w) {
     uint32_t cch = (uint32_t)ARG(2);
     if (!ARG(0) || !cch) { RET(0); return; }
-    uint16_t *d = W32P(w, ARG(0));
-    const uint16_t *s = ARG(1) ? W32P(w, ARG(1)) : 0;
+    uint16_t *d = W32PN(w, ARG(0), 2 * (uint64_t)cch);
+    const uint16_t *s = ARG(1) ? W32PN(w, ARG(1), 2) : 0;
     if (!d) { RET(0); return; }
     uint32_t i = 0;
     if (s) for (; i + 1 < cch && s[i]; i++) d[i] = s[i];
@@ -1700,7 +1829,7 @@ static void k_lstrcpynW(w32 *w) {
 static void k_lstrcpynA(w32 *w) {
     uint32_t cch = (uint32_t)ARG(2);
     if (!ARG(0) || !cch) { RET(0); return; }
-    char *d = W32P(w, ARG(0));
+    char *d = W32PN(w, ARG(0), cch);
     const char *s = ARG(1) ? GSTR(ARG(1)) : 0;
     if (!d) { RET(0); return; }
     uint32_t i = 0;
@@ -2124,7 +2253,9 @@ static void k_K32GetProcessMemoryInfo(w32 *w) {
     uint64_t p = ARG(1);
     uint32_t cb = (uint32_t)ARG(2);
     if (!p || cb < 8) { RET(0); return; }
-    memset(W32P(w, p), 0, cb);
+    void *d = W32PN(w, p, cb);
+    if (!d) { w32_set_last_error(w, ERROR_NOACCESS); RET(0); return; }
+    memset(d, 0, cb);
     w32_write(w, p, 4, cb);
     RET(1);
 }

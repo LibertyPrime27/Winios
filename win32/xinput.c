@@ -21,7 +21,8 @@
 
 #include <string.h>
 
-enum { ERROR_SUCCESS_ = 0, ERROR_DEVICE_NOT_CONNECTED_ = 1167, ERROR_EMPTY_ = 4306 };
+enum { ERROR_SUCCESS_ = 0, ERROR_BAD_ARGUMENTS_ = 160,
+       ERROR_DEVICE_NOT_CONNECTED_ = 1167, ERROR_EMPTY_ = 4306 };
 
 /* XINPUT_GAMEPAD buttons */
 enum {
@@ -122,7 +123,11 @@ static void x_XInputGetCapabilities(w32 *w) {
     uint64_t c = ARG(2);
     if (user != 0) { RET(ERROR_DEVICE_NOT_CONNECTED_); return; }
     if (!c) { RET(ERROR_SUCCESS_); return; }
-    memset(W32P(w, c), 0, 20);
+    /* XInput has no error for "your structure is not there", so this borrows
+     * the one it uses for an argument it cannot make sense of. */
+    void *p = W32PN(w, c, 20);
+    if (!p) { RET(ERROR_BAD_ARGUMENTS_); return; }
+    memset(p, 0, 20);
     w32_write(w, c + 0, 1, 1);          /* XINPUT_DEVTYPE_GAMEPAD */
     w32_write(w, c + 1, 1, 1);          /* XINPUT_DEVSUBTYPE_GAMEPAD */
     w32_write(w, c + 2, 2, 0);          /* no wireless/voice flags */
@@ -150,8 +155,9 @@ static void x_XInputGetAudioDeviceIds(w32 *w) {
     RET(ERROR_DEVICE_NOT_CONNECTED_);
 }
 static void x_XInputGetDSoundAudioDeviceGuids(w32 *w) {
-    if (ARG(1)) memset(W32P(w, ARG(1)), 0, 16);
-    if (ARG(2)) memset(W32P(w, ARG(2)), 0, 16);
+    void *a = W32PN(w, ARG(1), 16), *b = W32PN(w, ARG(2), 16);
+    if (a) memset(a, 0, 16);
+    if (b) memset(b, 0, 16);
     RET(ERROR_DEVICE_NOT_CONNECTED_);
 }
 /* Ordinal 100, undocumented, and imported by ordinal by a good number of

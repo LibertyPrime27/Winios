@@ -216,8 +216,11 @@ void w32_d3d11_reset(void) {
 static int shader_record(w32 *w, uint64_t blob, uint64_t len) {
     if (g_nshaders >= MAX_SHADERS) return -1;
     int i = g_nshaders++;
-    const void *p = blob ? W32P(w, blob) : 0;
-    if (p && len) dxbc_parse(p, (size_t)len, &g_shaders[i]);
+    /* Both the blob and its length come from the program, and dxbc_parse
+     * walks the whole thing chunk by chunk, so a length that runs past the
+     * end of the allocation is read out of bounds before anything notices. */
+    const void *p = len ? W32PN(w, blob, len) : 0;
+    if (p) dxbc_parse(p, (size_t)len, &g_shaders[i]);
     return i;
 }
 static const dxbc_info *shader_info(int i) {
@@ -335,6 +338,17 @@ static void dev_CreateBuffer(w32 *w) {
     uint32_t bind = (uint32_t)w32_read(w, desc + 8, 4);
     uint32_t stride = (uint32_t)w32_read(w, desc + 20, 4);
     if (!size || size > 256u * 1024 * 1024) { out_ptr(w, out, 0); RET((uint64_t)(uint32_t)E_INVALIDARG_); return; }
+    /* D3D11_SUBRESOURCE_DATA is { pSysMem, SysMemPitch, SysMemSlicePitch }.
+     * The initial contents are checked before anything is allocated, so a
+     * program that hands over a stale pSysMem gets the E_INVALIDARG the
+     * debug layer would give it rather than a half-built buffer. */
+    const void *sys_mem = 0;
+    if (init) {
+        uint64_t src = w32_read(w, init, (int)w32_ptrsize(w));
+        if (src && !(sys_mem = W32PN(w, src, size))) {
+            out_ptr(w, out, 0); RET((uint64_t)(uint32_t)E_INVALIDARG_); return;
+        }
+    }
     uint64_t obj = w32_com_new(w, &cls_buffer, BUF_N);
     uint64_t data = obj ? w32_alloc(w, size + 4096, 0) : 0;
     if (!obj || !data) { out_ptr(w, out, 0); RET((uint64_t)(uint32_t)E_OUTOFMEMORY_); return; }
@@ -343,11 +357,7 @@ static void dev_CreateBuffer(w32 *w) {
     w32_com_set(w, obj, BUF_BIND, bind);
     w32_com_set(w, obj, BUF_USAGE, usage);
     w32_com_set(w, obj, BUF_STRIDE, stride);
-    /* D3D11_SUBRESOURCE_DATA is { pSysMem, SysMemPitch, SysMemSlicePitch }. */
-    if (init) {
-        uint64_t src = w32_read(w, init, (int)w32_ptrsize(w));
-        if (src) memcpy(W32P(w, data), W32P(w, src), size);
-    }
+    if (sys_mem) memcpy(W32P(w, data), sys_mem, size);
     out_ptr(w, out, obj);
     RET(S_OK_);
 }
@@ -372,10 +382,16 @@ static void dev_CreateTexture2D(w32 *w) {
             uint64_t dst = w32_com_get(w, obj, TEX_PIXELS);
             uint32_t dst_pitch = (uint32_t)w32_com_get(w, obj, TEX_PITCH);
             if (!src_pitch) src_pitch = dst_pitch;
+            uint32_t n = dst_pitch < src_pitch ? dst_pitch : src_pitch;
+            /* Every row but the last spans a whole pitch, so the span the
+             * copy touches is pitch * (height - 1) + n. In 64-bit
+             * arithmetic: a SysMemPitch near 2^32 multiplied out in 32 bits
+             * wraps to something small and would sail through the check. */
+            const uint8_t *sp = W32PN(w, src, (uint64_t)src_pitch * (uint64_t)(height - 1) + n);
+            if (!sp) { out_ptr(w, out, 0); RET((uint64_t)(uint32_t)E_INVALIDARG_); return; }
             for (int y = 0; y < height; y++)
                 memcpy((uint8_t *)W32P(w, dst) + (size_t)y * dst_pitch,
-                       (const uint8_t *)W32P(w, src) + (size_t)y * src_pitch,
-                       dst_pitch < src_pitch ? dst_pitch : src_pitch);
+                       sp + (size_t)y * src_pitch, n);
         }
     }
     out_ptr(w, out, obj);
@@ -419,7 +435,9 @@ static void dev_CreateInputLayout(w32 *w) {
     uint32_t stride = (uint32_t)(ps == 8 ? 32 : 28);
     uint64_t copy = w32_alloc(w, (uint64_t)stride * count + 64, 0);
     if (!copy) { out_ptr(w, out, 0); RET((uint64_t)(uint32_t)E_OUTOFMEMORY_); return; }
-    memcpy(W32P(w, copy), W32P(w, descs), (size_t)stride * count);
+    const void *elems = W32PN(w, descs, (uint64_t)stride * count);
+    if (!elems) { out_ptr(w, out, 0); RET((uint64_t)(uint32_t)E_INVALIDARG_); return; }
+    memcpy(W32P(w, copy), elems, (size_t)stride * count);
     /* The semantic names are pointers into the caller's memory, and those
      * strings are almost always literals in the image, which outlive the
      * call. Copying them too would mean rewriting the pointers; pointing at
@@ -538,7 +556,11 @@ static void dev_CheckFormatSupport(w32 *w) {
 static void dev_CheckFeatureSupport(w32 *w) {
     uint64_t data = ARG(2);
     uint32_t size = (uint32_t)ARG(3);
-    if (data && size && size < 4096) memset(W32P(w, data), 0, size);
+    if (data && size && size < 4096) {
+        void *p = W32PN(w, data, size);
+        if (!p) { RET((uint64_t)(uint32_t)E_INVALIDARG_); return; }
+        memset(p, 0, size);
+    }
     RET(S_OK_);
 }
 static void dev_CheckMultisampleQualityLevels(w32 *w) {
@@ -674,16 +696,21 @@ static void ctx_UpdateSubresource(w32 *w) {
             uint32_t l = (uint32_t)w32_read(w, box, 4), r = (uint32_t)w32_read(w, box + 12, 4);
             if (r > l && r <= size) { off = l; n = r - l; }
         }
-        if (dst) memcpy((uint8_t *)W32P(w, dst) + off, W32P(w, src), n);
+        const void *sp = W32PN(w, src, n);
+        if (dst && sp) memcpy((uint8_t *)W32P(w, dst) + off, sp, n);
     } else if (tag == TAG_D11_TEXTURE) {
         uint64_t dst = w32_com_get(w, res, TEX_PIXELS);
         uint32_t dpitch = (uint32_t)w32_com_get(w, res, TEX_PITCH);
         int h = (int)w32_com_get(w, res, TEX_H);
         if (!row_pitch) row_pitch = dpitch;
-        if (dst) for (int y = 0; y < h; y++)
-            memcpy((uint8_t *)W32P(w, dst) + (size_t)y * dpitch,
-                   (const uint8_t *)W32P(w, src) + (size_t)y * row_pitch,
-                   dpitch < row_pitch ? dpitch : row_pitch);
+        uint32_t n = dpitch < row_pitch ? dpitch : row_pitch;
+        /* The source is h rows a row_pitch apart, of which only the last is
+         * shorter than a pitch. UpdateSubresource returns void, so a source
+         * that is not there can only be dropped -- there is no status word
+         * for the caller to read. */
+        const uint8_t *sp = h > 0 ? W32PN(w, src, (uint64_t)row_pitch * (uint64_t)(h - 1) + n) : 0;
+        if (dst && sp) for (int y = 0; y < h; y++)
+            memcpy((uint8_t *)W32P(w, dst) + (size_t)y * dpitch, sp + (size_t)y * row_pitch, n);
     }
     RET(0);
 }
@@ -729,7 +756,11 @@ static void ctx_GetData(w32 *w) {
      * "nothing was drawn", and is the one answer that could mislead. It is
      * reported rather than left to be discovered. */
     w32_note_refused(w, "d3d11: GetData -- queries always report zero (no occlusion or timing here)");
-    if (ARG(2) && ARG(3)) memset(W32P(w, ARG(2)), 0, (size_t)ARG(3));
+    if (ARG(2) && ARG(3)) {
+        void *p = W32PN(w, ARG(2), ARG(3));
+        if (!p) { RET((uint64_t)(uint32_t)E_INVALIDARG_); return; }
+        memset(p, 0, (size_t)ARG(3));
+    }
     RET(S_OK_);
 }
 
@@ -1049,7 +1080,9 @@ static void sc_GetDesc(w32 *w) {
     if (!d) { RET((uint64_t)(uint32_t)E_INVALIDARG_); return; }
     /* 60 bytes at 32 bits, 72 at 64: the HWND in the middle is pointer-sized
      * and everything after it moves. */
-    memset(W32P(w, d), 0, w->is32 ? 60 : 72);
+    void *p = W32PN(w, d, w->is32 ? 60 : 72);
+    if (!p) { RET((uint64_t)(uint32_t)E_INVALIDARG_); return; }
+    memset(p, 0, w->is32 ? 60 : 72);
     w32_write(w, d, 4, w32_com_get(w, self, SC_W));
     w32_write(w, d + 4, 4, w32_com_get(w, self, SC_H));
     w32_write(w, d + 8, 4, 60);
@@ -1082,7 +1115,11 @@ static void sc_GetLastPresentCount(w32 *w) {
 static void sc_GetFrameStatistics(w32 *w) {
     /* DXGI_FRAME_STATISTICS: three counts, then two 64-bit times -- 32 bytes
      * in both bitnesses. */
-    if (ARG(1)) memset(W32P(w, ARG(1)), 0, 32);
+    if (ARG(1)) {
+        void *p = W32PN(w, ARG(1), 32);
+        if (!p) { RET((uint64_t)(uint32_t)E_INVALIDARG_); return; }
+        memset(p, 0, 32);
+    }
     RET(S_OK_);
 }
 static void sc_GetContainingOutput(w32 *w) { out_ptr(w, ARG(1), 0); RET((uint64_t)(uint32_t)DXGI_ERROR_NOT_FOUND_); }
@@ -1109,8 +1146,12 @@ static void child_GetDevice(w32 *w) { if (ARG(1)) w32_write(w, ARG(1), (int)w32_
 
 static void tex_GetDesc(w32 *w) {
     uint64_t self = ARG(0), d = ARG(1);
-    if (!d) { RET(0); return; }
-    memset(W32P(w, d), 0, 44);
+    /* D3D11_TEXTURE2D_DESC is 44 bytes with no pointers in it, so it is the
+     * same size in both bitnesses. GetDesc returns void: a description that
+     * cannot be delivered is simply not delivered. */
+    void *p = W32PN(w, d, 44);
+    if (!p) { RET(0); return; }
+    memset(p, 0, 44);
     w32_write(w, d, 4, w32_com_get(w, self, TEX_W));
     w32_write(w, d + 4, 4, w32_com_get(w, self, TEX_H));
     w32_write(w, d + 8, 4, 1);                     /* MipLevels */
@@ -1173,7 +1214,9 @@ static void adp_GetDesc(w32 *w) {
      * this function has returned successfully. It cost an afternoon once. */
     uint64_t d = ARG(1);
     if (!d) { RET((uint64_t)(uint32_t)E_INVALIDARG_); return; }
-    memset(W32P(w, d), 0, w->is32 ? 292 : 304);
+    void *p = W32PN(w, d, w->is32 ? 292 : 304);
+    if (!p) { RET((uint64_t)(uint32_t)E_INVALIDARG_); return; }
+    memset(p, 0, w->is32 ? 292 : 304);
     static const char *name = "Winios software renderer";
     for (int i = 0; name[i]; i++) w32_write(w, d + (unsigned)i * 2, 2, (uint8_t)name[i]);
     RET(S_OK_);

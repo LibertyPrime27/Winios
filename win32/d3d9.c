@@ -159,8 +159,9 @@ static void s_GetDevice(w32 *w) {
 }
 static void s_GetDesc(w32 *w) {
     uint64_t self = ARG(0), d = ARG(1);
-    if (!d) { RET(D3DERR_INVALIDCALL); return; }
-    memset(W32P(w, d), 0, 32);
+    void *p = W32PN(w, d, 32);
+    if (!p) { RET(D3DERR_INVALIDCALL); return; }
+    memset(p, 0, 32);
     w32_write(w, d +  0, 4, FMT_X8R8G8B8);           /* Format */
     w32_write(w, d +  4, 4, 1);                      /* Type = D3DRTYPE_SURFACE */
     w32_write(w, d + 12, 4, 0);                      /* Pool = D3DPOOL_DEFAULT */
@@ -215,8 +216,9 @@ static void vb_GetDevice(w32 *w) {
 /* D3DVERTEXBUFFER_DESC: Format, Type, Usage, Pool, Size, FVF */
 static void vb_GetDesc(w32 *w) {
     uint64_t self = ARG(0), d = ARG(1);
-    if (!d) { RET(D3DERR_INVALIDCALL); return; }
-    memset(W32P(w, d), 0, 24);
+    void *p = W32PN(w, d, 24);
+    if (!p) { RET(D3DERR_INVALIDCALL); return; }
+    memset(p, 0, 24);
     w32_write(w, d + 4, 4, 1);                                /* Type */
     w32_write(w, d + 16, 4, w32_com_get(w, self, VB_BYTES));
     w32_write(w, d + 20, 4, w32_com_get(w, self, VB_FVF));
@@ -248,8 +250,9 @@ static void t_GetLevelCount(w32 *w) { RET(w32_com_get(w, ARG(0), TEX_LEVELS)); }
  * Width, Height -- eight DWORDs, the same in both bitnesses. */
 static void t_GetLevelDesc(w32 *w) {
     uint64_t self = ARG(0), d = ARG(2);
-    if (!d) { RET(D3DERR_INVALIDCALL); return; }
-    memset(W32P(w, d), 0, 32);
+    void *p = W32PN(w, d, 32);
+    if (!p) { RET(D3DERR_INVALIDCALL); return; }
+    memset(p, 0, 32);
     w32_write(w, d + 0,  4, w32_com_get(w, self, TEX_FMT));
     w32_write(w, d + 4,  4, 3);                              /* D3DRTYPE_TEXTURE */
     w32_write(w, d + 12, 4, 1);                              /* D3DPOOL_MANAGED */
@@ -340,8 +343,9 @@ static void ib_Lock(w32 *w) {
 static void ib_Unlock(w32 *w) { (void)w; RET(S_OK_); }
 static void ib_GetDesc(w32 *w) {
     uint64_t self = ARG(0), d = ARG(1);
-    if (!d) { RET(D3DERR_INVALIDCALL); return; }
-    memset(W32P(w, d), 0, 24);
+    void *p = W32PN(w, d, 24);
+    if (!p) { RET(D3DERR_INVALIDCALL); return; }
+    memset(p, 0, 24);
     w32_write(w, d + 0, 4, w32_com_get(w, self, IB_FMT));
     w32_write(w, d + 4, 4, 2);
     w32_write(w, d + 16, 4, w32_com_get(w, self, IB_BYTES));
@@ -519,7 +523,12 @@ static int fetch_vertex(w32 *w, uint64_t self, uint64_t base, const fvf_layout *
                         int i, const float *mvp, int transformed,
                         int vx, int vy, int vw, int vh, d3d11_vertex *out) {
     uint64_t at = base + (uint64_t)L->stride * (unsigned)i;
-    const unsigned char *p = (const unsigned char *)W32P(w, at);
+    /* The stream pointer, the stride and the index all come from the program,
+     * and DrawPrimitiveUP takes the vertices themselves as a raw pointer, so
+     * this is the one check on the hot path. It costs a compare against the
+     * cached mapping in the common case, which is the same mapping every
+     * vertex of every draw lands in. */
+    const unsigned char *p = (const unsigned char *)W32PN(w, at, L->stride);
     if (!p) return 0;
     memset(out, 0, sizeof *out);
     out->color = 0xFFFFFFFFu;
@@ -853,10 +862,15 @@ static void d_DrawIndexedPrimitive(w32 *w) {
     /* D3DFMT_INDEX16 is 101, INDEX32 is 102. */
     int wide = w32_com_get(w, self, DEV_INDEX_FMT) == 102;
     uint32_t start = (uint32_t)ARG(5);
-    const void *p = W32P(w, idx + (uint64_t)start * (unsigned)(wide ? 4 : 2));
-    if (!p) { RET(D3DERR_INVALIDCALL); return; }
     uint64_t base = w32_com_get(w, self, DEV_STREAM) + w32_com_get(w, self, DEV_STREAM_OFF);
     int count = (int)(uint32_t)ARG(6);
+    /* The index buffer is ours, but StartIndex and PrimitiveCount are not, and
+     * draw_indexed will read up to three indices per primitive from here. The
+     * span is computed in 64 bits because a PrimitiveCount of 0x7fffffff times
+     * three is not representable in the int the loop uses. */
+    uint64_t isz = wide ? 4 : 2;
+    const void *p = W32PN(w, idx + (uint64_t)start * isz, ((uint64_t)(uint32_t)count * 3 + 3) * isz);
+    if (!p) { RET(D3DERR_INVALIDCALL); return; }
     draw_indexed(w, self, base, (uint32_t)w32_com_get(w, self, DEV_FVF),
                  (int)(uint32_t)ARG(1), count,
                  wide ? 0 : (const uint16_t *)p, wide ? (const uint32_t *)p : 0,
@@ -868,10 +882,12 @@ static void d_DrawIndexedPrimitive(w32 *w) {
  * pIndexData, IndexFormat, pVertexData, VertexStride). */
 static void d_DrawIndexedPrimitiveUP(w32 *w) {
     uint64_t self = ARG(0);
-    const void *p = W32P(w, ARG(5));
-    if (!p) { RET(D3DERR_INVALIDCALL); return; }
     int wide = (uint32_t)ARG(6) == 102;
     int count = (int)(uint32_t)ARG(4);
+    /* pIndexData is the caller's own array rather than a buffer object, so
+     * both the pointer and the extent of it are the program's word. */
+    const void *p = W32PN(w, ARG(5), ((uint64_t)(uint32_t)count * 3 + 3) * (wide ? 4u : 2u));
+    if (!p) { RET(D3DERR_INVALIDCALL); return; }
     w32_com_set(w, self, DEV_STREAM_STRIDE, (uint32_t)ARG(8));
     draw_indexed(w, self, ARG(7), (uint32_t)w32_com_get(w, self, DEV_FVF),
                  (int)(uint32_t)ARG(1), count,
@@ -1235,8 +1251,11 @@ static void d_shader_const_get(w32 *w) {
      * set gets a defined answer instead of its own uninitialised stack. */
     uint64_t out = ARG(2);
     uint32_t count = (uint32_t)ARG(3);
-    if (out && count && count < 4096)
-        memset(W32P(w, out), 0, (size_t)count * 16);
+    if (out && count && count < 4096) {
+        void *p = W32PN(w, out, (uint64_t)count * 16);
+        if (!p) { RET(D3DERR_INVALIDCALL); return; }
+        memset(p, 0, (size_t)count * 16);
+    }
     RET(S_OK_);
 }
 
@@ -1319,8 +1338,9 @@ static void d_GetDisplayMode(w32 *w) {
  * conservative path, which is the one most likely to work. */
 static void d_GetDeviceCaps(w32 *w) {
     uint64_t c = ARG(1);
-    if (!c) { RET(D3DERR_INVALIDCALL); return; }
-    memset(W32P(w, c), 0, 304);
+    void *p = W32PN(w, c, 304);
+    if (!p) { RET(D3DERR_INVALIDCALL); return; }
+    memset(p, 0, 304);
     w32_write(w, c + 0, 4, 1);                       /* DeviceType = D3DDEVTYPE_HAL */
     RET(S_OK_);
 }
@@ -1498,12 +1518,13 @@ static void i_EnumAdapterModes(w32 *w) {
  * rather than impersonating a card that would imply drivers we do not have. */
 static void i_GetAdapterIdentifier(w32 *w) {
     uint64_t p = ARG(3);
-    if (!p) { RET(D3DERR_INVALIDCALL); return; }
-    memset(W32P(w, p), 0, 1104);
+    char *id = W32PN(w, p, 1104);
+    if (!id) { RET(D3DERR_INVALIDCALL); return; }
+    memset(id, 0, 1104);
     const char *drv = "d12mt.dll", *desc = "xcore d3d9 on Metal (d12mt)", *dev = "\\\\.\\DISPLAY1";
-    memcpy((char *)W32P(w, p), drv, strlen(drv));
-    memcpy((char *)W32P(w, p + 512), desc, strlen(desc));
-    memcpy((char *)W32P(w, p + 1024), dev, strlen(dev));
+    memcpy(id, drv, strlen(drv));
+    memcpy(id + 512, desc, strlen(desc));
+    memcpy(id + 1024, dev, strlen(dev));
     w32_write(w, p + 1064, 4, 0x106B);               /* VendorId: Apple */
     w32_write(w, p + 1068, 4, 1);                    /* DeviceId */
     RET(S_OK_);
@@ -1515,8 +1536,9 @@ static void i_CheckDepthStencilMatch(w32 *w) { RET(S_OK_); }
 static void i_CheckDeviceFormatConversion(w32 *w) { RET(S_OK_); }
 static void i_GetDeviceCaps(w32 *w) {
     uint64_t c = ARG(3);
-    if (!c) { RET(D3DERR_INVALIDCALL); return; }
-    memset(W32P(w, c), 0, 304);
+    void *p = W32PN(w, c, 304);
+    if (!p) { RET(D3DERR_INVALIDCALL); return; }
+    memset(p, 0, 304);
     w32_write(w, c + 0, 4, 1);
     RET(S_OK_);
 }

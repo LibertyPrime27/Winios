@@ -495,12 +495,14 @@ static void k_RtlRestoreContext(w32 *w) { k_NtContinue(w); }
 static void k_IsBadReadPtr(w32 *w) {
     uint64_t p = ARG(0), n = ARG(1);
     if (!n) { RET(0); return; }
-    RET(p && W32P(w, p) && W32P(w, p + n - 1) ? 0 : 1);
+    /* These used to answer from W32P, which for a 64-bit guest says yes to
+     * every non-zero number -- so a program using them to avoid a fault was
+     * told to go ahead and fault. The mapping table gives the real answer. */
+    RET(w32_mem_ok(w, p, n) ? 0 : 1);
 }
 static void k_IsBadWritePtr(w32 *w) { k_IsBadReadPtr(w); }
 static void k_IsBadCodePtr(w32 *w) {
-    uint64_t p = ARG(0);
-    RET(p && W32P(w, p) ? 0 : 1);
+    RET(w32_mem_ok(w, ARG(0), 1) ? 0 : 1);
 }
 
 /* These belong to two DLLs on real Windows and are declared as two tables for

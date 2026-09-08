@@ -168,7 +168,8 @@ static void o_PropVariantClear(w32 *w) {
     RET(S_OK_);
 }
 static void o_PropVariantInit(w32 *w) {
-    if (ARG(0)) memset(W32P(w, ARG(0)), 0, 24);
+    void *p = W32PN(w, ARG(0), 24);
+    if (p) memset(p, 0, 24);
     RET(0);
 }
 static void o_VariantClear(w32 *w) { o_PropVariantClear(w); }

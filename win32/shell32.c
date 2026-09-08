@@ -114,11 +114,11 @@ static void put_path(w32 *w, uint64_t buf, int wide, const char *s) {
     if (!buf) return;
     size_t l = strlen(s);
     if (wide) {
-        uint16_t *d = W32P(w, buf);
+        uint16_t *d = W32PN(w, buf, 2 * (l + 1));
         if (d) { for (size_t i = 0; i < l; i++) d[i] = (uint8_t)s[i]; d[l] = 0; }
     } else {
-        memcpy(W32P(w, buf), s, l);
-        w32_write(w, buf + l, 1, 0);
+        char *d = W32PN(w, buf, l + 1);
+        if (d) { memcpy(d, s, l); d[l] = 0; }
     }
 }
 

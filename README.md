@@ -1,3 +1,5 @@
+<img src="docs/logo/winios-logo.png" alt="Winios" width="128" align="right">
+
 # Winios
 
 Run 32-bit and 64-bit Windows games on iOS. Sideloaded, JIT-enabled, maximum performance.
@@ -128,3 +130,11 @@ next report can separate "this machine is slow" from "this emulator is slow".
 ## Licensing
 
 The 32-bit engine is built on [Boxedwine](https://github.com/danoon2/Boxedwine) (GPL-2.0). This project is therefore GPL-2.0 and ships source. See `ARCHITECTURE.md` §6.
+
+## Credits
+
+The Winios logo and app icon are by **MegaNoob101**.
+
+The fonts the Win32 layer draws with are subsets of Liberation Sans and
+Liberation Mono, under the SIL Open Font License 1.1 — see
+[`third_party/liberation/OFL.txt`](third_party/liberation/OFL.txt).

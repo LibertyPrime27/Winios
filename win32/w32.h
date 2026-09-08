@@ -208,6 +208,14 @@ void     w32_ret64(w32 *w, uint64_t v);                     /* 64-bit result (ed
 void     w32_fret(w32 *w, double v);
 uint64_t w32_read(w32 *w, uint64_t addr, int bytes);
 void     w32_write(w32 *w, uint64_t addr, int bytes, uint64_t v);
+/* Is this guest range actually mapped? A 64-bit guest's addresses are host
+ * addresses, so a pointer a program got wrong is a host pointer unless
+ * something checks -- and one of those took the whole app down on a phone,
+ * without a signal any handler could report. */
+int      w32_mem_ok(w32 *w, uint64_t addr, uint64_t len);
+/* W32P, but NULL when `len` bytes are not mapped. Use this wherever the host
+ * is about to memset or memcpy through an address the guest supplied. */
+void    *W32PN(w32 *w, uint64_t addr, uint64_t len);
 uint64_t w32_ptrsize(w32 *w);
 uint64_t w32_call_guest(w32 *w, uint64_t fn, int nargs, const uint64_t *args);
 void     w32_exit(w32 *w, int code);

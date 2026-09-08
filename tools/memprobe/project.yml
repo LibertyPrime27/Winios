@@ -55,6 +55,11 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: winios.app
+        # The home-screen icon. iOS icons carry no alpha channel, which is why
+        # the asset is the full-bleed gradient version rather than the one on
+        # white -- a transparent corner is rejected at submission and looks
+        # black on the device.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         # winrun_lib is the PE loader + kernel32/msvcrt: it lets the app run a
         # real Windows .exe, and must precede xcore, which it calls into.
         # import_lib is the importer (a zip reader, installer detection, a

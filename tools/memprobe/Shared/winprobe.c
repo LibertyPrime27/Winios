@@ -61,6 +61,13 @@ static void grab_frame(void *ctx, const void *pixels, int width, int height, int
     pthread_mutex_unlock(&g_lock);
 }
 
+size_t win_probe_frame_bytes(void) {
+    pthread_mutex_lock(&g_lock);
+    size_t n = g_frame ? (size_t)g_fh * (size_t)g_fpitch : 0;
+    pthread_mutex_unlock(&g_lock);
+    return n;
+}
+
 int win_probe_copy_frame(uint64_t *seq, void *dst, size_t dst_len,
                          int *width, int *height, int *pitch) {
     int got = 0;

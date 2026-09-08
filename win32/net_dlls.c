@@ -63,7 +63,7 @@ enum {
     WSAENETDOWN_    = 10050,
     WSAENOTSOCK_    = 10038,
     WSAEHOSTUNREACH_ = 10065,
-    WSANOTINITIALISED_ = 10093,
+    WSANOTINITIALISED_ = 10093, WSAEFAULT_ = 10014,
     WSAHOST_NOT_FOUND_ = 11001,
 };
 /* A SOCKET is a UINT_PTR: 32 bits on x86 and 64 on x64, and INVALID_SOCKET
@@ -90,7 +90,9 @@ static void ws_WSAStartup(w32 *w) {
         /* WSADATA: version, high version, then a description and status
          * string, and on 32-bit the socket count before them. Filling the
          * version and clearing the rest is enough for every caller. */
-        memset(W32P(w, d), 0, w->is32 ? 400 : 408);
+        void *p = W32PN(w, d, w->is32 ? 400 : 408);
+        if (!p) { ws_fail(w, WSAEFAULT_); RET(WSAEFAULT_); return; }
+        memset(p, 0, w->is32 ? 400 : 408);
         w32_write(w, d, 2, ARG(0) ? ARG(0) : 0x0202);
         w32_write(w, d + 2, 2, 0x0202);
     }

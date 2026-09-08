@@ -150,6 +150,15 @@ int win_probe_run_at(const char *exe_path, int cx, int cy,
 int win_probe_copy_frame(uint64_t *seq, void *dst, size_t dst_len,
                          int *width, int *height, int *pitch);
 
+/* How many bytes the newest frame needs, or 0 when there is none.
+ *
+ * win_probe_copy_frame refuses a buffer that is too small and says nothing
+ * about it, which is a silent black screen: the app kept a fixed 1920x1080
+ * buffer, and an iPad asked to run at its native 2360x1640 produced frames
+ * that were 15 MB against a buffer of 8, so every one of them was dropped and
+ * the display never showed anything. Ask this first and grow. */
+size_t win_probe_frame_bytes(void);
+
 /* Ask a presenting guest to stop: its next Present returns D3DERR_DEVICELOST.
  * Cleared automatically when the next run starts. */
 void win_probe_request_stop(void);
