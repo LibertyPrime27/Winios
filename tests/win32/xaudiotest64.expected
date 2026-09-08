@@ -1,0 +1,8 @@
+XAudio2Create: ok
+mastering voice: ok
+source voice: ok
+volume 0.50, frequency ratio 1.50
+before Start: 3 queued, current context 1, 0 samples played
+after playing: 0 queued, samples played about 6615, events: S1 E1 S2 E2 S3 E3 X 
+flush: 2 queued before, 0 after, events: E5 E4 
+2.7 through CoCreateInstance: ok, 1 device

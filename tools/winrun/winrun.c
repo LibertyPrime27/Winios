@@ -373,6 +373,14 @@ uint64_t w32_arg(w32 *w, int i) {
     default: return w32_read(w, c->gpr[XC_RSP] + 8 + 0x20 + 8u * (i - 4), 8);
     }
 }
+float w32_fargf(w32 *w, int i) {
+    float f; uint32_t bits;
+    if (w->is32) bits = (uint32_t)w32_read(w, w32_cpu(w)->gpr[XC_RSP] + 4 + 4u * i, 4);
+    else if (i < 4) bits = (uint32_t)w32_cpu(w)->xmm[i].lo;
+    else bits = (uint32_t)w32_read(w, w32_cpu(w)->gpr[XC_RSP] + 8 + 0x20 + 8u * (i - 4), 4);
+    memcpy(&f, &bits, 4);
+    return f;
+}
 double w32_farg(w32 *w, int i) {
     double d;
     if (w->is32) { uint64_t v = w32_read(w, w32_cpu(w)->gpr[XC_RSP] + 4 + 4u * i, 8); memcpy(&d, &v, 8); return d; }
@@ -468,6 +476,12 @@ static const w32_dll g_dlls[] = {
      * dinput8.dll and the older dinput.dll are one implementation. */
     { "dinput8.dll",  { w32_dinput8 },                                    0 },
     { "dinput.dll",   { w32_dinput },                                     0 },
+    /* XAudio2: 2.8 and 2.9 export XAudio2Create; 2.7 is reached through
+     * CoCreateInstance and its DLL exports only the class factory. */
+    { "xaudio2_9.dll", { w32_xaudio2 },                                   0 },
+    { "xaudio2_8.dll", { w32_xaudio2 },                                   0 },
+    { "xaudio2_9redist.dll", { w32_xaudio2 },                             0 },
+    { "xaudio2_7.dll", { w32_xaudio2 },                                   0 },
     /* Every XInput version games link against, all the same implementation:
      * the DLL name changed five times and the eight functions did not. */
     { "xinput1_4.dll",   { w32_xinput },                                  0 },
@@ -1053,6 +1067,7 @@ static void winrun_reset(void) {
     w32_input_reset();
     w32_dsound_reset();
     w32_dinput_reset();
+    w32_xaudio2_reset();
     w32_xinput_reset();
     w32_thread_reset();
     g_nscript = 0; g_frame = 0;

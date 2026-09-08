@@ -60,6 +60,7 @@ for a in 32 64; do
     $CC -O2 -s -o audiotest$a.exe audiotest.c -ldsound -lxinput -lole32
     $CC -O2 -s -o spawntest$a.exe spawntest.c -lshell32
     $CC -O2 -s -o dinputtest$a.exe dinputtest.c -ldinput8 -ldxguid
+    $CC -O2 -s -o xaudiotest$a.exe xaudiotest.c -lole32
     # threads: CreateThread and the CRT's own, critical sections, events,
     # mutexes, interlocked, TLS. Written so every check is true under every
     # interleaving, so a pass means locking works rather than that the

@@ -431,6 +431,7 @@ void w32_dsound_tick(w32 *w) {
     static int inside;                        /* play_cursor below can call back in through a stop */
     if (inside) return;
     inside = 1;
+    w32_audio_pump();
     for (int i = 0; i < MAX_NBUF; i++) {
         uint64_t buf = g_notify[i].buf;
         if (!buf || !g_notify[i].n) continue;

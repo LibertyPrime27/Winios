@@ -358,6 +358,7 @@ static uint32_t wait_one(w32 *w, uint64_t hv, uint32_t ms) {
     uint64_t deadline = ms == INFINITE_ ? 0 : now_ms() + ms;
     for (;;) {
         w32_dsound_tick(w);                 /* a wait is where a sound's position event is noticed */
+        w32_xaudio2_tick(w);
         int r = handle_ready(w, hv, 1);
         if (r < 0) return WAIT_FAILED_;
         if (r) return WAIT_OBJECT_0_;
@@ -393,6 +394,7 @@ static void k_WaitForMultipleObjects(w32 *w) {
     uint64_t deadline = ms == INFINITE_ ? 0 : now_ms() + ms;
     for (;;) {
         w32_dsound_tick(w);
+        w32_xaudio2_tick(w);
         if (all) {
             /* Every one has to be ready *before* any is consumed, or a
              * partial wait eats a signal it is not going to act on. */

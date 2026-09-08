@@ -203,6 +203,7 @@ void     w32_host_path(w32 *w, const char *win, char *out, size_t n);
 
 /* calling convention */
 uint64_t w32_arg(w32 *w, int i);
+float    w32_fargf(w32 *w, int i);                          /* a float argument: XMM on x64, four stack bytes on x86 */
 double   w32_farg(w32 *w, int i);                           /* i-th float/double argument (x64: xmm0-3) */
 void     w32_ret(w32 *w, uint64_t v);
 void     w32_ret64(w32 *w, uint64_t v);                     /* 64-bit result (edx:eax on x86) */
@@ -314,6 +315,20 @@ int  w32_audio_src_add(const w32_audio_src *s);            /* an id >= 0, or -1 
 void w32_audio_src_set(int id, const w32_audio_src *s);    /* refresh; the read position survives unless play (re)starts */
 void w32_audio_src_remove(int id);
 int  w32_audio_src_playing(int id);                        /* a one-shot ends by itself */
+/* Streaming: one block may wait behind the one playing, and the mixer moves
+ * to it without a gap when the first ends. The owner keeps the rest of its
+ * queue and refills the slot at every tick; `ended` counts blocks finished
+ * since it was last asked, `frames_done` the frames played since the source
+ * was made -- what XAudio2's GetState reports. */
+int  w32_audio_src_queue_next(int id, const w32_audio_src *next);   /* 1 if taken, 0 if the slot is full */
+int  w32_audio_src_next_pending(int id);
+int  w32_audio_src_take_ended(int id);
+uint64_t w32_audio_src_frames_done(int id);
+void w32_audio_src_clear_next(int id);
+/* With no device, advance the mixer by the wall clock so sources still end and
+ * queues still drain: a game waiting on OnBufferEnd must not wait forever on a
+ * machine with no speaker. Called from the tick paths. */
+void w32_audio_pump(void);
 void w32_audio_mix(int16_t *out, int frames);              /* render stereo 44.1 kHz frames: what the device calls */
 int  w32_audio_parse_wav(const uint8_t *p, size_t n, w32_audio_src *out);   /* RIFF/WAVE -> a source over p's data */
 /* A GUID as the 16 bytes it occupies in memory, from the eleven numbers a
@@ -355,7 +370,7 @@ extern const w32_api w32_ntdll[];
 extern const w32_api w32_user32[];
 extern const w32_api w32_winmm[];
 extern const w32_api w32_dsound[];
-extern const w32_api w32_dinput8[], w32_dinput[];
+extern const w32_api w32_dinput8[], w32_dinput[], w32_xaudio2[];
 extern const w32_api w32_xinput[];
 extern const w32_api w32_thread_api[];      /* kernel32's threads and synchronisation */
 extern const w32_api w32_thread_crt[];      /* msvcrt's _beginthread* */
@@ -600,6 +615,9 @@ void w32_pad_current(w32_pad *p);                   /* what XInput would report 
 void w32_xinput_reset(void);
 void w32_dsound_reset(void);
 void w32_dinput_reset(void);
+void w32_xaudio2_reset(void);
+void w32_xaudio2_tick(w32 *w);
+int  w32_xaudio2_create_class(w32 *w, const uint8_t clsid[16], const uint8_t iid[16], uint64_t out);
 int  w32_dinput_create_class(w32 *w, const uint8_t clsid[16], const uint8_t iid[16], uint64_t out);
 
 /* d3d9.c: where a presented frame goes. NULL simply drops it, which is what

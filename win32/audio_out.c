@@ -43,6 +43,10 @@ typedef struct {
     uint64_t pos_fp;             /* read position in source frames, 16.16 */
     int32_t  gl, gr;             /* Q15 gains, left and right */
     int      used;
+    w32_audio_src next;          /* the block behind this one, if has_next */
+    int      has_next;
+    int      ended;              /* blocks finished since the owner last asked */
+    uint64_t frames_done;        /* source frames consumed, 16.16 */
 } slot;
 
 static slot g_src[MAX_SRC];
@@ -111,7 +115,7 @@ void w32_audio_src_set(int id, const w32_audio_src *s) {
 void w32_audio_src_remove(int id) {
     if (id < 0 || id >= MAX_SRC) return;
     pthread_mutex_lock(&g_lock);
-    if (g_src[id].used) { free(g_src[id].s.owner); memset(&g_src[id], 0, sizeof g_src[id]); }
+    if (g_src[id].used) { free(g_src[id].s.owner); if (g_src[id].has_next) free(g_src[id].next.owner); memset(&g_src[id], 0, sizeof g_src[id]); }
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -184,15 +188,35 @@ void w32_audio_mix(int16_t *out, int frames) {
         for (int i = 0; i < frames; i++) {
             uint32_t fr = (uint32_t)(t->pos_fp >> 16);
             if (fr >= total) {
-                if (!s->looping) { s->playing = 0; break; }
-                t->pos_fp -= (uint64_t)total << 16;
-                fr = (uint32_t)(t->pos_fp >> 16);
-                if (fr >= total) { t->pos_fp = 0; fr = 0; }
+                if (!s->looping) {
+                    t->ended++;
+                    if (!t->has_next) { s->playing = 0; break; }
+                    /* the next block, from its start, without a gap: the
+                     * fraction of a frame carried over is the resampler's */
+                    void *owner = s->owner;
+                    t->s = t->next; t->has_next = 0;
+                    if (!t->s.owner) t->s.owner = owner; else free(owner);
+                    s = &t->s;
+                    fb = frame_bytes(s); total = fb ? s->size / fb : 0;
+                    freq = s->freq ? s->freq : OUT_RATE;
+                    step = ((uint64_t)freq << 16) / OUT_RATE;
+                    nch = s->channels > 1 ? 2 : 1;
+                    t->pos_fp = ((uint64_t)(fb ? s->start_byte / fb : 0) << 16) | (t->pos_fp & 0xFFFF);
+                    set_gains(t);
+                    if (!total) { s->playing = 0; break; }
+                    fr = (uint32_t)(t->pos_fp >> 16);
+                    if (fr >= total) { t->pos_fp = 0; fr = 0; }
+                } else {
+                    t->pos_fp -= (uint64_t)total << 16;
+                    fr = (uint32_t)(t->pos_fp >> 16);
+                    if (fr >= total) { t->pos_fp = 0; fr = 0; }
+                }
             }
             int32_t l = sample_at(s, fr, 0), r = nch > 1 ? sample_at(s, fr, 1) : l;
             acc[2 * i]     += (int32_t)(((int64_t)l * t->gl) >> 15);
             acc[2 * i + 1] += (int32_t)(((int64_t)r * t->gr) >> 15);
             t->pos_fp += step;
+            t->frames_done += step;
         }
     }
     pthread_mutex_unlock(&g_lock);
@@ -281,14 +305,69 @@ static void device_close(void) { g_device_on = 0; }
 void w32_audio_close(void) {
     device_close();
     pthread_mutex_lock(&g_lock);
-    for (int i = 0; i < MAX_SRC; i++) if (g_src[i].used) { free(g_src[i].s.owner); memset(&g_src[i], 0, sizeof g_src[i]); }
+    for (int i = 0; i < MAX_SRC; i++) if (g_src[i].used) { free(g_src[i].s.owner); if (g_src[i].has_next) free(g_src[i].next.owner); memset(&g_src[i], 0, sizeof g_src[i]); }
     pthread_mutex_unlock(&g_lock);
 }
 int w32_audio_device_on(void) { return g_device_on; }
+
+int w32_audio_src_queue_next(int id, const w32_audio_src *next) {
+    if (id < 0 || id >= MAX_SRC) return 0;
+    pthread_mutex_lock(&g_lock);
+    slot *t = &g_src[id];
+    int ok = t->used && !t->has_next;
+    if (ok) {
+        /* a source that has already run out takes the block as its current one */
+        if (!t->s.playing && t->s.mem && !t->has_next && t->ended && t->frames_done) {
+            void *owner = t->s.owner;
+            t->s = *next; t->s.playing = 1; free(owner);
+            uint32_t fb = frame_bytes(&t->s); t->pos_fp = (uint64_t)(fb ? next->start_byte / fb : 0) << 16;
+            set_gains(t);
+        } else { t->next = *next; t->has_next = 1; }
+    }
+    pthread_mutex_unlock(&g_lock);
+    return ok;
+}
+int w32_audio_src_next_pending(int id) {
+    if (id < 0 || id >= MAX_SRC) return 0;
+    pthread_mutex_lock(&g_lock); int p = g_src[id].used && g_src[id].has_next; pthread_mutex_unlock(&g_lock);
+    return p;
+}
+int w32_audio_src_take_ended(int id) {
+    if (id < 0 || id >= MAX_SRC) return 0;
+    pthread_mutex_lock(&g_lock); int n = g_src[id].used ? g_src[id].ended : 0; if (g_src[id].used) g_src[id].ended = 0; pthread_mutex_unlock(&g_lock);
+    return n;
+}
+uint64_t w32_audio_src_frames_done(int id) {
+    if (id < 0 || id >= MAX_SRC) return 0;
+    pthread_mutex_lock(&g_lock); uint64_t n = g_src[id].used ? g_src[id].frames_done >> 16 : 0; pthread_mutex_unlock(&g_lock);
+    return n;
+}
 int w32_audio_src_count(void) {
     int n = 0;
     pthread_mutex_lock(&g_lock);
     for (int i = 0; i < MAX_SRC; i++) n += g_src[i].used;
     pthread_mutex_unlock(&g_lock);
     return n;
+}
+
+void w32_audio_src_clear_next(int id) {
+    if (id < 0 || id >= MAX_SRC) return;
+    pthread_mutex_lock(&g_lock);
+    if (g_src[id].used && g_src[id].has_next) { free(g_src[id].next.owner); memset(&g_src[id].next, 0, sizeof g_src[id].next); g_src[id].has_next = 0; }
+    pthread_mutex_unlock(&g_lock);
+}
+
+/* No device: the mixer is driven by the wall clock instead, into nowhere.
+ * Bounded per call so a long pause does not mix a minute of silence at once. */
+void w32_audio_pump(void) {
+    static uint64_t last_ns;
+    static int16_t sink[2 * 1024];
+    if (g_device_on) { last_ns = 0; return; }
+    uint64_t now = now_ns();
+    if (!last_ns) { last_ns = now; return; }
+    uint64_t frames = (now - last_ns) * OUT_RATE / 1000000000ull;
+    if (frames > 4 * 1024) frames = 4 * 1024;
+    if (!frames) return;
+    last_ns += frames * 1000000000ull / OUT_RATE;
+    while (frames) { int n = frames > 1024 ? 1024 : (int)frames; w32_audio_mix(sink, n); frames -= (uint64_t)n; }
 }
