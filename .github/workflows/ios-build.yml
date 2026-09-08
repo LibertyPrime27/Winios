@@ -17,6 +17,40 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The guest programs under tests/win32 are committed binaries: neither the
+  # Mac nor the macOS runner has mingw-w64. Here it is a stock package, so this
+  # job rebuilds every guest from source, runs the suite against the fresh
+  # build -- a change to a guest's .c is tested before its .exe is committed --
+  # and uploads the result for whoever commits it. It does not compare against
+  # the committed files: mingw output is not byte-reproducible across versions,
+  # so a difference there would mean nothing.
+  guests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - name: mingw-w64
+        run: sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 gcc-mingw-w64-i686
+      - name: Rebuild the guest programs
+        run: sh tests/win32/build.sh
+      - name: Run the suite against the fresh build
+        run: |
+          cmake -S . -B build-host -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build-host -j"$(nproc)"
+          out=$(sh tests/win32/run.sh build-host/winrun tests/win32 2>&1); rc=$?
+          echo "$out" | awk '/^FAIL/{p=1} /^ok /{p=0} p' | head -400
+          echo "::notice::guests: $(echo "$out" | grep -c '^ok') ok, $(echo "$out" | grep -c '^FAIL') failed (rc $rc)"
+          echo "$out" | grep -E '^FAIL' | head -8 | while IFS= read -r l; do echo "::error::guests: ${l}"; done
+          [ "$rc" -eq 0 ]
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win32-guests-${{ github.sha }}
+          path: |
+            tests/win32/*.exe
+            tests/win32/*.dll
+          retention-days: 7
+
   # Fast feedback on the portable core: ~2 minutes on a free Linux runner
   # instead of ~20 on macOS. Most logic bugs get caught here.
   core-tests:
