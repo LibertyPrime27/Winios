@@ -59,7 +59,7 @@ for a in 32 64; do
     # audio that initialises, and a gamepad the keyboard can stand in for
     $CC -O2 -s -o audiotest$a.exe audiotest.c -ldsound -lxinput -lole32
     $CC -O2 -s -o spawntest$a.exe spawntest.c -lshell32
-    $CC -O2 -s -o dinputtest$a.exe dinputtest.c -ldinput8 -ldinput -ldxguid
+    $CC -O2 -s -o dinputtest$a.exe dinputtest.c -ldinput8 -ldxguid
     # threads: CreateThread and the CRT's own, critical sections, events,
     # mutexes, interlocked, TLS. Written so every check is true under every
     # interleaving, so a pass means locking works rather than that the

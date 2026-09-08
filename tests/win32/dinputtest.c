@@ -83,8 +83,13 @@ int main(void) {
            j.rgdwPOV[0] == 0xFFFFFFFF ? "centred" : "MOVED");
 
     /* the older entry points: dinput.dll, IDirectInput7A, CreateDeviceEx */
+    /* DirectInputCreateEx is not in mingw's import library, so it is fetched
+     * the way a game with an optional DirectInput path fetches it -- which
+     * also loads dinput.dll by name. */
+    typedef HRESULT (WINAPI *dice_t)(HINSTANCE, DWORD, REFIID, LPVOID *, LPUNKNOWN);
+    dice_t dice = (dice_t)GetProcAddress(LoadLibraryA("dinput.dll"), "DirectInputCreateEx");
     IDirectInput7A *di7 = NULL;
-    hr = DirectInputCreateEx(GetModuleHandleA(NULL), 0x0700, &IID_IDirectInput7A, (void **)&di7, NULL);
+    hr = dice ? dice(GetModuleHandleA(NULL), 0x0700, &IID_IDirectInput7A, (void **)&di7, NULL) : E_FAIL;
     IDirectInputDevice7A *kb7 = NULL;
     HRESULT hr3 = di7 ? IDirectInput7_CreateDeviceEx(di7, &GUID_SysKeyboard, &IID_IDirectInputDevice7A, (void **)&kb7, NULL) : E_FAIL;
     DIDEVICEINSTANCEA inst; memset(&inst, 0, sizeof inst); inst.dwSize = sizeof inst;

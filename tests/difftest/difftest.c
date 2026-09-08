@@ -17,6 +17,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+/* A Mac has no MAP_32BIT and no compat-mode selector we can name, so the
+ * 64-bit cases run against real silicon there and the 32-bit ones are
+ * skipped. The golden file is recorded on Linux, where both halves run. */
+#ifdef __APPLE__
+#ifndef MAP_32BIT
+#define MAP_32BIT 0
+#endif
+#define HAVE_COMPAT32 0
+#else
+#define HAVE_COMPAT32 1
+#endif
 
 /* Does this snippet reference memory at all -- read, write, or via the stack?
  *
@@ -616,6 +627,7 @@ static void s_cl1(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RCX] = (g[XC_RCX]
 static void s_cl7(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RCX] = (g[XC_RCX] & ~0xFFull) | 7; }
 static void s_rcx4(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RCX] = 4; }
 static void s_rcx16(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RCX] = 16; }
+static void s_len(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RAX] = 5; g[XC_RDX] = 9; }   /* PCMPESTR*: short explicit lengths */
 static void s_zf(uint64_t g[16], uint64_t *f) { (void)g; *f |= XC_ZF; }
 static void s_nzf(uint64_t g[16], uint64_t *f) { (void)g; *f &= ~(uint64_t)XC_ZF; }
 static void s_eq(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RBX] = g[XC_RAX]; }
@@ -740,6 +752,7 @@ static const tcase cases[] = {
 
 int main(int argc, char **argv) {
     const char *emit = 0;
+    int skipped32 = 0;
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--emit-golden") && i + 1 < argc) emit = argv[++i];
 
@@ -749,10 +762,16 @@ int main(int argc, char **argv) {
     if (g_code == MAP_FAILED || g_stack == MAP_FAILED || g_data == MAP_FAILED) {
         perror("mmap"); return 2;
     }
-    g_code32  = low_alloc(CODE_SZ, PROT_READ | PROT_WRITE | PROT_EXEC);
-    g_stack32 = low_alloc(STACK_SZ, PROT_READ | PROT_WRITE);
-    g_data32  = low_alloc(DATA_SZ, PROT_READ | PROT_WRITE);
-    setup32();
+    if (HAVE_COMPAT32) {
+        g_code32  = low_alloc(CODE_SZ, PROT_READ | PROT_WRITE | PROT_EXEC);
+        g_stack32 = low_alloc(STACK_SZ, PROT_READ | PROT_WRITE);
+        g_data32  = low_alloc(DATA_SZ, PROT_READ | PROT_WRITE);
+        setup32();
+    }
+    if (emit && !HAVE_COMPAT32) {
+        fprintf(stderr, "difftest: the golden file includes the 32-bit cases; record it on Linux\n");
+        return 2;
+    }
 
     if (emit) {
         g_golden = fopen(emit, "w");
@@ -774,6 +793,7 @@ int main(int argc, char **argv) {
     const int dbg = getenv("XDBG") != 0;
     if (dbg) setvbuf(stdout, 0, _IONBF, 0);
     for (int i = 0; i < n; i++) {
+        if (!HAVE_COMPAT32 && cases[i].mode == 32) { skipped32++; continue; }
         /* several seeds per case: flags-in and register soup vary */
         for (uint64_t seed = 1; seed <= 6; seed++) {
             total++;

@@ -43,7 +43,8 @@ jobs:
           echo "::notice::guests: $(echo "$out" | grep -c '^ok') ok, $(echo "$out" | grep -c '^FAIL') failed (rc $rc)"
           echo "$out" | grep -E '^FAIL' | head -8 | while IFS= read -r l; do echo "::error::guests: ${l}"; done
           [ "$rc" -eq 0 ]
-      - uses: actions/upload-artifact@v4
+      - if: always()                # what did build is still worth having
+        uses: actions/upload-artifact@v4
         with:
           name: win32-guests-${{ github.sha }}
           path: |
@@ -155,12 +156,22 @@ jobs:
           diff -u core/src/golden_vectors.c /tmp/golden.c > /tmp/gdiff.txt
           rc=$?
           if [ $rc -ne 0 ]; then
-            echo "::error::golden_vectors.c differs from this runner's recording"
+            echo "::error::golden_vectors.c differs from this runner's recording (the recording is uploaded as golden-vectors-<sha>: commit it as core/src/golden_vectors.c)"
             head -40 /tmp/gdiff.txt > /tmp/gd40.txt
             while IFS= read -r l; do echo "::error::${l}"; done < /tmp/gd40.txt
+            cp /tmp/golden.c /tmp/golden_vectors.c
             exit 1
           fi
           echo "golden vectors match the CI runner's CPU"
+      # The recording itself, when it differs: the vectors have to come from real
+      # x86-64 silicon, and this runner is the one with both 32- and 64-bit halves.
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-vectors-${{ github.sha }}
+          path: /tmp/golden_vectors.c
+          if-no-files-found: ignore
+          retention-days: 7
 
   ios:
     # Pinned, not macos-latest: a silent image bump changes the SDK underneath us.

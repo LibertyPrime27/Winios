@@ -88,7 +88,9 @@ add_executable(test_a64 tests/test_a64.c)
 add_test(NAME a64_encoder COMMAND test_a64)
 
 # --- differential test: needs a real x86-64 to act as the oracle -------------
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+# Linux runs both halves; a Mac with an x86-64 runs the 64-bit half (see the
+# note in difftest.c) and records nothing.
+if(CMAKE_SYSTEM_NAME MATCHES "Linux|Darwin" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     enable_language(ASM)
     add_executable(difftest tests/difftest/difftest.c tests/difftest/native_x64.S)
     target_link_libraries(difftest PRIVATE xcore)

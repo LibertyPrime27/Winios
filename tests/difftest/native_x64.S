@@ -12,10 +12,23 @@
  *   144 saved_rsp
  *   160 fxsave area (512 bytes, 16-aligned): x87, MXCSR, XMM0-15
  */
+/* Mach-O spells a C symbol with a leading underscore and has no .type/.size,
+ * no .bss directive and no GNU-stack note; the code is the same. */
+#ifdef __APPLE__
+#define SYM(x) _##x
+#define TYPE(x)
+#define SIZE(x)
+#define BSS .data
+#else
+#define SYM(x) x
+#define TYPE(x) .type x, @function
+#define SIZE(x) .size x, .-x
+#define BSS .bss
+#endif
     .text
-    .globl  native_run
-    .type   native_run, @function
-native_run:
+    .globl  SYM(native_run)
+    TYPE(native_run)
+SYM(native_run):
     pushq   %rbp
     pushq   %rbx
     pushq   %r12
@@ -87,9 +100,9 @@ native_run:
     popq    %rbx
     popq    %rbp
     ret
-    .size   native_run, .-native_run
+    SIZE(native_run)
 
-    .bss
+    BSS
     .align  8
 g_state:   .quad 0
 g_code:    .quad 0
@@ -117,9 +130,9 @@ g_hostfx:  .space 512
  *   64  fxsave area (512 bytes, 16-aligned)
  */
     .text
-    .globl  native_run32
-    .type   native_run32, @function
-native_run32:
+    .globl  SYM(native_run32)
+    TYPE(native_run32)
+SYM(native_run32):
     pushq   %rbp
     pushq   %rbx
     pushq   %r12
@@ -137,8 +150,8 @@ native_run32:
     pushq   $0x23                    /* __USER32_CS */
     pushq   %rsi                     /* 32-bit stub address */
     lretq
-    .globl  native_back64
-native_back64:                       /* reached through the landing pad */
+    .globl  SYM(native_back64)
+SYM(native_back64):                       /* reached through the landing pad */
     cld                              /* a snippet may leave DF set; the ABI needs it clear */
     movq    g_saved_rsp(%rip), %rsp
     movq    g_state(%rip), %rdi
@@ -151,17 +164,17 @@ native_back64:                       /* reached through the landing pad */
     popq    %rbx
     popq    %rbp
     ret
-    .size   native_run32, .-native_run32
+    SIZE(native_run32)
 
 /* 32-bit stub template. Patched at copy time: the two state addresses, the
  * absolute call target (state + 36) and the landing-pad address. Each patch
  * label marks the byte after a 4-byte immediate. */
-    .globl  stub32_tmpl, stub32_tmpl_end
-    .globl  s32_p_state1, s32_p_code, s32_p_state2, s32_p_land
+    .globl  SYM(stub32_tmpl), SYM(stub32_tmpl_end)
+    .globl  SYM(s32_p_state1), SYM(s32_p_code), SYM(s32_p_state2), SYM(s32_p_land)
     .code32
-stub32_tmpl:
+SYM(stub32_tmpl):
     movl    $0x11111111, %esi
-s32_p_state1:
+SYM(s32_p_state1):
     movl    16(%esi), %esp           /* first: the 64-bit stack is out of reach here */
     pushl   32(%esi)
     popfl
@@ -173,11 +186,11 @@ s32_p_state1:
     movl    28(%esi), %edi
     movl    24(%esi), %esi
     call    *0x22222222              /* [state + 36] */
-s32_p_code:
+SYM(s32_p_code):
     pushfl
     pushl   %esi
     movl    $0x11111111, %esi
-s32_p_state2:
+SYM(s32_p_state2):
     movl    %eax, 0(%esi)
     movl    %ecx, 4(%esi)
     movl    %edx, 8(%esi)
@@ -189,18 +202,20 @@ s32_p_state2:
     movl    %esp, 16(%esi)
     pushl   $0x33                    /* __USER_CS */
     pushl   $0x33333333              /* landing pad */
-s32_p_land:
+SYM(s32_p_land):
     lret
-stub32_tmpl_end:
+SYM(stub32_tmpl_end):
     .code64
 
 /* 64-bit landing pad template, also copied below 4 GB (a 32-bit far return
  * can only name a 32-bit offset). Jumps to native_back64. */
-    .globl  land64_tmpl, land64_tmpl_end, l64_p_target
-land64_tmpl:
+    .globl  SYM(land64_tmpl), SYM(land64_tmpl_end), SYM(l64_p_target)
+SYM(land64_tmpl):
     movabs  $0x4444444444444444, %rax
-l64_p_target:
+SYM(l64_p_target):
     jmp     *%rax
-land64_tmpl_end:
+SYM(land64_tmpl_end):
 
+#ifndef __APPLE__
     .section .note.GNU-stack,"",@progbits
+#endif
