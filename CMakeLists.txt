@@ -124,7 +124,7 @@ if(NOT WIN32)
         win32/advapi32.c win32/seh.c win32/thread.c
         win32/user32.c win32/gdi32.c win32/gdifont.c win32/truetype.c
         win32/fontdata.c win32/image.c win32/comctl32.c
-        win32/dsound.c win32/audio_out.c win32/xinput.c win32/shell32.c win32/ole32.c
+        win32/dsound.c win32/audio_out.c win32/xinput.c win32/dinput.c win32/shell32.c win32/ole32.c
         win32/misc_dlls.c win32/net_dlls.c
         win32/d3d11.c win32/d3d11_raster.c win32/dxbc.c)
 

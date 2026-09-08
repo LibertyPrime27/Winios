@@ -21,7 +21,9 @@ int main(int argc, char **argv) {
     if (argc > 1) {
         char cwd[MAX_PATH] = "";
         GetCurrentDirectoryA(sizeof cwd, cwd);
-        printf("child %s: argc %d, cwd %s\n", argv[1], argc, cwd);
+        /* the last component only: the test runner's echo eats backslashes */
+        const char *leaf = strrchr(cwd, '\\');
+        printf("child %s: argc %d, cwd ...%s\n", argv[1], argc, leaf ? leaf + 1 : cwd);
         return 7;
     }
     printf("%d-bit parent\n", (int)(8 * sizeof(void *)));

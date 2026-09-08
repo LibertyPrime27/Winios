@@ -10,8 +10,8 @@ ShellExecuteEx: ok, hInstApp 42, process handle given
 
 ================ CreateProcess started spawntest64.exe first; running it now ================
 
-child first: argc 2, cwd C:\xcore
+child first: argc 2, cwd ...xcore
 
 ================ ShellExecute started spawntest64.exe second; running it now ================
 
-child second: argc 2, cwd C:\xcore
+child second: argc 2, cwd ...xcore

@@ -242,7 +242,7 @@ final class GuestViewController: UIViewController {
             let rc = exe.withCString { p in
                 dll.withCString { d in
                     AudioSession.activate()
-                    win_probe_run_dir(p, dll.isEmpty ? nil : d, 0, 0, &out, out.count, &ns)
+                    return win_probe_run_dir(p, dll.isEmpty ? nil : d, 0, 0, &out, out.count, &ns)
                 }
             }
             xc_jit_enable(0)

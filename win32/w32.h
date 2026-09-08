@@ -352,6 +352,7 @@ extern const w32_api w32_ntdll[];
 extern const w32_api w32_user32[];
 extern const w32_api w32_winmm[];
 extern const w32_api w32_dsound[];
+extern const w32_api w32_dinput8[], w32_dinput[];
 extern const w32_api w32_xinput[];
 extern const w32_api w32_thread_api[];      /* kernel32's threads and synchronisation */
 extern const w32_api w32_thread_crt[];      /* msvcrt's _beginthread* */
@@ -558,6 +559,10 @@ void w32_input_mouse_delta(int dx, int dy);        /* relative: mouselook, a tra
 void w32_input_mouse_button(int button, int down); /* 0 left, 1 right, 2 middle */
 void w32_input_mouse_wheel(int delta);             /* +/-120 per notch */
 void w32_input_reset(void);
+/* Running totals of relative motion and wheel, and the button bits -- a
+ * consumer that wants deltas keeps the last total it saw, so two consumers do
+ * not steal each other's motion. */
+void w32_mouse_totals(int32_t *tx, int32_t *ty, int32_t *twheel, uint32_t *buttons);
 void w32_client_size(int *cw, int *ch);
 int  w32_has_window(void);                         /* has the guest made one yet? */
 /* Whether the guest wants a pointer drawn, and where it thinks it is. A game
@@ -588,8 +593,11 @@ typedef struct {
     int      present;
 } w32_pad;
 void w32_pad_state(const w32_pad *p);
+void w32_pad_current(w32_pad *p);                   /* what XInput would report now: the host pad, or the keyboard as one */
 void w32_xinput_reset(void);
 void w32_dsound_reset(void);
+void w32_dinput_reset(void);
+int  w32_dinput_create_class(w32 *w, const uint8_t clsid[16], const uint8_t iid[16], uint64_t out);
 
 /* d3d9.c: where a presented frame goes. NULL simply drops it, which is what
  * the headless test and CI want; the iOS app sets it to a Metal blit. */

@@ -1,0 +1,15 @@
+DirectInput8Create: ok
+  Keyboard (type 0x413)
+  Mouse (type 0x212)
+  Winios Gamepad (type 0x115)
+EnumDevices: 3 devices
+keyboard: created
+buffer size: ok
+GetDeviceState before Acquire: DIERR_NOTACQUIRED, as it should be
+W down, D down, Space down, Q up
+GetDeviceData: ok, 0 events (what was held at Acquire is state, not events)
+mouse: created, dx 15 dy -8 wheel 120, left down, right up
+mouse again: dx 0 dy 0 (relative: consumed by the first read)
+gamepad: created, range set, caps: 6 axes 10 buttons 1 POV, 17 objects
+gamepad state: lX 1000 lY -1000 button0 down POV centred
+dinput.dll: IDirectInput7A ok, keyboard via CreateDeviceEx ok, product Keyboard, type 0x403

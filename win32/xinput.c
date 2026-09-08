@@ -164,6 +164,7 @@ static void x_XInputGetDSoundAudioDeviceGuids(w32 *w) {
  * games that want the Guide button. Same shape as XInputGetState. */
 static void x_XInputGetStateEx(w32 *w) { x_XInputGetState(w); }
 
+void w32_pad_current(w32_pad *p) { if (g_pad_set) *p = g_pad; else pad_from_keyboard(p); }
 void w32_xinput_reset(void) { g_pad_set = 0; g_packet = 0; memset(&g_pad, 0, sizeof g_pad); }
 
 #define F(n, a)  { #n, a, 0, x_##n, 0 }

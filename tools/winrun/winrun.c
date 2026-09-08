@@ -464,6 +464,10 @@ static const w32_dll g_dlls[] = {
     { "ole32.dll",    { w32_ole32 },                                      0 },
     { "winmm.dll",    { w32_winmm },                                      0 },
     { "dsound.dll",   { w32_dsound },                                     0 },
+    /* DirectInput: the keyboard, the mouse and a gamepad the pre-XInput way.
+     * dinput8.dll and the older dinput.dll are one implementation. */
+    { "dinput8.dll",  { w32_dinput8 },                                    0 },
+    { "dinput.dll",   { w32_dinput },                                     0 },
     /* Every XInput version games link against, all the same implementation:
      * the DLL name changed five times and the eight functions did not. */
     { "xinput1_4.dll",   { w32_xinput },                                  0 },
@@ -1024,6 +1028,7 @@ static void winrun_reset(void) {
     w32_seh_reset();
     w32_input_reset();
     w32_dsound_reset();
+    w32_dinput_reset();
     w32_xinput_reset();
     w32_thread_reset();
     g_nscript = 0; g_frame = 0;

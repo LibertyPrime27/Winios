@@ -1,0 +1,9 @@
+# Keys and mouse motion before the program starts: what DirectInput should
+# report as state. No absolute moves -- the pointer's starting place depends
+# on the screen size, and this is about the deltas.
+key down 87        # W  -> keyboard state, and the gamepad's left stick up
+key down 68        # D  -> right
+key down 32        # Space -> gamepad button 0
+mouse delta 15 -8
+mouse down left
+mouse wheel 120
