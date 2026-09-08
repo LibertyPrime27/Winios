@@ -205,6 +205,15 @@ jobs:
           out5=$(sh tests/win32/run.sh build-mac/winrun tests/win32 2>&1); rc5=$?
           echo "::notice::win32: $(echo "$out5" | grep -c '^ok') ok, $(echo "$out5" | grep -c '^FAIL') failed (rc $rc5)"
           echo "$out5" | grep -E '^FAIL|winrun: host SIG' | head -8 | while IFS= read -r l; do echo "::error::win32: ${l}"; done
+          # The FAIL line names the test; the lines after it are the diff and
+          # the -v diagnostics, which is the part that says *why*. Without them
+          # a failure that only happens on this runner cannot be diagnosed from
+          # anywhere else -- the summary below is not visible through the API.
+          if [ "$rc5" -ne 0 ]; then
+            echo "::group::win32: failing cases, expected vs got"
+            echo "$out5" | awk '/^FAIL/{p=1} /^ok /{p=0} p' | head -400
+            echo "::endgroup::"
+          fi
           out7=$(./build-mac/test_winrun_lib tests/win32 2>&1); rc7=$?
           echo "$out7" | tail -1 | while IFS= read -r l; do echo "::notice::winrun-lib: ${l}"; done
           echo "rc jit=$rc interp=$rc2 arena=$rc3 jitdiff=$rc4 faultdiff=$rc8 win32=$rc5 bench=$rc6 winrunlib=$rc7"
