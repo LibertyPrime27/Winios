@@ -251,6 +251,11 @@ checkrc d3dshader64.exe 0 "0 failures"
 checkrc d3dshader32.exe 0 "0 failures"
 checkframe d3dshader64.exe own 8e183572
 checkframe d3dshader32.exe own 8e183572
+# GetProcAddress says NULL for what is not here, and the thread pool runs
+# its callbacks: work, a periodic timer, a wait, a one-off. Timing is judged
+# generously, so the count is what is checked.
+checkrc pooltest64.exe 0 "0 failures"
+checkrc pooltest32.exe 0 "0 failures"
 # C++ exceptions: on x64 the table-driven dispatcher through libgcc's real personality.
 check cxxtest64.exe 0
 check cxxtest32.exe 0
