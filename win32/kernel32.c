@@ -1002,7 +1002,6 @@ static void k_SetErrorMode(w32 *w) { RET(0); }
 static void k_RtlPcToFileHeader(w32 *w) { w32_write(w, ARG(1), (int)w32_ptrsize(w), w->image_base); RET(w->image_base); }
 static void k_RtlLookupFunctionEntry(w32 *w) { RET(0); }
 static void k_RtlVirtualUnwind(w32 *w) { RET(0); }
-static void k_RtlUnwindEx(w32 *w) { fprintf(stderr, "winrun: RtlUnwindEx: exception unwinding is not supported\n"); w32_exit(w, 129); }
 static void k_EncodePointer(w32 *w) { RET(ARG(0)); }
 static void k_DecodePointer(w32 *w) { RET(ARG(0)); }
 static void k_InitializeSListHead(w32 *w) { void *p = W32PN(w, ARG(0), 16); if (p) memset(p, 0, 16); }
@@ -2641,7 +2640,7 @@ const w32_api w32_kernel32[] = {
      * the unhandled filter are in win32/seh.c, which kernel32 pulls in as its
      * second table. What is left here is the 64-bit table-driven unwinder,
      * which is not implemented. */
-    F(RtlPcToFileHeader, 2), F(RtlLookupFunctionEntry, 3), F(RtlVirtualUnwind, 8), F(RtlUnwindEx, 6),
+    F(RtlPcToFileHeader, 2), F(RtlLookupFunctionEntry, 3), F(RtlVirtualUnwind, 8),
     F(EncodePointer, 1), F(DecodePointer, 1), F(InitializeSListHead, 1), F(SetHandleCount, 1), F(GetLogicalDrives, 0), F(GetDriveTypeA, 1),
     F(GetComputerNameA, 2), F(GetUserNameA, 2), F(lstrlenA, 1), F(lstrlenW, 1), F(lstrcpyA, 2), F(lstrcpyW, 2), F(lstrcmpiA, 2),
     F(GetSystemDirectoryA, 2), F(GetWindowsDirectoryA, 2), F(IsProcessorFeaturePresent, 1), F(GetCurrentProcessorNumber, 0),

@@ -32,16 +32,17 @@ jobs:
         with: { submodules: recursive }
       - name: mingw-w64, and 7-Zip for the one fixture Python cannot make
         run: sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 g++-mingw-w64-x86-64 g++-mingw-w64-i686 p7zip-full
-      - name: Rebuild the guest programs
-        run: sh tests/win32/build.sh
       # BCJ2 -- 7-Zip's four-stream x86 filter -- has no encoder in liblzma, so
       # the fixture for it is made here and shipped with the guests, to be
-      # committed as tests/import/bcj2.7z.
+      # committed as tests/import/bcj2.7z. Made from the *committed* hello binaries,
+      # before build.sh rebuilds them: the test compares against what is in git.
       - name: A BCJ2 archive
         run: |
           rm -f tests/import/bcj2.7z
           7z a -m0=BCJ2 -m1=LZMA:d=64k -m2=LZMA:d=64k -m3=LZMA:d=64k -mb0:1 -mb0s1:2 -mb0s2:3 tests/import/bcj2.7z ./tests/win32/hello64.exe ./tests/win32/hello32.exe >/dev/null
           ls -la tests/import/bcj2.7z
+      - name: Rebuild the guest programs
+        run: sh tests/win32/build.sh
       - name: Run the suite against the fresh build
         run: |
           cmake -S . -B build-host -DCMAKE_BUILD_TYPE=RelWithDebInfo

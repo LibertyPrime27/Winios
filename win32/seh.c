@@ -502,7 +502,7 @@ static int cross_host_frame(w32 *w, uint64_t uctx) {
     uint64_t rip = rd64(w, uctx + CTX64_RIP);
     if (rip != w32_stub_return_addr(w) || !g_nresume) return 0;
     ctx_copy(w, uctx, g_resume_ctx[g_nresume - 1]);
-    return 1;
+    return rd64(w, uctx + CTX64_RIP) != rip;                     /* a resume point that is itself the stub would loop */
 }
 static void dc_write(w32 *w, uint64_t dc, uint64_t pc, uint64_t base, uint64_t entry, uint64_t frame, uint64_t target_ip,
                      uint64_t ctx, uint64_t handler, uint64_t hdata) {
@@ -518,11 +518,15 @@ static void dc_write(w32 *w, uint64_t dc, uint64_t pc, uint64_t base, uint64_t e
 static int dispatch64(w32 *w, uint64_t rec, uint64_t ctx) {
     xc_cpu *c = w32_cpu(w);
     uint64_t sp = c->gpr[XC_RSP];
-    uint64_t uctx = (sp - CTX64_SIZE - DC_SIZE - 64) & ~15ull, dc = uctx + CTX64_SIZE;
+    uint64_t uctx = (sp - 2 * CTX64_SIZE - DC_SIZE - 64) & ~15ull, dc = uctx + CTX64_SIZE, resume = dc + DC_SIZE;
     if (uctx < w32_self()->stack_limit) return 0;
     ctx_copy(w, uctx, ctx);
+    /* A private copy is what a walk resumes from past our host frame. The
+     * record the handlers see (`ctx`) is theirs to scribble on -- libgcc
+     * passes it to RtlUnwindEx as scratch -- so it cannot also be the anchor. */
+    ctx_copy(w, resume, ctx);
     c->gpr[XC_RSP] = uctx - 64;                                  /* handlers run below all of it */
-    if (g_nresume < 8) g_resume_ctx[g_nresume++] = ctx;
+    if (g_nresume < 8) g_resume_ctx[g_nresume++] = resume;
     int handled = 0;
     for (int steps = 0; steps < 4096 && !handled; steps++) {
         uint64_t pc = rd64(w, uctx + CTX64_RIP), base = 0;
@@ -563,10 +567,10 @@ static void unwind64(w32 *w, uint64_t target_frame, uint64_t target_ip, uint64_t
     xc_cpu *c = w32_cpu(w);
     uint64_t saved_rsp = c->gpr[XC_RSP];
     uint64_t sp = c->gpr[XC_RSP];
-    uint64_t scratch = (sp - 2 * CTX64_SIZE - DC_SIZE - ER64_SIZE - 128) & ~15ull;
+    uint64_t scratch = (sp - 3 * CTX64_SIZE - DC_SIZE - ER64_SIZE - 128) & ~15ull;
     if (scratch < w32_self()->stack_limit) { fprintf(stderr, "winrun: RtlUnwindEx: no stack for the unwind\n"); w32_exit(w, 129); return; }
     uint64_t ctx = ctx_arg && w32_mem_ok(w, ctx_arg, CTX64_SIZE) ? ctx_arg : scratch;
-    uint64_t next = scratch + CTX64_SIZE, dc = next + CTX64_SIZE, rec = urec ? urec : dc + DC_SIZE;
+    uint64_t next = scratch + CTX64_SIZE, dc = next + CTX64_SIZE, rec = urec ? urec : dc + DC_SIZE, resume = dc + DC_SIZE + ER64_SIZE;
     /* the caller's context: RtlUnwindEx returned to it, as far as the walk is concerned */
     { uint64_t ret = rd64(w, c->gpr[XC_RSP]); uint64_t rip0 = c->rip, rsp0 = c->gpr[XC_RSP];
       c->rip = ret; c->gpr[XC_RSP] = rsp0 + 8; w32_context_save(w, ctx); c->rip = rip0; c->gpr[XC_RSP] = rsp0; }
@@ -577,23 +581,26 @@ static void unwind64(w32 *w, uint64_t target_frame, uint64_t target_ip, uint64_t
     for (int steps = 0; steps < 4096; steps++) {
         uint64_t pc = rd64(w, ctx + CTX64_RIP), base = 0;
         uint64_t entry = lookup_entry(w, pc, &base);
+        if (w->verbose > 1) fprintf(stderr, "winrun: unwind64: pc %#llx rsp %#llx entry %#llx%s\n", (unsigned long long)pc, (unsigned long long)ctx_reg(w, ctx, 4), (unsigned long long)entry, pc == w32_stub_return_addr(w) ? "  (host stub)" : "");
         if (!entry) {
             if (cross_host_frame(w, ctx)) continue;
             uint64_t rsp = ctx_reg(w, ctx, 4);
-            if (!frame_in_stack(w, rsp)) break;
+            if (!frame_in_stack(w, rsp)) { if (w->verbose) fprintf(stderr, "winrun: unwind64: leaf with rsp %#llx outside the stack; stopping\n", (unsigned long long)rsp); break; }
             w32_write(w, ctx + CTX64_RIP, 8, rd64(w, rsp)); ctx_set(w, ctx, 4, rsp + 8);
             continue;
         }
         ctx_copy(w, next, ctx);
         uint64_t hdata = 0, frame = 0;
         uint64_t handler = virtual_unwind(w, UNW_FLAG_UHANDLER, base, pc, entry, next, &hdata, &frame);
-        if (!frame_in_stack(w, frame)) break;
+        if (w->verbose > 1) fprintf(stderr, "winrun: unwind64:   frame %#llx handler %#llx -> pc %#llx rsp %#llx\n", (unsigned long long)frame, (unsigned long long)handler, (unsigned long long)rd64(w, next + CTX64_RIP), (unsigned long long)ctx_reg(w, next, 4));
+        if (!frame_in_stack(w, frame)) { if (w->verbose) fprintf(stderr, "winrun: unwind64: frame %#llx outside the stack; stopping\n", (unsigned long long)frame); break; }
         if (target_frame && frame > target_frame) { fprintf(stderr, "winrun: RtlUnwindEx: passed the target frame %#llx at %#llx\n", (unsigned long long)target_frame, (unsigned long long)frame); break; }
         if (handler) {
             uint32_t fl = rd32(w, rec + ER64_FLAGS);
             if (frame == target_frame) w32_write(w, rec + ER64_FLAGS, 4, fl | EF_TARGET_UNWIND);
             dc_write(w, dc, pc, base, entry, frame, target_ip, ctx, handler, hdata);
-            if (g_nresume < 8) g_resume_ctx[g_nresume++] = ctx;
+            ctx_copy(w, resume, ctx);
+            if (g_nresume < 8) g_resume_ctx[g_nresume++] = resume;
             uint64_t args[4] = { rec, frame, ctx, dc };
             uint64_t r = (uint32_t)w32_call_guest(w, handler, 4, args);
             g_nresume--;

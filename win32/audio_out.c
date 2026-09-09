@@ -106,6 +106,7 @@ void w32_audio_src_set(int id, const w32_audio_src *s) {
         void *owner = t->s.owner;
         t->s = *s;
         if (!t->s.owner) t->s.owner = owner;
+        if (t->has_next) { t->next.playing = s->playing; t->next.vol_mB = s->vol_mB; t->next.pan_mB = s->pan_mB; t->next.freq = t->next.freq ? t->next.freq : s->freq; }
         if (restart) { uint32_t fb = frame_bytes(&t->s); t->pos_fp = (uint64_t)(fb ? s->start_byte / fb : 0) << 16; }
         set_gains(t);
     }
@@ -193,8 +194,9 @@ void w32_audio_mix(int16_t *out, int frames) {
                     if (!t->has_next) { s->playing = 0; break; }
                     /* the next block, from its start, without a gap: the
                      * fraction of a frame carried over is the resampler's */
-                    void *owner = s->owner;
+                    void *owner = s->owner; int playing = s->playing;
                     t->s = t->next; t->has_next = 0;
+                    t->s.playing = playing;                 /* the voice is playing; the block was queued before it started */
                     if (!t->s.owner) t->s.owner = owner; else free(owner);
                     s = &t->s;
                     fb = frame_bytes(s); total = fb ? s->size / fb : 0;

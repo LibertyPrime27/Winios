@@ -80,6 +80,22 @@ int main(int argc, char **argv) {
       snprintf(path, sizeof path, "%s/ramp.bin", out); file_is(path, ramp, sizeof ramp, "  ramp.bin comes back byte for byte"); }
     rmtree(out);
 
+    /* BCJ2, from 7-Zip itself (the guests job makes this one): two executables
+     * through the four-stream x86 filter and three LZMA coders */
+    snprintf(arc, sizeof arc, "%s/bcj2.7z", dir);
+    { FILE *f = fopen(arc, "rb"); if (f) { fclose(f);
+        rmtree(out); mkdir(out, 0755); err[0] = 0;
+        n = sz_extract(arc, out, 0, 0, &skipped, err, sizeof err);
+        ok(n == 2 && !skipped, err[0] ? err : "BCJ2 + LZMA x3: extracts");
+        for (int b = 0; b < 2; b++) {
+            const char *nm = b ? "hello32.exe" : "hello64.exe"; size_t want_n; char ref[4200];
+            snprintf(ref, sizeof ref, "%s/../win32/%s", dir, nm); unsigned char *want = slurp(ref, &want_n);
+            snprintf(path, sizeof path, "%s/%s", out, nm); char what[64]; snprintf(what, sizeof what, "  %s comes back byte for byte", nm);
+            file_is(path, want, want_n, what); free(want);
+        }
+        rmtree(out);
+    } else printf("skip BCJ2: %s not present yet (the guests job makes it)\n", arc); }
+
     /* damage is reported, not written */
     { size_t n7; snprintf(arc, sizeof arc, "%s/lzma1.7z", dir); unsigned char *p = slurp(arc, &n7);
       if (p && n7 > 100) { p[60] ^= 0x55; snprintf(path, sizeof path, "%s/.damaged.7z", dir); FILE *f = fopen(path, "wb"); fwrite(p, 1, n7, f); fclose(f);

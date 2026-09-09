@@ -371,7 +371,9 @@ static uint64_t make_voice(w32 *w, int kind, int ver, uint64_t engine) {
 }
 /* CreateSourceVoice(ppVoice, pFormat, Flags, MaxFrequencyRatio, pCallback, pSendList, pEffectChain) */
 static void e_CreateSourceVoice(w32 *w) {
-    uint64_t out = ARG(1), fmt = ARG(2), cb = ARG(4); int ver = (int)w32_com_get(w, ARG(0), E_VER);
+    /* (this, ppVoice, pFormat, Flags, MaxFrequencyRatio, pCallback, pSendList, pEffectChain): the float is
+     * argument 4 and the callback 5 -- the first version read the callback from the float's slot. */
+    uint64_t out = ARG(1), fmt = ARG(2), cb = ARG(5); int ver = (int)w32_com_get(w, ARG(0), E_VER);
     if (!out) { RET((uint64_t)(uint32_t)E_POINTER_); return; }
     if (!fmt || !w32_mem_ok(w, fmt, 16)) { RET((uint64_t)(uint32_t)E_INVALIDARG_); return; }
     uint32_t tag = (uint32_t)w32_read(w, fmt, 2), ch = (uint32_t)w32_read(w, fmt + 2, 2), rate = (uint32_t)w32_read(w, fmt + 4, 4), bits = (uint32_t)w32_read(w, fmt + 14, 2);

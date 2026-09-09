@@ -234,6 +234,13 @@ check spawntest32.exe 0
 # DirectInput: keyboard, relative mouse and the keyboard-as-gamepad, from injected input.
 checkx dinputtest64.exe dinputtest64.expected 0 -- -input dinputtest.script
 checkx dinputtest32.exe dinputtest32.expected 0 -- -input dinputtest.script
+# XAudio2: buffers submitted ahead come back in order through the callback; the
+# mixer runs on the wall clock here, so this waits for them (bounded).
+checkx xaudiotest64.exe xaudiotest64.expected 0
+checkx xaudiotest32.exe xaudiotest32.expected 0
+# C++ exceptions: on x64 the table-driven dispatcher through libgcc's real personality.
+check cxxtest64.exe 0
+check cxxtest32.exe 0
 # Threads. Every line of the expected output is true under every interleaving
 # -- "four threads each added 400, so the total is 1600" -- so a pass means
 # the locking held, not that the scheduler happened to be kind. Run twice for
