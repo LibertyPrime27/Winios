@@ -50,6 +50,15 @@ typedef struct w32_thread {
     int       depth;             /* w32_call_guest nesting, on this thread */
     int       used, running, finished;
     pthread_t host;
+    /* A thread-pool callback thread: what to call it with, and what to do
+     * first -- sleep for a timer, wait on a handle for a wait object. */
+    int       pool_kind;         /* 0: an ordinary thread */
+    int       pool_nargs;
+    uint64_t  pool_args[4];
+    uint64_t  pool_obj;          /* the work/timer/wait object, guest memory */
+    uint32_t  pool_delay_ms, pool_period_ms, pool_wait_ms;
+    uint64_t  pool_wait_handle;
+    uint32_t  pool_gen;          /* the object's generation when set; a later Set cancels this thread */
 } w32_thread;
 
 /* One host-implemented export. conv: 0 = stdcall/x64, callee pops (x86);
@@ -277,6 +286,7 @@ uint64_t w32_load_library(w32 *w, const char *name);                /* a guest D
 w32_module *w32_module_at(w32 *w, uint64_t base);                   /* the loaded image with that base, or NULL */
 uint64_t w32_module_export(w32 *w, uint64_t hmodule, const char *name, int ordinal);
 uint64_t w32_import_addr(w32 *w, const char *dll, const char *name, int ordinal, int depth);
+int      w32_dll_has(w32 *w, const char *dll, const char *name);     /* is `name` implemented for this built-in DLL? */
 void     w32_attach_modules(w32 *w);                                /* DllMain(DLL_PROCESS_ATTACH) for every new DLL */
 void     w32_thread_notify(w32 *w, int reason);                    /* DllMain(DLL_THREAD_ATTACH=2 / DETACH=3) for every attached DLL */
 /* A program this one asked to start. There is one process at a time, so it

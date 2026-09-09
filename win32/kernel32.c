@@ -475,8 +475,12 @@ static void k_GetProcAddress(w32 *w) {
          * that loads dsound or xinput lazily asks this way, and used to get
          * NULL for everything but the first four. */
         const char *dn = w32_builtin_dll_name(w, h);
-        if (dn && nm) a = w32_stub_for(w, dn, nm);
-        else if (dn) { const char *o = w32_ordinal_name(dn, ordinal); if (o) a = w32_stub_for(w, dn, o); }
+        /* Only a function that exists here. A stub for one that does not
+         * would be a lie the caller acts on: a C runtime that probes for
+         * CreateEventExW falls back to CreateEventW when told NULL, and
+         * fails fast when handed something that returns garbage. */
+        if (dn && nm) { if (w32_dll_has(w, dn, nm)) a = w32_stub_for(w, dn, nm); }
+        else if (dn) { const char *o = w32_ordinal_name(dn, ordinal); if (o && w32_dll_has(w, dn, o)) a = w32_stub_for(w, dn, o); }
     }
     if (w->verbose) {
         char ob[16]; if (!nm) snprintf(ob, sizeof ob, "#%d", ordinal);

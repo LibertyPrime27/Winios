@@ -62,6 +62,8 @@ for a in 32 64; do
     $CC -O2 -s -o wasapitest$a.exe wasapitest.c -lole32
     # Direct3D 9 shaders: vs_2_0 and ps_2_0 bytecode assembled by hand
     $CC -O2 -s -o d3dshader$a.exe d3dshader.c -ld3d9
+    # the thread pool, and GetProcAddress saying NULL for what is not here
+    $CC -O2 -s -o pooltest$a.exe pooltest.c
     $CC -O2 -s -o spawntest$a.exe spawntest.c -lshell32
     $CC -O2 -s -o dinputtest$a.exe dinputtest.c -ldinput8 -ldxguid
     $CC -O2 -s -o xaudiotest$a.exe xaudiotest.c -lole32

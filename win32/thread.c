@@ -160,6 +160,7 @@ static w32 *g_w;                              /* the process, for the thread bod
  * and re-enters the run loop, which is exactly the shape a thread procedure
  * needs: run until it returns, then take its return value as the exit code.
  */
+static uint64_t pool_body(w32 *w, w32_thread *t);
 static void *thread_body(void *arg) {
     w32_thread *t = arg;
     pthread_once(&g_once, make_key);
@@ -185,8 +186,9 @@ static void *thread_body(void *arg) {
     t->running = 1;
 
     w32_thread_notify(w, 2);                          /* DLL_THREAD_ATTACH, before the body */
-    uint64_t args[1] = { t->param };
-    uint64_t rc = w32_call_guest(w, t->entry, 1, args);
+    uint64_t rc;
+    if (t->pool_kind) rc = pool_body(w, t);
+    else { uint64_t args[1] = { t->param }; rc = w32_call_guest(w, t->entry, 1, args); }
     if (!w->exited) w32_thread_notify(w, 3);          /* DLL_THREAD_DETACH, after it */
 
     t->exit_code = (uint32_t)rc;
@@ -201,11 +203,215 @@ static void *thread_body(void *arg) {
     return 0;
 }
 
+/* --- the thread pool ------------------------------------------------------
+ *
+ * Vista's thread pool: work items, timers and waits, each a callback the
+ * pool runs on a thread of its own choosing. The C runtime probes for these
+ * and ConcRT (std::async, PPL) lives on them, so a program that finds them
+ * missing either falls back or fails, and one that finds a fake fails fast.
+ *
+ * Here every callback runs on a guest thread made for it, which is the
+ * pool's contract kept exactly if not efficiently: SubmitThreadpoolWork
+ * starts a thread that calls the work callback, SetThreadpoolTimer one that
+ * sleeps until the due time and calls the timer callback (again every
+ * period, until the timer is set to nothing), SetThreadpoolWait one that
+ * waits on the handle and calls the wait callback with the result. A pool
+ * object is 48 bytes of guest memory: the callback, its context, the kind,
+ * how many callbacks are outstanding (what the WaitFor* functions wait on),
+ * a generation that a new Set bumps so the previous timer thread ends, and
+ * an event to set when the callback returns. Environments, cleanup groups
+ * and pools proper are accepted and not modelled -- there is nothing to
+ * configure about a pool that makes a thread per callback.
+ */
+enum { POOL_WORK = 1, POOL_TIMER, POOL_WAIT, POOL_SIMPLE };
+enum { PO_CB = 0, PO_CTX = 8, PO_KIND = 16, PO_PENDING = 24, PO_GEN = 28, PO_EVENT = 32, PO_SIZE = 48 };
+static uint64_t spawn_pool(w32 *w, w32_thread **out);
+static int spawn_launch(w32 *w, w32_thread *t);
+static uint64_t now_ms(void);
+static uint64_t spawn(w32 *w, uint64_t entry, uint64_t param, uint64_t stack_size, uint32_t *out_id);
+
+/* sleep with the guest lock released, until the time is up, the process
+ * exits, or the object's generation moves on; 1 if the wait ran out */
+static int pool_sleep(w32 *w, w32_thread *t, uint32_t ms) {
+    uint64_t until = now_ms() + ms;
+    for (;;) {
+        if (g_exiting || w->exited) return 0;
+        if (t->pool_obj && (uint32_t)w32_read(w, t->pool_obj + PO_GEN, 4) != t->pool_gen) return 0;
+        uint64_t now = now_ms();
+        if (now >= until) return 1;
+        uint64_t left = until - now; if (left > 20) left = 20;
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += (long)left * 1000000L;
+        while (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&g_change, &g_guest, &ts);
+    }
+}
+static uint32_t wait_one(w32 *w, uint64_t hv, uint32_t ms);
+static void pool_done(w32 *w, w32_thread *t) {
+    if (!t->pool_obj) return;
+    uint32_t p = (uint32_t)w32_read(w, t->pool_obj + PO_PENDING, 4);
+    if (p) w32_write(w, t->pool_obj + PO_PENDING, 4, p - 1);
+    uint64_t ev = w32_read(w, t->pool_obj + PO_EVENT, 8);
+    if (ev) { w32_event_set(w, ev); w32_write(w, t->pool_obj + PO_EVENT, 8, 0); }
+    pthread_cond_broadcast(&g_change);
+}
+static uint64_t pool_body(w32 *w, w32_thread *t) {
+    uint64_t rc = 0;
+    switch (t->pool_kind) {
+    case POOL_TIMER:
+        if (!pool_sleep(w, t, t->pool_delay_ms)) break;
+        for (;;) {
+            rc = w32_call_guest(w, t->entry, t->pool_nargs, t->pool_args);
+            if (!t->pool_period_ms || w->exited) break;
+            if (!pool_sleep(w, t, t->pool_period_ms)) break;
+        }
+        break;
+    case POOL_WAIT: {
+        uint32_t r = wait_one(w, t->pool_wait_handle, t->pool_wait_ms);
+        if (w->exited || g_exiting) break;
+        if (t->pool_obj && (uint32_t)w32_read(w, t->pool_obj + PO_GEN, 4) != t->pool_gen) break;   /* re-set or cancelled meanwhile */
+        t->pool_args[3] = r;
+        rc = w32_call_guest(w, t->entry, t->pool_nargs, t->pool_args);
+        break;
+    }
+    default:
+        rc = w32_call_guest(w, t->entry, t->pool_nargs, t->pool_args);
+        break;
+    }
+    if (!w->exited) pool_done(w, t);
+    return rc;
+}
+static uint64_t pool_new(w32 *w, int kind, uint64_t cb, uint64_t ctx) {
+    uint64_t o = w32_heap_alloc(w, PO_SIZE);
+    if (!o) return 0;
+    for (int i = 0; i < PO_SIZE; i += 8) w32_write(w, o + i, 8, 0);
+    w32_write(w, o + PO_CB, 8, cb); w32_write(w, o + PO_CTX, 8, ctx); w32_write(w, o + PO_KIND, 4, (uint32_t)kind);
+    return o;
+}
+/* start the thread that runs one callback of `obj`; the arguments are the
+ * callback's (instance, context, object[, result]) */
+static int pool_start(w32 *w, uint64_t obj, int kind, int nargs, uint32_t delay_ms, uint32_t period_ms, uint64_t wait_h, uint32_t wait_ms) {
+    uint64_t cb = w32_read(w, obj + PO_CB, 8), ctx = w32_read(w, obj + PO_CTX, 8);
+    if (!cb) return 0;
+    w32_thread *t = 0;
+    uint32_t pending = (uint32_t)w32_read(w, obj + PO_PENDING, 4);
+    w32_write(w, obj + PO_PENDING, 4, pending + 1);
+    uint64_t h = spawn_pool(w, &t);
+    if (!h || !t) { w32_write(w, obj + PO_PENDING, 4, pending); return 0; }
+    t->pool_kind = kind; t->pool_nargs = nargs; t->pool_obj = obj;
+    t->pool_args[0] = obj; t->pool_args[1] = ctx; t->pool_args[2] = obj; t->pool_args[3] = 0;
+    t->pool_delay_ms = delay_ms; t->pool_period_ms = period_ms;
+    t->pool_wait_handle = wait_h; t->pool_wait_ms = wait_ms;
+    t->pool_gen = (uint32_t)w32_read(w, obj + PO_GEN, 4);
+    t->entry = cb;
+    /* the thread was made without being started; now that it knows its job, off it goes */
+    if (!spawn_launch(w, t)) { w32_write(w, obj + PO_PENDING, 4, pending); return 0; }
+    return 1;
+}
+/* wait until no callback of `obj` is outstanding */
+static void pool_wait_idle(w32 *w, uint64_t obj) {
+    while (!g_exiting && !w->exited && obj && w32_read(w, obj + PO_PENDING, 4)) {
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 20 * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&g_change, &g_guest, &ts);
+    }
+}
+/* a FILETIME due time in milliseconds from now: negative is relative (in
+ * 100 ns units), positive is absolute since 1601 */
+static uint32_t due_ms(w32 *w, uint64_t pft) {
+    if (!pft || !w32_mem_ok(w, pft, 8)) return 0;
+    int64_t ft = (int64_t)w32_read(w, pft, 8);
+    if (ft < 0) return (uint32_t)((-ft) / 10000);
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    int64_t now = (int64_t)ts.tv_sec * 10000000 + ts.tv_nsec / 100 + 116444736000000000LL;
+    return ft > now ? (uint32_t)((ft - now) / 10000) : 0;
+}
+static void k_CreateThreadpoolWork(w32 *w)  { RET(pool_new(w, POOL_WORK, ARG(0), ARG(1))); }
+static void k_CreateThreadpoolTimer(w32 *w) { RET(pool_new(w, POOL_TIMER, ARG(0), ARG(1))); }
+static void k_CreateThreadpoolWait(w32 *w)  { RET(pool_new(w, POOL_WAIT, ARG(0), ARG(1))); }
+static void k_SubmitThreadpoolWork(w32 *w) {
+    /* the callback is (instance, context, work) */
+    if (ARG(0)) pool_start(w, ARG(0), POOL_WORK, 3, 0, 0, 0, 0);
+}
+/* SetThreadpoolTimer(timer, pftDueTime, msPeriod, msWindowLength): a NULL
+ * due time cancels; setting again supersedes the previous setting. */
+static void k_SetThreadpoolTimer(w32 *w) {
+    uint64_t o = ARG(0);
+    if (!o) return;
+    w32_write(w, o + PO_GEN, 4, (uint32_t)w32_read(w, o + PO_GEN, 4) + 1);      /* ends the thread of the previous setting */
+    if (!ARG(1)) return;
+    pool_start(w, o, POOL_TIMER, 3, due_ms(w, ARG(1)), (uint32_t)ARG(2), 0, 0);
+}
+static void k_IsThreadpoolTimerSet(w32 *w) { RET(ARG(0) && w32_read(w, ARG(0) + PO_PENDING, 4) ? 1 : 0); }
+/* SetThreadpoolWait(wait, handle, pftTimeout): the callback is
+ * (instance, context, wait, waitResult); a NULL handle cancels. */
+static void k_SetThreadpoolWait(w32 *w) {
+    uint64_t o = ARG(0);
+    if (!o) return;
+    w32_write(w, o + PO_GEN, 4, (uint32_t)w32_read(w, o + PO_GEN, 4) + 1);
+    if (!ARG(1)) return;
+    uint32_t ms = ARG(2) ? due_ms(w, ARG(2)) : 0xFFFFFFFFu;
+    if (ARG(2) && w32_mem_ok(w, ARG(2), 8) && w32_read(w, ARG(2), 8) == 0) ms = 0;            /* a zero timeout: report now */
+    pool_start(w, o, POOL_WAIT, 4, 0, 0, ARG(1), ms);
+}
+static void k_WaitForThreadpoolCallbacks(w32 *w) {
+    /* (object, cancelPending): pending callbacks that have not started
+     * would be dropped by `cancel`; here every submitted callback has its
+     * thread already, so all of them run, and the wait is for all */
+    pool_wait_idle(w, ARG(0));
+}
+static void k_CloseThreadpoolObject(w32 *w) {
+    /* the memory stays: a thread may still be finishing on it */
+    if (ARG(0)) w32_write(w, ARG(0) + PO_GEN, 4, (uint32_t)w32_read(w, ARG(0) + PO_GEN, 4) + 1);
+}
+/* TrySubmitThreadpoolCallback(callback, context, environment): a one-off
+ * work item without an object to wait on; the callback is (instance, context). */
+static void k_TrySubmitThreadpoolCallback(w32 *w) {
+    uint64_t o = pool_new(w, POOL_SIMPLE, ARG(0), ARG(1));
+    RET(o && pool_start(w, o, POOL_SIMPLE, 2, 0, 0, 0, 0) ? 1 : 0);
+}
+static void k_CreateThreadpool(w32 *w) { RET(w32_heap_alloc(w, 16)); }
+static void k_CloseThreadpool(w32 *w) { (void)w; }
+static void k_SetThreadpoolThreadMaximum(w32 *w) { (void)w; }
+static void k_SetThreadpoolThreadMinimum(w32 *w) { RET(1); }
+static void k_CreateThreadpoolCleanupGroup(w32 *w) { RET(w32_heap_alloc(w, 16)); }
+/* CloseThreadpoolCleanupGroupMembers waits for every outstanding callback of
+ * the group's objects; the group is not tracked, so it waits for every pool
+ * thread there is, which includes them. */
+static void k_CloseThreadpoolCleanupGroupMembers(w32 *w) {
+    for (;;) {
+        int busy = 0;
+        for (int i = 0; i < W32_MAX_THREADS; i++) if (g_threads[i].used && g_threads[i].pool_kind && !g_threads[i].finished && &g_threads[i] != w32_self()) busy = 1;
+        if (!busy || g_exiting || w->exited) break;
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 20 * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&g_change, &g_guest, &ts);
+    }
+}
+static void k_CloseThreadpoolCleanupGroup(w32 *w) { (void)w; }
+static void k_CallbackMayRunLong(w32 *w) { RET(1); }
+static void k_DisassociateCurrentThreadFromCallback(w32 *w) { (void)w; }
+static void k_FreeLibraryWhenCallbackReturns(w32 *w) { (void)w; }
+/* (instance, event): the instance is the object; the event is set when the
+ * callback returns, in pool_done */
+static void k_SetEventWhenCallbackReturns(w32 *w) { if (ARG(0) && w32_mem_ok(w, ARG(0), PO_SIZE)) w32_write(w, ARG(0) + PO_EVENT, 8, ARG(1)); }
+static void k_ReleaseSemaphoreWhenCallbackReturns(w32 *w) {
+    /* released now rather than at return: a semaphore released a little
+     * early is a race nobody has lost yet, and there is one slot to remember one thing in */
+    w32_handle *h = w32_handle_get(w, ARG(1));
+    if (h) { h->u1 += ARG(2); h->flags |= 1u; pthread_cond_broadcast(&g_change); }
+}
+static void k_ReleaseMutexWhenCallbackReturns(w32 *w) { (void)w; }
+static void k_LeaveCriticalSectionWhenCallbackReturns(w32 *w) { (void)w; }
+
 /* The one path that starts a thread. CreateThread, _beginthreadex and
  * _beginthread all reach it; they differ only in which argument is which, so
  * they read their own arguments and call this with them named. Returns the
  * handle, or 0 with the last error set. */
-static uint64_t spawn(w32 *w, uint64_t entry, uint64_t param, uint64_t stack_size, uint32_t *out_id) {
+static int spawn_launch(w32 *w, w32_thread *t);
+static uint64_t spawn_prepare(w32 *w, uint64_t entry, uint64_t param, uint64_t stack_size, uint32_t *out_id, w32_thread **out_thread) {
     g_w = w;
     if (!entry) { w32_set_last_error(w, 87); return 0; }        /* ERROR_INVALID_PARAMETER */
     if (g_nthreads >= W32_MAX_THREADS) {
@@ -262,20 +468,30 @@ static uint64_t spawn(w32 *w, uint64_t entry, uint64_t param, uint64_t stack_siz
     if (hh) { hh->flags = 0; hh->u1 = t->id; }         /* unsignalled until it finishes */
     t->handle = h;
     if (out_id) *out_id = t->id;
-
+    if (out_thread) { *out_thread = t; return h; }     /* the pool fills in the job, then launches */
+    return spawn_launch(w, t) ? h : 0;
+}
+static int spawn_launch(w32 *w, w32_thread *t) {
     g_nthreads++;
     if (pthread_create(&t->host, 0, thread_body, t)) {
         g_nthreads--;
         t->used = 0;
-        w32_handle_close(w, h);
+        w32_handle_close(w, t->handle);
         fprintf(stderr, "winrun: CreateThread: the host refused a thread\n");
         w32_set_last_error(w, 8);
         return 0;
     }
     pthread_detach(t->host);
-    if (w->verbose) fprintf(stderr, "winrun: thread %u started at %#llx\n",
-                            t->id, (unsigned long long)entry);
-    return h;
+    if (w->verbose) fprintf(stderr, "winrun: thread %u started at %#llx%s\n",
+                            t->id, (unsigned long long)t->entry, t->pool_kind ? " (thread pool)" : "");
+    return 1;
+}
+static uint64_t spawn(w32 *w, uint64_t entry, uint64_t param, uint64_t stack_size, uint32_t *out_id) {
+    return spawn_prepare(w, entry, param, stack_size, out_id, 0);
+}
+/* a thread for the pool: a small stack, made but not yet running */
+static uint64_t spawn_pool(w32 *w, w32_thread **out) {
+    return spawn_prepare(w, 1, 0, 256u << 10, 0, out);
 }
 
 /* CreateThread(sa, stackSize, start, param, flags, pTid) */
@@ -436,6 +652,16 @@ static void ev_create(w32 *w, int wide) {
 }
 static void k_CreateEventA(w32 *w) { ev_create(w, 0); }
 static void k_CreateEventW(w32 *w) { ev_create(w, 1); }
+/* CreateEventExW(attributes, name, flags, access): CREATE_EVENT_MANUAL_RESET
+ * is 1, CREATE_EVENT_INITIAL_SET is 2 -- the same two facts as CreateEventW
+ * carries in its two BOOLs. */
+static void k_CreateEventExW(w32 *w) {
+    uint32_t flags = (uint32_t)ARG(2);
+    uint64_t h = w32_handle_new(w, H_EVENT, -1);
+    w32_handle *hh = w32_handle_get(w, h);
+    if (hh) hh->flags = ((flags & 2) ? 1u : 0u) | ((flags & 1) ? 2u : 0u);
+    RET(h);
+}
 /* SetEvent from host code: dsound.c signals a buffer's position events from
  * the guest thread, where a program waiting on one is in the loop below. */
 void w32_event_set(w32 *w, uint64_t h) {
@@ -486,6 +712,7 @@ static void sem_create(w32 *w) {
 }
 static void k_CreateSemaphoreA(w32 *w) { sem_create(w); }
 static void k_CreateSemaphoreW(w32 *w) { sem_create(w); }
+static void k_CreateSemaphoreExW(w32 *w) { sem_create(w); }      /* (attributes, initial, maximum, name, flags, access): the first three are what matter */
 static void k_ReleaseSemaphore(w32 *w) {
     w32_handle *h = w32_handle_get(w, ARG(0));
     if (!h) { RET(0); return; }
@@ -776,6 +1003,21 @@ const w32_api w32_thread_api[] = {
     F(InterlockedIncrement, 1), F(InterlockedDecrement, 1), F(InterlockedExchange, 2),
     F(InterlockedExchangeAdd, 2), F(InterlockedCompareExchange, 3),
     F(InterlockedExchangePointer, 2), F(InterlockedCompareExchangePointer, 3),
+    F(CreateEventExW, 4), F(CreateSemaphoreExW, 6),
+    /* the thread pool */
+    F(CreateThreadpoolWork, 3), F(SubmitThreadpoolWork, 1), F(CreateThreadpoolTimer, 3), F(SetThreadpoolTimer, 4),
+    F(IsThreadpoolTimerSet, 1), F(CreateThreadpoolWait, 3), F(SetThreadpoolWait, 3), F(TrySubmitThreadpoolCallback, 3),
+    { "WaitForThreadpoolWorkCallbacks",  2, 0, k_WaitForThreadpoolCallbacks, 0 },
+    { "WaitForThreadpoolTimerCallbacks", 2, 0, k_WaitForThreadpoolCallbacks, 0 },
+    { "WaitForThreadpoolWaitCallbacks",  2, 0, k_WaitForThreadpoolCallbacks, 0 },
+    { "CloseThreadpoolWork",  1, 0, k_CloseThreadpoolObject, 0 },
+    { "CloseThreadpoolTimer", 1, 0, k_CloseThreadpoolObject, 0 },
+    { "CloseThreadpoolWait",  1, 0, k_CloseThreadpoolObject, 0 },
+    F(CreateThreadpool, 1), F(CloseThreadpool, 1), F(SetThreadpoolThreadMaximum, 2), F(SetThreadpoolThreadMinimum, 2),
+    F(CreateThreadpoolCleanupGroup, 0), F(CloseThreadpoolCleanupGroupMembers, 3), F(CloseThreadpoolCleanupGroup, 1),
+    F(CallbackMayRunLong, 1), F(DisassociateCurrentThreadFromCallback, 1), F(FreeLibraryWhenCallbackReturns, 2),
+    F(SetEventWhenCallbackReturns, 2), F(ReleaseSemaphoreWhenCallbackReturns, 3), F(ReleaseMutexWhenCallbackReturns, 2),
+    F(LeaveCriticalSectionWhenCallbackReturns, 2),
     { 0, 0, 0, 0, 0 },
 };
 const w32_api w32_thread_crt[] = {

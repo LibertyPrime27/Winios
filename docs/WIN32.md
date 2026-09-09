@@ -1671,6 +1671,18 @@ where to read more.
   draw's shaded triangles and hand them over at once; rows are dealt out in
   bands, so the result is what one thread would have drawn. `WINRUN_THREADS=1`
   turns it off. The interpreters' scratch state is thread-local for this.
+- **`GetProcAddress` says NULL** for a function no built-in DLL has, with
+  `ERROR_PROC_NOT_FOUND`, instead of a stub that reports itself when called.
+  Every C runtime probes kernel32 for the functions newer than its minimum
+  Windows and falls back on NULL; handed a stub, the Spamton runner's CRT
+  called `CreateEventExW`, got a made-up value and failed fast at 147 ms.
+  Statically imported names still get the reporting stub -- there is no
+  fallback path to take for those.
+- **The thread pool** (`thread.c`): `CreateThreadpoolWork/Timer/Wait`, the
+  `Set`/`Submit`/`WaitFor*Callbacks`/`Close` calls, `TrySubmitThreadpoolCallback`,
+  cleanup groups and the "when the callback returns" helpers, plus
+  `CreateEventExW` and `CreateSemaphoreExW`. Every callback runs on a guest
+  thread made for it: exact, not efficient. `pooltest.exe`.
 - **For testing a build**: the run report carries the last 48 API calls before
   the end, a subsystems block (audio device, sources and WASAPI streams,
   DirectInput devices, JIT, rasterizer threads, D3D9 draws through shaders

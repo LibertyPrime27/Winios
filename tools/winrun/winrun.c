@@ -139,15 +139,17 @@ int w32_mem_ok(w32 *w, uint64_t addr, uint64_t len) {
 /* Said once per address, and only when asked for. A program that walks off
  * the end of something does it in a loop, and a line per iteration is the log
  * flood that got the process killed for CPU in the first place. */
+static int g_cur_stub = -1;            /* the API being executed, for the message below */
 static void note_bad_pointer(w32 *w, uint64_t addr, uint64_t len, const char *what) {
     static uint64_t seen[16];
     static int n;
     if (!w->verbose) return;
     for (int i = 0; i < n; i++) if (seen[i] == addr) return;
     if (n < 16) seen[n++] = addr;
+    const char *api = g_cur_stub >= 0 && g_cur_stub < w->nstubs && w->stubs[g_cur_stub].api ? w->stubs[g_cur_stub].api->name : 0;
     fprintf(stderr, "winrun: %s of %llu bytes at %#llx is not mapped guest memory; "
-                    "ignored rather than faulting the host\n",
-            what, (unsigned long long)len, (unsigned long long)addr);
+                    "ignored rather than faulting the host%s%s%s\n",
+            what, (unsigned long long)len, (unsigned long long)addr, api ? "  (in " : "", api ? api : "", api ? ")" : "");
 }
 
 /* Guest memory is never executed by the host -- the interpreter reads it and
@@ -557,6 +559,27 @@ const char *w32_builtin_dll_name(w32 *w, uint64_t h) {
     return 0;
 }
 
+/* Does any built-in table implement `name` for `dll`? GetProcAddress asks
+ * this before handing out a stub: a program that probes for a function --
+ * every C runtime does, for the ones newer than its minimum Windows -- must
+ * get NULL for one we do not have and take its fallback, not a stub that
+ * returns a made-up value when called. The Spamton runner's CRT probed
+ * CreateEventExW, CreateSemaphoreExW and CreateThreadpoolTimer, was told yes
+ * three times, and failed fast a few calls later. */
+int w32_dll_has(w32 *w, const char *dll, const char *name) {
+    (void)w;
+    int d = -1;
+    for (int k = 0; k < NDLLS; k++) if (!strcmp(g_dlls[k].name, dll)) d = k;
+    if (d < 0 && !strncmp(dll, "api-ms-win-crt", 14)) d = 1;
+    if (d < 0 && (!strncmp(dll, "vcruntime", 9) || !strncmp(dll, "ucrtbase", 8) || !strncmp(dll, "msvcr", 5))) d = 1;
+    if (d < 0 && !strncmp(dll, "api-ms-win", 10)) d = 0;
+    if (d < 0) return 0;
+    for (int t = 0; t < W32_DLL_TABLES; t++) {
+        const w32_api *tab = g_dlls[d].apis[t];
+        for (const w32_api *a = tab; a && a->name; a++) if (!strcmp(a->name, name)) return 1;
+    }
+    return 0;
+}
 uint64_t w32_stub_for(w32 *w, const char *dll, const char *name) {
     int d = -1;
     for (int k = 0; k < NDLLS; k++) if (!strcmp(g_dlls[k].name, dll)) d = k;
@@ -664,7 +687,14 @@ static void trace_call(w32 *w, int i) {
     for (int k = 0; k < 4; k++) t->a[k] = w32_arg(w, k);
 }
 
+static void dispatch_inner(w32 *w, int i);
 static void dispatch(w32 *w, int i) {
+    int prev = g_cur_stub;
+    g_cur_stub = i;
+    dispatch_inner(w, i);
+    g_cur_stub = prev;
+}
+static void dispatch_inner(w32 *w, int i) {
     xc_cpu *c = w32_cpu(w);
     const w32_api *a = w->stubs[i].api;
     trace_call(w, i);
