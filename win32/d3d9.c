@@ -1660,7 +1660,15 @@ static void d_GetPixelShaderConstantI(w32 *w) { const_get(w, g_psi, 16, 16); }
 static void d_SetPixelShaderConstantB(w32 *w) { bools_set(w, &g_psb); }
 static void d_GetPixelShaderConstantB(w32 *w) { bools_get(w, g_psb); }
 
-static void d_SetFVF(w32 *w) { w32_com_set(w, ARG(0), DEV_FVF, ARG(1)); RET(S_OK_); }
+/* SetFVF replaces the current vertex declaration with the one the format
+ * implies -- so a program that drew with a declaration and then falls back
+ * to an FVF for its next quad must not have the stale declaration read its
+ * vertices. d3dshader.exe's second quad went off-screen exactly that way. */
+static void d_SetFVF(w32 *w) {
+    w32_com_set(w, ARG(0), DEV_FVF, ARG(1));
+    if ((uint32_t)ARG(1) != 0) w32_com_set(w, ARG(0), DEV_DECL, 0);
+    RET(S_OK_);
+}
 static void d_GetFVF(w32 *w) {
     uint64_t out = ARG(1);
     if (out) w32_write(w, out, 4, w32_com_get(w, ARG(0), DEV_FVF));

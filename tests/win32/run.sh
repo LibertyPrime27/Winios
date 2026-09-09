@@ -238,6 +238,11 @@ checkx dinputtest32.exe dinputtest32.expected 0 -- -input dinputtest.script
 # mixer runs on the wall clock here, so this waits for them (bounded).
 checkx xaudiotest64.exe xaudiotest64.expected 0
 checkx xaudiotest32.exe xaudiotest32.expected 0
+# WASAPI: the enumerator, an event-driven stream over the mixer, the clock.
+# Judged by its own count rather than a recording: the run prints how long
+# the first event took, which is a clock and not a number to record.
+checkrc wasapitest64.exe 0 "0 failures"
+checkrc wasapitest32.exe 0 "0 failures"
 # C++ exceptions: on x64 the table-driven dispatcher through libgcc's real personality.
 check cxxtest64.exe 0
 check cxxtest32.exe 0

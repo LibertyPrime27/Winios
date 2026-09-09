@@ -10,7 +10,8 @@
  * test_sm3.c does on the host, so the test does not depend on a shader
  * compiler being present at build time. Three quads: one through both
  * shaders (a vertex declaration, a constant matrix, a texture sampled and
- * tinted, and texkill cutting three quarters away); one through the pixel
+ * tinted, and texkill cutting away the strips where u or v is below one
+ * half); one through the pixel
  * shader alone with the fixed-function transform in front of it; one through
  * the vertex shader alone with the fixed-function texture-times-colour after
  * it. The frame checksum is what makes it a test.
@@ -84,7 +85,7 @@ int main(void) {
     IDirect3DVertexShader9 *vs = NULL;
     ok(IDirect3DDevice9_CreateVertexShader(dev, code, &vs) == D3D_OK && vs, "CreateVertexShader(vs_2_0)");
 
-    /* ps_2_0: r0 = tex(t0) * v0 * c0; kill where t0 - c1 < 0 (the top-left three quarters); oC0 = r0 */
+    /* ps_2_0: r0 = tex(t0) * v0 * c0; kill where t0 - 0.5 < 0 in u or in v; oC0 = r0 */
     begin(0, 2, 0);
     dcl(D3DDECLUSAGE_COLOR, 0, V, 0); dcl(D3DDECLUSAGE_TEXCOORD, 0, T, 0); dcl_sampler(0);
     op(TEXLD); dst(R, 0, 0xF); src(T, 0, XYZW); src(SMP, 0, XYZW); end();
@@ -152,18 +153,21 @@ int main(void) {
     ok(IDirect3DDevice9_EndScene(dev) == D3D_OK, "EndScene");
     ok(IDirect3DDevice9_Present(dev, NULL, NULL, NULL, NULL) == D3D_OK, "Present");
 
-    /* look at the back buffer: quad 1's kept quarter is tinted red/blue checks, the killed part is background */
+    /* look at the back buffer: quad 1's kept part is tinted red/blue checks, its killed strips are
+     * background; quad 2's kept quarter is the texture times green, which for red and blue texels is black */
     IDirect3DSurface9 *bb2 = NULL;
     if (IDirect3DDevice9_GetBackBuffer(dev, 0, 0, D3DBACKBUFFER_TYPE_MONO, &bb2) == D3D_OK && bb2) {
         D3DLOCKED_RECT r;
         if (IDirect3DSurface9_LockRect(bb2, &r, NULL, D3DLOCK_READONLY) == D3D_OK) {
             DWORD killed = ((DWORD *)((BYTE *)r.pBits + 30 * r.Pitch))[20] & 0xFFFFFF;
             DWORD kept = ((DWORD *)((BYTE *)r.pBits + 110 * r.Pitch))[100] & 0xFFFFFF;
-            DWORD q2px = ((DWORD *)((BYTE *)r.pBits + 30 * r.Pitch))[134] & 0xFFFFFF;
+            DWORD q2px = ((DWORD *)((BYTE *)r.pBits + 66 * r.Pitch))[170] & 0xFFFFFF;
+            DWORD q2killed = ((DWORD *)((BYTE *)r.pBits + 30 * r.Pitch))[134] & 0xFFFFFF;
             ok(killed == 0x202020, "texkill left the background where t0 < 0.5");
-            ok(kept == 0xFF0000 || kept == 0x000080, "the kept quarter is the texture, tinted (red, or blue at half)");
-            ok(q2px == 0x000000 || q2px == 0x008000, "the pixel-shader-only quad is the texture times green");
-            printf("  pixels: killed %06lx kept %06lx quad2 %06lx\n", (unsigned long)killed, (unsigned long)kept, (unsigned long)q2px);
+            ok(kept == 0xFF0000 || kept == 0x000080, "the kept part is the texture, tinted (red, or blue at half)");
+            ok(q2px == 0x000000, "the pixel-shader-only quad's kept quarter is the texture times green: black");
+            ok(q2killed == 0x202020, "  and texkill cut its other three quarters");
+            printf("  pixels: killed %06lx kept %06lx quad2 %06lx / %06lx\n", (unsigned long)killed, (unsigned long)kept, (unsigned long)q2px, (unsigned long)q2killed);
             IDirect3DSurface9_UnlockRect(bb2);
         }
         IDirect3DSurface9_Release(bb2);
