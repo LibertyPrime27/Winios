@@ -140,6 +140,10 @@ int w32_mem_ok(w32 *w, uint64_t addr, uint64_t len) {
  * the end of something does it in a loop, and a line per iteration is the log
  * flood that got the process killed for CPU in the first place. */
 static int g_cur_stub = -1;            /* the API being executed, for the message below */
+/* Why the run stopped, kept for the end of the report. The line that says so
+ * is printed to stderr when it happens, but the device shows the tail of a
+ * long log, so the same facts go at the end where they will be seen. */
+static struct { int valid, has_addr; uint32_t code; uint64_t rip, addr; char dis[128]; } g_why;
 static void note_bad_pointer(w32 *w, uint64_t addr, uint64_t len, const char *what) {
     static uint64_t seen[16];
     static int n;
@@ -554,6 +558,12 @@ uint64_t w32_module_handle(w32 *w, const char *name) {
     return 0;
 }
 
+/* Has any stub of built-in DLL `d` been made? That is what "loaded" means for
+ * a DLL that is a table: the report names the ones a program touched. */
+static int w32_builtin_used(w32 *w, int d) {
+    for (int i = STUB_FIRST; i < w->nstubs; i++) if (w->stubs[i].dll == &g_dlls[d]) return 1;
+    return 0;
+}
 const char *w32_builtin_dll_name(w32 *w, uint64_t h) {
     for (int d = 0; d < NDLLS; d++) if (h == w->stub_base + 0x10000u * (d + 1)) return g_dlls[d].name;
     return 0;
@@ -675,7 +685,7 @@ static void note_unimplemented(w32 *w, const char *name) {
  * arguments, no formatting until a report is written, so it costs a few
  * stores per call. */
 enum { TRACE_N = 48 };
-typedef struct { const char *dll, *name; uint64_t a[4]; int missing; char str[48]; } trace_ent;
+typedef struct { const char *dll, *name; uint64_t a[4]; int missing, has_ret; uint64_t ret; char str[48]; } trace_ent;
 static trace_ent g_trace[TRACE_N];
 static unsigned g_trace_n;
 /* For the calls whose one interesting argument is a string -- which library,
@@ -695,6 +705,7 @@ static void trace_call(w32 *w, int i) {
     t->dll = w->stubs[i].dll ? w->stubs[i].dll->name : 0;
     t->name = api ? api->name : (w->stubs[i].missing ? w->stubs[i].missing : "?");
     t->missing = !api;
+    t->has_ret = 0; t->ret = 0;
     for (int k = 0; k < 4; k++) t->a[k] = w32_arg(w, k);
     t->str[0] = 0;
     if (api && api->name) {
@@ -780,7 +791,11 @@ static void dispatch_inner(w32 *w, int i) {
                                 (unsigned long long)w32_arg(w, 0), (unsigned long long)w32_arg(w, 1),
                                 (unsigned long long)w32_arg(w, 2), (unsigned long long)w32_arg(w, 3));
     uint64_t rsp = c->gpr[XC_RSP];
+    unsigned trace_at = g_trace_n ? (g_trace_n - 1) % TRACE_N : 0;
     a->fn(w);
+    /* the result, for the report: a GetProcAddress that answered NULL is
+     * the whole story of a program that then gave up */
+    if (g_trace[trace_at].name == a->name) { g_trace[trace_at].has_ret = 1; g_trace[trace_at].ret = c->gpr[XC_RAX]; }
     if (w->exited) return;
     /* An implementation that set rip and rsp itself -- RaiseException handing
      * control to a handler, NtContinue restoring a context -- has already
@@ -865,6 +880,9 @@ static int run_loop(w32 *w) {
             uint64_t ea = 0; uint32_t code = w32_last_exception(&ea);
             w->stop_reason = "an unhandled exception";
             char dis[128]; xc_disasm(c, at, dis, sizeof dis);
+            g_why.valid = 1; g_why.code = code; g_why.rip = at; g_why.addr = kind == XC_STOP_FAULT && c->fault_kind == XC_FAULT_MEM ? addr : 0;
+            g_why.has_addr = kind == XC_STOP_FAULT && c->fault_kind == XC_FAULT_MEM;
+            snprintf(g_why.dis, sizeof g_why.dis, "%s", dis);
             fprintf(stderr, "winrun: unhandled %s (%#x) at rip=%#llx  [%s]",
                     w32_exception_name(code), code, (unsigned long long)at, dis);
             if (kind == XC_STOP_FAULT && c->fault_kind == XC_FAULT_MEM)
@@ -874,6 +892,8 @@ static int run_loop(w32 *w) {
         }
         w->stop_reason = xc_stop_name(st);
         char dis[128]; xc_disasm(c, c->rip, dis, sizeof dis);
+        g_why.valid = 1; g_why.code = 0; g_why.rip = c->rip; g_why.has_addr = 0;
+        snprintf(g_why.dis, sizeof g_why.dis, "%s", dis);
         fprintf(stderr, "winrun: stopped: %s at rip=%#llx  [%s]", xc_stop_name(st), (unsigned long long)c->rip, dis);
         fprintf(stderr, "\n");
         w32_exit(w, 125); return 0;
@@ -1655,10 +1675,11 @@ int w32_crash_report(w32 *w, char *out, size_t out_len) {
         unsigned from = g_trace_n > TRACE_N ? g_trace_n - TRACE_N : 0;
         for (unsigned k = from; k < g_trace_n; k++) {
             const trace_ent *t = &g_trace[k % TRACE_N];
-            P("    %s%s%s(%#llx, %#llx, %#llx, %#llx)%s%s%s%s\n", t->dll && !t->missing ? t->dll : "", t->dll && !t->missing ? "!" : "",
+            P("    %s%s%s(%#llx, %#llx, %#llx, %#llx)%s%s%s", t->dll && !t->missing ? t->dll : "", t->dll && !t->missing ? "!" : "",
               t->name, (unsigned long long)t->a[0], (unsigned long long)t->a[1], (unsigned long long)t->a[2], (unsigned long long)t->a[3],
-              t->str[0] ? "   \"" : "", t->str[0] ? t->str : "", t->str[0] ? "\"" : "",
-              t->missing ? "   <- not implemented" : "");
+              t->str[0] ? "   \"" : "", t->str[0] ? t->str : "", t->str[0] ? "\"" : "");
+            if (t->str[0] && t->has_ret) P(" = %#llx%s", (unsigned long long)t->ret, t->ret ? "" : "  <- not found");
+            P("%s\n", t->missing ? "   <- not implemented" : "");
         }
     }
     {
@@ -1666,6 +1687,12 @@ int w32_crash_report(w32 *w, char *out, size_t out_len) {
         P("\n  subsystems:\n");
         P("    audio      %s, %d sound source%s, %d WASAPI stream%s\n", w32_audio_device_on() ? "device open" : "no device (silent)", ns, ns == 1 ? "" : "s", nw, nw == 1 ? "" : "s");
         P("    dinput     %d device%s created\n", nd, nd == 1 ? "" : "s");
+        /* every image in the process, so a module handle in the calls above
+         * can be named from this block alone */
+        P("    modules   ");
+        for (int k = 0; k < w->nmods; k++) P(" %s@%#llx", w->mods[k].name, (unsigned long long)w->mods[k].base);
+        for (int d = 0; d < NDLLS; d++) if (w32_builtin_used(w, d)) P(" %s@%#llx", g_dlls[d].name, (unsigned long long)(w->stub_base + 0x10000u * (unsigned)(d + 1)));
+        P("\n");
         {
             uint64_t sd, st, fd;
             w32_d3d9_stats(&sd, &st, &fd);
@@ -1685,6 +1712,32 @@ int w32_crash_report(w32 *w, char *out, size_t out_len) {
         for (int k = 0; k < w->nunimpl; k++)
             P("    %6u x  %s\n", w->unimpl[k].calls, w->unimpl[k].name);
         if (w->unimpl_dropped) P("    (and %u more distinct)\n", w->unimpl_dropped);
+    }
+    /* The summary, last, because last is what a device log shows. */
+    P("\n  why it stopped:\n");
+    P("    %s, exit code %d\n", w->stop_reason ? w->stop_reason : "it returned", w->exit_code);
+    if (g_why.valid) {
+        if (g_why.code) P("    %s (%#x) at rip=%#llx  [%s]\n", w32_exception_name(g_why.code), g_why.code, (unsigned long long)g_why.rip, g_why.dis);
+        else P("    at rip=%#llx  [%s]\n", (unsigned long long)g_why.rip, g_why.dis);
+        if (g_why.has_addr) P("    faulting address %#llx\n", (unsigned long long)g_why.addr);
+        int named = 0;
+        for (int i = 0; i < w->nmods; i++)
+            if (g_why.rip >= w->mods[i].base && g_why.rip < w->mods[i].base + w->mods[i].size) { P("    rip is in %s, at +%#llx\n", w->mods[i].name, (unsigned long long)(g_why.rip - w->mods[i].base)); named = 1; }
+        if (!named && g_why.rip < 0x10000) P("    rip is near zero: a call through a null function pointer -- look for a lookup above that found nothing\n");
+        if (!named && g_why.rip >= w->stub_base && g_why.rip < w->stub_base + 0x100000) P("    rip is in the import stubs\n");
+    }
+    {
+        /* the last lookups that answered NULL: a program that gave up usually gave up over one of these */
+        int shown = 0;
+        unsigned from = g_trace_n > TRACE_N ? g_trace_n - TRACE_N : 0;
+        for (unsigned k = g_trace_n; k > from; k--) {
+            const trace_ent *t = &g_trace[(k - 1) % TRACE_N];
+            if (t->str[0] && t->has_ret && !t->ret) {
+                if (!shown++) P("    lookups that found nothing, most recent first:\n");
+                P("      %s(\"%s\") = NULL, %u call%s before the end\n", t->name, t->str, g_trace_n - k, g_trace_n - k == 1 ? "" : "s");
+                if (shown >= 6) break;
+            }
+        }
     }
     /* A keep-going run that ended badly almost always ended badly *because*
      * of the lie, not beside it -- so say so, rather than leaving a fault
@@ -1878,7 +1931,7 @@ static int winrun_once(int argc, char **argv) {
     /* A report whenever there is something to report: an abnormal end, or a
      * clean one that leaned on functions we do not have. */
     if (w->stop_reason || w->nunimpl) {
-        static char rep[16384];
+        static char rep[32768];
         w32_crash_report(w, rep, sizeof rep);
         printf("\n%s", rep);
         fflush(stdout);
