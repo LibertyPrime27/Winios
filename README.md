@@ -1,4 +1,4 @@
-<img src="docs/logo/winios-logo.png" alt="Winios" width="128" align="right">
+<img src="docs/logo/winios-icon.png" alt="Winios" width="128" align="right">
 
 # Winios
 
