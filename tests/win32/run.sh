@@ -193,7 +193,9 @@ for b in 64 32; do
     else echo "FAIL keepgoing$b.exe without -k exited $rcs, want 127"; fail=1; fi
 
     outk=$($emu "$winrun" -k "./keepgoing$b.exe" 2>&1); rck=$?
-    missing=$(printf '%s\n' "$outk" | grep -c 'user32.dll!\(SwitchDesktop\|LockWorkStation\|CreateDesktopW\)')
+    # counted in the "called but not implemented" list only ("N x  name"): the
+    # calls window above it now reaches back far enough to show them too
+    missing=$(printf '%s\n' "$outk" | grep -c '^ *[0-9][0-9]* x  user32.dll!\(SwitchDesktop\|LockWorkStation\|CreateDesktopW\)')
     if [ "$rck" = "0" ] && [ "$missing" = "3" ] && printf '%s\n' "$outk" | grep -q '0 failures'; then
         echo "ok   keepgoing$b.exe -k names all three and the guest survives the answers"
     else

@@ -684,7 +684,7 @@ static void note_unimplemented(w32 *w, const char *name) {
  * RtlAllocateHeap, then ..." says what the program was doing. Names and four
  * arguments, no formatting until a report is written, so it costs a few
  * stores per call. */
-enum { TRACE_N = 48 };
+enum { TRACE_N = 256, TRACE_SHOW = 48 };
 typedef struct { const char *dll, *name; uint64_t a[4]; int missing, has_ret; uint64_t ret; char str[48]; } trace_ent;
 static trace_ent g_trace[TRACE_N];
 static unsigned g_trace_n;
@@ -1671,15 +1671,33 @@ int w32_crash_report(w32 *w, char *out, size_t out_len) {
               (unsigned long long)(c->rip - w->mods[i].base));
 
     if (g_trace_n) {
-        P("\n  last calls into the API layer (oldest first):\n");
+        /* The last calls, each with what it returned. A run of the same
+         * function -- a lock taken and released a hundred times, a timer
+         * read in a loop -- is one line with a count, so the window shows
+         * what the program did rather than how often it locked. The ring
+         * holds 256 calls; 48 lines are printed, from the newest back. */
+        P("\n  last calls into the API layer (oldest first, each with its result):\n");
         unsigned from = g_trace_n > TRACE_N ? g_trace_n - TRACE_N : 0;
-        for (unsigned k = from; k < g_trace_n; k++) {
+        /* find where to start so that at most TRACE_SHOW lines come out */
+        unsigned start = g_trace_n, lines = 0;
+        while (start > from && lines < TRACE_SHOW) {
+            unsigned k = start - 1;
             const trace_ent *t = &g_trace[k % TRACE_N];
+            while (k > from && g_trace[(k - 1) % TRACE_N].name == t->name) k--;
+            start = k; lines++;
+        }
+        for (unsigned k = start; k < g_trace_n;) {
+            const trace_ent *t = &g_trace[k % TRACE_N];
+            unsigned run = 1;                        /* not `n`: that is the report's own write offset */
+            while (k + run < g_trace_n && g_trace[(k + run) % TRACE_N].name == t->name) run++;
+            const trace_ent *last = &g_trace[(k + run - 1) % TRACE_N];
             P("    %s%s%s(%#llx, %#llx, %#llx, %#llx)%s%s%s", t->dll && !t->missing ? t->dll : "", t->dll && !t->missing ? "!" : "",
               t->name, (unsigned long long)t->a[0], (unsigned long long)t->a[1], (unsigned long long)t->a[2], (unsigned long long)t->a[3],
               t->str[0] ? "   \"" : "", t->str[0] ? t->str : "", t->str[0] ? "\"" : "");
-            if (t->str[0] && t->has_ret) P(" = %#llx%s", (unsigned long long)t->ret, t->ret ? "" : "  <- not found");
+            if (last->has_ret) P(" = %#llx%s", (unsigned long long)last->ret, t->str[0] && !last->ret ? "  <- not found" : "");
+            if (run > 1) P("   (x%u)", run);
             P("%s\n", t->missing ? "   <- not implemented" : "");
+            k += run;
         }
     }
     {
@@ -1725,6 +1743,34 @@ int w32_crash_report(w32 *w, char *out, size_t out_len) {
             if (g_why.rip >= w->mods[i].base && g_why.rip < w->mods[i].base + w->mods[i].size) { P("    rip is in %s, at +%#llx\n", w->mods[i].name, (unsigned long long)(g_why.rip - w->mods[i].base)); named = 1; }
         if (!named && g_why.rip < 0x10000) P("    rip is near zero: a call through a null function pointer -- look for a lookup above that found nothing\n");
         if (!named && g_why.rip >= w->stub_base && g_why.rip < w->stub_base + 0x100000) P("    rip is in the import stubs\n");
+        /* the registers, and the return addresses on the stack: where in the
+         * program the fault was reached from, as module offsets a build of
+         * that program can be read against */
+        {
+            const xc_cpu *c = w32_cpu(w);
+            static const char *rn[16] = { "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15" };
+            int nregs = w->is32 ? 8 : 16;
+            P("    registers:");
+            for (int r = 0; r < nregs; r++) P("%s%s=%#llx", r % 8 == 0 ? "\n      " : " ", rn[r], (unsigned long long)c->gpr[r]);
+            P("\n");
+            int psz = (int)w32_ptrsize(w), shown = 0;
+            uint64_t sp = c->gpr[XC_RSP];
+            for (int i = 0; i < 128 && shown < 10; i++) {
+                uint64_t at = sp + (uint64_t)psz * (unsigned)i;
+                if (!w32_mem_ok(w, at, (uint64_t)psz)) break;
+                uint64_t v = w32_read(w, at, psz);
+                for (int m = 0; m < w->nmods; m++)
+                    if (v > w->mods[m].base && v < w->mods[m].base + w->mods[m].size) {
+                        /* a return address follows a call: the byte before it is the call's last byte */
+                        uint8_t prev = (uint8_t)w32_read(w, v - 1, 1), prev5 = (uint8_t)w32_read(w, v - 5, 1);
+                        if (prev5 == 0xE8 || prev == 0xD0 || prev == 0xD2 || prev == 0xD1 || (prev >= 0x10 && prev <= 0x17 && (uint8_t)w32_read(w, v - 2, 1) == 0xFF) || (uint8_t)w32_read(w, v - 6, 1) == 0xFF || (uint8_t)w32_read(w, v - 2, 1) == 0xFF || (uint8_t)w32_read(w, v - 3, 1) == 0xFF) {
+                            if (!shown++) P("    return addresses on the stack (innermost first):\n");
+                            P("      %s+%#llx  (rsp+%#x)\n", w->mods[m].name, (unsigned long long)(v - w->mods[m].base), (unsigned)(psz * i));
+                        }
+                        break;
+                    }
+            }
+        }
     }
     {
         /* the last lookups that answered NULL: a program that gave up usually gave up over one of these */
