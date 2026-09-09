@@ -243,6 +243,14 @@ checkx xaudiotest32.exe xaudiotest32.expected 0
 # the first event took, which is a clock and not a number to record.
 checkrc wasapitest64.exe 0 "0 failures"
 checkrc wasapitest32.exe 0 "0 failures"
+# Direct3D 9 shaders: vs_2_0 and ps_2_0 assembled by hand, three quads --
+# both shaders with texkill, the pixel shader behind the fixed-function
+# transform, the vertex shader in front of fixed-function texturing. The
+# frame is the test: the same on x86, under qemu, and in both bitnesses.
+checkrc d3dshader64.exe 0 "0 failures"
+checkrc d3dshader32.exe 0 "0 failures"
+checkframe d3dshader64.exe own 8e183572
+checkframe d3dshader32.exe own 8e183572
 # C++ exceptions: on x64 the table-driven dispatcher through libgcc's real personality.
 check cxxtest64.exe 0
 check cxxtest32.exe 0
