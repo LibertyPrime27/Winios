@@ -13,6 +13,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define COBJMACROS
 #include <windows.h>
+#include <mmsystem.h>          /* WAVEFORMATEX, which WIN32_LEAN_AND_MEAN leaves out */
 #include <objbase.h>
 #include <stdio.h>
 #include <string.h>
