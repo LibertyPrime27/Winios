@@ -25,23 +25,42 @@ static volatile LONG g_guarded;        /* incremented under the critical section
 static volatile LONG g_interlocked;    /* incremented with InterlockedIncrement */
 static volatile LONG g_ran;            /* how many threads actually started */
 
-/* Static (compiler) TLS: the linker puts these in the image's TLS directory,
- * and every thread reads them through TEB.ThreadLocalStoragePointer with no
- * null check -- so a thread that was not given its own block faults on the
- * first access. One starts from the template, the other from the zero fill. */
-static __thread LONG t_mine = 7;
-static __thread LONG t_zero;
-static volatile LONG g_tls_ok;         /* threads whose copy was theirs alone */
+/* Static (compiler) TLS, read the way MSVC-built code reads a
+ * __declspec(thread) variable: TEB.ThreadLocalStoragePointer -> the module's
+ * slot (_tls_index) -> the thread's copy of the image's TLS template, with
+ * no null check anywhere. A thread that was not given its own copy faults on
+ * the first access; a thread given the loader's copy sees another thread's
+ * writes. GameMaker's frame timer died exactly this way.
+ *
+ * mingw's own __thread goes through its emulated-TLS runtime and never
+ * touches the TEB, so it cannot stand in for that. Instead the variables are
+ * placed in the .tls$ section by hand -- the linker sorts them between the
+ * CRT's _tls_start and _tls_end, so they are in the template the loader
+ * copies -- and read through the TEB explicitly. */
+extern ULONG _tls_index;                             /* the CRT's; the loader writes it */
+extern int _tls_start;                               /* first byte of the template */
+__attribute__((section(".tls$B"))) static LONG t_mine = 7;
+__attribute__((section(".tls$B"))) static LONG t_zero = 0;
+static volatile LONG g_tls_ok;                       /* threads whose copy was theirs alone */
+static volatile LONG g_tls_null;                     /* threads with no TLS pointer at all */
+
+static LONG *tls_here(LONG *templ) {
+    char **slots = (char **)NtCurrentTeb()->ThreadLocalStoragePointer;
+    if (!slots || !slots[_tls_index]) return NULL;
+    return (LONG *)(slots[_tls_index] + ((char *)templ - (char *)&_tls_start));
+}
 
 static DWORD WINAPI worker(LPVOID p) {
     (void)p;
     InterlockedIncrement(&g_ran);
-    int ok = t_mine == 7 && t_zero == 0;             /* fresh copy of the template */
-    t_mine = 1000 + (LONG)GetCurrentThreadId();
-    t_zero = 1;
+    LONG *mine = tls_here(&t_mine), *zero = tls_here(&t_zero);
+    if (!mine || !zero) { InterlockedIncrement(&g_tls_null); return 2; }
+    int ok = *mine == 7 && *zero == 0;                /* a fresh copy of the template */
+    *mine = 1000 + (LONG)GetCurrentThreadId();
+    *zero = 1;
     for (int i = 0; i < 20; i++) {                    /* let the others run over it, if it is shared */
         Sleep(0);
-        if (t_mine != 1000 + (LONG)GetCurrentThreadId() || t_zero != 1) ok = 0;
+        if (*mine != 1000 + (LONG)GetCurrentThreadId() || *zero != 1) ok = 0;
     }
     if (ok) InterlockedIncrement(&g_tls_ok);
     for (int i = 0; i < PER_THREAD; i++) {
@@ -114,8 +133,11 @@ int main(void) {
     printf("guarded total: %ld (want %d)\n", (long)g_guarded, NTHREADS * PER_THREAD);
     printf("interlocked total: %ld (want %d)\n", (long)g_interlocked, NTHREADS * PER_THREAD);
     printf("both totals agree: %s\n", g_guarded == g_interlocked ? "yes" : "NO");
-    printf("static TLS: %ld of %d threads had their own copy; ours still %ld (want 7), %ld (want 0)\n",
-           (long)g_tls_ok, NTHREADS, (long)t_mine, (long)t_zero);
+    {
+        LONG *mine = tls_here(&t_mine), *zero = tls_here(&t_zero);
+        printf("static TLS: %ld of %d threads had their own copy, %ld had none; ours still %ld (want 7), %ld (want 0)\n",
+               (long)g_tls_ok, NTHREADS, (long)g_tls_null, mine ? (long)*mine : -1L, zero ? (long)*zero : -1L);
+    }
 
     /* the exit code the thread returned */
     DWORD ec = 0;

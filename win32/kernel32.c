@@ -2571,6 +2571,9 @@ const w32_api w32_kernel32[] = {
     F(TlsAlloc, 0), F(TlsFree, 1), F(TlsGetValue, 1), F(TlsSetValue, 2), F(FlsAlloc, 1), F(FlsFree, 1), F(FlsGetValue, 1), F(FlsSetValue, 2), F(FlsGetValue2, 1), F(DisableThreadLibraryCalls, 1),
     FN(InitializeSRWLock, 1, k_nop_void), FN(AcquireSRWLockExclusive, 1, k_nop_void), FN(ReleaseSRWLockExclusive, 1, k_nop_void),
     FN(AcquireSRWLockShared, 1, k_nop_void), FN(ReleaseSRWLockShared, 1, k_nop_void), FN(InitOnceExecuteOnce, 4, k_nop_true),
+    /* one guest thread runs at a time and the handover happens at API calls
+     * and block boundaries, so an SRW lock is never contended: Try always wins */
+    FN(TryAcquireSRWLockExclusive, 1, k_nop_true), FN(TryAcquireSRWLockShared, 1, k_nop_true),
     FN(InitializeConditionVariable, 1, k_nop_void), FN(WakeAllConditionVariable, 1, k_nop_void), FN(WakeConditionVariable, 1, k_nop_void),
     F(GetStdHandle, 1), F(SetStdHandle, 2), F(WriteFile, 5), F(WriteConsoleA, 5), F(WriteConsoleW, 5), F(ReadFile, 5),
     F(CreateFileA, 7), F(CreateFileW, 7), F(CloseHandle, 1), F(GetFileType, 1), F(GetFileSize, 2), F(GetFileSizeEx, 2),
