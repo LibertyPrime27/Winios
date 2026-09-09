@@ -84,6 +84,7 @@ typedef struct {
     uint64_t entry;              /* DllMain, or the executable's entry point; 0 if none */
     uint32_t exp_rva, exp_size;  /* export directory, 0 if the image exports nothing */
     uint32_t res_rva, res_size;  /* resource directory: dialogs, strings, icons */
+    uint32_t pdata_rva, pdata_size; /* exception directory: x64 unwind tables, sorted by address */
     uint64_t tls_callbacks;
     int      is_exe;
     int      refs;               /* LoadLibrary count; nothing is ever unmapped */
@@ -358,6 +359,8 @@ int      w32_fault_to_exception(w32 *w);                    /* a CPU fault, as t
 const char *w32_exception_name(uint32_t code);
 uint32_t w32_last_exception(uint64_t *addr);                /* what ended the run, for the report */
 void     w32_seh_reset(void);
+void     w32_C_specific_handler(w32 *w);
+uint64_t w32_stub_return_addr(w32 *w);                              /* where a w32_call_guest returns to: no module's address */                           /* MSVC's __try/__except language handler, x64 */
 /* one int3 stub bound to `api`, or a named "not implemented" stub when it is NULL */
 uint64_t w32_stub_alloc(w32 *w, const w32_dll *dll, const w32_api *api, char *missing);
 

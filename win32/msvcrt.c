@@ -327,7 +327,7 @@ static void m__get_initial_narrow_environment(w32 *w) { build_args(w); RET(g_env
 static void m__initialize_narrow_environment(w32 *w) { RET(0); }
 static void m___p___initenv(w32 *w) { static uint64_t p; if (!p) p = w32_heap_alloc(w, 8); RET(p); }
 static void m__XcptFilter(w32 *w) { RET(0); }
-static void m___C_specific_handler(w32 *w) { RET(1); }
+static void m___C_specific_handler(w32 *w) { w32_C_specific_handler(w); }
 static void m__except_handler3(w32 *w) { RET(1); }
 static void m__except_handler4_common(w32 *w) { RET(1); }
 static void m__beginthreadex(w32 *w) { fprintf(stderr, "winrun: threads are not supported yet (_beginthreadex)\n"); RET(0); }

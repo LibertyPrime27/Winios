@@ -61,6 +61,10 @@ for a in 32 64; do
     $CC -O2 -s -o spawntest$a.exe spawntest.c -lshell32
     $CC -O2 -s -o dinputtest$a.exe dinputtest.c -ldinput8 -ldxguid
     $CC -O2 -s -o xaudiotest$a.exe xaudiotest.c -lole32
+    # C++ with a static runtime: the exception personality is in the binary,
+    # and on x64 it drives RtlUnwindEx and friends.
+    CXX=$(echo "$CC" | sed 's/gcc$/g++/')
+    $CXX -O2 -s -static -o sehtest$a.exe sehtest.cpp
     # threads: CreateThread and the CRT's own, critical sections, events,
     # mutexes, interlocked, TLS. Written so every check is true under every
     # interleaving, so a pass means locking works rather than that the

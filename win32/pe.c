@@ -40,7 +40,7 @@ static inline uint16_t RD16(const void *p) { const uint8_t *b = p; return (uint1
 static inline uint32_t RD32(const void *p) { const uint8_t *b = p; return (uint32_t)(b[0] | b[1] << 8 | b[2] << 16 | (uint32_t)b[3] << 24); }
 static inline uint64_t RD64(const void *p) { const uint8_t *b = p; return (uint64_t)RD32(b) | (uint64_t)RD32(b + 4) << 32; }
 
-enum { DIR_EXPORT = 0, DIR_IMPORT = 1, DIR_RESOURCE = 2, DIR_RELOC = 5, DIR_TLS = 9 };
+enum { DIR_EXPORT = 0, DIR_IMPORT = 1, DIR_RESOURCE = 2, DIR_EXCEPTION = 3, DIR_RELOC = 5, DIR_TLS = 9 };
 enum { DLL_PROCESS_ATTACH = 1 };
 
 typedef struct { uint32_t rva, size; } datadir;
@@ -413,6 +413,9 @@ static int load_image(w32 *w, const char *path, const char *lname, int is_exe, w
     }
     if (dir[DIR_RESOURCE].size && in_image(m, dir[DIR_RESOURCE].rva, 16)) {
         m->res_rva = dir[DIR_RESOURCE].rva; m->res_size = dir[DIR_RESOURCE].size;
+    }
+    if (plus && dir[DIR_EXCEPTION].size && in_image(m, dir[DIR_EXCEPTION].rva, 12)) {
+        m->pdata_rva = dir[DIR_EXCEPTION].rva; m->pdata_size = dir[DIR_EXCEPTION].size;
     }
     if (out) *out = m;
 

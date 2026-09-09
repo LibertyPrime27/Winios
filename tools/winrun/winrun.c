@@ -836,6 +836,7 @@ static int run_loop(w32 *w) {
  * would: set RIP to the return-to-host stub the call pushed. ExitThread does
  * this rather than unwinding the host stack, because the host stack below it
  * belongs to the emulator, not to the guest. */
+uint64_t w32_stub_return_addr(w32 *w) { return stub_addr(w, STUB_RETURN); }
 void w32_return_to_host(w32 *w) {
     w32_cpu(w)->rip = stub_addr(w, STUB_RETURN);
     w->redirected = 1;
