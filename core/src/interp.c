@@ -854,6 +854,26 @@ static float sse_sqrt32(float a) {
     if (a < 0) { sse_flags |= MX_IE; return bits_f32(0xFFC00000u); }
     return sqrtf(a);
 }
+/* RSQRT and RCP: hardware answers with a 12-bit approximation and raises no
+ * exception whatever the input -- denormals count as zero, zero gives an
+ * infinity with the input's sign, a negative under the root gives the
+ * default NaN. The exact value is returned instead of an approximation,
+ * because no two CPUs agree on the approximation and a game only asks for
+ * "about 1/sqrt(x)"; exact is inside every one of their error bands, and
+ * the same on x86 and arm. A GameMaker runner's first rsqrtss stopped a
+ * run as an undefined instruction before these existed. */
+static float sse_rsqrt32(float a) {
+    if (isnan(a)) return bits_f32(f32_bits(a) | (1u << 22));
+    if (den32(a) || a == 0.0f) return bits_f32(f32_bits(a) & 0x80000000u ? 0xFF800000u : 0x7F800000u);
+    if (a < 0) return bits_f32(0xFFC00000u);
+    return 1.0f / sqrtf(a);
+}
+static float sse_rcp32(float a) {
+    if (isnan(a)) return bits_f32(f32_bits(a) | (1u << 22));
+    if (den32(a) || a == 0.0f) return bits_f32(f32_bits(a) & 0x80000000u ? 0xFF800000u : 0x7F800000u);
+    if (isinf(a)) return bits_f32(f32_bits(a) & 0x80000000u);
+    return 1.0f / a;
+}
 
 /* Widening/narrowing conversions: SNaN -> IE, denormal -> DE, otherwise the
  * host cast (which raises OE/UE/PE for narrowing exactly as x86 does). */
@@ -1136,6 +1156,8 @@ static int do_sse(ctx *x, ZydisMnemonic m, int *ok) {
     case ZYDIS_MNEMONIC_MINSS: FENV(); RD(0, r); RD(1, b); r.f[0] = sse_min32(r.f[0], b.f[0]); WRF(r, 128);
     case ZYDIS_MNEMONIC_MAXSS: FENV(); RD(0, r); RD(1, b); r.f[0] = sse_max32(r.f[0], b.f[0]); WRF(r, 128);
     case ZYDIS_MNEMONIC_SQRTSS: FENV(); RD(0, r); RD(1, b); r.f[0] = sse_sqrt32(b.f[0]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_RSQRTSS: FENV(); RD(0, r); RD(1, b); r.f[0] = sse_rsqrt32(b.f[0]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_RCPSS:   FENV(); RD(0, r); RD(1, b); r.f[0] = sse_rcp32(b.f[0]); WRF(r, 128);
     /* ---- packed double ---- */
     case ZYDIS_MNEMONIC_ADDPD: FENV(); RD(0, a); RD(1, b); for (int i = 0; i < 2; i++) r.e[i] = sse_fix64(a.e[i] + b.e[i], a.e[i], b.e[i]); WRF(r, 128);
     case ZYDIS_MNEMONIC_SUBPD: FENV(); RD(0, a); RD(1, b); for (int i = 0; i < 2; i++) r.e[i] = sse_fix64(a.e[i] - b.e[i], a.e[i], b.e[i]); WRF(r, 128);
@@ -1152,6 +1174,8 @@ static int do_sse(ctx *x, ZydisMnemonic m, int *ok) {
     case ZYDIS_MNEMONIC_MINPS: FENV(); RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) r.f[i] = sse_min32(a.f[i], b.f[i]); WRF(r, 128);
     case ZYDIS_MNEMONIC_MAXPS: FENV(); RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) r.f[i] = sse_max32(a.f[i], b.f[i]); WRF(r, 128);
     case ZYDIS_MNEMONIC_SQRTPS: FENV(); RD(1, b); for (int i = 0; i < 4; i++) r.f[i] = sse_sqrt32(b.f[i]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_RSQRTPS: FENV(); RD(1, b); for (int i = 0; i < 4; i++) r.f[i] = sse_rsqrt32(b.f[i]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_RCPPS:   FENV(); RD(1, b); for (int i = 0; i < 4; i++) r.f[i] = sse_rcp32(b.f[i]); WRF(r, 128);
 
     /* ---- FP compares ---- */
     case ZYDIS_MNEMONIC_COMISD: case ZYDIS_MNEMONIC_UCOMISD:
