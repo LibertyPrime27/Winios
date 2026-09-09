@@ -45,7 +45,10 @@ static volatile LONG g_tls_ok;                       /* threads whose copy was t
 static volatile LONG g_tls_null;                     /* threads with no TLS pointer at all */
 
 static LONG *tls_here(LONG *templ) {
-    char **slots = (char **)NtCurrentTeb()->ThreadLocalStoragePointer;
+    /* mingw keeps struct _TEB opaque; ThreadLocalStoragePointer is at 0x58
+     * in the 64-bit TEB and 0x2C in the 32-bit one, the offsets the compiler
+     * hard-codes into every __declspec(thread) access */
+    char **slots = *(char ***)((char *)NtCurrentTeb() + (sizeof(void *) == 8 ? 0x58 : 0x2C));
     if (!slots || !slots[_tls_index]) return NULL;
     return (LONG *)(slots[_tls_index] + ((char *)templ - (char *)&_tls_start));
 }
