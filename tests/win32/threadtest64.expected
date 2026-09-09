@@ -7,6 +7,7 @@ threads that ran: 4 (want 4)
 guarded total: 1600 (want 1600)
 interlocked total: 1600 (want 1600)
 both totals agree: yes
+static TLS: 4 of 4 threads had their own copy; ours still 7 (want 7), 0 (want 0)
 GetExitCodeThread: 0x1234 (want 0x1234)
 waiting again on a finished thread: returns at once
 

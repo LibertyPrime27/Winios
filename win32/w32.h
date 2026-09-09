@@ -147,8 +147,12 @@ struct w32 {
 
     /* heap: bump allocator plus a size header per block */
     uint64_t  heap_cur, heap_end;
-    uint64_t  tls_slots[W32_MAX_TLS]; uint64_t tls_used;
-    uint64_t  tls_array;         /* TEB.ThreadLocalStoragePointer: one entry per module with TLS */
+    uint64_t  tls_used;
+    /* static TLS: one entry per module with a TLS directory, in index order.
+     * Every thread gets its own copy of each module's template (raw bytes
+     * from the image, then zero fill), and its TEB.ThreadLocalStoragePointer
+     * points at an array of those copies -- see w32_tls_thread_init. */
+    struct { uint64_t raw, size; uint32_t zero_fill; } tls[W32_MAX_TLS];
     int       ntls;
 
     /* loaded images */
@@ -289,6 +293,7 @@ uint64_t w32_import_addr(w32 *w, const char *dll, const char *name, int ordinal,
 int      w32_dll_has(w32 *w, const char *dll, const char *name);     /* is `name` implemented for this built-in DLL? */
 void     w32_attach_modules(w32 *w);                                /* DllMain(DLL_PROCESS_ATTACH) for every new DLL */
 void     w32_thread_notify(w32 *w, int reason);                    /* DllMain(DLL_THREAD_ATTACH=2 / DETACH=3) for every attached DLL */
+void     w32_tls_thread_init(w32 *w, w32_thread *t);               /* a new thread's copies of every module's static TLS block */
 /* A program this one asked to start. There is one process at a time, so it
  * runs after this one ends; see CreateProcess in kernel32.c and the loop in
  * winrun_main. Returns the queue index, or -1 when the queue is full. */

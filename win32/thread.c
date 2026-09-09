@@ -462,6 +462,7 @@ static uint64_t spawn_prepare(w32 *w, uint64_t entry, uint64_t param, uint64_t s
         w32_write(w, teb + 0x48, 4, t->id);
         w32_write(w, teb + TEB64_PEB, 8, w->peb);
     }
+    w32_tls_thread_init(w, t);                         /* its own copies of every static TLS block */
 
     uint64_t h = w32_handle_new(w, H_THREAD, -1);
     w32_handle *hh = w32_handle_get(w, h);

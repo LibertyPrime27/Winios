@@ -25,9 +25,25 @@ static volatile LONG g_guarded;        /* incremented under the critical section
 static volatile LONG g_interlocked;    /* incremented with InterlockedIncrement */
 static volatile LONG g_ran;            /* how many threads actually started */
 
+/* Static (compiler) TLS: the linker puts these in the image's TLS directory,
+ * and every thread reads them through TEB.ThreadLocalStoragePointer with no
+ * null check -- so a thread that was not given its own block faults on the
+ * first access. One starts from the template, the other from the zero fill. */
+static __thread LONG t_mine = 7;
+static __thread LONG t_zero;
+static volatile LONG g_tls_ok;         /* threads whose copy was theirs alone */
+
 static DWORD WINAPI worker(LPVOID p) {
     (void)p;
     InterlockedIncrement(&g_ran);
+    int ok = t_mine == 7 && t_zero == 0;             /* fresh copy of the template */
+    t_mine = 1000 + (LONG)GetCurrentThreadId();
+    t_zero = 1;
+    for (int i = 0; i < 20; i++) {                    /* let the others run over it, if it is shared */
+        Sleep(0);
+        if (t_mine != 1000 + (LONG)GetCurrentThreadId() || t_zero != 1) ok = 0;
+    }
+    if (ok) InterlockedIncrement(&g_tls_ok);
     for (int i = 0; i < PER_THREAD; i++) {
         /* A read-modify-write with a deliberate handover in the middle of it.
          *
@@ -98,6 +114,8 @@ int main(void) {
     printf("guarded total: %ld (want %d)\n", (long)g_guarded, NTHREADS * PER_THREAD);
     printf("interlocked total: %ld (want %d)\n", (long)g_interlocked, NTHREADS * PER_THREAD);
     printf("both totals agree: %s\n", g_guarded == g_interlocked ? "yes" : "NO");
+    printf("static TLS: %ld of %d threads had their own copy; ours still %ld (want 7), %ld (want 0)\n",
+           (long)g_tls_ok, NTHREADS, (long)t_mine, (long)t_zero);
 
     /* the exit code the thread returned */
     DWORD ec = 0;

@@ -293,6 +293,35 @@ uint64_t w32_resource_data(w32 *w, uint64_t hrsrc, uint32_t *size) {
 
 /* --------------------------------------------------------------- loading */
 
+/* One thread's copy of module `index`'s static TLS block: the template bytes
+ * from the image, then zeros (w32_alloc hands out zeroed pages). 16 spare
+ * bytes because MSVC's TLS code has been seen reading just past the block. */
+static uint64_t tls_block_new(w32 *w, int index) {
+    uint64_t size = w->tls[index].size;
+    uint64_t block = w32_alloc(w, size + w->tls[index].zero_fill + 16, 0);
+    if (!block) return 0;
+    if (size) {
+        const void *raw = W32PN(w, w->tls[index].raw, size);
+        if (raw) memcpy(W32P(w, block), raw, size);
+    }
+    return block;
+}
+
+/* Static TLS for a thread that is about to start. Every __declspec(thread)
+ * access the compiler emits goes TEB.ThreadLocalStoragePointer -> [module's
+ * index] -> variable, without any check for null, so a thread without this
+ * faults on its first thread-local read -- GameMaker's frame timer did,
+ * keeping its waitable-timer handle in one. */
+void w32_tls_thread_init(w32 *w, w32_thread *t) {
+    if (!w->ntls) return;
+    int psz = w->is32 ? 4 : 8;
+    t->tls_array = w32_alloc(w, 4096, 0);
+    if (!t->tls_array) return;
+    for (int i = 0; i < w->ntls; i++)
+        w32_write(w, t->tls_array + (uint64_t)psz * i, psz, tls_block_new(w, i));
+    w32_write(w, t->teb + (w->is32 ? TEB32_TLSPTR : TEB64_TLSPTR), psz, t->tls_array);
+}
+
 static void setup_tls(w32 *w, w32_module *m, const uint8_t *t, int plus,
                       uint64_t pref_base, uint64_t base, int64_t delta) {
     int psz = plus ? 8 : 4;
@@ -306,24 +335,24 @@ static void setup_tls(w32 *w, w32_module *m, const uint8_t *t, int plus,
     REBASE(raw_start); REBASE(raw_end); REBASE(idx_addr); REBASE(cb_addr);
     #undef REBASE
     if (w->ntls >= W32_MAX_TLS) { fprintf(stderr, "winrun: out of TLS slots for %s\n", m->name); return; }
-    uint32_t index = (uint32_t)w->ntls++;
-
     uint64_t size = raw_end > raw_start ? raw_end - raw_start : 0;
-    uint64_t block = w32_alloc(w, size + zero_fill + 16, 0);
     /* raw_start comes out of the image's TLS directory, so it is the file's
      * word rather than ours; a directory that points outside the image would
      * otherwise be read as a host address. */
-    const void *tls_raw = size ? W32PN(w, raw_start, size) : 0;
-    if (size && !tls_raw) { fprintf(stderr, "winrun: %s has a TLS template outside its image\n", m->name); return; }
-    if (size) memcpy(W32P(w, block), tls_raw, size);
+    if (size && !W32PN(w, raw_start, size)) { fprintf(stderr, "winrun: %s has a TLS template outside its image\n", m->name); return; }
+    uint32_t index = (uint32_t)w->ntls++;
+    w->tls[index].raw = raw_start; w->tls[index].size = size; w->tls[index].zero_fill = zero_fill;
     w32_write(w, idx_addr, 4, index);
-    /* ThreadLocalStoragePointer -> the array of per-module blocks */
-    if (!w32_self()->tls_array) {
-        w32_self()->tls_array = w32_alloc(w, 4096, 0);
-        w32_write(w, w32_self()->teb + (plus ? TEB64_TLSPTR : TEB32_TLSPTR), psz, w32_self()->tls_array);
+    /* The thread doing the loading gets its copy now. Threads made later get
+     * theirs in w32_tls_thread_init; threads already running when a DLL with
+     * TLS is loaded do not get one (Windows grows theirs lazily; nothing here
+     * has needed that yet). */
+    w32_thread *self = w32_self();
+    if (!self->tls_array) {
+        self->tls_array = w32_alloc(w, 4096, 0);
+        w32_write(w, self->teb + (plus ? TEB64_TLSPTR : TEB32_TLSPTR), psz, self->tls_array);
     }
-    w32_write(w, w32_self()->tls_array + (uint64_t)psz * index, psz, block);
-    w->tls_slots[index] = block;
+    w32_write(w, self->tls_array + (uint64_t)psz * index, psz, tls_block_new(w, index));
     m->tls_callbacks = cb_addr;
     if (m->is_exe) { w->tls_index = index; w->tls_callbacks = cb_addr; }
     if (w->verbose) fprintf(stderr, "winrun: %s: TLS index %u, %llu bytes\n", m->name, index, (unsigned long long)(size + zero_fill));
@@ -500,6 +529,22 @@ void w32_attach_modules(w32 *w) {
  * faults somewhere nowhere near the cause. The executable never gets these.
  * Called on the new thread, with the guest lock held. */
 void w32_thread_notify(w32 *w, int reason) {
+    /* TLS callbacks first: the C runtime's runs the thread's dynamic
+     * thread_local initializers at attach, which DllMain code may rely on.
+     * The executable has them too, and Windows calls those on every thread. */
+    int psz = w->is32 ? 4 : 8;
+    for (int i = 0; i < w->nmods && !w->exited; i++) {
+        w32_module *m = &w->mods[i];
+        if (!m->tls_callbacks || !(m->is_exe || m->attached)) continue;
+        for (uint32_t k = 0; !w->exited; k++) {
+            uint64_t cb = w32_read(w, m->tls_callbacks + (uint64_t)psz * k, psz);
+            if (!cb) break;
+            uint64_t args[3] = { m->base, (uint64_t)reason, 0 };
+            if (w->verbose > 1) fprintf(stderr, "winrun: %s TLS callback %#llx(%s)\n", m->name, (unsigned long long)cb,
+                                        reason == 2 ? "DLL_THREAD_ATTACH" : "DLL_THREAD_DETACH");
+            w32_call_guest(w, cb, 3, args);
+        }
+    }
     for (int k = 0; k < w->nloaded && !w->exited; k++) {
         int s = reason == 2 ? k + 1 : w->nloaded - k;
         for (int i = 0; i < w->nmods; i++) {
