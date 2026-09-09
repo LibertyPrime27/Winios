@@ -164,7 +164,7 @@ if(NOT WIN32)
         # parts that have nothing to do with the emulator (a zip reader, installer
         # detection, a drive diff) can be tested without starting a guest.
         add_library(import_lib STATIC
-            tools/import/setupkind.c tools/import/unzip.c
+            tools/import/setupkind.c tools/import/unzip.c tools/import/un7z.c
             tools/import/drivediff.c tools/import/import.c)
         target_include_directories(import_lib PUBLIC tools/import)
         target_link_libraries(import_lib PUBLIC ${WINIOS_ZLIB})
@@ -184,6 +184,12 @@ if(NOT WIN32)
         target_link_libraries(test_import PRIVATE import_lib winrun_lib)
         target_include_directories(test_import PRIVATE tests)
         add_test(NAME import COMMAND test_import ${CMAKE_CURRENT_SOURCE_DIR}/tests/import)
+
+        # The 7z reader against liblzma-made archives; see tests/import/make_7z_fixtures.py.
+        add_executable(test_un7z tests/test_un7z.c)
+        target_link_libraries(test_un7z PRIVATE import_lib)
+        target_include_directories(test_un7z PRIVATE tools)
+        add_test(NAME un7z COMMAND test_un7z ${CMAKE_CURRENT_SOURCE_DIR}/tests/import)
 
         # Installer mode end to end, against a guest that behaves like a silent
         # install and refuses to work if it was handed the wrong flags.
