@@ -143,7 +143,13 @@ static int g_cur_stub = -1;            /* the API being executed, for the messag
 /* Why the run stopped, kept for the end of the report. The line that says so
  * is printed to stderr when it happens, but the device shows the tail of a
  * long log, so the same facts go at the end where they will be seen. */
-static struct { int valid, has_addr; uint32_t code; uint64_t rip, addr; char dis[128]; } g_why;
+static struct { int valid, has_addr; uint32_t code; uint64_t rip, addr; char dis[128];
+                uint32_t tid; uint64_t thread_entry; uint64_t gpr[16]; } g_why;
+static void why_thread(w32 *w) {
+    w32_thread *t = w32_self();
+    g_why.tid = t->id; g_why.thread_entry = t->entry;
+    memcpy(g_why.gpr, w32_cpu(w)->gpr, sizeof g_why.gpr);
+}
 static void note_bad_pointer(w32 *w, uint64_t addr, uint64_t len, const char *what) {
     static uint64_t seen[16];
     static int n;
@@ -685,7 +691,7 @@ static void note_unimplemented(w32 *w, const char *name) {
  * arguments, no formatting until a report is written, so it costs a few
  * stores per call. */
 enum { TRACE_N = 256, TRACE_SHOW = 48 };
-typedef struct { const char *dll, *name; uint64_t a[4]; int missing, has_ret; uint64_t ret; char str[48]; } trace_ent;
+typedef struct { const char *dll, *name; uint64_t a[4]; int missing, has_ret; uint64_t ret; uint32_t tid; char str[48]; } trace_ent;
 static trace_ent g_trace[TRACE_N];
 static unsigned g_trace_n;
 /* For the calls whose one interesting argument is a string -- which library,
@@ -705,7 +711,7 @@ static void trace_call(w32 *w, int i) {
     t->dll = w->stubs[i].dll ? w->stubs[i].dll->name : 0;
     t->name = api ? api->name : (w->stubs[i].missing ? w->stubs[i].missing : "?");
     t->missing = !api;
-    t->has_ret = 0; t->ret = 0;
+    t->has_ret = 0; t->ret = 0; t->tid = w32_self()->id;
     for (int k = 0; k < 4; k++) t->a[k] = w32_arg(w, k);
     t->str[0] = 0;
     if (api && api->name) {
@@ -883,6 +889,7 @@ static int run_loop(w32 *w) {
             g_why.valid = 1; g_why.code = code; g_why.rip = at; g_why.addr = kind == XC_STOP_FAULT && c->fault_kind == XC_FAULT_MEM ? addr : 0;
             g_why.has_addr = kind == XC_STOP_FAULT && c->fault_kind == XC_FAULT_MEM;
             snprintf(g_why.dis, sizeof g_why.dis, "%s", dis);
+            why_thread(w);
             fprintf(stderr, "winrun: unhandled %s (%#x) at rip=%#llx  [%s]",
                     w32_exception_name(code), code, (unsigned long long)at, dis);
             if (kind == XC_STOP_FAULT && c->fault_kind == XC_FAULT_MEM)
@@ -894,6 +901,7 @@ static int run_loop(w32 *w) {
         char dis[128]; xc_disasm(c, c->rip, dis, sizeof dis);
         g_why.valid = 1; g_why.code = 0; g_why.rip = c->rip; g_why.has_addr = 0;
         snprintf(g_why.dis, sizeof g_why.dis, "%s", dis);
+        why_thread(w);
         fprintf(stderr, "winrun: stopped: %s at rip=%#llx  [%s]", xc_stop_name(st), (unsigned long long)c->rip, dis);
         fprintf(stderr, "\n");
         w32_exit(w, 125); return 0;
@@ -1747,14 +1755,27 @@ int w32_crash_report(w32 *w, char *out, size_t out_len) {
          * program the fault was reached from, as module offsets a build of
          * that program can be read against */
         {
-            const xc_cpu *c = w32_cpu(w);
+            /* the faulting thread's state -- not the reporting thread's, which
+             * is the main thread and was somewhere else entirely when a
+             * worker died; the first report of a GameMaker runner's crash
+             * showed the main thread's registers under a worker's rip */
+            if (g_why.tid) {
+                const char *tname = g_why.tid < 5000 ? "the main thread" : "a thread";
+                P("    on %s (id %u", tname, g_why.tid);
+                if (g_why.thread_entry) {
+                    for (int m = 0; m < w->nmods; m++)
+                        if (g_why.thread_entry >= w->mods[m].base && g_why.thread_entry < w->mods[m].base + w->mods[m].size)
+                            P(", started at %s+%#llx", w->mods[m].name, (unsigned long long)(g_why.thread_entry - w->mods[m].base));
+                }
+                P(")\n");
+            }
             static const char *rn[16] = { "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15" };
             int nregs = w->is32 ? 8 : 16;
             P("    registers:");
-            for (int r = 0; r < nregs; r++) P("%s%s=%#llx", r % 8 == 0 ? "\n      " : " ", rn[r], (unsigned long long)c->gpr[r]);
+            for (int r = 0; r < nregs; r++) P("%s%s=%#llx", r % 8 == 0 ? "\n      " : " ", rn[r], (unsigned long long)g_why.gpr[r]);
             P("\n");
             int psz = (int)w32_ptrsize(w), shown = 0;
-            uint64_t sp = c->gpr[XC_RSP];
+            uint64_t sp = g_why.gpr[XC_RSP];
             for (int i = 0; i < 128 && shown < 10; i++) {
                 uint64_t at = sp + (uint64_t)psz * (unsigned)i;
                 if (!w32_mem_ok(w, at, (uint64_t)psz)) break;
@@ -1769,6 +1790,26 @@ int w32_crash_report(w32 *w, char *out, size_t out_len) {
                         }
                         break;
                     }
+            }
+            /* that thread's own last calls, which the shared list above may
+             * have lost under another thread's chatter */
+            if (g_why.tid && g_trace_n) {
+                unsigned from = g_trace_n > TRACE_N ? g_trace_n - TRACE_N : 0, cnt = 0;
+                for (unsigned k = g_trace_n; k > from && cnt < 12; k--) if (g_trace[(k - 1) % TRACE_N].tid == g_why.tid) cnt++;
+                if (cnt) {
+                    P("    that thread's last calls (oldest first):\n");
+                    unsigned k = g_trace_n, left = cnt;
+                    unsigned idx[12]; 
+                    while (k > from && left) { k--; if (g_trace[k % TRACE_N].tid == g_why.tid) idx[--left] = k; }
+                    for (unsigned q = 0; q < cnt; q++) {
+                        const trace_ent *t = &g_trace[idx[q] % TRACE_N];
+                        P("      %s%s%s(%#llx, %#llx, %#llx, %#llx)", t->dll && !t->missing ? t->dll : "", t->dll && !t->missing ? "!" : "", t->name,
+                          (unsigned long long)t->a[0], (unsigned long long)t->a[1], (unsigned long long)t->a[2], (unsigned long long)t->a[3]);
+                        if (t->str[0]) P("  \"%s\"", t->str);
+                        if (t->has_ret) P(" = %#llx", (unsigned long long)t->ret);
+                        P("%s\n", t->missing ? "   <- not implemented" : "");
+                    }
+                }
             }
         }
     }
