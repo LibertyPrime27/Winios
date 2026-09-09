@@ -48,6 +48,7 @@ int main(void) {
     for (int i = 0; i < 4; i++) SubmitThreadpoolWork(work);
     WaitForThreadpoolWorkCallbacks(work, FALSE);
     ok(work_runs == 4, "four submissions ran by the time WaitForThreadpoolWorkCallbacks returned");
+    if (work_runs != 4) printf("  (%ld ran)\n", (long)work_runs);
     CloseThreadpoolWork(work);
 
     /* timer: due in 20 ms, then every 30 ms */
@@ -61,11 +62,13 @@ int main(void) {
     Sleep(400);
     LONG runs = timer_runs;
     ok(runs >= 3, "  a periodic timer fired repeatedly in 400 ms");
+    printf("  (%ld firings)\n", (long)runs);
     SetThreadpoolTimer(timer, NULL, 0, 0);                        /* cancel */
     WaitForThreadpoolTimerCallbacks(timer, TRUE);
     LONG after = timer_runs;
     Sleep(150);
     ok(timer_runs == after, "  and stopped once set to nothing");
+    if (timer_runs != after) printf("  (%ld more after the cancel)\n", (long)(timer_runs - after));
     CloseThreadpoolTimer(timer);
 
     /* wait: on an event we set from here */
@@ -78,12 +81,15 @@ int main(void) {
     SetEvent(wev);
     WaitForThreadpoolWaitCallbacks(wait, FALSE);
     ok(wait_runs == 1 && wait_result == WAIT_OBJECT_0, "  the callback ran with WAIT_OBJECT_0 once the event was set");
+    if (wait_runs != 1 || wait_result != WAIT_OBJECT_0) printf("  (runs %ld, result %lu)\n", (long)wait_runs, (unsigned long)wait_result);
     CloseThreadpoolWait(wait);
 
     /* a one-off callback, and the event it sets on return */
     HANDLE done = CreateEventW(NULL, TRUE, FALSE, NULL);
     ok(TrySubmitThreadpoolCallback(simple_cb, done, NULL), "TrySubmitThreadpoolCallback");
-    ok(WaitForSingleObject(done, 2000) == WAIT_OBJECT_0 && simple_runs == 1, "  SetEventWhenCallbackReturns set the event after it ran");
+    DWORD dw = WaitForSingleObject(done, 2000);
+    ok(dw == WAIT_OBJECT_0 && simple_runs == 1, "  SetEventWhenCallbackReturns set the event after it ran");
+    if (dw != WAIT_OBJECT_0 || simple_runs != 1) printf("  (wait %lu, runs %ld)\n", (unsigned long)dw, (long)simple_runs);
 
     /* cleanup groups and a pool: accepted */
     PTP_POOL pool = CreateThreadpool(NULL);

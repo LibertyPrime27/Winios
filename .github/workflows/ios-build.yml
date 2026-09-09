@@ -48,7 +48,7 @@ jobs:
           cmake -S . -B build-host -DCMAKE_BUILD_TYPE=RelWithDebInfo
           cmake --build build-host -j"$(nproc)"
           out=$(sh tests/win32/run.sh build-host/winrun tests/win32 2>&1); rc=$?
-          echo "$out" | awk '/^FAIL/{p=1} /^ok /{p=0} p' | head -400
+          echo "$out" | awk '/^FAIL/{p=1} /^ok   /{p=0} p' | head -400
           echo "::notice::guests: $(echo "$out" | grep -c '^ok') ok, $(echo "$out" | grep -c '^FAIL') failed (rc $rc)"
           echo "$out" | grep -E '^FAIL' | head -8 | while IFS= read -r l; do echo "::error::guests: ${l}"; done
           [ "$rc" -eq 0 ]
@@ -266,7 +266,7 @@ jobs:
           # anywhere else -- the summary below is not visible through the API.
           if [ "$rc5" -ne 0 ]; then
             echo "::group::win32: failing cases, expected vs got"
-            echo "$out5" | awk '/^FAIL/{p=1} /^ok /{p=0} p' | head -400
+            echo "$out5" | awk '/^FAIL/{p=1} /^ok   /{p=0} p' | head -400
             echo "::endgroup::"
           fi
           out7=$(./build-mac/test_winrun_lib tests/win32 2>&1); rc7=$?
