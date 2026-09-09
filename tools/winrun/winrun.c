@@ -139,15 +139,21 @@ int w32_mem_ok(w32 *w, uint64_t addr, uint64_t len) {
 /* Said once per address, and only when asked for. A program that walks off
  * the end of something does it in a loop, and a line per iteration is the log
  * flood that got the process killed for CPU in the first place. */
+static int g_cur_stub = -1;            /* the API being executed, for the message below */
+/* Why the run stopped, kept for the end of the report. The line that says so
+ * is printed to stderr when it happens, but the device shows the tail of a
+ * long log, so the same facts go at the end where they will be seen. */
+static struct { int valid, has_addr; uint32_t code; uint64_t rip, addr; char dis[128]; } g_why;
 static void note_bad_pointer(w32 *w, uint64_t addr, uint64_t len, const char *what) {
     static uint64_t seen[16];
     static int n;
     if (!w->verbose) return;
     for (int i = 0; i < n; i++) if (seen[i] == addr) return;
     if (n < 16) seen[n++] = addr;
+    const char *api = g_cur_stub >= 0 && g_cur_stub < w->nstubs && w->stubs[g_cur_stub].api ? w->stubs[g_cur_stub].api->name : 0;
     fprintf(stderr, "winrun: %s of %llu bytes at %#llx is not mapped guest memory; "
-                    "ignored rather than faulting the host\n",
-            what, (unsigned long long)len, (unsigned long long)addr);
+                    "ignored rather than faulting the host%s%s%s\n",
+            what, (unsigned long long)len, (unsigned long long)addr, api ? "  (in " : "", api ? api : "", api ? ")" : "");
 }
 
 /* Guest memory is never executed by the host -- the interpreter reads it and
@@ -373,6 +379,14 @@ uint64_t w32_arg(w32 *w, int i) {
     default: return w32_read(w, c->gpr[XC_RSP] + 8 + 0x20 + 8u * (i - 4), 8);
     }
 }
+float w32_fargf(w32 *w, int i) {
+    float f; uint32_t bits;
+    if (w->is32) bits = (uint32_t)w32_read(w, w32_cpu(w)->gpr[XC_RSP] + 4 + 4u * i, 4);
+    else if (i < 4) bits = (uint32_t)w32_cpu(w)->xmm[i].lo;
+    else bits = (uint32_t)w32_read(w, w32_cpu(w)->gpr[XC_RSP] + 8 + 0x20 + 8u * (i - 4), 4);
+    memcpy(&f, &bits, 4);
+    return f;
+}
 double w32_farg(w32 *w, int i) {
     double d;
     if (w->is32) { uint64_t v = w32_read(w, w32_cpu(w)->gpr[XC_RSP] + 4 + 4u * i, 8); memcpy(&d, &v, 8); return d; }
@@ -464,6 +478,16 @@ static const w32_dll g_dlls[] = {
     { "ole32.dll",    { w32_ole32 },                                      0 },
     { "winmm.dll",    { w32_winmm },                                      0 },
     { "dsound.dll",   { w32_dsound },                                     0 },
+    /* DirectInput: the keyboard, the mouse and a gamepad the pre-XInput way.
+     * dinput8.dll and the older dinput.dll are one implementation. */
+    { "dinput8.dll",  { w32_dinput8 },                                    0 },
+    { "dinput.dll",   { w32_dinput },                                     0 },
+    /* XAudio2: 2.8 and 2.9 export XAudio2Create; 2.7 is reached through
+     * CoCreateInstance and its DLL exports only the class factory. */
+    { "xaudio2_9.dll", { w32_xaudio2 },                                   0 },
+    { "xaudio2_8.dll", { w32_xaudio2 },                                   0 },
+    { "xaudio2_9redist.dll", { w32_xaudio2 },                             0 },
+    { "xaudio2_7.dll", { w32_xaudio2 },                                   0 },
     /* Every XInput version games link against, all the same implementation:
      * the DLL name changed five times and the eight functions did not. */
     { "xinput1_4.dll",   { w32_xinput },                                  0 },
@@ -485,6 +509,7 @@ static const w32_dll g_dlls[] = {
     { "dwmapi.dll",   { w32_dwmapi },                                     0 },
     { "uxtheme.dll",  { w32_uxtheme },                                    0 },
     { "avrt.dll",     { w32_avrt },                                       0 },
+    { "mmdevapi.dll", { w32_mmdevapi },                                   0 },
     { "version.dll",  { w32_version },                                    0 },
     { "rpcrt4.dll",   { w32_rpcrt4 },                                     0 },
     { "gdiplus.dll",  { w32_gdiplus },                                    0 },
@@ -533,10 +558,46 @@ uint64_t w32_module_handle(w32 *w, const char *name) {
     return 0;
 }
 
+/* Has any stub of built-in DLL `d` been made? That is what "loaded" means for
+ * a DLL that is a table: the report names the ones a program touched. */
+static int w32_builtin_used(w32 *w, int d) {
+    for (int i = STUB_FIRST; i < w->nstubs; i++) if (w->stubs[i].dll == &g_dlls[d]) return 1;
+    return 0;
+}
+const char *w32_builtin_dll_name(w32 *w, uint64_t h) {
+    for (int d = 0; d < NDLLS; d++) if (h == w->stub_base + 0x10000u * (d + 1)) return g_dlls[d].name;
+    return 0;
+}
+
+/* Does any built-in table implement `name` for `dll`? GetProcAddress asks
+ * this before handing out a stub: a program that probes for a function --
+ * every C runtime does, for the ones newer than its minimum Windows -- must
+ * get NULL for one we do not have and take its fallback, not a stub that
+ * returns a made-up value when called. The Spamton runner's CRT probed
+ * CreateEventExW, CreateSemaphoreExW and CreateThreadpoolTimer, was told yes
+ * three times, and failed fast a few calls later. */
+int w32_dll_has(w32 *w, const char *dll, const char *name) {
+    (void)w;
+    int d = -1;
+    for (int k = 0; k < NDLLS; k++) if (!strcmp(g_dlls[k].name, dll)) d = k;
+    if (d < 0 && !strncmp(dll, "api-ms-win-crt", 14)) d = 1;
+    if (d < 0 && (!strncmp(dll, "vcruntime", 9) || !strncmp(dll, "ucrtbase", 8) || !strncmp(dll, "msvcr", 5))) d = 1;
+    if (d < 0 && !strncmp(dll, "api-ms-win", 10)) d = 0;
+    if (d < 0) return 0;
+    for (int t = 0; t < W32_DLL_TABLES; t++) {
+        const w32_api *tab = g_dlls[d].apis[t];
+        for (const w32_api *a = tab; a && a->name; a++) if (!strcmp(a->name, name)) return 1;
+    }
+    return 0;
+}
 uint64_t w32_stub_for(w32 *w, const char *dll, const char *name) {
     int d = -1;
     for (int k = 0; k < NDLLS; k++) if (!strcmp(g_dlls[k].name, dll)) d = k;
     if (d < 0 && !strncmp(dll, "api-ms-win-crt", 14)) d = 1;       /* UCRT forwarders -> msvcrt */
+    /* The C runtimes a game imports by name and may not ship. Only reached when
+     * no such file was beside the executable: a shipped vcruntime140.dll is
+     * loaded as itself, and is a better vcruntime140 than this table. */
+    if (d < 0 && (!strncmp(dll, "vcruntime", 9) || !strncmp(dll, "ucrtbase", 8) || !strncmp(dll, "msvcr", 5))) d = 1;
     if (d < 0 && !strncmp(dll, "api-ms-win", 10)) d = 0;
     if (d >= 0) {
         /* already have a stub? */
@@ -592,6 +653,23 @@ void w32_exit(w32 *w, int code) {
  * why" is worth more in it than a silent zero. */
 static void note_unimplemented(w32 *w, const char *name);
 void w32_note_refused(w32 *w, const char *name) { note_unimplemented(w, name); }
+
+/* Programs this one asked to start. There is one process at a time, so a
+ * child runs after its parent, from the loop in winrun_main; the queue lives
+ * outside the w32 because winrun_once resets that for every program. */
+enum { MAX_LAUNCH = 8 };
+static struct { char exe[1024], args[2048], cwd[512], who[24]; } g_launch[MAX_LAUNCH];
+static int g_nlaunch, g_launch_next;
+int w32_launch_queue(w32 *w, const char *host_exe, const char *args, const char *cwd_win, const char *who) {
+    if (g_nlaunch >= MAX_LAUNCH) return -1;
+    int i = g_nlaunch++;
+    snprintf(g_launch[i].exe, sizeof g_launch[i].exe, "%s", host_exe);
+    snprintf(g_launch[i].args, sizeof g_launch[i].args, "%s", args ? args : "");
+    snprintf(g_launch[i].cwd, sizeof g_launch[i].cwd, "%s", cwd_win ? cwd_win : "");
+    snprintf(g_launch[i].who, sizeof g_launch[i].who, "%s", who);
+    if (w->verbose) fprintf(stderr, "winrun: %s queued %s %s\n", who, host_exe, g_launch[i].args);
+    return i;
+}
 static void note_unimplemented(w32 *w, const char *name) {
     for (int k = 0; k < w->nunimpl; k++)
         if (w->unimpl[k].name == name) { w->unimpl[k].calls++; return; }
@@ -601,9 +679,53 @@ static void note_unimplemented(w32 *w, const char *name) {
     w->nunimpl++;
 }
 
+/* The last calls into the API layer, for the report. A fault at rip 0 says
+ * nothing; the same fault after "FlsGetValue2 -> made-up 0, then
+ * RtlAllocateHeap, then ..." says what the program was doing. Names and four
+ * arguments, no formatting until a report is written, so it costs a few
+ * stores per call. */
+enum { TRACE_N = 48 };
+typedef struct { const char *dll, *name; uint64_t a[4]; int missing, has_ret; uint64_t ret; char str[48]; } trace_ent;
+static trace_ent g_trace[TRACE_N];
+static unsigned g_trace_n;
+/* For the calls whose one interesting argument is a string -- which library,
+ * which function -- the report is worth nothing without it, so the string is
+ * copied at call time. Everything else keeps its four raw arguments. */
+static void trace_string(w32 *w, trace_ent *t, uint64_t p, int wide) {
+    t->str[0] = 0;
+    if (!p || (p >> 16) == 0) return;                 /* an ordinal, or nothing */
+    if (wide) { w32_wtoa(w, p, t->str, sizeof t->str); return; }
+    size_t n = 0;
+    while (n + 1 < sizeof t->str && w32_mem_ok(w, p + n, 1)) { char c = (char)w32_read(w, p + n, 1); if (!c) break; t->str[n++] = c; }
+    t->str[n] = 0;
+}
+static void trace_call(w32 *w, int i) {
+    trace_ent *t = &g_trace[g_trace_n++ % TRACE_N];
+    const w32_api *api = w->stubs[i].api;
+    t->dll = w->stubs[i].dll ? w->stubs[i].dll->name : 0;
+    t->name = api ? api->name : (w->stubs[i].missing ? w->stubs[i].missing : "?");
+    t->missing = !api;
+    t->has_ret = 0; t->ret = 0;
+    for (int k = 0; k < 4; k++) t->a[k] = w32_arg(w, k);
+    t->str[0] = 0;
+    if (api && api->name) {
+        if (!strcmp(api->name, "GetProcAddress")) trace_string(w, t, t->a[1], 0);
+        else if (!strncmp(api->name, "LoadLibrary", 11)) trace_string(w, t, t->a[0], strchr(api->name, 'W') != 0);
+        else if (!strncmp(api->name, "GetModuleHandle", 15)) trace_string(w, t, t->a[0], strchr(api->name, 'W') != 0);
+    }
+}
+
+static void dispatch_inner(w32 *w, int i);
 static void dispatch(w32 *w, int i) {
+    int prev = g_cur_stub;
+    g_cur_stub = i;
+    dispatch_inner(w, i);
+    g_cur_stub = prev;
+}
+static void dispatch_inner(w32 *w, int i) {
     xc_cpu *c = w32_cpu(w);
     const w32_api *a = w->stubs[i].api;
+    trace_call(w, i);
     if (!a) {
         const char *full = w->stubs[i].missing;
         const char *bang = full ? strchr(full, '!') : 0;
@@ -669,7 +791,11 @@ static void dispatch(w32 *w, int i) {
                                 (unsigned long long)w32_arg(w, 0), (unsigned long long)w32_arg(w, 1),
                                 (unsigned long long)w32_arg(w, 2), (unsigned long long)w32_arg(w, 3));
     uint64_t rsp = c->gpr[XC_RSP];
+    unsigned trace_at = g_trace_n ? (g_trace_n - 1) % TRACE_N : 0;
     a->fn(w);
+    /* the result, for the report: a GetProcAddress that answered NULL is
+     * the whole story of a program that then gave up */
+    if (g_trace[trace_at].name == a->name) { g_trace[trace_at].has_ret = 1; g_trace[trace_at].ret = c->gpr[XC_RAX]; }
     if (w->exited) return;
     /* An implementation that set rip and rsp itself -- RaiseException handing
      * control to a handler, NtContinue restoring a context -- has already
@@ -754,6 +880,9 @@ static int run_loop(w32 *w) {
             uint64_t ea = 0; uint32_t code = w32_last_exception(&ea);
             w->stop_reason = "an unhandled exception";
             char dis[128]; xc_disasm(c, at, dis, sizeof dis);
+            g_why.valid = 1; g_why.code = code; g_why.rip = at; g_why.addr = kind == XC_STOP_FAULT && c->fault_kind == XC_FAULT_MEM ? addr : 0;
+            g_why.has_addr = kind == XC_STOP_FAULT && c->fault_kind == XC_FAULT_MEM;
+            snprintf(g_why.dis, sizeof g_why.dis, "%s", dis);
             fprintf(stderr, "winrun: unhandled %s (%#x) at rip=%#llx  [%s]",
                     w32_exception_name(code), code, (unsigned long long)at, dis);
             if (kind == XC_STOP_FAULT && c->fault_kind == XC_FAULT_MEM)
@@ -763,6 +892,8 @@ static int run_loop(w32 *w) {
         }
         w->stop_reason = xc_stop_name(st);
         char dis[128]; xc_disasm(c, c->rip, dis, sizeof dis);
+        g_why.valid = 1; g_why.code = 0; g_why.rip = c->rip; g_why.has_addr = 0;
+        snprintf(g_why.dis, sizeof g_why.dis, "%s", dis);
         fprintf(stderr, "winrun: stopped: %s at rip=%#llx  [%s]", xc_stop_name(st), (unsigned long long)c->rip, dis);
         fprintf(stderr, "\n");
         w32_exit(w, 125); return 0;
@@ -773,6 +904,7 @@ static int run_loop(w32 *w) {
  * would: set RIP to the return-to-host stub the call pushed. ExitThread does
  * this rather than unwinding the host stack, because the host stack below it
  * belongs to the emulator, not to the guest. */
+uint64_t w32_stub_return_addr(w32 *w) { return stub_addr(w, STUB_RETURN); }
 void w32_return_to_host(w32 *w) {
     w32_cpu(w)->rip = stub_addr(w, STUB_RETURN);
     w->redirected = 1;
@@ -988,6 +1120,7 @@ static void on_crash(int sig, siginfo_t *si, void *uctx) {
 static void present_hook(void *ctx, const void *px, int w, int h, int pitch);
 
 static void winrun_reset(void) {
+    w32_audio_close();                 /* the mixer reads guest memory; stop it before that goes */
     if (g_w.is32 && g_w.base) munmap(g_w.base, 1ull << 32);
     for (int i = 0; i < g_nmaps; i++) munmap(g_maps[i].p, g_maps[i].n);
     g_nmaps = 0;
@@ -1002,9 +1135,13 @@ static void winrun_reset(void) {
     w32_seh_reset();
     w32_input_reset();
     w32_dsound_reset();
+    w32_dinput_reset();
+    w32_xaudio2_reset();
+    w32_mmdevapi_reset();
     w32_xinput_reset();
     w32_thread_reset();
     g_nscript = 0; g_frame = 0;
+    g_trace_n = 0;
     /* Undo *our* hook, not whoever's is there. When winrun is a library --
      * which it is inside the app -- the embedder installs the present
      * callback that puts frames on the screen before it calls in, and
@@ -1488,6 +1625,13 @@ int w32_crash_report(w32 *w, char *out, size_t out_len) {
     P("  program   %s (%d-bit)\n", w->exe_path ? w->exe_path : "?", w->is32 ? 32 : 64);
     P("  ended     %s\n", w->stop_reason ? w->stop_reason : "normally");
     P("  exit code %d\n", w->exit_code);
+    for (int i = 0; i < g_nlaunch; i++)
+        P("  %-9s %s started %s%s%s\n", i < g_launch_next ? "ran next" : "runs next", g_launch[i].who,
+          g_launch[i].exe, g_launch[i].args[0] ? " " : "", g_launch[i].args);
+    for (int i = 0; i < w->nstubs; i++)
+        if (w->stubs[i].missing && !strncasecmp(w->stubs[i].missing, "mscoree.dll!", 12)) {
+            P("  this is a .NET program: it needs the .NET runtime, which is not here\n"); break;
+        }
 
     P("\n  rip %016llx  rsp %016llx  rbp %016llx\n",
       (unsigned long long)c->rip, (unsigned long long)c->gpr[XC_RSP], (unsigned long long)c->gpr[XC_RBP]);
@@ -1526,11 +1670,74 @@ int w32_crash_report(w32 *w, char *out, size_t out_len) {
             P("\n  rip is in %s, at +%#llx\n", w->mods[i].name,
               (unsigned long long)(c->rip - w->mods[i].base));
 
+    if (g_trace_n) {
+        P("\n  last calls into the API layer (oldest first):\n");
+        unsigned from = g_trace_n > TRACE_N ? g_trace_n - TRACE_N : 0;
+        for (unsigned k = from; k < g_trace_n; k++) {
+            const trace_ent *t = &g_trace[k % TRACE_N];
+            P("    %s%s%s(%#llx, %#llx, %#llx, %#llx)%s%s%s", t->dll && !t->missing ? t->dll : "", t->dll && !t->missing ? "!" : "",
+              t->name, (unsigned long long)t->a[0], (unsigned long long)t->a[1], (unsigned long long)t->a[2], (unsigned long long)t->a[3],
+              t->str[0] ? "   \"" : "", t->str[0] ? t->str : "", t->str[0] ? "\"" : "");
+            if (t->str[0] && t->has_ret) P(" = %#llx%s", (unsigned long long)t->ret, t->ret ? "" : "  <- not found");
+            P("%s\n", t->missing ? "   <- not implemented" : "");
+        }
+    }
+    {
+        int ns = w32_audio_src_count(), nd = w32_dinput_device_count(), nw = w32_mmdevapi_stream_count();
+        P("\n  subsystems:\n");
+        P("    audio      %s, %d sound source%s, %d WASAPI stream%s\n", w32_audio_device_on() ? "device open" : "no device (silent)", ns, ns == 1 ? "" : "s", nw, nw == 1 ? "" : "s");
+        P("    dinput     %d device%s created\n", nd, nd == 1 ? "" : "s");
+        /* every image in the process, so a module handle in the calls above
+         * can be named from this block alone */
+        P("    modules   ");
+        for (int k = 0; k < w->nmods; k++) P(" %s@%#llx", w->mods[k].name, (unsigned long long)w->mods[k].base);
+        for (int d = 0; d < NDLLS; d++) if (w32_builtin_used(w, d)) P(" %s@%#llx", g_dlls[d].name, (unsigned long long)(w->stub_base + 0x10000u * (unsigned)(d + 1)));
+        P("\n");
+        {
+            uint64_t sd, st, fd;
+            w32_d3d9_stats(&sd, &st, &fd);
+            if (sd || fd) P("    d3d9       %llu draw%s through shaders (%llu triangles), %llu fixed-function\n",
+                            (unsigned long long)sd, sd == 1 ? "" : "s", (unsigned long long)st, (unsigned long long)fd);
+        }
+        P("    jit        %s\n", xc_jit_enabled() ? "on" : "off (interpreted)");
+        { int nt = w32_raster_threads(); P("    raster     %d thread%s for shaded pixels\n", nt, nt == 1 ? "" : "s"); }
+        {
+            uint64_t fr; double fps; w32_frame_stats(&fr, &fps);
+            if (fr) P("    video      %llu frame%s presented, %.1f fps over the run\n", (unsigned long long)fr, fr == 1 ? "" : "s", fps);
+        }
+    }
+
     if (w->nunimpl) {
         P("\n  called but not implemented (%d):\n", w->nunimpl);
         for (int k = 0; k < w->nunimpl; k++)
             P("    %6u x  %s\n", w->unimpl[k].calls, w->unimpl[k].name);
         if (w->unimpl_dropped) P("    (and %u more distinct)\n", w->unimpl_dropped);
+    }
+    /* The summary, last, because last is what a device log shows. */
+    P("\n  why it stopped:\n");
+    P("    %s, exit code %d\n", w->stop_reason ? w->stop_reason : "it returned", w->exit_code);
+    if (g_why.valid) {
+        if (g_why.code) P("    %s (%#x) at rip=%#llx  [%s]\n", w32_exception_name(g_why.code), g_why.code, (unsigned long long)g_why.rip, g_why.dis);
+        else P("    at rip=%#llx  [%s]\n", (unsigned long long)g_why.rip, g_why.dis);
+        if (g_why.has_addr) P("    faulting address %#llx\n", (unsigned long long)g_why.addr);
+        int named = 0;
+        for (int i = 0; i < w->nmods; i++)
+            if (g_why.rip >= w->mods[i].base && g_why.rip < w->mods[i].base + w->mods[i].size) { P("    rip is in %s, at +%#llx\n", w->mods[i].name, (unsigned long long)(g_why.rip - w->mods[i].base)); named = 1; }
+        if (!named && g_why.rip < 0x10000) P("    rip is near zero: a call through a null function pointer -- look for a lookup above that found nothing\n");
+        if (!named && g_why.rip >= w->stub_base && g_why.rip < w->stub_base + 0x100000) P("    rip is in the import stubs\n");
+    }
+    {
+        /* the last lookups that answered NULL: a program that gave up usually gave up over one of these */
+        int shown = 0;
+        unsigned from = g_trace_n > TRACE_N ? g_trace_n - TRACE_N : 0;
+        for (unsigned k = g_trace_n; k > from; k--) {
+            const trace_ent *t = &g_trace[(k - 1) % TRACE_N];
+            if (t->str[0] && t->has_ret && !t->ret) {
+                if (!shown++) P("    lookups that found nothing, most recent first:\n");
+                P("      %s(\"%s\") = NULL, %u call%s before the end\n", t->name, t->str, g_trace_n - k, g_trace_n - k == 1 ? "" : "s");
+                if (shown >= 6) break;
+            }
+        }
     }
     /* A keep-going run that ended badly almost always ended badly *because*
      * of the lie, not beside it -- so say so, rather than leaving a fault
@@ -1549,8 +1756,11 @@ int w32_crash_report(w32 *w, char *out, size_t out_len) {
     return (int)n;
 }
 
-int winrun_main(int argc, char **argv) {
+static int g_prog_index;
+static const char *g_child_cwd;
+static int winrun_once(int argc, char **argv) {
     winrun_reset();
+    g_child_cwd = 0;
     w32 *w = &g_w;
     { struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_sigaction = on_crash; sa.sa_flags = SA_SIGINFO;
       sigaction(SIGSEGV, &sa, 0); sigaction(SIGBUS, &sa, 0); }
@@ -1562,6 +1772,7 @@ int winrun_main(int argc, char **argv) {
         else if (!strcmp(argv[ai], "-survey") && ai + 1 < argc) return survey(argv[ai + 1]);
         else if (!strcmp(argv[ai], "-input") && ai + 1 < argc) { if (script_load(argv[++ai])) return 2; }
         else if (!strcmp(argv[ai], "-k")) w->keep_going = 1;
+        else if (!strcmp(argv[ai], "-cd") && ai + 1 < argc) { g_child_cwd = argv[ai + 1]; ai++; }   /* a child's starting directory */
         else if (!strcmp(argv[ai], "-t") && ai + 1 < argc) { w->deadline_ns = now_ns_host() + (uint64_t)atoll(argv[ai + 1]) * 1000000000ull; ai++; }
         else if (!strcmp(argv[ai], "-C") && ai + 1 < argc) { w32_set_drive_c(argv[ai + 1]); ai++; }
         /* What the guest is told the display is. A game reads it before it
@@ -1606,6 +1817,9 @@ int winrun_main(int argc, char **argv) {
                                       "              [-C drive_c] [-L dlldir] [-input script] [-screen WxH] [-frame] [-dpi n]\n"
                           "              program.exe [args...]\n"); return 2; }
     w->exe_path = argv[ai];
+    g_prog_index = ai;
+    /* The app has no command line; its "detailed run log" switch sets this. */
+    { const char *v = getenv("WINRUN_VERBOSE"); if (v && *v && *v != '0') w->verbose += atoi(v) > 1 ? 2 : 1; }
 
     /* bitness decides the memory model, so peek at the header first */
     { FILE *f = fopen(argv[ai], "rb"); uint8_t h[0x200] = {0};
@@ -1647,6 +1861,7 @@ int winrun_main(int argc, char **argv) {
      * arena's bump allocator or host mmap, neither of which lands on a PE32+
      * preferred base (0x140000000) or a PE32 one (0x400000) */
     process_init(w, argc - ai, argv + ai);
+    if (g_child_cwd && g_child_cwd[0]) w32_set_cwd_win(w, g_child_cwd);
     if (w32_load_pe(w, argv[ai])) return 2;
     if (w->imports_only) {
         if (g_surveying) sv_collect(w); else report_imports(w);
@@ -1716,7 +1931,7 @@ int winrun_main(int argc, char **argv) {
     /* A report whenever there is something to report: an abnormal end, or a
      * clean one that leaned on functions we do not have. */
     if (w->stop_reason || w->nunimpl) {
-        static char rep[16384];
+        static char rep[32768];
         w32_crash_report(w, rep, sizeof rep);
         printf("\n%s", rep);
         fflush(stdout);
@@ -1729,6 +1944,50 @@ int winrun_main(int argc, char **argv) {
                 (unsigned long long)jco, (unsigned long long)jl, (unsigned long long)jlw, (unsigned long long)jls);
     }
     return code;
+}
+
+/* Run the program, then whatever it started, each in turn. A child gets the
+ * flags its parent was run with (not its input script or frame dump, which
+ * belong to the parent alone), its own program and arguments, and the
+ * directory it asked for. The exit code returned is the first program's:
+ * that is what an importer or a launcher's caller is asking about. */
+static int split_args(char *s, char **out, int max) {
+    int n = 0;
+    while (*s && n < max) {
+        while (*s == ' ') s++;
+        if (!*s) break;
+        if (*s == '"') { s++; out[n++] = s; while (*s && *s != '"') s++; }
+        else { out[n++] = s; while (*s && *s != ' ') s++; }
+        if (*s) *s++ = 0;
+    }
+    return n;
+}
+int winrun_main(int argc, char **argv) {
+    g_nlaunch = 0; g_launch_next = 0;
+    int rc = winrun_once(argc, argv);
+    while (g_launch_next < g_nlaunch) {
+        int i = g_launch_next++;
+        static char exe[1024], args[2048], cwd[512];
+        snprintf(exe, sizeof exe, "%s", g_launch[i].exe);
+        snprintf(args, sizeof args, "%s", g_launch[i].args);
+        snprintf(cwd, sizeof cwd, "%s", g_launch[i].cwd);
+        char *cargv[96]; int cargc = 0;
+        for (int k = 0; k < g_prog_index && cargc < 64; k++) {
+            if (!strcmp(argv[k], "-input")) { k++; continue; }
+            if (!strcmp(argv[k], "-frame") || !strcmp(argv[k], "-imports")) continue;
+            cargv[cargc++] = argv[k];
+        }
+        if (cwd[0]) { cargv[cargc++] = (char *)"-cd"; cargv[cargc++] = cwd; }
+        cargv[cargc++] = exe;
+        cargc += split_args(args, cargv + cargc, 16);
+        cargv[cargc] = 0;
+        const char *base = strrchr(exe, '/'); base = base ? base + 1 : exe;
+        printf("\n================ %s started %s%s%s; running it now ================\n\n",
+               g_launch[i].who, base, args[0] ? " " : "", args);
+        fflush(stdout);
+        winrun_once(cargc, cargv);
+    }
+    return rc;
 }
 
 #ifndef WINRUN_NO_MAIN

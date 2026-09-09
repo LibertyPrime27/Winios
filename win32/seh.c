@@ -92,8 +92,18 @@ static int g_depth;                            /* dispatches in flight, to stop 
 static uint32_t g_last_code;                   /* what ended the run, for the report */
 static uint64_t g_last_addr;
 
+/* 64-bit state; see the table-driven section below. */
+enum { MAX_DYNTAB = 32 };
+static struct { uint64_t table, base; uint32_t count; } g_dyntab[MAX_DYNTAB];   /* RtlAddFunctionTable: a JIT's frames */
+static int g_ndyntab;
+static uint64_t g_seh_target;             /* the unwind a handler asked for, waiting for the host frames to drop */
+static uint64_t g_resume_ctx[8];          /* the exception contexts the dispatches in progress work with */
+static int g_nresume;
+static int dispatch64(w32 *w, uint64_t rec, uint64_t ctx);
+
 void w32_seh_reset(void) {
     g_filter = 0; g_nveh = 0; g_depth = 0; g_last_code = 0; g_last_addr = 0;
+    g_ndyntab = 0; g_seh_target = 0; g_nresume = 0;
 }
 
 /* --- CONTEXT ------------------------------------------------------------- */
@@ -275,8 +285,10 @@ int w32_raise(w32 *w, uint32_t code, uint32_t flags, uint64_t exc_addr,
         if (r == FILTER_CONTINUE_EXECUTION) handled = 1;
     }
 
-    /* The frame list. 64-bit Windows does not have one -- see the note at the
-     * end of this file -- so this is the 32-bit path only. */
+    /* 64-bit: the unwind tables. */
+    if (!handled && !w->is32) handled = dispatch64(w, rec, ctx);
+
+    /* The frame list: 32-bit only; 64-bit Windows does not have one. */
     if (!handled && w->is32) {
         uint64_t frame = w32_read(w, w32_self()->teb + 0, 4), prev = 0;
         while (frame && frame != 0xFFFFFFFFu) {
@@ -316,7 +328,12 @@ int w32_raise(w32 *w, uint32_t code, uint32_t flags, uint64_t exc_addr,
     }
 
     g_depth--;
-    if (handled) { w32_context_load(w, ctx); return 1; }
+    if (handled) {
+        /* a handler that unwound left the landing pad's context for us */
+        if (g_seh_target) { uint64_t t = g_seh_target; g_seh_target = 0; w32_context_load(w, t); }
+        else w32_context_load(w, ctx);
+        return 1;
+    }
     c->gpr[XC_RSP] = saved_rsp; c->rip = saved_rip;
     return 0;
 }
@@ -345,6 +362,364 @@ int w32_fault_to_exception(w32 *w) {
         code = EXC_STACK_OVERFLOW;
     return w32_raise(w, code, 0, c->rip, code == EXC_STACK_OVERFLOW ? 0 : 2, params);
 }
+
+
+/* --- 64-bit: table-driven unwinding ---------------------------------------
+ *
+ * x86-64 Windows keeps no list on the stack. The compiler emits, for every
+ * function, a RUNTIME_FUNCTION in .pdata (begin, end, unwind info) and an
+ * UNWIND_INFO in .xdata describing its prologue as a list of codes; the
+ * dispatcher looks the faulting RIP up, plays the codes backwards to recover
+ * the caller's registers, and calls the language handler the entry names.
+ * That is RtlLookupFunctionEntry and RtlVirtualUnwind, and the two loops
+ * built on them: dispatch (search for a handler that wants it) and
+ * RtlUnwindEx (run the cleanups and land on the target).
+ *
+ * Two things about running this in an emulator. A handler is called through
+ * w32_call_guest, whose return address is a host stub that is in no module;
+ * when a walk started inside a handler reaches it, it continues from the
+ * exception context the dispatch was working with -- which is what Windows'
+ * own dispatcher frame does, with a machine frame. And a handler that unwinds
+ * to a landing pad does not longjmp over the host: RtlUnwindEx loads the
+ * target context, notes it, and returns to the host through the same stub, so
+ * the dispatcher's host frames unwind too. Each caught exception costs no
+ * host stack afterwards.
+ */
+enum { UNW_FLAG_EHANDLER = 1, UNW_FLAG_UHANDLER = 2, UNW_FLAG_CHAININFO = 4 };
+enum { UWOP_PUSH_NONVOL = 0, UWOP_ALLOC_LARGE, UWOP_ALLOC_SMALL, UWOP_SET_FPREG, UWOP_SAVE_NONVOL, UWOP_SAVE_NONVOL_FAR,
+       UWOP_EPILOG, UWOP_SPARE_CODE, UWOP_SAVE_XMM128, UWOP_SAVE_XMM128_FAR, UWOP_PUSH_MACHFRAME };
+enum { DC_ControlPc = 0, DC_ImageBase = 8, DC_FunctionEntry = 16, DC_EstablisherFrame = 24, DC_TargetIp = 32,
+       DC_ContextRecord = 40, DC_LanguageHandler = 48, DC_HandlerData = 56, DC_HistoryTable = 64, DC_ScopeIndex = 72, DC_SIZE = 80 };
+enum { STATUS_UNWIND_ = 0xC0000027 };
+
+/* Function tables a JIT registers at run time (RtlAddFunctionTable): Mono,
+ * .NET and V8 all do, so their frames unwind like compiled ones. */
+
+static uint64_t rd64(w32 *w, uint64_t a) { return w32_read(w, a, 8); }
+static uint32_t rd32(w32 *w, uint64_t a) { return (uint32_t)w32_read(w, a, 4); }
+
+/* RtlLookupFunctionEntry: the RUNTIME_FUNCTION covering `pc`, or 0. Modules
+ * first (binary search: .pdata is sorted), then the dynamic tables. */
+static uint64_t lookup_entry(w32 *w, uint64_t pc, uint64_t *base) {
+    for (int i = 0; i < w->nmods; i++) {
+        w32_module *m = &w->mods[i];
+        if (pc < m->base || pc >= m->base + m->size || !m->pdata_size) continue;
+        uint64_t tab = m->base + m->pdata_rva; uint32_t n = m->pdata_size / 12, lo = 0, hi = n;
+        uint32_t rva = (uint32_t)(pc - m->base);
+        while (lo < hi) {
+            uint32_t mid = (lo + hi) / 2, b = rd32(w, tab + 12ull * mid), e = rd32(w, tab + 12ull * mid + 4);
+            if (rva < b) hi = mid; else if (rva >= e) lo = mid + 1;
+            else { *base = m->base; return tab + 12ull * mid; }
+        }
+        return 0;                                    /* in the module, but a leaf */
+    }
+    for (int i = 0; i < g_ndyntab; i++) {
+        uint64_t b = g_dyntab[i].base;
+        for (uint32_t k = 0; k < g_dyntab[i].count; k++) {
+            uint64_t e = g_dyntab[i].table + 12ull * k;
+            if (pc >= b + rd32(w, e) && pc < b + rd32(w, e + 4)) { *base = b; return e; }
+        }
+    }
+    return 0;
+}
+static uint64_t ctx_reg(w32 *w, uint64_t ctx, int r) { return rd64(w, ctx + CTX64_RAX + 8u * (unsigned)r); }
+static void ctx_set(w32 *w, uint64_t ctx, int r, uint64_t v) { w32_write(w, ctx + CTX64_RAX + 8u * (unsigned)r, 8, v); }
+
+/* RtlVirtualUnwind: play one function's prologue backwards over `ctx`, so it
+ * becomes the caller's context. Returns the handler if the entry has one of
+ * the `want` kind, and says where the establisher frame was. */
+static uint64_t virtual_unwind(w32 *w, int want, uint64_t base, uint64_t pc, uint64_t entry, uint64_t ctx,
+                               uint64_t *handler_data, uint64_t *establisher) {
+    uint64_t handler = 0; int chained = 0;
+    *handler_data = 0; *establisher = ctx_reg(w, ctx, 4);
+    for (int hop = 0; hop < 8; hop++) {
+        uint64_t begin = base + rd32(w, entry), info = base + rd32(w, entry + 8);
+        if (!w32_mem_ok(w, info, 4)) return 0;
+        uint32_t b0 = rd32(w, info) & 0xFF, flags = b0 >> 3;
+        uint32_t ncodes = (rd32(w, info) >> 16) & 0xFF, frame_reg = (rd32(w, info) >> 24) & 0xF, frame_off = (rd32(w, info) >> 28) & 0xF;
+        uint64_t codes = info + 4;
+        uint64_t rsp = ctx_reg(w, ctx, 4);
+        if (!chained && frame_reg) *establisher = ctx_reg(w, ctx, (int)frame_reg) - 16ull * frame_off;
+        uint32_t offset_in = pc >= begin ? (uint32_t)(pc - begin) : 0xFFFFFFFFu;
+        int machframe = 0;
+        for (uint32_t i = 0; i < ncodes; ) {
+            uint32_t code = rd32(w, codes + 2ull * i) & 0xFFFF, coff = code & 0xFF, op = (code >> 8) & 0xF, opinfo = code >> 12;
+            uint32_t slots = 1;
+            switch (op) {
+            case UWOP_ALLOC_LARGE: slots = opinfo ? 3 : 2; break;
+            case UWOP_SAVE_NONVOL: case UWOP_SAVE_XMM128: case UWOP_EPILOG: slots = 2; break;
+            case UWOP_SAVE_NONVOL_FAR: case UWOP_SAVE_XMM128_FAR: case UWOP_SPARE_CODE: slots = 3; break;
+            default: break;
+            }
+            if (op == UWOP_EPILOG) slots = 1;
+            /* a code the prologue has not executed yet (fault inside the prologue) does not apply */
+            if (!chained && coff > offset_in) { i += slots; continue; }
+            switch (op) {
+            case UWOP_PUSH_NONVOL: ctx_set(w, ctx, (int)opinfo, rd64(w, rsp)); rsp += 8; break;
+            case UWOP_ALLOC_LARGE:
+                if (opinfo) rsp += rd32(w, codes + 2ull * (i + 1));
+                else rsp += 8ull * (rd32(w, codes + 2ull * (i + 1)) & 0xFFFF);
+                break;
+            case UWOP_ALLOC_SMALL: rsp += 8ull * opinfo + 8; break;
+            case UWOP_SET_FPREG: rsp = ctx_reg(w, ctx, (int)frame_reg) - 16ull * frame_off; break;
+            case UWOP_SAVE_NONVOL: ctx_set(w, ctx, (int)opinfo, rd64(w, rsp + 8ull * (rd32(w, codes + 2ull * (i + 1)) & 0xFFFF))); break;
+            case UWOP_SAVE_NONVOL_FAR: ctx_set(w, ctx, (int)opinfo, rd64(w, rsp + rd32(w, codes + 2ull * (i + 1)))); break;
+            case UWOP_SAVE_XMM128: { uint64_t at = rsp + 16ull * (rd32(w, codes + 2ull * (i + 1)) & 0xFFFF);
+                w32_write(w, ctx + CTX64_XMM0 + 16u * opinfo, 8, rd64(w, at)); w32_write(w, ctx + CTX64_XMM0 + 16u * opinfo + 8, 8, rd64(w, at + 8)); break; }
+            case UWOP_SAVE_XMM128_FAR: { uint64_t at = rsp + rd32(w, codes + 2ull * (i + 1));
+                w32_write(w, ctx + CTX64_XMM0 + 16u * opinfo, 8, rd64(w, at)); w32_write(w, ctx + CTX64_XMM0 + 16u * opinfo + 8, 8, rd64(w, at + 8)); break; }
+            case UWOP_PUSH_MACHFRAME:
+                w32_write(w, ctx + CTX64_RIP, 8, rd64(w, rsp + (opinfo ? 8 : 0)));
+                rsp = rd64(w, rsp + (opinfo ? 32 : 24)); machframe = 1; break;
+            default: break;
+            }
+            i += slots;
+        }
+        ctx_set(w, ctx, 4, rsp);
+        if ((flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER)) && !handler) {
+            uint64_t after = codes + 2ull * ((ncodes + 1) & ~1u);
+            if (flags & want) { handler = base + rd32(w, after); *handler_data = after + 4; }
+        }
+        if (flags & UNW_FLAG_CHAININFO) {
+            entry = codes + 2ull * ((ncodes + 1) & ~1u);      /* a RUNTIME_FUNCTION follows the codes */
+            chained = 1; continue;
+        }
+        if (!machframe) { w32_write(w, ctx + CTX64_RIP, 8, rd64(w, rsp)); ctx_set(w, ctx, 4, rsp + 8); }   /* the return address */
+        break;
+    }
+    return handler;
+}
+static void ctx_copy(w32 *w, uint64_t dst, uint64_t src) {
+    void *d = W32PN(w, dst, CTX64_SIZE); const void *s = W32PN(w, src, CTX64_SIZE);
+    if (d && s) memcpy(d, s, CTX64_SIZE);
+}
+static int frame_in_stack(w32 *w, uint64_t f) {
+    return f >= w32_self()->stack_limit && f < w32_self()->stack_base && !(f & 7);
+}
+/* A walk that meets one of our return stubs: the frame above it is host code,
+ * and above that the exception the dispatch was working with. */
+static int cross_host_frame(w32 *w, uint64_t uctx) {
+    uint64_t rip = rd64(w, uctx + CTX64_RIP);
+    if (rip != w32_stub_return_addr(w) || !g_nresume) return 0;
+    ctx_copy(w, uctx, g_resume_ctx[g_nresume - 1]);
+    return rd64(w, uctx + CTX64_RIP) != rip;                     /* a resume point that is itself the stub would loop */
+}
+static void dc_write(w32 *w, uint64_t dc, uint64_t pc, uint64_t base, uint64_t entry, uint64_t frame, uint64_t target_ip,
+                     uint64_t ctx, uint64_t handler, uint64_t hdata) {
+    w32_write(w, dc + DC_ControlPc, 8, pc); w32_write(w, dc + DC_ImageBase, 8, base); w32_write(w, dc + DC_FunctionEntry, 8, entry);
+    w32_write(w, dc + DC_EstablisherFrame, 8, frame); w32_write(w, dc + DC_TargetIp, 8, target_ip); w32_write(w, dc + DC_ContextRecord, 8, ctx);
+    w32_write(w, dc + DC_LanguageHandler, 8, handler); w32_write(w, dc + DC_HandlerData, 8, hdata); w32_write(w, dc + DC_HistoryTable, 8, 0);
+    w32_write(w, dc + DC_ScopeIndex, 4, 0); w32_write(w, dc + DC_ScopeIndex + 4, 4, 0);
+}
+
+/* The search: walk from the exception context, calling each frame's exception
+ * handler until one continues execution, or unwinds (g_seh_target), or the
+ * stack runs out. `ctx` is the record the handlers see; the walk uses a copy. */
+static int dispatch64(w32 *w, uint64_t rec, uint64_t ctx) {
+    xc_cpu *c = w32_cpu(w);
+    uint64_t sp = c->gpr[XC_RSP];
+    uint64_t uctx = (sp - 2 * CTX64_SIZE - DC_SIZE - 64) & ~15ull, dc = uctx + CTX64_SIZE, resume = dc + DC_SIZE;
+    if (uctx < w32_self()->stack_limit) return 0;
+    ctx_copy(w, uctx, ctx);
+    /* A private copy is what a walk resumes from past our host frame. The
+     * record the handlers see (`ctx`) is theirs to scribble on -- libgcc
+     * passes it to RtlUnwindEx as scratch -- so it cannot also be the anchor. */
+    ctx_copy(w, resume, ctx);
+    c->gpr[XC_RSP] = uctx - 64;                                  /* handlers run below all of it */
+    if (g_nresume < 8) g_resume_ctx[g_nresume++] = resume;
+    int handled = 0;
+    for (int steps = 0; steps < 4096 && !handled; steps++) {
+        uint64_t pc = rd64(w, uctx + CTX64_RIP), base = 0;
+        uint64_t entry = lookup_entry(w, pc, &base);
+        if (!entry) {
+            if (cross_host_frame(w, uctx)) continue;
+            uint64_t rsp = ctx_reg(w, uctx, 4);                   /* a leaf: the return address is at RSP */
+            if (!frame_in_stack(w, rsp)) break;
+            w32_write(w, uctx + CTX64_RIP, 8, rd64(w, rsp)); ctx_set(w, uctx, 4, rsp + 8);
+            continue;
+        }
+        uint64_t hdata = 0, frame = 0;
+        uint64_t handler = virtual_unwind(w, UNW_FLAG_EHANDLER, base, pc, entry, uctx, &hdata, &frame);
+        if (!frame_in_stack(w, frame)) break;
+        if (handler) {
+            dc_write(w, dc, pc, base, entry, frame, 0, ctx, handler, hdata);
+            if (w->verbose > 1) fprintf(stderr, "winrun: seh64: frame %#llx handler %#llx for pc %#llx\n", (unsigned long long)frame, (unsigned long long)handler, (unsigned long long)pc);
+            uint64_t args[4] = { rec, frame, ctx, dc };
+            uint64_t r = (uint32_t)w32_call_guest(w, handler, 4, args);
+            if (w->exited) break;
+            if (g_seh_target) { handled = 1; break; }             /* it unwound to a landing pad */
+            if (r == ContinueExecution) { handled = 1; break; }
+            if (r != ContinueSearch) {
+                fprintf(stderr, "winrun: seh64: handler at %#llx returned %llu\n", (unsigned long long)handler, (unsigned long long)r);
+                break;
+            }
+        }
+    }
+    g_nresume--;
+    return handled;
+}
+
+/* RtlUnwindEx(TargetFrame, TargetIp, ExceptionRecord, ReturnValue, ContextRecord, HistoryTable).
+ * Walks from the caller, giving every frame's unwind handler its say, until
+ * the establisher frame is TargetFrame; lands there with RIP = TargetIp and
+ * RAX = ReturnValue. Never returns to its caller. */
+static void unwind64(w32 *w, uint64_t target_frame, uint64_t target_ip, uint64_t urec, uint64_t retval, uint64_t ctx_arg) {
+    xc_cpu *c = w32_cpu(w);
+    uint64_t saved_rsp = c->gpr[XC_RSP];
+    uint64_t sp = c->gpr[XC_RSP];
+    uint64_t scratch = (sp - 3 * CTX64_SIZE - DC_SIZE - ER64_SIZE - 128) & ~15ull;
+    if (scratch < w32_self()->stack_limit) { fprintf(stderr, "winrun: RtlUnwindEx: no stack for the unwind\n"); w32_exit(w, 129); return; }
+    uint64_t ctx = ctx_arg && w32_mem_ok(w, ctx_arg, CTX64_SIZE) ? ctx_arg : scratch;
+    uint64_t next = scratch + CTX64_SIZE, dc = next + CTX64_SIZE, rec = urec ? urec : dc + DC_SIZE, resume = dc + DC_SIZE + ER64_SIZE;
+    /* the caller's context: RtlUnwindEx returned to it, as far as the walk is concerned */
+    { uint64_t ret = rd64(w, c->gpr[XC_RSP]); uint64_t rip0 = c->rip, rsp0 = c->gpr[XC_RSP];
+      c->rip = ret; c->gpr[XC_RSP] = rsp0 + 8; w32_context_save(w, ctx); c->rip = rip0; c->gpr[XC_RSP] = rsp0; }
+    if (!urec) rec_write(w, rec, STATUS_UNWIND_, EF_UNWINDING | (target_frame ? 0 : EF_EXIT_UNWIND), rd64(w, ctx + CTX64_RIP), 0, 0);
+    else w32_write(w, rec + ER64_FLAGS, 4, rd32(w, rec + ER64_FLAGS) | (uint32_t)EF_UNWINDING | (target_frame ? 0 : (uint32_t)EF_EXIT_UNWIND));
+    c->gpr[XC_RSP] = scratch - 64;
+    int found = 0;
+    for (int steps = 0; steps < 4096; steps++) {
+        uint64_t pc = rd64(w, ctx + CTX64_RIP), base = 0;
+        uint64_t entry = lookup_entry(w, pc, &base);
+        if (w->verbose > 1) fprintf(stderr, "winrun: unwind64: pc %#llx rsp %#llx entry %#llx%s\n", (unsigned long long)pc, (unsigned long long)ctx_reg(w, ctx, 4), (unsigned long long)entry, pc == w32_stub_return_addr(w) ? "  (host stub)" : "");
+        if (!entry) {
+            if (cross_host_frame(w, ctx)) continue;
+            uint64_t rsp = ctx_reg(w, ctx, 4);
+            if (!frame_in_stack(w, rsp)) { if (w->verbose) fprintf(stderr, "winrun: unwind64: leaf with rsp %#llx outside the stack; stopping\n", (unsigned long long)rsp); break; }
+            w32_write(w, ctx + CTX64_RIP, 8, rd64(w, rsp)); ctx_set(w, ctx, 4, rsp + 8);
+            continue;
+        }
+        ctx_copy(w, next, ctx);
+        uint64_t hdata = 0, frame = 0;
+        uint64_t handler = virtual_unwind(w, UNW_FLAG_UHANDLER, base, pc, entry, next, &hdata, &frame);
+        if (w->verbose > 1) fprintf(stderr, "winrun: unwind64:   frame %#llx handler %#llx -> pc %#llx rsp %#llx\n", (unsigned long long)frame, (unsigned long long)handler, (unsigned long long)rd64(w, next + CTX64_RIP), (unsigned long long)ctx_reg(w, next, 4));
+        if (!frame_in_stack(w, frame)) { if (w->verbose) fprintf(stderr, "winrun: unwind64: frame %#llx outside the stack; stopping\n", (unsigned long long)frame); break; }
+        if (target_frame && frame > target_frame) { fprintf(stderr, "winrun: RtlUnwindEx: passed the target frame %#llx at %#llx\n", (unsigned long long)target_frame, (unsigned long long)frame); break; }
+        if (handler) {
+            uint32_t fl = rd32(w, rec + ER64_FLAGS);
+            if (frame == target_frame) w32_write(w, rec + ER64_FLAGS, 4, fl | EF_TARGET_UNWIND);
+            dc_write(w, dc, pc, base, entry, frame, target_ip, ctx, handler, hdata);
+            ctx_copy(w, resume, ctx);
+            if (g_nresume < 8) g_resume_ctx[g_nresume++] = resume;
+            uint64_t args[4] = { rec, frame, ctx, dc };
+            uint64_t r = (uint32_t)w32_call_guest(w, handler, 4, args);
+            g_nresume--;
+            w32_write(w, rec + ER64_FLAGS, 4, fl);
+            if (w->exited) return;
+            if (g_seh_target) return;                            /* a nested unwind took over */
+            if (r != ContinueSearch) fprintf(stderr, "winrun: RtlUnwindEx: handler at %#llx returned %llu\n", (unsigned long long)handler, (unsigned long long)r);
+        }
+        if (frame == target_frame) { found = 1; break; }
+        ctx_copy(w, ctx, next);
+    }
+    if (!found && target_frame) {
+        fprintf(stderr, "winrun: RtlUnwindEx: target frame %#llx not found on the stack\n", (unsigned long long)target_frame);
+        c->gpr[XC_RSP] = saved_rsp;
+        w->stop_reason = "an unhandled exception"; w32_exit(w, 129); return;
+    }
+    ctx_set(w, ctx, 0, retval);
+    if (target_ip) w32_write(w, ctx + CTX64_RIP, 8, target_ip);
+    if (g_depth > 0) {
+        /* inside a dispatch: hand the target to it and let the host frames unwind */
+        g_seh_target = ctx;
+        w32_return_to_host(w);
+    } else {
+        w32_context_load(w, ctx);
+        w->redirected = 1;
+    }
+}
+
+/* __C_specific_handler(rec, frame, ctx, dc): MSVC's __try. The scope table in
+ * the handler data lists, per __try, its range, its filter (or 1 for "always")
+ * and its __except body -- or, with no body, a __finally. */
+void w32_C_specific_handler(w32 *w) {
+    uint64_t rec = ARG(0), frame = ARG(1), ctx = ARG(2), dc = ARG(3);
+    uint64_t base = rd64(w, dc + DC_ImageBase), table = rd64(w, dc + DC_HandlerData);
+    uint64_t pc = rd64(w, dc + DC_ControlPc) - base;
+    uint32_t flags = rd32(w, rec + ER64_FLAGS), count = rd32(w, table), scope0 = rd32(w, dc + DC_ScopeIndex);
+    if (count > 4096 || !w32_mem_ok(w, table, 4 + 16ull * count)) { RET(ContinueSearch); return; }
+    if (flags & (EF_UNWINDING | EF_EXIT_UNWIND)) {
+        uint64_t target = rd64(w, dc + DC_TargetIp) - base;
+        for (uint32_t i = scope0; i < count; i++) {
+            uint64_t e = table + 4 + 16ull * i;
+            uint32_t b = rd32(w, e), en = rd32(w, e + 4), h = rd32(w, e + 8), jt = rd32(w, e + 12);
+            if (pc < b || pc >= en || jt) continue;               /* not this scope, or a __try/__except */
+            if ((flags & EF_TARGET_UNWIND) && target >= b && target < en) break;   /* landing inside it: leave it be */
+            w32_write(w, dc + DC_ScopeIndex, 4, i + 1);
+            uint64_t args[2] = { 1, frame };                       /* __finally(abnormal = TRUE, frame) */
+            w32_call_guest(w, base + h, 2, args);
+            if (w->exited || g_seh_target) { RET(ContinueSearch); return; }
+        }
+        RET(ContinueSearch); return;
+    }
+    for (uint32_t i = scope0; i < count; i++) {
+        uint64_t e = table + 4 + 16ull * i;
+        uint32_t b = rd32(w, e), en = rd32(w, e + 4), h = rd32(w, e + 8), jt = rd32(w, e + 12);
+        if (pc < b || pc >= en || !jt) continue;
+        int64_t r = 1;
+        if (h != 1) {                                             /* a filter expression; 1 means EXCEPTION_EXECUTE_HANDLER outright */
+            xc_cpu *c = w32_cpu(w);
+            uint64_t ptrs = (c->gpr[XC_RSP] - 32) & ~15ull;
+            w32_write(w, ptrs, 8, rec); w32_write(w, ptrs + 8, 8, ctx);
+            uint64_t saved = c->gpr[XC_RSP]; c->gpr[XC_RSP] = ptrs - 16;
+            uint64_t args[2] = { ptrs, frame };
+            r = (int32_t)w32_call_guest(w, base + h, 2, args);
+            c->gpr[XC_RSP] = saved;
+            if (w->exited || g_seh_target) { RET(ContinueSearch); return; }
+        }
+        if (r < 0) { RET(ContinueExecution); return; }
+        if (r > 0) {
+            unwind64(w, frame, base + jt, rec, rd32(w, rec + ER64_CODE), ctx);
+            RET(ContinueSearch); return;                          /* not reached as a return the guest sees */
+        }
+    }
+    RET(ContinueSearch);
+}
+
+/* --- the 64-bit exports ------------------------------------------------------ */
+static void k_RtlLookupFunctionEntry(w32 *w) {
+    uint64_t base = 0, e = w->is32 ? 0 : lookup_entry(w, ARG(0), &base);
+    if (ARG(1)) w32_write(w, ARG(1), 8, base);
+    RET(e);
+}
+/* RtlVirtualUnwind(HandlerType, ImageBase, ControlPc, FunctionEntry, Context, *HandlerData, *EstablisherFrame, ContextPointers) */
+static void k_RtlVirtualUnwind(w32 *w) {
+    if (w->is32 || !ARG(3) || !ARG(4) || !w32_mem_ok(w, ARG(4), CTX64_SIZE)) { RET(0); return; }
+    uint64_t hdata = 0, frame = 0;
+    uint64_t h = virtual_unwind(w, (int)ARG(0), ARG(1), ARG(2), ARG(3), ARG(4), &hdata, &frame);
+    if (ARG(5)) w32_write(w, ARG(5), 8, hdata);
+    if (ARG(6)) w32_write(w, ARG(6), 8, frame);
+    RET(h);
+}
+static void k_RtlUnwindEx(w32 *w) {
+    if (w->is32) { RET(0); return; }
+    unwind64(w, ARG(0), ARG(1), ARG(2), ARG(3), ARG(4));
+}
+static void k_RtlPcToFileHeader(w32 *w) {
+    uint64_t pc = ARG(0), base = 0;
+    for (int i = 0; i < w->nmods; i++) if (pc >= w->mods[i].base && pc < w->mods[i].base + w->mods[i].size) base = w->mods[i].base;
+    if (!base) base = w32_module_handle(w, "kernel32.dll") == pc ? pc : 0;
+    if (ARG(1)) w32_write(w, ARG(1), (int)w32_ptrsize(w), base);
+    RET(base);
+}
+/* RtlAddFunctionTable(FunctionTable, EntryCount, BaseAddress) -- a JIT's frames. */
+static void k_RtlAddFunctionTable(w32 *w) {
+    if (w->is32 || g_ndyntab >= MAX_DYNTAB || !ARG(0)) { RET(0); return; }
+    g_dyntab[g_ndyntab].table = ARG(0); g_dyntab[g_ndyntab].count = (uint32_t)ARG(1); g_dyntab[g_ndyntab].base = ARG(2);
+    g_ndyntab++;
+    if (w->verbose) fprintf(stderr, "winrun: RtlAddFunctionTable: %u entries at %#llx, base %#llx\n", (unsigned)ARG(1), (unsigned long long)ARG(0), (unsigned long long)ARG(2));
+    RET(1);
+}
+static void k_RtlDeleteFunctionTable(w32 *w) {
+    for (int i = 0; i < g_ndyntab; i++) if (g_dyntab[i].table == ARG(0)) { g_dyntab[i] = g_dyntab[--g_ndyntab]; RET(1); return; }
+    RET(0);
+}
+static void k_RtlInstallFunctionTableCallback(w32 *w) {
+    w32_note_refused(w, "ntdll!RtlInstallFunctionTableCallback (a callback-supplied unwind table; tables handed over whole do work)");
+    RET(0);
+}
+static void k_RtlGrowFunctionTable(w32 *w) { (void)w; RET(0); }
+static void k___C_specific_handler(w32 *w) { w32_C_specific_handler(w); }
 
 /* --- the API ------------------------------------------------------------- */
 
@@ -395,7 +770,7 @@ static void k_RaiseException(w32 *w) {
  * body -- MSVC's __global_unwind2 puts the label it wants immediately after
  * the call, so returning normally lands where TargetIp points. */
 static void k_RtlUnwind(w32 *w) {
-    if (!w->is32) { RET(0); return; }
+    if (!w->is32) { unwind64(w, ARG(0), ARG(1), ARG(2), ARG(3), 0); return; }
     uint64_t target = ARG(0);
     uint64_t urec = ARG(2);
     uint64_t frame = w32_read(w, w32_self()->teb + 0, 4), prev = 0;
@@ -523,6 +898,14 @@ const w32_api w32_seh_kernel32[] = {
     F(IsBadReadPtr, 2),
     F(IsBadWritePtr, 2),
     F(IsBadCodePtr, 1),
+    F(RtlLookupFunctionEntry, 3),
+    F(RtlVirtualUnwind, 8),
+    F(RtlUnwindEx, 6),
+    F(RtlPcToFileHeader, 2),
+    F(RtlAddFunctionTable, 3),
+    F(RtlDeleteFunctionTable, 1),
+    F(RtlInstallFunctionTableCallback, 6),
+    F(RtlGrowFunctionTable, 2),
     { 0, 0, 0, 0, 0 },
 };
 const w32_api w32_seh_ntdll[] = {
@@ -532,20 +915,18 @@ const w32_api w32_seh_ntdll[] = {
     F(NtContinue, 2),
     F(RtlAddVectoredExceptionHandler, 2),
     F(RtlRemoveVectoredExceptionHandler, 1),
+    F(RtlLookupFunctionEntry, 3),
+    F(RtlVirtualUnwind, 8),
+    F(RtlUnwindEx, 6),
+    F(RtlPcToFileHeader, 2),
+    F(RtlAddFunctionTable, 3),
+    F(RtlDeleteFunctionTable, 1),
+    F(RtlInstallFunctionTableCallback, 6),
+    F(__C_specific_handler, 4),
     { 0, 0, 0, 0, 0 },
 };
 
-/* --- what is not here ----------------------------------------------------
- *
- * 64-bit SEH. x86-64 Windows does not keep a list on the stack; the compiler
- * emits an unwind table (.pdata/.xdata) describing every function's prologue,
- * and the dispatcher looks the faulting RIP up in it, walks frames using that
- * description, and calls the language handler each entry names. It needs the
- * image's exception directory parsed and a frame walker, neither of which the
- * 32-bit path shares.
- *
- * Vectored handlers and the unhandled filter work in both bitnesses because
- * they do not depend on the frame mechanism; a 64-bit guest's __except does.
+/* --- notes ----------------------------------------------------------------
  *
  * Faults from dynarec-compiled code do work: each guest memory access carries
  * a recovery stub that writes the guest registers back, so the CONTEXT a

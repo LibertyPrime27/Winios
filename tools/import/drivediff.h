@@ -69,6 +69,8 @@ int dd_rank_exes(const char *root, const char *hint, dd_exe *out, int max);
 /* Read just enough of a PE to answer "32 or 64 bit". 1, 0, or -1 for
  * "not a PE / unreadable". */
 int dd_pe_is32(const char *path);
+/* 1 when the image carries a CLR header: a .NET program, which needs a runtime this project does not have. */
+int dd_pe_is_managed(const char *path);
 
 #ifdef __cplusplus
 }

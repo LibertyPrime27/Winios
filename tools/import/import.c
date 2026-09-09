@@ -9,6 +9,7 @@
 
 #include "drivediff.h"
 #include "unzip.h"
+#include "un7z.h"
 
 /* Declared here rather than by including w32.h, so this file -- and so the
  * zip reader, the installer detection and the drive diff beside it -- does
@@ -182,6 +183,12 @@ int wi_space_needed(const char *src, const char *drive_c,
         *needed = t;
         return 1;
     }
+    if (sz_is_7z(src)) {
+        uint64_t t = sz_uncompressed_total(src);
+        if (!t) return 0;
+        *needed = t;
+        return 1;
+    }
     *needed = (uint64_t)st.st_size;
     return 1;
 }
@@ -207,6 +214,7 @@ wi_probe_result wi_probe(const char *path) {
             char first[4096];
             snprintf(first, sizeof first, "%s/%s", path, e[0].rel);
             p.setup = sk_identify(first);
+            p.managed = dd_pe_is_managed(first);
             p.looks_like_installer = p.setup.kind != SK_PLAIN && p.setup.kind != SK_NOT_PE;
         }
         return p;
@@ -214,19 +222,28 @@ wi_probe_result wi_probe(const char *path) {
 
     /* An archive before an executable: a self-extracting .exe is both, and
      * unpacking it is always better than running it. */
-    if (uz_is_zip(path)) {
+    if (uz_is_zip(path) || sz_is_7z(path)) {
         p.src = WI_SRC_ZIP;
         p.setup = sk_identify(path);
-        /* A zip SFX is an archive we can open, so it is not an installer as
-         * far as the user is concerned. */
-        if (p.setup.kind == SK_SFX_ZIP) p.looks_like_installer = 0;
+        /* A zip or 7z SFX is an archive we can open, so it is not an installer
+         * as far as the user is concerned: unpacking beats running. */
+        if (p.setup.kind == SK_SFX_ZIP || p.setup.kind == SK_SFX_7Z) p.looks_like_installer = 0;
         else p.looks_like_installer = p.setup.kind != SK_PLAIN && p.setup.kind != SK_NOT_PE;
+        return p;
+    }
+    if (sz_is_rar(path)) {
+        /* Named, so the importer can say why rather than shrug. */
+        p.src = WI_SRC_UNKNOWN;
+        p.setup = sk_identify(path);
+        p.setup.note = "This is a RAR archive. RAR cannot be unpacked here (its decoder is not free to include); "
+                       "extract it on a computer and import the folder, or repack it as zip or 7z.";
         return p;
     }
 
     p.setup = sk_identify(path);
     p.src = p.setup.kind == SK_NOT_PE ? WI_SRC_UNKNOWN : WI_SRC_EXE;
     p.is32 = dd_pe_is32(path);
+    p.managed = p.src == WI_SRC_EXE && dd_pe_is_managed(path);
     p.looks_like_installer = p.setup.kind != SK_PLAIN && p.setup.kind != SK_NOT_PE;
     return p;
 }
@@ -328,7 +345,7 @@ int wi_import_game(const char *src, const char *drive_c,
     wi_probe_result p = wi_probe(src);
 
     if (p.src == WI_SRC_ZIP) {
-        addf(out, "%s is an archive; extracting it.\n", base_of(src));
+        addf(out, "%s is a %s archive; extracting it.\n", base_of(src), sz_is_7z(src) ? "7z" : "zip");
         /* Into a staging directory first. An archive almost always holds a
          * single top-level folder -- that is what a download unpacks to -- and
          * extracting straight into the entry would nest it one level deeper
@@ -344,7 +361,8 @@ int wi_import_game(const char *src, const char *drive_c,
         /* No cast: uz_progress and wi_progress are the same signature, and a
          * cast here would keep compiling if one of them ever stopped being. */
         uz_progress zcb = cb;
-        int n = uz_extract(src, stage, zcb, ctx, &skipped, err, sizeof err);
+        int n = sz_is_7z(src) ? sz_extract(src, stage, zcb, ctx, &skipped, err, sizeof err)
+                              : uz_extract(src, stage, zcb, ctx, &skipped, err, sizeof err);
         if (n < 0) { addf(out, "extraction failed: %s\n", err); return -1; }
         out->files = n;
         addf(out, "%d file%s extracted", n, n == 1 ? "" : "s");
@@ -519,7 +537,7 @@ int wi_import_installer(const char *setup, const char *drive_c,
     /* A zip payload never has to be executed, whatever the wrapper claims to
      * be -- and not executing it removes every way it can fail. */
     if (p.src == WI_SRC_ZIP) {
-        addf(out, "\nThe payload is a zip, so it is being unpacked rather than run.\n");
+        addf(out, "\nThe payload is an archive, so it is being unpacked rather than run.\n");
         return wi_import_game(setup, drive_c, cb, ctx, out) == 0
              ? (out->ok = 1, 0)
              : -1;

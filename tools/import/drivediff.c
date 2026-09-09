@@ -208,6 +208,28 @@ int dd_pe_is32(const char *path) {
     return -1;
 }
 
+/* A managed (.NET) image: the CLR header data directory is present. Such a
+ * program's only import is mscoree!_CorExeMain and it needs a runtime this
+ * project does not have, so the importer says so up front rather than after a
+ * run that stops on one missing name. */
+int dd_pe_is_managed(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    unsigned char h[0x400] = {0};
+    size_t got = fread(h, 1, sizeof h, f);
+    fclose(f);
+    if (got < 0x40 || h[0] != 'M' || h[1] != 'Z') return 0;
+    uint32_t pe = (uint32_t)h[0x3C] | (uint32_t)h[0x3D] << 8 | (uint32_t)h[0x3E] << 16 | (uint32_t)h[0x3F] << 24;
+    if (pe + 26 > got) return 0;
+    uint16_t magic = (uint16_t)(h[pe + 24] | h[pe + 25] << 8);
+    uint32_t dirs = pe + 24 + (magic == 0x20B ? 112 : magic == 0x10B ? 96 : 0);
+    if (!dirs) return 0;
+    uint32_t com = dirs + 14 * 8;                     /* IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR */
+    if (com + 8 > got) return 0;
+    uint32_t size = (uint32_t)h[com + 4] | (uint32_t)h[com + 5] << 8 | (uint32_t)h[com + 6] << 16 | (uint32_t)h[com + 7] << 24;
+    return size != 0;
+}
+
 /* Names that are never the game, matched as a whole word or a prefix. Being
  * wrong here only costs the executable its ranking, not its place in the
  * list, so a slightly over-eager entry is cheap and a missing one is not. */

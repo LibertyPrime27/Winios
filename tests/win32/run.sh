@@ -4,6 +4,9 @@
 # checked by hand / against the Linux build of the same source).
 #   run.sh <winrun> <dir>
 winrun=$(cd "$(dirname "$1")" && pwd)/$(basename "$1"); cd "$2" || exit 2; fail=0
+# The guests that play sound must not reach a speaker from a test run; the
+# mixer still tracks every buffer, only the device is skipped.
+WINRUN_NO_AUDIO=1; export WINRUN_NO_AUDIO
 # When winrun was cross-compiled -- the aarch64 build, which is the one that
 # matches the device -- it cannot be exec'd here, so CMake passes the
 # emulator to put in front of it. Empty for a native build.
@@ -225,6 +228,37 @@ check dlgtest32.exe 0 -- -frame -screen 640x400
 # keyboard reaches XInput.
 check audiotest64.exe 0 -- -input audiotest.script
 check audiotest32.exe 0 -- -input audiotest.script
+# A program that starts programs: the children run after it, in order.
+check spawntest64.exe 0
+check spawntest32.exe 0
+# DirectInput: keyboard, relative mouse and the keyboard-as-gamepad, from injected input.
+checkx dinputtest64.exe dinputtest64.expected 0 -- -input dinputtest.script
+checkx dinputtest32.exe dinputtest32.expected 0 -- -input dinputtest.script
+# XAudio2: buffers submitted ahead come back in order through the callback; the
+# mixer runs on the wall clock here, so this waits for them (bounded).
+checkx xaudiotest64.exe xaudiotest64.expected 0
+checkx xaudiotest32.exe xaudiotest32.expected 0
+# WASAPI: the enumerator, an event-driven stream over the mixer, the clock.
+# Judged by its own count rather than a recording: the run prints how long
+# the first event took, which is a clock and not a number to record.
+checkrc wasapitest64.exe 0 "0 failures"
+checkrc wasapitest32.exe 0 "0 failures"
+# Direct3D 9 shaders: vs_2_0 and ps_2_0 assembled by hand, three quads --
+# both shaders with texkill, the pixel shader behind the fixed-function
+# transform, the vertex shader in front of fixed-function texturing. The
+# frame is the test: the same on x86, under qemu, and in both bitnesses.
+checkrc d3dshader64.exe 0 "0 failures"
+checkrc d3dshader32.exe 0 "0 failures"
+checkframe d3dshader64.exe own 8e183572
+checkframe d3dshader32.exe own 8e183572
+# GetProcAddress says NULL for what is not here, and the thread pool runs
+# its callbacks: work, a periodic timer, a wait, a one-off. Timing is judged
+# generously, so the count is what is checked.
+checkrc pooltest64.exe 0 "0 failures"
+checkrc pooltest32.exe 0 "0 failures"
+# C++ exceptions: on x64 the table-driven dispatcher through libgcc's real personality.
+check cxxtest64.exe 0
+check cxxtest32.exe 0
 # Threads. Every line of the expected output is true under every interleaving
 # -- "four threads each added 400, so the total is 1600" -- so a pass means
 # the locking held, not that the scheduler happened to be kind. Run twice for

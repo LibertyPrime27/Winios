@@ -138,11 +138,17 @@ an x86 runner, qemu on aarch64 and an M3, and nothing a compiler can contract
 into an fma. `d3ddraw.exe` produces checksum `acde04d16c79039c` in all of
 them, and identically as PE32 and PE32+.
 
-What is still missing is the GPU. d12mt already compiles D3D9 SM3 shaders to
-MSL and passes 27/27 on both devices; pointing the draw path at it, so the
-back buffer becomes a Metal render target instead of memory the CPU writes, is
-the next step. The rasterizer stays as the reference the GPU path is checked
-against, and as the fallback where no GPU path is available.
+What is still missing is the GPU. The rasterizer runs on every core the
+machine has (`w32_d3d11_triangles_shaded` deals a draw's rows out in bands of
+eight, one worker per core, each walking the triangles in order, so a pixel is
+always drawn by one thread in program order and the checksum of a frame is
+the same on one core or eight), which is a multiple of the speed and not a
+change of kind. Pointing the draw path at Metal, so the back buffer becomes a
+render target instead of memory the CPU writes, is still the step after this
+one; d12mt on the submodule compiles DXIL (Direct3D 12), so the DXBC of D3D11
+and the tokens of D3D9 would need a translator in front of it. The rasterizer
+stays as the reference the GPU path is checked against, and as the fallback
+where no GPU path is available.
 
 ## d3d11.dll and dxgi.dll
 
@@ -185,16 +191,34 @@ to get them right rather than plausible.
 
 ### What the pipeline does, and what it does not
 
-**The shaders are not executed.** `CreateVertexShader` and `CreatePixelShader`
-are handed DXBC containers, and `dxbc.c` parses the container — the chunk
-directory, and the `ISGN`/`OSGN`/`ISG1`/`OSG1` signature chunks — to learn
-each stage's inputs and outputs by semantic. The draw path is then
-*interpreted* from those signatures: the vertex stage transforms `POSITION` by
-the 4x4 matrix in constant buffer 0 and passes `TEXCOORD` and `COLOR` through,
-and the pixel stage samples texture 0 and modulates by the interpolated
-colour. That covers what a sprite, a UI layer or a textured quad needs, and it
-is wrong for anything whose look comes out of its own shader arithmetic. Each
-shader says so once, through `note_shader_not_run`, rather than silently.
+**The shaders run** (since September 2026; before that they were parsed and not
+executed). `CreateVertexShader` and `CreatePixelShader` are handed DXBC
+containers; `dxbc.c` parses the chunk directory, the `ISGN`/`OSGN` signatures
+and keeps a copy of the `SHDR`/`SHEX` code, and `dxbc_exec.c` decodes the code
+once and interprets it per vertex and per pixel: the whole model 4/5 operand
+encoding, temporaries, indexable arrays, constant buffers and immediate
+constants, `if`/`loop`/`break`/`ret`, float, integer and unsigned arithmetic,
+sampling, texel loads and resource queries. `d3d11.c` joins the two stages by
+semantic as the hardware does and tracks four slots each of constant buffers,
+textures and samplers. What is not interpreted — geometry/hull/domain/compute,
+calls, switches, comparison sampling, gather — is refused by name, the draw
+falls back to the fixed-function reading of the signatures described next, and
+the report says which shader and why.
+
+The fixed-function reading remains the fallback: the vertex stage transforms
+`POSITION` by the 4x4 matrix in constant buffer 0 and passes `TEXCOORD` and
+`COLOR` through, and the pixel stage samples texture 0 and modulates by the
+interpolated colour. It is also what a container with signatures and no code
+gets — which is what the hand-built shaders in `d11test.c` are.
+
+The interpreter's float arithmetic is compiled with contraction off (see
+`CMakeLists.txt`), so `a*b+c` is two roundings on x86 and ARM alike and a frame
+checksum recorded on one machine holds on the other. It is slow — every pixel
+runs the pixel program — and the CPU rasterizer is the ceiling regardless; what
+it buys is a *correct* frame from a shader-driven 2D engine such as GameMaker,
+whose vertex transform is a matrix in a constant buffer that no reading of a
+signature could see. `test_dxbc.c` assembles token streams by hand and checks
+results to the bit.
 
 Two more limits worth stating plainly: there is **no depth buffer** (a
 depth-stencil view is accepted and ignored, so a scene that relies on z
@@ -469,10 +493,24 @@ checkerboard quad modulated by vertex colour, a triangle through the transform
 pipeline, a blended quad and an indexed draw out of real buffers; the frame is
 `4cbae1e7` on x86, under qemu on aarch64, and in both bitnesses.
 
-**Shaders are created, bound, and not executed** — the same position D3D11
-takes and for the same reason. A game with its own shaders draws with the
-fixed-function interpretation: texture 0 modulated by the vertex colour. It
-says so once rather than silently.
+**Shaders run** (since September 2026). `CreateVertexShader` and
+`CreatePixelShader` decode the token stream — vs_2_0 to vs_3_0, ps_2_0 to
+ps_3_0: the arithmetic, the matrix macros, if/ifc/else, loop/rep/break,
+call/ret, relative addressing through `a0` and `aL`, def/defi/defb, dcl,
+texld with its projected and biased forms, texldl, texkill — and a draw with
+a shader bound goes through `win32/d3d9_shader.c` per vertex and per pixel.
+The vertex is fetched element by element as its declaration says (or as the
+FVF implies), so every `D3DDECLTYPE` a declaration can name is read; the
+constants set with `Set*ShaderConstant{F,I,B}` are what the shader sees, and
+a shader's own `def`s are loaded when it is bound, as the hardware does. A
+vertex shader alone runs in front of the fixed-function texture-times-colour;
+a pixel shader alone runs behind the fixed-function transform; all sixteen
+texture stages and their sampler states are visible to it, and the alpha test
+(`D3DRS_ALPHATESTENABLE`) is honoured on this path. ps_1_x, vs_1_1 and
+predication are refused by name, in which case the fixed-function reading
+draws and the report says which shader and why. `tests/test_sm3.c` checks
+the interpreter instruction by instruction on hand-assembled tokens;
+`d3dshader.exe` draws three quads through it and is checked by frame checksum.
 
 ### Two bugs worth naming
 
@@ -784,6 +822,9 @@ run can see came back off disk and nowhere else.
 
 ## Structured exception handling
 
+Both bitnesses are implemented; they work differently. 64-bit is described
+after the 32-bit mechanism below.
+
 On 32-bit Windows this is a linked list on the stack. `__try` pushes an
 eight-byte record — next pointer, handler address — and stores its address at
 `fs:[0]`; `__except` pops it. When something faults, the kernel walks that list
@@ -992,9 +1033,15 @@ instead hangs in its audio thread. `Lock` also returns two pointers when the
 region crosses the end of the circular buffer, because a program handed only
 the first writes past the end.
 
-What is missing is only the last step — handing those bytes to CoreAudio. The
-buffer contents are correct by the time `Play` is called, so that is a consumer,
-not a redesign.
+That last step — the bytes reaching a speaker — exists since September 2026:
+`audio_out.c` is one integer mixer over *sources* (a DirectSound buffer, a
+`PlaySound` clip, an XAudio2 voice's block), feeding an `AudioQueue` on macOS
+and iOS, and pumped by the wall clock into nowhere when no device is open so
+that nothing waits forever on a machine without a speaker. `test_audio.c`
+checks the mix to the sample. DirectSound buffers keep their format, honour
+`SetCurrentPosition`, end when played once, and fire their notification
+positions from the guest thread at every wait; `xaudio2.c` is the queue-per-
+voice API on top of the same mixer, in both the 2.7 and the 2.8/2.9 layouts.
 
 `QueryInterface` on a buffer is real here, unlike the shared one COM objects
 use by default. A game asks a buffer for `IDirectSound3DBuffer` and then calls
@@ -1545,7 +1592,7 @@ table-driven mechanism is not — see the end of `win32/seh.c`). GDI beyond the
 stubs a message loop needs, and any window decoration: a window here is its own
 client area, which is what a fullscreen game wants and not what a windowed
 program expects. Drawing reaches the screen but goes through the reference
-rasterizer rather than Metal.
+rasterizer, on every core, rather than Metal.
 
 Installers are a partial answer rather than a missing one: silent mode works,
 and the importer runs it and keeps what it produces (see above), but an
@@ -1557,11 +1604,10 @@ compatibility one (see the Threads section).
 
 Within the loader specifically: `DLL_PROCESS_DETACH` is never sent (nothing is
 ever unloaded and the process exits without unwinding), `DLL_THREAD_ATTACH`
-and `DLL_THREAD_DETACH` are not sent to guest DLLs even though threads now
-exist (nothing has needed them yet, and a DLL that allocates per-thread state
-in its `DllMain` would), delay-loaded imports are left to the guest's own
-helper, and `GetProcAddress` by ordinal works on guest DLLs but not on the
-host-implemented ones, which have no ordinals to speak of.
+and `DLL_THREAD_DETACH` are sent to guest DLLs since September 2026 (a C runtime
+keeps its per-thread state behind them), delay-loaded imports are left to the
+guest's own helper, and `GetProcAddress` answers for every host-implemented DLL
+by name and by documented ordinal, not only the first four.
 
 Each of those is a defined next step, not a design gap: the stub mechanism, the
 two memory models, the calling-convention helpers and now the module table are
@@ -1569,3 +1615,83 @@ the parts that had to be right first, and they are the same parts the
 D3D-to-Metal layer will plug into as `d3d9.dll` / `d3d11.dll` / `d3d12.dll` —
 which, now that a guest DLL can be loaded and its exports resolved, is the
 next thing to build.
+
+## The next build (September 2026)
+
+Everything on the branch `features/next-build`, in the order it landed and with
+where to read more.
+
+- **A next process.** `CreateProcess` and `ShellExecute(Ex)` queue a program
+  that winrun runs after the parent ends, each with the parent's flags, its own
+  arguments and the directory it asked for; the parent gets a signalled handle
+  and exit code 0; the report lists what was queued. Still one process at a
+  time — the runtime's globals are per process — but installers that run a
+  redistributable and launchers that spawn the game get past it. `kernel32.c`,
+  `shell32.c`, the loop at the end of `winrun.c`.
+- **`DLL_THREAD_ATTACH/DETACH`**, `DisableThreadLibraryCalls`; `FlsGetValue2`,
+  `AreFileApisANSI`, `GetUserDefaultLocaleName` (a GameMaker 2026 game called
+  the first 222,476 times and died at rip 0 on the made-up zero).
+- **`CoCreateInstance`** names the CLSID it refuses, and a registry lets each
+  DLL create its own classes: dsound, dinput, xaudio2 (`com.c`).
+- **The CRTs a game may not ship**: System32 is a DLL search root; vcruntime,
+  ucrtbase and msvcr* fall back to the msvcrt table when no file satisfies
+  them; a shipped copy is still preferred.
+- **.NET** is detected by the importer and named in the run report.
+- **Sound**: `audio_out.c`, dsound wired to it, `PlaySound`, XAudio2 (`xaudio2.c`).
+- **DirectInput** (`dinput.c`): keyboard, relative mouse, keyboard-as-gamepad;
+  slots from `tools/gen/vtables.sh`, which can read a directory of headers
+  fetched by hand (`MINGW_INCLUDE`).
+- **SSE3, SSSE3, SSE4.1, SSE4.2** in the interpreter, CPUID says so, and
+  `difftest` builds on a Darwin x86-64 host for the 64-bit half.
+- **64-bit structured exception handling**: `RtlLookupFunctionEntry`,
+  `RtlVirtualUnwind`, `RtlUnwindEx`, `__C_specific_handler`, the tables a JIT
+  registers with `RtlAddFunctionTable`; a handler that unwinds returns through
+  the host's own stub so the dispatcher's frames unwind too (`seh.c`).
+- **7z archives** (`tools/import/un7z.c`): LZMA, LZMA2, BCJ, BCJ2, Delta,
+  stored, encoded headers, self-extractors; RAR refused with the reason.
+- **The shaders run** (above), on the CPU.
+- **DXGI as a Windows 8+ program sees it** (`d3d11.c`): `GetParent` answers
+  with the factory above an adapter or swap chain and the adapter above a
+  device (a GameMaker runner asked its adapter for the factory, took the
+  `E_NOINTERFACE` it got as "Direct3D is broken", put the HRESULT in a message
+  box and exited); the factory is `IDXGIFactory2` with
+  `CreateSwapChainForHwnd`, the swap chain `IDXGISwapChain1`, the adapter
+  `IDXGIAdapter2` with a quarter gigabyte of video memory in its description,
+  the device `IDXGIDevice2`.
+- **WASAPI** (`mmdevapi.c`): `CoCreateInstance(CLSID_MMDeviceEnumerator)`, one
+  active render endpoint with its property store, `IAudioClient` through
+  `IAudioClient3` over `audio_out.c` — shared and exclusive mode alike, event
+  driven or polled, `IAudioRenderClient`, `IAudioClock`, the volumes and the
+  session control. The event is set from the tick that runs inside every
+  wait and `Sleep`, so an audio thread paces itself the way it would on
+  Windows. `wasapitest.exe`.
+- **D3D9 shaders** (`d3d9_shader.c`, above): vs/ps 2.0 to 3.0 interpreted, the
+  declaration-driven vertex fetch, constants, sixteen stages, the alpha test.
+- **The rasterizer uses every core** (`d3d11_raster.c`): both APIs gather a
+  draw's shaded triangles and hand them over at once; rows are dealt out in
+  bands, so the result is what one thread would have drawn. `WINRUN_THREADS=1`
+  turns it off. The interpreters' scratch state is thread-local for this.
+- **`GetProcAddress` says NULL** for a function no built-in DLL has, with
+  `ERROR_PROC_NOT_FOUND`, instead of a stub that reports itself when called.
+  Every C runtime probes kernel32 for the functions newer than its minimum
+  Windows and falls back on NULL; handed a stub, the Spamton runner's CRT
+  called `CreateEventExW`, got a made-up value and failed fast at 147 ms.
+  Statically imported names still get the reporting stub -- there is no
+  fallback path to take for those.
+- **The thread pool** (`thread.c`): `CreateThreadpoolWork/Timer/Wait`, the
+  `Set`/`Submit`/`WaitFor*Callbacks`/`Close` calls, `TrySubmitThreadpoolCallback`,
+  cleanup groups and the "when the callback returns" helpers, plus
+  `CreateEventExW` and `CreateSemaphoreExW`. Every callback runs on a guest
+  thread made for it: exact, not efficient. `pooltest.exe`.
+- **For testing a build**: the run report carries the last 48 API calls before
+  the end, a subsystems block (audio device, sources and WASAPI streams,
+  DirectInput devices, JIT, rasterizer threads, D3D9 draws through shaders
+  versus fixed-function, frames presented and the average frame rate), stderr
+  with stdout, and a *Detailed run log* switch in Settings that adds winrun's
+  own narration (`WINRUN_VERBOSE`) — including, every sixtieth frame, how long
+  the last sixty took, and each shader as it is decoded or refused.
+
+Still not here, in the order it matters: the GPU (both rasterizers are CPU,
+now on every core; d12mt on the submodule takes DXIL, so a DXBC/SM3 front end
+would come first), a depth buffer, guest threads running in parallel rather
+than in turn, instanced draws, ps_1_x and vs_1_1.

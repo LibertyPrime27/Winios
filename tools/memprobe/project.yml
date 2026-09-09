@@ -54,7 +54,7 @@ targets:
     entitlements: { path: Host/Host.entitlements }
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: winios.app
+        PRODUCT_BUNDLE_IDENTIFIER: com.winios.libertyprime27
         # The home-screen icon. iOS icons carry no alpha channel, which is why
         # the asset is the full-bleed gradient version rather than the one on
         # white -- a transparent corner is rejected at submission and looks
@@ -67,7 +67,8 @@ targets:
         # first. -lz is zlib from the SDK, for the zip reader's inflate.
         # $(inherited) keeps the core libraries from the shared settings, and
         # they have to come after these.
-        OTHER_LDFLAGS: -limport_lib -lwinrun_lib $(inherited) -lz
+        # AudioToolbox is the AudioQueue in audio_out.c: the guest's sound.
+        OTHER_LDFLAGS: -limport_lib -lwinrun_lib $(inherited) -lz -framework AudioToolbox
     dependencies:
       - target: WiniosProbe
         embed: true
@@ -86,4 +87,4 @@ targets:
     entitlements: { path: Probe/Probe.entitlements }
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: winios.app.probe
+        PRODUCT_BUNDLE_IDENTIFIER: com.winios.libertyprime27.probe

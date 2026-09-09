@@ -58,6 +58,19 @@ for a in 32 64; do
     $CC -O2 -s -o inputtest$a.exe inputtest.c -ld3d9 -luser32
     # audio that initialises, and a gamepad the keyboard can stand in for
     $CC -O2 -s -o audiotest$a.exe audiotest.c -ldsound -lxinput -lole32
+    # WASAPI: the enumerator, an event-driven stream, and the clock
+    $CC -O2 -s -o wasapitest$a.exe wasapitest.c -lole32
+    # Direct3D 9 shaders: vs_2_0 and ps_2_0 bytecode assembled by hand
+    $CC -O2 -s -o d3dshader$a.exe d3dshader.c -ld3d9
+    # the thread pool, and GetProcAddress saying NULL for what is not here
+    $CC -O2 -s -o pooltest$a.exe pooltest.c
+    $CC -O2 -s -o spawntest$a.exe spawntest.c -lshell32
+    $CC -O2 -s -o dinputtest$a.exe dinputtest.c -ldinput8 -ldxguid
+    $CC -O2 -s -o xaudiotest$a.exe xaudiotest.c -lole32
+    # C++ with a static runtime: the exception personality is in the binary,
+    # and on x64 it drives RtlUnwindEx and friends.
+    CXX=$(echo "$CC" | sed 's/gcc$/g++/')
+    $CXX -O2 -s -static -o cxxtest$a.exe cxxtest.cpp
     # threads: CreateThread and the CRT's own, critical sections, events,
     # mutexes, interlocked, TLS. Written so every check is true under every
     # interleaving, so a pass means locking works rather than that the

@@ -53,6 +53,7 @@ static void s_cl1(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RCX] = (g[XC_RCX]
 static void s_cl7(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RCX] = (g[XC_RCX] & ~0xFFull) | 7; }
 static void s_rcx4(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RCX] = 4; }
 static void s_rcx16(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RCX] = 16; }
+static void s_len(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RAX] = 5; g[XC_RDX] = 9; }   /* PCMPESTR*: short explicit lengths */
 static void s_zf(uint64_t g[16], uint64_t *f) { (void)g; *f |= XC_ZF; }
 static void s_nzf(uint64_t g[16], uint64_t *f) { (void)g; *f &= ~(uint64_t)XC_ZF; }
 static void s_eq(uint64_t g[16], uint64_t *f) { (void)f; g[XC_RBX] = g[XC_RAX]; }

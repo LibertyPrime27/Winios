@@ -363,6 +363,107 @@ CASES = [
     ("fld m64 x2; fsubp (zero)",          "ALL", "0", "fld qword ptr [rdi]\n fld qword ptr [rdi]\n fsubp st(1), st(0)", "FSW_NOCC", 0),
     ("fld1; fld1; fdivp; frndint; fstp m64", "ALL", "0", "fld1\n fld st(1)\n fdivrp st(1), st(0)\n frndint\n fstp qword ptr [rdi]", "FSW_NOCC", 0),
     ("nbody inner (add eax between x87)", "ALL", "s_eax0", "fld qword ptr [rdi]\n fld qword ptr [rdi+8]\n add eax, 0x38\n fmul st, st(1)\n faddp st(4), st\n fld qword ptr [rdi+16]\n fmul st, st(1)\n faddp st(2), st", "FSW_NOCC", 0),
+    # --- SSE3 / SSSE3 / SSE4.1 / SSE4.2: what CPUID now claims ---
+    # Float cases use xmm8-15 (modest values); xmm0-7 are bit soup with NaNs,
+    # whose quieting is exercised by the SSE2 arithmetic cases above.
+    ("movshdup xmm8,xmm9",          "ALL", "0", "movshdup xmm8, xmm9"),
+    ("movsldup xmm8,[rdi]",         "ALL", "0", "movsldup xmm8, [rdi]"),
+    ("addsubps xmm8,xmm9",          "ALL", "0", "addsubps xmm8, xmm9"),
+    ("addsubpd xmm10,xmm11",        "ALL", "0", "addsubpd xmm10, xmm11"),
+    ("haddps xmm8,xmm9",            "ALL", "0", "haddps xmm8, xmm9"),
+    ("hsubps xmm8,xmm9",            "ALL", "0", "hsubps xmm8, xmm9"),
+    ("haddpd xmm10,xmm11",          "ALL", "0", "haddpd xmm10, xmm11"),
+    ("hsubpd xmm10,xmm11",          "ALL", "0", "hsubpd xmm10, xmm11"),
+    ("pshufb xmm0,xmm1",            "ALL", "0", "pshufb xmm0, xmm1"),
+    ("pshufb xmm2,[rdi]",           "ALL", "0", "pshufb xmm2, [rdi]"),
+    ("palignr xmm0,xmm1,5",         "ALL", "0", "palignr xmm0, xmm1, 5"),
+    ("palignr xmm0,xmm1,20",        "ALL", "0", "palignr xmm0, xmm1, 20"),
+    ("pabsb xmm0,xmm1",             "ALL", "0", "pabsb xmm0, xmm1"),
+    ("pabsw xmm0,xmm1",             "ALL", "0", "pabsw xmm0, xmm1"),
+    ("pabsd xmm0,[rdi]",            "ALL", "0", "pabsd xmm0, [rdi]"),
+    ("phaddw xmm0,xmm1",            "ALL", "0", "phaddw xmm0, xmm1"),
+    ("phaddd xmm0,xmm1",            "ALL", "0", "phaddd xmm0, xmm1"),
+    ("phaddsw xmm0,xmm1",           "ALL", "0", "phaddsw xmm0, xmm1"),
+    ("phsubw xmm0,xmm1",            "ALL", "0", "phsubw xmm0, xmm1"),
+    ("phsubd xmm0,xmm1",            "ALL", "0", "phsubd xmm0, xmm1"),
+    ("phsubsw xmm0,xmm1",           "ALL", "0", "phsubsw xmm0, xmm1"),
+    ("pmaddubsw xmm0,xmm1",         "ALL", "0", "pmaddubsw xmm0, xmm1"),
+    ("pmulhrsw xmm0,xmm1",          "ALL", "0", "pmulhrsw xmm0, xmm1"),
+    ("psignb xmm0,xmm1",            "ALL", "0", "psignb xmm0, xmm1"),
+    ("psignw xmm0,xmm1",            "ALL", "0", "psignw xmm0, xmm1"),
+    ("psignd xmm0,xmm1",            "ALL", "0", "psignd xmm0, xmm1"),
+    ("pblendvb xmm1,xmm2,xmm0",     "ALL", "0", "pblendvb xmm1, xmm2, xmm0"),
+    ("blendvps xmm9,xmm10,xmm0",    "ALL", "0", "blendvps xmm9, xmm10, xmm0"),
+    ("blendvpd xmm9,xmm10,xmm0",    "ALL", "0", "blendvpd xmm9, xmm10, xmm0"),
+    ("pblendw xmm0,xmm1,0xA5",      "ALL", "0", "pblendw xmm0, xmm1, 0xA5"),
+    ("blendps xmm8,xmm9,5",         "ALL", "0", "blendps xmm8, xmm9, 5"),
+    ("blendpd xmm10,xmm11,2",       "ALL", "0", "blendpd xmm10, xmm11, 2"),
+    ("pminsb xmm0,xmm1",            "ALL", "0", "pminsb xmm0, xmm1"),
+    ("pmaxsb xmm0,xmm1",            "ALL", "0", "pmaxsb xmm0, xmm1"),
+    ("pminuw xmm0,xmm1",            "ALL", "0", "pminuw xmm0, xmm1"),
+    ("pmaxuw xmm0,xmm1",            "ALL", "0", "pmaxuw xmm0, xmm1"),
+    ("pminsd xmm0,xmm1",            "ALL", "0", "pminsd xmm0, xmm1"),
+    ("pmaxsd xmm0,xmm1",            "ALL", "0", "pmaxsd xmm0, xmm1"),
+    ("pminud xmm0,xmm1",            "ALL", "0", "pminud xmm0, xmm1"),
+    ("pmaxud xmm0,xmm1",            "ALL", "0", "pmaxud xmm0, xmm1"),
+    ("pmulld xmm0,xmm1",            "ALL", "0", "pmulld xmm0, xmm1"),
+    ("pmuldq xmm0,xmm1",            "ALL", "0", "pmuldq xmm0, xmm1"),
+    ("packusdw xmm0,xmm1",          "ALL", "0", "packusdw xmm0, xmm1"),
+    ("pmovsxbw xmm0,xmm1",          "ALL", "0", "pmovsxbw xmm0, xmm1"),
+    ("pmovzxbw xmm0,[rdi]",         "ALL", "0", "pmovzxbw xmm0, [rdi]"),
+    ("pmovsxbd xmm0,xmm1",          "ALL", "0", "pmovsxbd xmm0, xmm1"),
+    ("pmovzxbd xmm0,xmm1",          "ALL", "0", "pmovzxbd xmm0, xmm1"),
+    ("pmovsxbq xmm0,xmm1",          "ALL", "0", "pmovsxbq xmm0, xmm1"),
+    ("pmovzxbq xmm0,xmm1",          "ALL", "0", "pmovzxbq xmm0, xmm1"),
+    ("pmovsxwd xmm0,xmm1",          "ALL", "0", "pmovsxwd xmm0, xmm1"),
+    ("pmovzxwd xmm0,xmm1",          "ALL", "0", "pmovzxwd xmm0, xmm1"),
+    ("pmovsxwq xmm0,xmm1",          "ALL", "0", "pmovsxwq xmm0, xmm1"),
+    ("pmovzxwq xmm0,xmm1",          "ALL", "0", "pmovzxwq xmm0, xmm1"),
+    ("pmovsxdq xmm0,xmm1",          "ALL", "0", "pmovsxdq xmm0, xmm1"),
+    ("pmovzxdq xmm0,[rdi]",         "ALL", "0", "pmovzxdq xmm0, [rdi]"),
+    ("pinsrb xmm0,ecx,7",           "ALL", "0", "pinsrb xmm0, ecx, 7"),
+    ("pinsrd xmm0,ecx,2",           "ALL", "0", "pinsrd xmm0, ecx, 2"),
+    ("pinsrq xmm0,rcx,1",           "ALL", "0", "pinsrq xmm0, rcx, 1"),
+    ("pinsrd xmm0,[rdi],3",         "ALL", "0", "pinsrd xmm0, dword ptr [rdi], 3"),
+    ("pextrb eax,xmm1,9",           "ALL", "0", "pextrb eax, xmm1, 9"),
+    ("pextrb [rdi],xmm1,3",         "ALL", "0", "pextrb byte ptr [rdi], xmm1, 3"),
+    ("pextrd eax,xmm1,2",           "ALL", "0", "pextrd eax, xmm1, 2"),
+    ("pextrq rax,xmm1,1",           "ALL", "0", "pextrq rax, xmm1, 1"),
+    ("pextrq [rdi],xmm1,0",         "ALL", "0", "pextrq qword ptr [rdi], xmm1, 0"),
+    ("pextrw [rdi],xmm1,3",         "ALL", "0", "pextrw word ptr [rdi], xmm1, 3"),
+    ("extractps eax,xmm8,2",        "ALL", "0", "extractps eax, xmm8, 2"),
+    ("insertps xmm8,xmm9,0x9C",     "ALL", "0", "insertps xmm8, xmm9, 0x9C"),
+    ("insertps xmm8,[rdi],0x30",    "ALL", "0", "insertps xmm8, dword ptr [rdi], 0x30"),
+    ("roundps xmm8,xmm9,0",         "ALL", "0", "roundps xmm8, xmm9, 0"),
+    ("roundps xmm8,xmm9,1",         "ALL", "0", "roundps xmm8, xmm9, 1"),
+    ("roundpd xmm10,xmm11,2",       "ALL", "0", "roundpd xmm10, xmm11, 2"),
+    ("roundss xmm8,xmm9,3",         "ALL", "0", "roundss xmm8, xmm9, 3"),
+    ("roundsd xmm10,xmm11,0",       "ALL", "0", "roundsd xmm10, xmm11, 0"),
+    ("roundps xmm8,xmm9,8 (mxcsr)", "ALL", "0", "roundps xmm8, xmm9, 8"),
+    ("dpps xmm8,xmm9,0xF1",         "ALL", "0", "dpps xmm8, xmm9, 0xF1"),
+    ("dppd xmm10,xmm11,0x31",       "ALL", "0", "dppd xmm10, xmm11, 0x31"),
+    ("ptest xmm0,xmm1",             "ALL", "0", "ptest xmm0, xmm1"),
+    ("ptest xmm0,xmm0",             "ALL", "0", "ptest xmm0, xmm0"),
+    ("pcmpeqq xmm0,xmm1",           "ALL", "0", "pcmpeqq xmm0, xmm1"),
+    ("movntdqa xmm0,[rdi]",         "ALL", "0", "movntdqa xmm0, [rdi]"),
+    ("mpsadbw xmm0,xmm1,2",         "ALL", "0", "mpsadbw xmm0, xmm1, 2"),
+    ("phminposuw xmm0,xmm1",        "ALL", "0", "phminposuw xmm0, xmm1"),
+    ("pcmpgtq xmm0,xmm1",           "ALL", "0", "pcmpgtq xmm0, xmm1"),
+    ("crc32 eax,cl",                "ALL", "0", "crc32 eax, cl"),
+    ("crc32 eax,cx",                "ALL", "0", "crc32 eax, cx"),
+    ("crc32 eax,ecx",               "ALL", "0", "crc32 eax, ecx"),
+    ("crc32 rax,rcx",               "ALL", "0", "crc32 rax, rcx"),
+    ("crc32 eax,byte[rdi]",         "ALL", "0", "crc32 eax, byte ptr [rdi]"),
+    ("pcmpistri xmm0,xmm1,0x0C",    "ALL", "0", "pcmpistri xmm0, xmm1, 0x0C"),
+    ("pcmpistri xmm0,xmm1,0x1A",    "ALL", "0", "pcmpistri xmm0, xmm1, 0x1A"),
+    ("pcmpistri xmm0,[rdi],0x38",   "ALL", "0", "pcmpistri xmm0, [rdi], 0x38"),
+    ("pcmpistri xmm0,xmm1,0x45",    "ALL", "0", "pcmpistri xmm0, xmm1, 0x45"),
+    ("pcmpistrm xmm0,xmm1,0x40",    "ALL", "0", "pcmpistrm xmm0, xmm1, 0x40"),
+    ("pcmpistrm xmm0,xmm1,0x02",    "ALL", "0", "pcmpistrm xmm0, xmm1, 0x02"),
+    ("pcmpestri xmm0,xmm1,0x0C",    "ALL", "s_len", "pcmpestri xmm0, xmm1, 0x0C"),
+    ("pcmpestri xmm0,xmm1,0x18",    "ALL", "s_len", "pcmpestri xmm0, xmm1, 0x18"),
+    ("pcmpestrm xmm0,xmm1,0x55",    "ALL", "s_len", "pcmpestrm xmm0, xmm1, 0x55"),
+    ("pcmpestrm xmm0,xmm1,0x60",    "ALL", "s_len", "pcmpestrm xmm0, xmm1, 0x60"),
 ]
 
 # 32-bit mode: run natively in compatibility mode. edi/esi point at the data
@@ -529,22 +630,86 @@ CASES32 = [
     ("fpatan",                      "ALL", "0", "fpatan",                    "FSW_TOP", 1),
     ("fnstenv [edi]",               "ALL", "0", "fnstenv [edi]",             "FSW_ALL", 0),
     ("fnsave/frstor [edi]",         "ALL", "0", "fnsave [edi]\n frstor [edi]", "FSW_ALL", 0),
+    # --- SSE4 in 32-bit mode: the same lowering, the other operand encoding ---
+    ("pshufb xmm0,xmm1 (32)",       "ALL", "0", "pshufb xmm0, xmm1"),
+    ("palignr xmm0,xmm1,3 (32)",    "ALL", "0", "palignr xmm0, xmm1, 3"),
+    ("pmulld xmm0,xmm1 (32)",       "ALL", "0", "pmulld xmm0, xmm1"),
+    ("pminsd xmm0,xmm1 (32)",       "ALL", "0", "pminsd xmm0, xmm1"),
+    ("pmovzxbw xmm0,xmm1 (32)",     "ALL", "0", "pmovzxbw xmm0, xmm1"),
+    ("pextrd eax,xmm1,1 (32)",      "ALL", "0", "pextrd eax, xmm1, 1"),
+    ("pinsrd xmm0,ecx,3 (32)",      "ALL", "0", "pinsrd xmm0, ecx, 3"),
+    ("ptest xmm0,xmm1 (32)",        "ALL", "0", "ptest xmm0, xmm1"),
+    ("crc32 eax,ecx (32)",          "ALL", "0", "crc32 eax, ecx"),
+    ("pcmpistri xmm0,xmm1,0x0C (32)","ALL", "0", "pcmpistri xmm0, xmm1, 0x0C"),
 ]
 
-def assemble(asm, bits=64):
+def elf_text(path):
+    """The .text section of a small ELF64 relocatable, without objcopy."""
+    import struct
+    d = open(path, "rb").read()
+    if d[4] == 2:                                             # ELFCLASS64
+        shoff = struct.unpack_from("<Q", d, 0x28)[0]
+        shentsize, shnum, shstrndx = struct.unpack_from("<HHH", d, 0x3A)
+        def sh(i): return struct.unpack_from("<IIQQQQIIQQ", d, shoff + i * shentsize)
+    else:                                                     # ELFCLASS32: the i686 case
+        shoff = struct.unpack_from("<I", d, 0x20)[0]
+        shentsize, shnum, shstrndx = struct.unpack_from("<HHH", d, 0x2E)
+        def sh(i): return struct.unpack_from("<IIIIIIIIII", d, shoff + i * shentsize)
+    names_off = sh(shstrndx)[4]
+    for i in range(shnum):
+        name, _type, _flags, _addr, off, size = sh(i)[:6]
+        n = d[names_off + name:d.index(b"\0", names_off + name)]
+        if n == b".text":
+            return d[off:off + size]
+    raise RuntimeError("no .text in " + path)
+
+def cached_bytes(name, bits):
+    """What the checked-in table already has for this case, when the local
+    assembler cannot produce it (clang refuses GNU-only spellings such as a
+    label difference in an immediate). The bytes were right when they were
+    recorded; only a changed asm string would make this stale, and that is
+    said out loud."""
+    import re
+    inc = os.path.join(HERE, "cases_gen.inc" if bits == 64 else "cases32_gen.inc")
+    try:
+        for line in open(inc):
+            m = re.match(r'\s+T(?:X)?(?:32)?\("(.*?)", .*?, ((?:0x[0-9A-F]{2},?)+)\),', line)
+            if m and m.group(1) == name:
+                return bytes(int(b, 16) for b in m.group(2).split(","))
+    except OSError:
+        pass
+    return None
+
+def assemble(asm, bits=64, name=None):
     with tempfile.TemporaryDirectory() as d:
         src = os.path.join(d, "t.s"); obj = os.path.join(d, "t.o"); bin_ = os.path.join(d, "t.bin")
         with open(src, "w") as f:
             f.write(".intel_syntax noprefix\n.text\n" + asm + "\n")
-        subprocess.check_call(["as", f"--{bits}", "-o", obj, src])
-        subprocess.check_call(["objcopy", "-O", "binary", "-j", ".text", obj, bin_])
-        return open(bin_, "rb").read()
+        try:
+            subprocess.check_call(["as", f"--{bits}", "-o", obj, src], stderr=subprocess.DEVNULL)
+            subprocess.check_call(["objcopy", "-O", "binary", "-j", ".text", obj, bin_])
+            return open(bin_, "rb").read()
+        except (OSError, subprocess.CalledProcessError):
+            # No GNU binutils (a Mac): clang's integrated assembler emits the
+            # same bytes, as an ELF object we read ourselves.
+            target = "x86_64-linux-gnu" if bits == 64 else "i686-linux-gnu"
+            with open(src) as f: text = f.read()
+            with open(src, "w") as f: f.write(text.replace("\nxlat\n", "\nxlatb\n"))   # clang knows only the explicit form; same byte
+            try:
+                subprocess.check_call(["clang", "-c", "-x", "assembler", "-target", target, "-o", obj, src], stderr=subprocess.DEVNULL)
+                return elf_text(obj)
+            except subprocess.CalledProcessError:
+                cached = cached_bytes(name, bits) if name else None
+                if cached is None:
+                    raise
+                sys.stderr.write(f"cases_gen: clang cannot assemble {name!r}; keeping the recorded bytes\n")
+                return cached
 
 def main():
     out = [f"/* GENERATED by cases_gen.py -- edit CASES there, not this file. */"]
     for case in CASES:
         name, mask, setup, asm = case[:4]
-        code = assemble(asm)
+        code = assemble(asm, 64, name)
         bytes_ = ",".join("0x%02X" % b for b in code)
         cmt = asm.replace(chr(10), "; ")
         if len(case) == 6:
@@ -559,7 +724,7 @@ def main():
     out = ["/* GENERATED by cases_gen.py (32-bit mode) -- edit CASES32 there, not this file. */"]
     for case in CASES32:
         name, mask, setup, asm = case[:4]
-        code = assemble(asm, 32)
+        code = assemble(asm, 32, name)
         bytes_ = ",".join("0x%02X" % b for b in code)
         cmt = asm.replace(chr(10), "; ")
         if len(case) == 6:

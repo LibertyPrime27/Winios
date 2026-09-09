@@ -40,7 +40,7 @@ static inline uint16_t RD16(const void *p) { const uint8_t *b = p; return (uint1
 static inline uint32_t RD32(const void *p) { const uint8_t *b = p; return (uint32_t)(b[0] | b[1] << 8 | b[2] << 16 | (uint32_t)b[3] << 24); }
 static inline uint64_t RD64(const void *p) { const uint8_t *b = p; return (uint64_t)RD32(b) | (uint64_t)RD32(b + 4) << 32; }
 
-enum { DIR_EXPORT = 0, DIR_IMPORT = 1, DIR_RESOURCE = 2, DIR_RELOC = 5, DIR_TLS = 9 };
+enum { DIR_EXPORT = 0, DIR_IMPORT = 1, DIR_RESOURCE = 2, DIR_EXCEPTION = 3, DIR_RELOC = 5, DIR_TLS = 9 };
 enum { DLL_PROCESS_ATTACH = 1 };
 
 typedef struct { uint32_t rva, size; } datadir;
@@ -137,9 +137,16 @@ static int find_dll_file(w32 *w, const char *lname, char *out, size_t n) {
         char *slash = strrchr(dir, '/');
         if (slash) slash[1] = 0; else dir[0] = 0;
     }
-    const char *roots[3]; int nr = 0;
+    /* The drive's System32 is where an installer that ran a redistributable
+     * put its runtime, so it is searched -- after the program's own copies,
+     * which Windows also prefers. */
+    char sys[600];
+    w32_host_path(w, "C:\\Windows\\System32", sys, sizeof sys - 2);
+    strcat(sys, "/");
+    const char *roots[4]; int nr = 0;
     if (dir[0]) roots[nr++] = dir;
     if (w->dll_dir) roots[nr++] = w->dll_dir;
+    roots[nr++] = sys;
     roots[nr++] = "./";
     for (int i = 0; i < nr; i++) {
         snprintf(out, n, "%s%s", roots[i], lname);
@@ -407,6 +414,9 @@ static int load_image(w32 *w, const char *path, const char *lname, int is_exe, w
     if (dir[DIR_RESOURCE].size && in_image(m, dir[DIR_RESOURCE].rva, 16)) {
         m->res_rva = dir[DIR_RESOURCE].rva; m->res_size = dir[DIR_RESOURCE].size;
     }
+    if (plus && dir[DIR_EXCEPTION].size && in_image(m, dir[DIR_EXCEPTION].rva, 12)) {
+        m->pdata_rva = dir[DIR_EXCEPTION].rva; m->pdata_size = dir[DIR_EXCEPTION].size;
+    }
     if (out) *out = m;
 
     /* imports */
@@ -480,5 +490,25 @@ void w32_attach_modules(w32 *w) {
         uint64_t ok = w32_call_guest(w, m->entry, 3, dargs);
         if (!w->exited && !(ok & 0xFFFFFFFFu))
             fprintf(stderr, "winrun: %s DllMain returned FALSE; continuing anyway\n", m->name);
+    }
+}
+
+/* DllMain(DLL_THREAD_ATTACH / DLL_THREAD_DETACH) for every DLL that has not
+ * asked to be left alone -- in load order on the way in and reverse on the
+ * way out, as Windows does. A C runtime sets up its per-thread state behind
+ * this; without it, a second thread's first call into the DLL finds none and
+ * faults somewhere nowhere near the cause. The executable never gets these.
+ * Called on the new thread, with the guest lock held. */
+void w32_thread_notify(w32 *w, int reason) {
+    for (int k = 0; k < w->nloaded && !w->exited; k++) {
+        int s = reason == 2 ? k + 1 : w->nloaded - k;
+        for (int i = 0; i < w->nmods; i++) {
+            w32_module *m = &w->mods[i];
+            if (m->seq != s || m->is_exe || !m->attached || !m->entry || m->no_thread_calls) continue;
+            uint64_t args[3] = { m->base, (uint64_t)reason, 0 };
+            if (w->verbose > 1) fprintf(stderr, "winrun: %s DllMain(%s)\n", m->name,
+                                        reason == 2 ? "DLL_THREAD_ATTACH" : "DLL_THREAD_DETACH");
+            w32_call_guest(w, m->entry, 3, args);
+        }
     }
 }

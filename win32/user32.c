@@ -381,6 +381,7 @@ static uint32_t g_keychar[256];         /* the character the host resolved for t
 static int32_t g_mx, g_my;              /* pointer, in client pixels */
 static int     g_mouse_moved;           /* has anything put the pointer somewhere? */
 static int32_t g_rel_dx, g_rel_dy;      /* relative motion not yet consumed */
+static int32_t g_tot_dx, g_tot_dy, g_tot_wheel;   /* running totals, for consumers that keep their own last-seen */
 static uint32_t g_buttons;              /* bit 0 left, 1 right, 2 middle */
 static int32_t g_wheel;
 static int     g_quit, g_quit_code;
@@ -485,6 +486,7 @@ void w32_input_reset(void) {
     g_mx = SCREEN_W / 2; g_my = SCREEN_H / 2;
     g_mouse_moved = 0;
     g_rel_dx = g_rel_dy = 0;
+    g_tot_dx = g_tot_dy = g_tot_wheel = 0;
     g_buttons = 0; g_wheel = 0;
     g_quit = 0; g_quit_code = 0;
     g_focus = 0; g_capture = 0;
@@ -599,6 +601,7 @@ void w32_input_char(uint32_t ch) {
 void w32_input_mouse_move(int x, int y) {
     pthread_mutex_lock(&g_lock);
     g_rel_dx += x - g_mx; g_rel_dy += y - g_my;
+    g_tot_dx += x - g_mx; g_tot_dy += y - g_my;
     g_mx = x; g_my = y; g_mouse_moved = 1;
     push(0, WM_MOUSEMOVE, mouse_wp(), xy_lp(x, y), x, y);
     pthread_mutex_unlock(&g_lock);
@@ -613,6 +616,7 @@ void w32_input_mouse_move(int x, int y) {
 void w32_input_mouse_delta(int dx, int dy) {
     pthread_mutex_lock(&g_lock);
     g_rel_dx += dx; g_rel_dy += dy;
+    g_tot_dx += dx; g_tot_dy += dy;
     g_mx += dx; g_my += dy; g_mouse_moved = 1;
     if (g_mx < 0) g_mx = 0;
     if (g_mx >= SCREEN_W) g_mx = SCREEN_W - 1;
@@ -637,7 +641,7 @@ void w32_input_mouse_button(int button, int down) {
 
 void w32_input_mouse_wheel(int delta) {
     pthread_mutex_lock(&g_lock);
-    g_wheel += delta;
+    g_wheel += delta; g_tot_wheel += delta;
     /* wParam is delta in the high word, key flags in the low word */
     push(0, WM_MOUSEWHEEL, ((uint64_t)(uint16_t)(int16_t)delta << 16) | mouse_wp(),
          xy_lp(g_mx, g_my), g_mx, g_my);
@@ -1805,6 +1809,14 @@ int w32_cursor_visible(void) {
 }
 /* For xinput.c, so a keyboard can stand in for a gamepad without a second
  * copy of this array. */
+void w32_mouse_totals(int32_t *tx, int32_t *ty, int32_t *twheel, uint32_t *buttons) {
+    pthread_mutex_lock(&g_lock);
+    if (tx) *tx = g_tot_dx;
+    if (ty) *ty = g_tot_dy;
+    if (twheel) *twheel = g_tot_wheel;
+    if (buttons) *buttons = g_buttons;
+    pthread_mutex_unlock(&g_lock);
+}
 int w32_key_down(int vk) {
     if (vk < 0 || vk > 255) return 0;
     pthread_mutex_lock(&g_lock);

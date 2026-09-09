@@ -18,6 +18,7 @@
  */
 #define _GNU_SOURCE
 #include "w32.h"
+#include <strings.h>
 
 #include <dirent.h>
 #include <errno.h>
@@ -166,25 +167,62 @@ static void s_SHCreateDirectoryExA(w32 *w) { create_dir_ex(w, 0); }
 static void s_SHCreateDirectoryExW(w32 *w) { create_dir_ex(w, 1); }
 
 /* ShellExecute is how an installer opens a readme, a URL, or the game it just
- * installed. There is no second process and no browser, so it fails -- and
- * says which target it wanted, in the run report, because "it tried to launch
- * something" is a fact worth having. Returning success would leave the caller
- * waiting for a window that will never appear. */
+ * installed. A program is queued to run after this one -- see CreateProcess
+ * -- while a document or a URL has nothing here to open it, and is refused
+ * with the target named in the run report: "it tried to open something" is a
+ * fact worth having. */
+static int shell_launch(w32 *w, const char *file, const char *params, const char *dir) {
+    size_t n = strlen(file);
+    if (n < 4 || strcasecmp(file + n - 4, ".exe")) return 0;
+    char host[4096];
+    w32_host_path(w, file, host, sizeof host);
+    if (access(host, R_OK)) return 0;
+    return w32_launch_queue(w, host, params, dir, "ShellExecute") >= 0;
+}
+static void gstr(w32 *w, uint64_t p, int wide, char *out, size_t n) {
+    out[0] = 0;
+    if (!p) return;
+    if (wide) w32_wtoa(w, p, out, n); else snprintf(out, n, "%s", w32_str(w, p));
+}
 static void shell_execute(w32 *w, int wide) {
-    char what[512] = "";
-    if (ARG(2)) { if (wide) w32_wtoa(w, ARG(2), what, sizeof what);
-                  else snprintf(what, sizeof what, "%s", w32_str(w, ARG(2))); }
-    w32_note_refused(w, "shell32!ShellExecute (nothing here can launch a second program)");
+    char what[1024], params[2048], dir[1024];
+    gstr(w, ARG(2), wide, what, sizeof what);
+    gstr(w, ARG(3), wide, params, sizeof params);
+    gstr(w, ARG(4), wide, dir, sizeof dir);
+    if (shell_launch(w, what, params, dir)) { RET(42); return; }     /* above 32 means it started */
+    w32_note_refused(w, "shell32!ShellExecute (a program can be started here; a document or a URL cannot)");
     if (w->verbose && what[0]) fprintf(stderr, "winrun: ShellExecute refused: %s\n", what);
     w32_set_last_error(w, 120);                     /* ERROR_CALL_NOT_IMPLEMENTED */
     RET(31);                                        /* SE_ERR_NOASSOC */
 }
 static void s_ShellExecuteA(w32 *w) { shell_execute(w, 0); }
 static void s_ShellExecuteW(w32 *w) { shell_execute(w, 1); }
-static void s_ShellExecuteExA(w32 *w) {
-    w32_note_refused(w, "shell32!ShellExecute (nothing here can launch a second program)");
+/* SHELLEXECUTEINFO, read by offset because the pointer fields pad differently
+ * in the two bitnesses: cbSize, fMask, hwnd, lpVerb, lpFile, lpParameters,
+ * lpDirectory, nShow, hInstApp, lpIDList, lpClass, hkeyClass, dwHotKey,
+ * hIcon, hProcess. */
+static void shell_execute_ex(w32 *w, int wide) {
+    uint64_t s = ARG(0); int psz = (int)w32_ptrsize(w);
+    if (!s || !w32_mem_ok(w, s, psz == 4 ? 60 : 112)) { w32_set_last_error(w, 87); RET(0); return; }
+    uint32_t mask = (uint32_t)w32_read(w, s + 4, 4);
+    uint64_t o_file = psz == 4 ? 16 : 24, o_params = psz == 4 ? 20 : 32, o_dir = psz == 4 ? 24 : 40;
+    uint64_t o_inst = psz == 4 ? 32 : 56, o_proc = psz == 4 ? 56 : 104;
+    char what[1024], params[2048], dir[1024];
+    gstr(w, w32_read(w, s + o_file, psz), wide, what, sizeof what);
+    gstr(w, w32_read(w, s + o_params, psz), wide, params, sizeof params);
+    gstr(w, w32_read(w, s + o_dir, psz), wide, dir, sizeof dir);
+    if (shell_launch(w, what, params, dir)) {
+        w32_write(w, s + o_inst, psz, 42);
+        if (mask & 0x40) w32_write(w, s + o_proc, psz, w32_process_handle_new(w));   /* SEE_MASK_NOCLOSEPROCESS */
+        RET(1); return;
+    }
+    w32_note_refused(w, "shell32!ShellExecuteEx (a program can be started here; a document or a URL cannot)");
+    if (w->verbose && what[0]) fprintf(stderr, "winrun: ShellExecuteEx refused: %s\n", what);
+    w32_write(w, s + o_inst, psz, 31);
     w32_set_last_error(w, 120); RET(0);
 }
+static void s_ShellExecuteExA(w32 *w) { shell_execute_ex(w, 0); }
+static void s_ShellExecuteExW(w32 *w) { shell_execute_ex(w, 1); }
 
 /* ---- SHFileOperation ------------------------------------------------------
  *
@@ -439,7 +477,7 @@ const w32_api w32_shell32[] = {
     F(SHGetSpecialFolderPathA, 4), F(SHGetSpecialFolderPathW, 4),
     F(SHCreateDirectoryExA, 3), F(SHCreateDirectoryExW, 3),
     F(ShellExecuteA, 6), F(ShellExecuteW, 6),
-    F(ShellExecuteExA, 1), FN(ShellExecuteExW, 1, s_ShellExecuteExA),
+    F(ShellExecuteExA, 1), F(ShellExecuteExW, 1),
     F(SHFileOperationA, 1), F(SHFileOperationW, 1),
     F(SHBrowseForFolderA, 1), F(SHBrowseForFolderW, 1),
     F(SHGetFileInfoA, 5), F(SHGetFileInfoW, 5),

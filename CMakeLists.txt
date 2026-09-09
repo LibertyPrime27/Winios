@@ -88,7 +88,9 @@ add_executable(test_a64 tests/test_a64.c)
 add_test(NAME a64_encoder COMMAND test_a64)
 
 # --- differential test: needs a real x86-64 to act as the oracle -------------
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+# Linux runs both halves; a Mac with an x86-64 runs the 64-bit half (see the
+# note in difftest.c) and records nothing.
+if(CMAKE_SYSTEM_NAME MATCHES "Linux|Darwin" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     enable_language(ASM)
     add_executable(difftest tests/difftest/difftest.c tests/difftest/native_x64.S)
     target_link_libraries(difftest PRIVATE xcore)
@@ -124,22 +126,47 @@ if(NOT WIN32)
         win32/advapi32.c win32/seh.c win32/thread.c
         win32/user32.c win32/gdi32.c win32/gdifont.c win32/truetype.c
         win32/fontdata.c win32/image.c win32/comctl32.c
-        win32/dsound.c win32/xinput.c win32/shell32.c win32/ole32.c
+        win32/dsound.c win32/audio_out.c win32/xinput.c win32/dinput.c win32/xaudio2.c win32/mmdevapi.c win32/shell32.c win32/ole32.c
         win32/misc_dlls.c win32/net_dlls.c
-        win32/d3d11.c win32/d3d11_raster.c win32/dxbc.c)
+        win32/d3d11.c win32/d3d11_raster.c win32/dxbc.c win32/dxbc_exec.c win32/d3d9_shader.c)
+    add_executable(test_sm3 tests/test_sm3.c)
+    target_link_libraries(test_sm3 PRIVATE winrun_lib m)
+    set_property(TARGET test_sm3 PROPERTY C_STANDARD 11)
+    add_test(NAME sm3 COMMAND test_sm3)
 
     add_library(winrun_lib STATIC ${WINRUN_SOURCES})
     target_link_libraries(winrun_lib PUBLIC xcore)
-    if(NOT APPLE)
+    if(APPLE)
+        # audio_out.c: the AudioQueue that plays the guest's sound, on macOS and
+        # iOS alike. Found as a library so every executable that links
+        # winrun_lib gets it, which a bare -framework flag does not guarantee.
+        find_library(WINIOS_AUDIOTOOLBOX AudioToolbox REQUIRED)
+        target_link_libraries(winrun_lib PUBLIC ${WINIOS_AUDIOTOOLBOX})
+    else()
         target_link_libraries(winrun_lib PUBLIC m)
     endif()
     target_include_directories(winrun_lib PUBLIC win32 tools/winrun)
     target_compile_definitions(winrun_lib PRIVATE WINRUN_NO_MAIN=1)
     set_property(TARGET winrun_lib PROPERTY C_STANDARD 11)
     target_compile_options(winrun_lib PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    # The shader interpreter and the rasterizer it feeds interpolate in float: with
+    # contraction off, a*b+c is two roundings on x86 and on ARM alike, and a frame
+    # checksum recorded on one machine holds on the other.
+    set_source_files_properties(win32/dxbc_exec.c win32/d3d11_raster.c win32/d3d11.c win32/d3d9_shader.c win32/d3d9.c PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+
+    add_executable(test_dxbc tests/test_dxbc.c)
+    target_link_libraries(test_dxbc PRIVATE winrun_lib m)
+    set_property(TARGET test_dxbc PROPERTY C_STANDARD 11)
+    add_test(NAME dxbc COMMAND test_dxbc)
+
+    # The mixer, to the sample: format conversion, rate, looping, volume, clipping.
+    add_executable(test_audio tests/test_audio.c)
+    target_link_libraries(test_audio winrun_lib)
+    set_property(TARGET test_audio PROPERTY C_STANDARD 11)
+    add_test(NAME audio COMMAND test_audio)
 
     add_executable(winrun ${WINRUN_SOURCES})
-    target_link_libraries(winrun PRIVATE xcore m)
+    target_link_libraries(winrun PRIVATE xcore m ${WINIOS_AUDIOTOOLBOX})   # the framework is empty off Apple
     target_include_directories(winrun PRIVATE win32)
     set_property(TARGET winrun PROPERTY C_STANDARD 11)
     target_compile_options(winrun PRIVATE -Wall -Wextra -Wno-unused-parameter)
@@ -150,7 +177,7 @@ if(NOT WIN32)
         # parts that have nothing to do with the emulator (a zip reader, installer
         # detection, a drive diff) can be tested without starting a guest.
         add_library(import_lib STATIC
-            tools/import/setupkind.c tools/import/unzip.c
+            tools/import/setupkind.c tools/import/unzip.c tools/import/un7z.c
             tools/import/drivediff.c tools/import/import.c)
         target_include_directories(import_lib PUBLIC tools/import)
         target_link_libraries(import_lib PUBLIC ${WINIOS_ZLIB})
@@ -170,6 +197,12 @@ if(NOT WIN32)
         target_link_libraries(test_import PRIVATE import_lib winrun_lib)
         target_include_directories(test_import PRIVATE tests)
         add_test(NAME import COMMAND test_import ${CMAKE_CURRENT_SOURCE_DIR}/tests/import)
+
+        # The 7z reader against liblzma-made archives; see tests/import/make_7z_fixtures.py.
+        add_executable(test_un7z tests/test_un7z.c)
+        target_link_libraries(test_un7z PRIVATE import_lib)
+        target_include_directories(test_un7z PRIVATE tools)
+        add_test(NAME un7z COMMAND test_un7z ${CMAKE_CURRENT_SOURCE_DIR}/tests/import)
 
         # Installer mode end to end, against a guest that behaves like a silent
         # install and refuses to work if it was handed the wrong flags.

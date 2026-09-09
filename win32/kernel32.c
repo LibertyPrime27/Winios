@@ -471,8 +471,16 @@ static void k_GetProcAddress(w32 *w) {
     if (w32_module_at(w, h)) {
         a = w32_module_export(w, h, nm, ordinal);
     } else {
-        static const char *names[] = { "kernel32.dll", "msvcrt.dll", "ntdll.dll", "user32.dll" };
-        for (int d = 0; d < 4; d++) if (h == w->stub_base + 0x10000u * (d + 1) && nm) a = w32_stub_for(w, names[d], nm);
+        /* A built-in DLL's handle: any of them, by name or by ordinal -- a game
+         * that loads dsound or xinput lazily asks this way, and used to get
+         * NULL for everything but the first four. */
+        const char *dn = w32_builtin_dll_name(w, h);
+        /* Only a function that exists here. A stub for one that does not
+         * would be a lie the caller acts on: a C runtime that probes for
+         * CreateEventExW falls back to CreateEventW when told NULL, and
+         * fails fast when handed something that returns garbage. */
+        if (dn && nm) { if (w32_dll_has(w, dn, nm)) a = w32_stub_for(w, dn, nm); }
+        else if (dn) { const char *o = w32_ordinal_name(dn, ordinal); if (o && w32_dll_has(w, dn, o)) a = w32_stub_for(w, dn, o); }
     }
     if (w->verbose) {
         char ob[16]; if (!nm) snprintf(ob, sizeof ob, "#%d", ordinal);
@@ -572,6 +580,18 @@ static void k_GetCPInfo(w32 *w) { uint64_t p = ARG(1); void *d = W32PN(w, p, 20)
     if (!d) { w32_set_last_error(w, ERROR_INVALID_PARAMETER); RET(0); return; }
     memset(d, 0, 20); w32_write(w, p, 4, 1); w32_write(w, p + 4, 1, '?'); RET(1); }
 static void k_GetUserDefaultLCID(w32 *w) { RET(0x409); }
+static void k_AreFileApisANSI(w32 *w) { (void)w; RET(1); }
+/* GetUserDefaultLocaleName(buf, cch): "en-US", which is what every other
+ * locale answer here agrees with. Returns the length including the
+ * terminator, as Windows does. */
+static void k_GetUserDefaultLocaleName(w32 *w) {
+    static const char name[] = "en-US";
+    uint32_t cch = (uint32_t)ARG(1), need = (uint32_t)sizeof name;
+    if (cch < need) { w32_set_last_error(w, 122); RET(0); return; }          /* ERROR_INSUFFICIENT_BUFFER */
+    if (!w32_mem_ok(w, ARG(0), 2ull * need)) { w32_set_last_error(w, ERROR_NOACCESS); RET(0); return; }
+    for (uint32_t i = 0; i < need; i++) w32_write(w, ARG(0) + 2ull * i, 2, (uint8_t)name[i]);
+    RET(need);
+}
 static void k_GetUserDefaultLangID(w32 *w) { RET(0x409); }
 static void k_GetSystemDefaultLCID(w32 *w) { RET(0x409); }
 static void k_GetThreadLocale(w32 *w) { RET(0x409); }
@@ -779,6 +799,20 @@ static void k_FlsAlloc(w32 *w) { k_TlsAlloc(w); }
 static void k_FlsFree(w32 *w) { k_TlsFree(w); }
 static void k_FlsGetValue(w32 *w) { k_TlsGetValue(w); }
 static void k_FlsSetValue(w32 *w) { k_TlsSetValue(w); }
+/* FlsGetValue2 is FlsGetValue that leaves the last error alone. The 2022
+ * UCRT reaches its per-thread data through it on every call that has any,
+ * so a made-up zero here is a null pointer a few instructions later -- which
+ * is how a GameMaker game died at rip 0 after 222,476 calls. */
+static void k_FlsGetValue2(w32 *w) {
+    uint32_t i = (uint32_t)ARG(0); int psz = (int)w32_ptrsize(w);
+    if (i >= W32_MAX_TLS) { RET(0); return; }
+    RET(w32_read(w, w32_self()->teb + (w->is32 ? TEB32_TLS : TEB64_TLS) + (uint64_t)psz * i, psz));
+}
+static void k_DisableThreadLibraryCalls(w32 *w) {
+    w32_module *m = w32_module_at(w, ARG(0));
+    if (m) m->no_thread_calls = 1;
+    RET(m ? 1 : 0);
+}
 static void k_nop_true(w32 *w) { RET(1); }
 static void k_nop_void(w32 *w) { (void)w; }
 static void k_nop_zero(w32 *w) { RET(0); }
@@ -911,12 +945,12 @@ static void k_GetCurrentDirectoryW(w32 *w) {
 /* Really change directory, and fail when the directory is not there. The
  * guest-visible form is kept alongside the host one because a program that
  * sets a directory and then asks for it expects its own spelling back. */
-static void set_cwd(w32 *w, const char *win) {
+static int cwd_change(w32 *w, const char *win) {
     char host[4096];
     host_path(w, win, host, sizeof host);
     struct stat st;
     if (stat(host, &st) || !S_ISDIR(st.st_mode)) {
-        w32_set_last_error(w, ERROR_FILE_NOT_FOUND); RET(0); return;
+        w32_set_last_error(w, ERROR_FILE_NOT_FOUND); return 0;
     }
     snprintf(g_cwd_host, sizeof g_cwd_host, "%.*s", (int)sizeof g_cwd_host - 1, host);
     /* An absolute Windows path is reported verbatim; a relative one is
@@ -929,11 +963,13 @@ static void set_cwd(w32 *w, const char *win) {
     /* Truncating a path is worse than refusing one: the caller would go on to
      * open something it did not name. Nothing real is this long. */
     if (n < 0 || (size_t)n >= sizeof next) {
-        w32_set_last_error(w, ERROR_FILENAME_EXCED_RANGE); RET(0); return;
+        w32_set_last_error(w, ERROR_FILENAME_EXCED_RANGE); return 0;
     }
     memcpy(g_cwd_win, next, (size_t)n + 1);
-    RET(1);
+    return 1;
 }
+static void set_cwd(w32 *w, const char *win) { RET(cwd_change(w, win)); }
+void w32_set_cwd_win(w32 *w, const char *win) { cwd_change(w, win); }
 static void k_SetCurrentDirectoryA(w32 *w) { set_cwd(w, GSTR(ARG(0))); }
 static void k_SetCurrentDirectoryW(w32 *w) {
     char s[1024]; w32_wtoa(w, ARG(0), s, sizeof s); set_cwd(w, s);
@@ -970,7 +1006,6 @@ static void k_SetErrorMode(w32 *w) { RET(0); }
 static void k_RtlPcToFileHeader(w32 *w) { w32_write(w, ARG(1), (int)w32_ptrsize(w), w->image_base); RET(w->image_base); }
 static void k_RtlLookupFunctionEntry(w32 *w) { RET(0); }
 static void k_RtlVirtualUnwind(w32 *w) { RET(0); }
-static void k_RtlUnwindEx(w32 *w) { fprintf(stderr, "winrun: RtlUnwindEx: exception unwinding is not supported\n"); w32_exit(w, 129); }
 static void k_EncodePointer(w32 *w) { RET(ARG(0)); }
 static void k_DecodePointer(w32 *w) { RET(ARG(0)); }
 static void k_InitializeSListHead(w32 *w) { void *p = W32PN(w, ARG(0), 16); if (p) memset(p, 0, 16); }
@@ -1343,17 +1378,83 @@ static void k_GetShortPathNameW(w32 *w) { path_identity(w, 1); }
 static void k_GetLongPathNameA(w32 *w)  { path_identity(w, 0); }
 static void k_GetLongPathNameW(w32 *w)  { path_identity(w, 1); }
 
-/* There is one process, and there will be one process: the runtime's globals
- * -- the block cache, the code arena, the handle table -- are per process and
- * a second guest process would need a second set of all of them. So this
- * fails, and says so in the report rather than returning a handle that goes
- * nowhere. An installer that re-launches itself elevated stops here; one that
- * shells out to a redistributable carries on without it, which is usually
- * what you want anyway. */
-static void k_CreateProcessA(w32 *w) {
-    w32_note_refused(w, "kernel32!CreateProcess (one guest process at a time)");
-    w32_set_last_error(w, ERROR_CALL_NOT_IMPLEMENTED); RET(0);
+/* There is one process at a time: the runtime's globals -- the block cache,
+ * the code arena, the handle table -- are per process. What there can be is
+ * a *next* process. CreateProcess records the program and winrun runs it after
+ * this one ends, in the order they were asked for. The caller gets a process
+ * handle that is already signalled and an exit code of 0, which is the truth
+ * for the two shapes this exists for: an installer that runs a redistributable
+ * and carries on, and a launcher that starts the game and quits. A parent that
+ * needs the child's output while it is still running is not served, and the
+ * run report lists what was queued so that is visible rather than guessed at. */
+uint64_t w32_process_handle_new(w32 *w) {
+    uint64_t h = w32_handle_new(w, H_PROCESS, -1);
+    w32_handle *hh = w32_handle_get(w, h);
+    if (hh) hh->flags = 1 | 2;                      /* signalled, and stays so */
+    return h;
 }
+static int program_exists(w32 *w, const char *win, char *host, size_t hn) {
+    w32_host_path(w, win, host, hn);
+    if (access(host, R_OK) == 0) return 1;
+    char withexe[1100];
+    snprintf(withexe, sizeof withexe, "%s.exe", win);
+    w32_host_path(w, withexe, host, hn);
+    return access(host, R_OK) == 0;
+}
+/* The program a command line names: the quoted first token, or, unquoted,
+ * the shortest prefix ending at a space that names a file -- "C:\Program
+ * Files\Game\game.exe" without quotes is legal and common. */
+static int resolve_program(w32 *w, const char *app, const char *cmd, char *host, size_t hn, const char **args_out) {
+    char cand[1024];
+    *args_out = "";
+    if (app[0]) { *args_out = cmd; return program_exists(w, app, host, hn); }
+    const char *p = cmd;
+    while (*p == ' ') p++;
+    if (*p == '"') {
+        const char *e = strchr(p + 1, '"');
+        size_t n = e ? (size_t)(e - p - 1) : strlen(p + 1);
+        if (n >= sizeof cand) return 0;
+        memcpy(cand, p + 1, n); cand[n] = 0;
+        *args_out = e ? e + 1 : "";
+        return program_exists(w, cand, host, hn);
+    }
+    for (const char *e = p; ; e++) {
+        if (*e && *e != ' ') continue;
+        size_t n = (size_t)(e - p);
+        if (n >= sizeof cand) return 0;
+        memcpy(cand, p, n); cand[n] = 0;
+        if (program_exists(w, cand, host, hn)) { *args_out = e; return 1; }
+        if (!*e) return 0;
+    }
+}
+static uint32_t g_child_pid = 4300;
+static void create_process(w32 *w, int wide) {
+    char app[1024] = "", cmd[4096] = "", cwd[1024] = "", host[4096];
+    if (ARG(0)) { if (wide) w32_wtoa(w, ARG(0), app, sizeof app); else snprintf(app, sizeof app, "%s", w32_str(w, ARG(0))); }
+    if (ARG(1)) { if (wide) w32_wtoa(w, ARG(1), cmd, sizeof cmd); else snprintf(cmd, sizeof cmd, "%s", w32_str(w, ARG(1))); }
+    if (ARG(7)) { if (wide) w32_wtoa(w, ARG(7), cwd, sizeof cwd); else snprintf(cwd, sizeof cwd, "%s", w32_str(w, ARG(7))); }
+    const char *args = "";
+    if (!resolve_program(w, app, cmd, host, sizeof host, &args)) {
+        if (w->verbose) fprintf(stderr, "winrun: CreateProcess: no such program: %s%s%s\n", app, app[0] ? " " : "", cmd);
+        w32_set_last_error(w, ERROR_FILE_NOT_FOUND); RET(0); return;
+    }
+    while (*args == ' ') args++;
+    if (w32_launch_queue(w, host, args, cwd[0] ? cwd : g_cwd_win, "CreateProcess") < 0) {
+        w32_set_last_error(w, 8); RET(0); return;     /* ERROR_NOT_ENOUGH_MEMORY: the queue is full */
+    }
+    /* PROCESS_INFORMATION: hProcess, hThread, dwProcessId, dwThreadId */
+    uint64_t pi = ARG(9); int psz = (int)w32_ptrsize(w);
+    if (pi && w32_mem_ok(w, pi, (uint64_t)psz * 2 + 8)) {
+        uint32_t pid = ++g_child_pid;
+        w32_write(w, pi, psz, w32_process_handle_new(w));
+        w32_write(w, pi + psz, psz, w32_process_handle_new(w));
+        w32_write(w, pi + 2 * psz, 4, pid);
+        w32_write(w, pi + 2 * psz + 4, 4, pid + 1);
+    }
+    RET(1);
+}
+static void k_CreateProcessA(w32 *w) { create_process(w, 0); }
+static void k_CreateProcessW(w32 *w) { create_process(w, 1); }
 
 /* ---- .ini files ------------------------------------------------------------
  *
@@ -2458,12 +2559,13 @@ const w32_api w32_kernel32[] = {
     F(GetTickCount, 0), F(GetTickCount64, 0), F(QueryPerformanceCounter, 1), F(QueryPerformanceFrequency, 1),
     F(GetSystemTimeAsFileTime, 1), F(GetSystemTimePreciseAsFileTime, 1), F(GetLocalTime, 1), F(GetSystemTime, 1), F(GetTimeZoneInformation, 1),
     F(GetACP, 0), F(GetOEMCP, 0), F(GetConsoleCP, 0), F(GetConsoleOutputCP, 0), F(IsValidCodePage, 1), F(GetCPInfo, 2),
+    F(GetUserDefaultLocaleName, 2), FN(GetSystemDefaultLocaleName, 2, k_GetUserDefaultLocaleName), F(AreFileApisANSI, 0),
     F(GetUserDefaultLCID, 0), F(GetUserDefaultLangID, 0), F(GetSystemDefaultLCID, 0), F(GetThreadLocale, 0),
     F(IsDBCSLeadByteEx, 2), F(IsDBCSLeadByte, 1), F(MultiByteToWideChar, 6), F(WideCharToMultiByte, 8), F(GetStringTypeW, 4), F(LCMapStringW, 6), F(CompareStringW, 6),
     F(VirtualAlloc, 4), F(VirtualAllocEx, 5), F(VirtualFree, 3), F(VirtualProtect, 4), F(VirtualQuery, 3),
     F(GetProcessHeap, 0), F(HeapCreate, 3), F(HeapDestroy, 1), F(HeapAlloc, 3), F(HeapReAlloc, 4), F(HeapFree, 3), F(HeapSize, 3), F(HeapValidate, 3), F(HeapSetInformation, 4),
     F(LocalAlloc, 2), F(LocalFree, 1), F(GlobalAlloc, 2), F(GlobalFree, 1),
-    F(TlsAlloc, 0), F(TlsFree, 1), F(TlsGetValue, 1), F(TlsSetValue, 2), F(FlsAlloc, 1), F(FlsFree, 1), F(FlsGetValue, 1), F(FlsSetValue, 2),
+    F(TlsAlloc, 0), F(TlsFree, 1), F(TlsGetValue, 1), F(TlsSetValue, 2), F(FlsAlloc, 1), F(FlsFree, 1), F(FlsGetValue, 1), F(FlsSetValue, 2), F(FlsGetValue2, 1), F(DisableThreadLibraryCalls, 1),
     FN(InitializeSRWLock, 1, k_nop_void), FN(AcquireSRWLockExclusive, 1, k_nop_void), FN(ReleaseSRWLockExclusive, 1, k_nop_void),
     FN(AcquireSRWLockShared, 1, k_nop_void), FN(ReleaseSRWLockShared, 1, k_nop_void), FN(InitOnceExecuteOnce, 4, k_nop_true),
     FN(InitializeConditionVariable, 1, k_nop_void), FN(WakeAllConditionVariable, 1, k_nop_void), FN(WakeConditionVariable, 1, k_nop_void),
@@ -2491,7 +2593,7 @@ const w32_api w32_kernel32[] = {
     /* Implemented, and refuses: there is one guest process and the runtime's
      * globals are per process. It reports itself in the run report so a
      * program that needed a child is not a silent mystery. */
-    F(CreateProcessA, 10), FN(CreateProcessW, 10, k_CreateProcessA),
+    F(CreateProcessA, 10), F(CreateProcessW, 10),
     /* Where DLLs are searched for. SetDefaultDllDirectories is what an NSIS
      * installer calls before anything else. */
     /* The wide half. NSIS is a Unicode program: every path it touches goes
@@ -2542,7 +2644,7 @@ const w32_api w32_kernel32[] = {
      * the unhandled filter are in win32/seh.c, which kernel32 pulls in as its
      * second table. What is left here is the 64-bit table-driven unwinder,
      * which is not implemented. */
-    F(RtlPcToFileHeader, 2), F(RtlLookupFunctionEntry, 3), F(RtlVirtualUnwind, 8), F(RtlUnwindEx, 6),
+    F(RtlPcToFileHeader, 2), F(RtlLookupFunctionEntry, 3), F(RtlVirtualUnwind, 8),
     F(EncodePointer, 1), F(DecodePointer, 1), F(InitializeSListHead, 1), F(SetHandleCount, 1), F(GetLogicalDrives, 0), F(GetDriveTypeA, 1),
     F(GetComputerNameA, 2), F(GetUserNameA, 2), F(lstrlenA, 1), F(lstrlenW, 1), F(lstrcpyA, 2), F(lstrcpyW, 2), F(lstrcmpiA, 2),
     F(GetSystemDirectoryA, 2), F(GetWindowsDirectoryA, 2), F(IsProcessorFeaturePresent, 1), F(GetCurrentProcessorNumber, 0),
@@ -2594,8 +2696,56 @@ static void m_joyGetDevCapsA(w32 *w) { (void)w; RET(JOYERR_UNPLUGGED_); }
 static void m_joyGetDevCapsW(w32 *w) { (void)w; RET(JOYERR_UNPLUGGED_); }
 static void m_joySetCapture(w32 *w) { (void)w; RET(JOYERR_UNPLUGGED_); }
 static void m_joyReleaseCapture(w32 *w) { (void)w; RET(JOYERR_UNPLUGGED_); }
-static void m_PlaySoundW(w32 *w) { (void)w; RET(0); }
-static void m_PlaySoundA(w32 *w) { (void)w; RET(0); }
+/* PlaySound(sound, hmod, flags): a WAV from memory or a file, through the
+ * mixer. One at a time, as on Windows -- a new one stops the last -- and
+ * without SND_ASYNC the call waits for it to finish, bounded. A sound kept in
+ * the program's resources (SND_RESOURCE) is not looked up yet, and says so. */
+enum { SND_ASYNC_ = 1, SND_MEMORY_ = 4, SND_LOOP_ = 8, SND_PURGE_ = 0x40, SND_RESOURCE_ = 0x40004 };
+static int g_playsound = -1;
+static void play_sound(w32 *w, int wide) {
+    uint64_t p = ARG(0); uint32_t fl = (uint32_t)ARG(2);
+    if (g_playsound >= 0) { w32_audio_src_remove(g_playsound); g_playsound = -1; }
+    if (!p || (fl & SND_PURGE_)) { RET(1); return; }
+    if ((fl & SND_RESOURCE_) == SND_RESOURCE_) {
+        w32_note_refused(w, "winmm!PlaySound (SND_RESOURCE: a sound from the program's own resources is not looked up yet)");
+        RET(0); return;
+    }
+    uint8_t *data = 0; size_t n = 0;
+    if (fl & SND_MEMORY_) {
+        const uint8_t *h = W32PN(w, p, 12);
+        if (!h || memcmp(h, "RIFF", 4) || memcmp(h + 8, "WAVE", 4)) { RET(0); return; }
+        uint32_t len = ((uint32_t)h[4] | (uint32_t)h[5] << 8 | (uint32_t)h[6] << 16 | (uint32_t)h[7] << 24) + 8;
+        const uint8_t *all = len < (64u << 20) ? W32PN(w, p, len) : 0;
+        if (!all) { RET(0); return; }
+        data = malloc(len); if (!data) { RET(0); return; }
+        memcpy(data, all, len); n = len;
+    } else {
+        char name[1024], host[4096];
+        if (wide) w32_wtoa(w, p, name, sizeof name); else snprintf(name, sizeof name, "%s", w32_str(w, p));
+        host_path(w, name, host, sizeof host);
+        FILE *f = fopen(host, "rb");
+        if (!f) { w32_set_last_error(w, ERROR_FILE_NOT_FOUND); RET(0); return; }
+        fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
+        if (len <= 0 || len > (64L << 20) || !(data = malloc((size_t)len))) { fclose(f); RET(0); return; }
+        n = fread(data, 1, (size_t)len, f); fclose(f);
+    }
+    w32_audio_src s;
+    if (!w32_audio_parse_wav(data, n, &s)) { free(data); RET(0); return; }
+    s.owner = data; s.playing = 1; s.looping = (fl & SND_LOOP_) != 0;
+    g_playsound = w32_audio_src_add(&s);
+    if (g_playsound < 0) { free(data); RET(0); return; }
+    w32_audio_open();
+    if (!(fl & SND_ASYNC_) && !s.looping) {
+        uint64_t ms = (uint64_t)s.size * 1000 / (s.bps ? s.bps : 1);
+        if (ms > 30000) ms = 30000;
+        for (uint64_t t = 0; t < ms && w32_audio_src_playing(g_playsound); t += 10) {
+            struct timespec ts = { 0, 10 * 1000000L }; nanosleep(&ts, 0);
+        }
+    }
+    RET(1);
+}
+static void m_PlaySoundW(w32 *w) { play_sound(w, 1); }
+static void m_PlaySoundA(w32 *w) { play_sound(w, 0); }
 static void m_mciSendStringW(w32 *w) { (void)w; RET(1); }
 static void m_mciSendStringA(w32 *w) { (void)w; RET(1); }
 

@@ -17,6 +17,51 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The guest programs under tests/win32 are committed binaries: neither the
+  # Mac nor the macOS runner has mingw-w64. Here it is a stock package, so this
+  # job rebuilds every guest from source, runs the suite against the fresh
+  # build -- a change to a guest's .c is tested before its .exe is committed --
+  # and uploads the result for whoever commits it. It does not compare against
+  # the committed files: mingw output is not byte-reproducible across versions,
+  # so a difference there would mean nothing.
+  guests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - name: mingw-w64, and 7-Zip for the one fixture Python cannot make
+        run: sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 g++-mingw-w64-x86-64 g++-mingw-w64-i686 p7zip-full
+      # BCJ2 -- 7-Zip's four-stream x86 filter -- has no encoder in liblzma, so
+      # the fixture for it is made here and shipped with the guests, to be
+      # committed as tests/import/bcj2.7z. Made from the *committed* hello binaries,
+      # before build.sh rebuilds them: the test compares against what is in git.
+      - name: A BCJ2 archive
+        run: |
+          rm -f tests/import/bcj2.7z
+          7z a -m0=BCJ2 -m1=LZMA:d=64k -m2=LZMA:d=64k -m3=LZMA:d=64k -mb0:1 -mb0s1:2 -mb0s2:3 tests/import/bcj2.7z ./tests/win32/hello64.exe ./tests/win32/hello32.exe >/dev/null
+          ls -la tests/import/bcj2.7z
+      - name: Rebuild the guest programs
+        run: sh tests/win32/build.sh
+      - name: Run the suite against the fresh build
+        run: |
+          cmake -S . -B build-host -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build-host -j"$(nproc)"
+          out=$(sh tests/win32/run.sh build-host/winrun tests/win32 2>&1); rc=$?
+          echo "$out" | awk '/^FAIL/{p=1} /^ok /{p=0} p' | head -400
+          echo "::notice::guests: $(echo "$out" | grep -c '^ok') ok, $(echo "$out" | grep -c '^FAIL') failed (rc $rc)"
+          echo "$out" | grep -E '^FAIL' | head -8 | while IFS= read -r l; do echo "::error::guests: ${l}"; done
+          [ "$rc" -eq 0 ]
+      - if: always()                # what did build is still worth having
+        uses: actions/upload-artifact@v4
+        with:
+          name: win32-guests-${{ github.sha }}
+          path: |
+            tests/win32/*.exe
+            tests/win32/*.dll
+            tests/import/bcj2.7z
+          retention-days: 7
+
   # Fast feedback on the portable core: ~2 minutes on a free Linux runner
   # instead of ~20 on macOS. Most logic bugs get caught here.
   core-tests:
@@ -121,12 +166,22 @@ jobs:
           diff -u core/src/golden_vectors.c /tmp/golden.c > /tmp/gdiff.txt
           rc=$?
           if [ $rc -ne 0 ]; then
-            echo "::error::golden_vectors.c differs from this runner's recording"
+            echo "::error::golden_vectors.c differs from this runner's recording (the recording is uploaded as golden-vectors-<sha>: commit it as core/src/golden_vectors.c)"
             head -40 /tmp/gdiff.txt > /tmp/gd40.txt
             while IFS= read -r l; do echo "::error::${l}"; done < /tmp/gd40.txt
+            cp /tmp/golden.c /tmp/golden_vectors.c
             exit 1
           fi
           echo "golden vectors match the CI runner's CPU"
+      # The recording itself, when it differs: the vectors have to come from real
+      # x86-64 silicon, and this runner is the one with both 32- and 64-bit halves.
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-vectors-${{ github.sha }}
+          path: /tmp/golden_vectors.c
+          if-no-files-found: ignore
+          retention-days: 7
 
   ios:
     # Pinned, not macos-latest: a silent image bump changes the SDK underneath us.
@@ -205,6 +260,15 @@ jobs:
           out5=$(sh tests/win32/run.sh build-mac/winrun tests/win32 2>&1); rc5=$?
           echo "::notice::win32: $(echo "$out5" | grep -c '^ok') ok, $(echo "$out5" | grep -c '^FAIL') failed (rc $rc5)"
           echo "$out5" | grep -E '^FAIL|winrun: host SIG' | head -8 | while IFS= read -r l; do echo "::error::win32: ${l}"; done
+          # The FAIL line names the test; the lines after it are the diff and
+          # the -v diagnostics, which is the part that says *why*. Without them
+          # a failure that only happens on this runner cannot be diagnosed from
+          # anywhere else -- the summary below is not visible through the API.
+          if [ "$rc5" -ne 0 ]; then
+            echo "::group::win32: failing cases, expected vs got"
+            echo "$out5" | awk '/^FAIL/{p=1} /^ok /{p=0} p' | head -400
+            echo "::endgroup::"
+          fi
           out7=$(./build-mac/test_winrun_lib tests/win32 2>&1); rc7=$?
           echo "$out7" | tail -1 | while IFS= read -r l; do echo "::notice::winrun-lib: ${l}"; done
           echo "rc jit=$rc interp=$rc2 arena=$rc3 jitdiff=$rc4 faultdiff=$rc8 win32=$rc5 bench=$rc6 winrunlib=$rc7"

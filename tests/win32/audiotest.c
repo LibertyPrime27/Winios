@@ -111,19 +111,33 @@ int main(void) {
      * that stands still makes it spin. Checked as a range, because it is a
      * clock and this is not a real-time system. */
     DWORD play0 = 0, play1 = 0, write0 = 0;
+    LARGE_INTEGER freq, t0, t1;
+    QueryPerformanceFrequency(&freq);
     IDirectSoundBuffer_GetCurrentPosition(buf, &play0, &write0);
+    QueryPerformanceCounter(&t0);
     Sleep(100);
     IDirectSoundBuffer_GetCurrentPosition(buf, &play1, NULL);
+    QueryPerformanceCounter(&t1);
     long moved = (long)play1 - (long)play0;
     if (moved < 0) moved += (long)bd.dwBufferBytes;
-    /* A wide window on purpose: it is a clock, not a real-time guarantee, and
-     * the recording must not contain a timing measurement. What is being
-     * tested is the order of magnitude -- that it moves, and at the rate the
-     * format implies rather than some other one. */
-    long want = (long)wf.nAvgBytesPerSec / 10;
-    printf("cursor moved %s in 100 ms (wanted roughly %ld bytes)\n",
-           moved > want / 2 && moved < want * 2 ? "about right"
-           : moved == 0 ? "NOT AT ALL" : "BY THE WRONG AMOUNT", want);
+    /* Judged against the time that actually passed, not the 100 ms that was
+     * asked for: Sleep on a shared CI runner has overshot by more than 2x,
+     * and a check pinned to the nominal interval failed on a cursor that was
+     * moving at exactly the right rate. The window stays wide -- it is a
+     * clock, not a real-time guarantee -- and the recording still carries no
+     * timing number, so the line below is the same whatever the wait took.
+     * What is tested is that it moves, and at the rate the format implies. */
+    long elapsed_ms = (long)((t1.QuadPart - t0.QuadPart) * 1000 / freq.QuadPart);
+    long want = (long)((long long)wf.nAvgBytesPerSec * elapsed_ms / 1000);
+    long nominal = (long)wf.nAvgBytesPerSec / 10;
+    if (elapsed_ms > 800)
+        /* longer than that and the cursor may have lapped the 1 s buffer, so
+         * the distance says nothing; fail with the reason rather than guess */
+        printf("cursor moved UNMEASURABLY: the 100 ms wait took %ld ms\n", elapsed_ms);
+    else
+        printf("cursor moved %s in 100 ms (wanted roughly %ld bytes)\n",
+               moved > want / 2 && moved < want * 2 ? "about right"
+               : moved == 0 ? "NOT AT ALL" : "BY THE WRONG AMOUNT", nominal);
     printf("write cursor leads the play cursor: %s\n", write0 != play0 ? "yes" : "NO");
 
     printf("Stop: %s\n", SUCCEEDED(IDirectSoundBuffer_Stop(buf)) ? "ok" : "FAILED");

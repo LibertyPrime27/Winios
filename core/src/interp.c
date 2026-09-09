@@ -635,10 +635,11 @@ static int do_bt(ctx *x, ZydisMnemonic m) {
     return is_mem ? mem_write(x, addr, bits, v) : op_write(x, 0, v);
 }
 
-/* CPUID: a fixed, deliberately modest x86-64 -- SSE2, CMOV, FXSR, no SSSE3/
- * SSE4/AVX/BMI. glibc and friends pick their baseline code paths from this,
- * which are exactly the instructions implemented here. Extend the two
- * together. */
+/* CPUID: a fixed, deliberately modest x86-64 -- through SSE4.2 and POPCNT, no
+ * AVX/BMI/FMA. glibc, the UCRT and game engines pick their code paths from
+ * this, which are exactly the instructions implemented here. Extend the two
+ * together: a bit claimed here for an instruction the interpreter lacks is a
+ * #UD in a program's fastest loop. */
 static void do_cpuid(xc_cpu *c) {
     uint32_t leaf = (uint32_t)c->gpr[XC_RAX], sub = (uint32_t)c->gpr[XC_RCX];
     uint32_t a = 0, b = 0, cc = 0, d = 0;
@@ -647,7 +648,8 @@ static void do_cpuid(xc_cpu *c) {
     case 1:
         a = 0x000306A9;                                   /* family 6, model 0x3A */
         b = 0x00000800;                                   /* 1 logical CPU, CLFLUSH 8*8 */
-        cc = (1u << 0)  /* SSE3 */ | (1u << 13) /* CX16 */;
+        cc = (1u << 0)  /* SSE3 */ | (1u << 9) /* SSSE3 */ | (1u << 13) /* CX16 */
+           | (1u << 19) /* SSE4.1 */ | (1u << 20) /* SSE4.2 */ | (1u << 23) /* POPCNT */;
         d  = (1u << 0)  /* FPU */ | (1u << 4) /* TSC */ | (1u << 8) /* CX8 */ | (1u << 15) /* CMOV */
            | (1u << 19) /* CLFSH */ | (1u << 23) /* MMX */ | (1u << 24) /* FXSR */ | (1u << 25) /* SSE */
            | (1u << 26) /* SSE2 */;
@@ -928,6 +930,22 @@ static int fpred32(int p, float a, float b) {
     return fpred(p, isnan(a) ? (double)a : (double)a, (double)b);   /* exact widening */
 }
 
+/* ROUND*: the four rounding modes, without touching the host's rounding state.
+ * Half-to-even by hand, because nearbyint would follow whatever mode the host
+ * happens to be in. NaN and infinity come back as they went in. */
+static double round_mode(double v, int mode) {
+    if (v != v || v == __builtin_inf() || v == -__builtin_inf()) return v;
+    switch (mode & 3) {
+    case 1: return __builtin_floor(v);
+    case 2: return __builtin_ceil(v);
+    case 3: return __builtin_trunc(v);
+    default: {
+        double f = __builtin_floor(v), d = v - f;
+        if (d > 0.5 || (d == 0.5 && __builtin_fmod(f, 2.0) != 0.0)) f += 1.0;
+        return f == 0.0 && v < 0 ? -0.0 : f;                     /* -0.3 rounds to -0.0 */
+    }
+    }
+}
 static inline uint8_t  sat_u8(int32_t v)  { return v < 0 ? 0 : v > 255 ? 255 : (uint8_t)v; }
 static inline int8_t   sat_s8(int32_t v)  { return v < -128 ? -128 : v > 127 ? 127 : (int8_t)v; }
 static inline uint16_t sat_u16(int32_t v) { return v < 0 ? 0 : v > 65535 ? 65535 : (uint16_t)v; }
@@ -981,7 +999,7 @@ static int do_sse(ctx *x, ZydisMnemonic m, int *ok) {
     case ZYDIS_MNEMONIC_MOVMSKPS: RD(1, a); r.q.lo = (a.d[0] >> 31) | ((a.d[1] >> 31) << 1) | ((a.d[2] >> 31) << 2) | ((a.d[3] >> 31) << 3); WR(r, 32);
     case ZYDIS_MNEMONIC_MOVMSKPD: RD(1, a); r.q.lo = (a.q.lo >> 63) | ((a.q.hi >> 63) << 1); WR(r, 32);
     case ZYDIS_MNEMONIC_PMOVMSKB: RD(1, a); for (int i = 0; i < 16; i++) r.q.lo |= (uint64_t)(a.b[i] >> 7) << i; WR(r, 32);
-    case ZYDIS_MNEMONIC_PEXTRW: RD(1, a); r.q.lo = a.w[IMM(2) & 7]; WR(r, 32);
+    case ZYDIS_MNEMONIC_PEXTRW: RD(1, a); r.q.lo = a.w[IMM(2) & 7]; WR(r, ops[0].type == XOP_MEM ? 16 : 32);   /* a word to memory, a zero-extended dword to a register */
     case ZYDIS_MNEMONIC_PINSRW: RD(0, r); RD(1, a); r.w[IMM(2) & 7] = (uint16_t)a.q.lo; WR(r, 128);
 
     /* ---- bitwise ---- */
@@ -1166,6 +1184,192 @@ static int do_sse(ctx *x, ZydisMnemonic m, int *ok) {
     /* ---- control ---- */
     case ZYDIS_MNEMONIC_LDMXCSR: { uint64_t v; *ok = op_read(x, 0, &v); if (*ok) c->mxcsr = (uint32_t)v; return 1; }
     case ZYDIS_MNEMONIC_STMXCSR: *ok = op_write(x, 0, c->mxcsr); return 1;
+
+    /* ---- SSE3 ---- */
+    case ZYDIS_MNEMONIC_MOVSHDUP: RD(1, a); r.d[0] = r.d[1] = a.d[1]; r.d[2] = r.d[3] = a.d[3]; WR(r, 128);
+    case ZYDIS_MNEMONIC_MOVSLDUP: RD(1, a); r.d[0] = r.d[1] = a.d[0]; r.d[2] = r.d[3] = a.d[2]; WR(r, 128);
+    case ZYDIS_MNEMONIC_ADDSUBPS: FENV(); RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) r.f[i] = sse_fix32(i & 1 ? a.f[i] + b.f[i] : a.f[i] - b.f[i], a.f[i], b.f[i]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_ADDSUBPD: FENV(); RD(0, a); RD(1, b); r.e[0] = sse_fix64(a.e[0] - b.e[0], a.e[0], b.e[0]); r.e[1] = sse_fix64(a.e[1] + b.e[1], a.e[1], b.e[1]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_HADDPS: FENV(); RD(0, a); RD(1, b); r.f[0] = sse_fix32(a.f[0] + a.f[1], a.f[0], a.f[1]); r.f[1] = sse_fix32(a.f[2] + a.f[3], a.f[2], a.f[3]); r.f[2] = sse_fix32(b.f[0] + b.f[1], b.f[0], b.f[1]); r.f[3] = sse_fix32(b.f[2] + b.f[3], b.f[2], b.f[3]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_HSUBPS: FENV(); RD(0, a); RD(1, b); r.f[0] = sse_fix32(a.f[0] - a.f[1], a.f[0], a.f[1]); r.f[1] = sse_fix32(a.f[2] - a.f[3], a.f[2], a.f[3]); r.f[2] = sse_fix32(b.f[0] - b.f[1], b.f[0], b.f[1]); r.f[3] = sse_fix32(b.f[2] - b.f[3], b.f[2], b.f[3]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_HADDPD: FENV(); RD(0, a); RD(1, b); r.e[0] = sse_fix64(a.e[0] + a.e[1], a.e[0], a.e[1]); r.e[1] = sse_fix64(b.e[0] + b.e[1], b.e[0], b.e[1]); WRF(r, 128);
+    case ZYDIS_MNEMONIC_HSUBPD: FENV(); RD(0, a); RD(1, b); r.e[0] = sse_fix64(a.e[0] - a.e[1], a.e[0], a.e[1]); r.e[1] = sse_fix64(b.e[0] - b.e[1], b.e[0], b.e[1]); WRF(r, 128);
+
+    /* ---- SSSE3 ---- */
+    case ZYDIS_MNEMONIC_PSHUFB: RD(0, a); RD(1, b); for (int i = 0; i < 16; i++) r.b[i] = (b.b[i] & 0x80) ? 0 : a.b[b.b[i] & 15]; WR(r, 128);
+    case ZYDIS_MNEMONIC_PALIGNR: {
+        RD(0, a); RD(1, b); int sh = IMM(2) & 0xFF;
+        uint8_t t[32]; memcpy(t, b.b, 16); memcpy(t + 16, a.b, 16);          /* src is the low half of the pair */
+        for (int i = 0; i < 16; i++) r.b[i] = sh + i < 32 ? t[sh + i] : 0;
+        WR(r, 128);
+    }
+    case ZYDIS_MNEMONIC_PABSB: RD(1, a); for (int i = 0; i < 16; i++) { int v = (int8_t)a.b[i]; r.b[i] = (uint8_t)(v < 0 ? -v : v); } WR(r, 128);
+    case ZYDIS_MNEMONIC_PABSW: RD(1, a); for (int i = 0; i < 8; i++) { int v = (int16_t)a.w[i]; r.w[i] = (uint16_t)(v < 0 ? -v : v); } WR(r, 128);
+    case ZYDIS_MNEMONIC_PABSD: RD(1, a); for (int i = 0; i < 4; i++) { int64_t v = (int32_t)a.d[i]; r.d[i] = (uint32_t)(v < 0 ? -v : v); } WR(r, 128);
+    case ZYDIS_MNEMONIC_PHADDW: RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) { r.w[i] = (uint16_t)(a.w[2 * i] + a.w[2 * i + 1]); r.w[4 + i] = (uint16_t)(b.w[2 * i] + b.w[2 * i + 1]); } WR(r, 128);
+    case ZYDIS_MNEMONIC_PHSUBW: RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) { r.w[i] = (uint16_t)(a.w[2 * i] - a.w[2 * i + 1]); r.w[4 + i] = (uint16_t)(b.w[2 * i] - b.w[2 * i + 1]); } WR(r, 128);
+    case ZYDIS_MNEMONIC_PHADDD: RD(0, a); RD(1, b); r.d[0] = a.d[0] + a.d[1]; r.d[1] = a.d[2] + a.d[3]; r.d[2] = b.d[0] + b.d[1]; r.d[3] = b.d[2] + b.d[3]; WR(r, 128);
+    case ZYDIS_MNEMONIC_PHSUBD: RD(0, a); RD(1, b); r.d[0] = a.d[0] - a.d[1]; r.d[1] = a.d[2] - a.d[3]; r.d[2] = b.d[0] - b.d[1]; r.d[3] = b.d[2] - b.d[3]; WR(r, 128);
+    case ZYDIS_MNEMONIC_PHADDSW: RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) { r.w[i] = (uint16_t)sat_s16((int16_t)a.w[2 * i] + (int16_t)a.w[2 * i + 1]); r.w[4 + i] = (uint16_t)sat_s16((int16_t)b.w[2 * i] + (int16_t)b.w[2 * i + 1]); } WR(r, 128);
+    case ZYDIS_MNEMONIC_PHSUBSW: RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) { r.w[i] = (uint16_t)sat_s16((int16_t)a.w[2 * i] - (int16_t)a.w[2 * i + 1]); r.w[4 + i] = (uint16_t)sat_s16((int16_t)b.w[2 * i] - (int16_t)b.w[2 * i + 1]); } WR(r, 128);
+    case ZYDIS_MNEMONIC_PMADDUBSW: RD(0, a); RD(1, b); for (int i = 0; i < 8; i++) r.w[i] = (uint16_t)sat_s16((int)a.b[2 * i] * (int8_t)b.b[2 * i] + (int)a.b[2 * i + 1] * (int8_t)b.b[2 * i + 1]); WR(r, 128);
+    case ZYDIS_MNEMONIC_PMULHRSW: RD(0, a); RD(1, b); for (int i = 0; i < 8; i++) { int32_t t = ((int32_t)(int16_t)a.w[i] * (int16_t)b.w[i]) >> 14; r.w[i] = (uint16_t)((t + 1) >> 1); } WR(r, 128);
+    case ZYDIS_MNEMONIC_PSIGNB: RD(0, a); RD(1, b); for (int i = 0; i < 16; i++) { int8_t s = (int8_t)b.b[i]; r.b[i] = s < 0 ? (uint8_t)(-(int8_t)a.b[i]) : s == 0 ? 0 : a.b[i]; } WR(r, 128);
+    case ZYDIS_MNEMONIC_PSIGNW: RD(0, a); RD(1, b); for (int i = 0; i < 8; i++) { int16_t s = (int16_t)b.w[i]; r.w[i] = s < 0 ? (uint16_t)(-(int16_t)a.w[i]) : s == 0 ? 0 : a.w[i]; } WR(r, 128);
+    case ZYDIS_MNEMONIC_PSIGND: RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) { int32_t s = (int32_t)b.d[i]; r.d[i] = s < 0 ? (uint32_t)(-(int32_t)a.d[i]) : s == 0 ? 0 : a.d[i]; } WR(r, 128);
+
+    /* ---- SSE4.1 ---- */
+    case ZYDIS_MNEMONIC_PBLENDVB: { lanes m; RD(0, a); RD(1, b); RD(2, m); for (int i = 0; i < 16; i++) r.b[i] = (m.b[i] & 0x80) ? b.b[i] : a.b[i]; WR(r, 128); }
+    case ZYDIS_MNEMONIC_BLENDVPS: { lanes m; RD(0, a); RD(1, b); RD(2, m); for (int i = 0; i < 4; i++) r.d[i] = (m.d[i] >> 31) ? b.d[i] : a.d[i]; WR(r, 128); }
+    case ZYDIS_MNEMONIC_BLENDVPD: { lanes m; RD(0, a); RD(1, b); RD(2, m); r.q.lo = (m.q.lo >> 63) ? b.q.lo : a.q.lo; r.q.hi = (m.q.hi >> 63) ? b.q.hi : a.q.hi; WR(r, 128); }
+    case ZYDIS_MNEMONIC_PBLENDW: { RD(0, a); RD(1, b); int im = IMM(2); for (int i = 0; i < 8; i++) r.w[i] = (im >> i) & 1 ? b.w[i] : a.w[i]; WR(r, 128); }
+    case ZYDIS_MNEMONIC_BLENDPS: { RD(0, a); RD(1, b); int im = IMM(2); for (int i = 0; i < 4; i++) r.d[i] = (im >> i) & 1 ? b.d[i] : a.d[i]; WR(r, 128); }
+    case ZYDIS_MNEMONIC_BLENDPD: { RD(0, a); RD(1, b); int im = IMM(2); r.q.lo = im & 1 ? b.q.lo : a.q.lo; r.q.hi = im & 2 ? b.q.hi : a.q.hi; WR(r, 128); }
+    case ZYDIS_MNEMONIC_PMINSB: RD(0, a); RD(1, b); for (int i = 0; i < 16; i++) r.b[i] = (int8_t)a.b[i] < (int8_t)b.b[i] ? a.b[i] : b.b[i]; WR(r, 128);
+    case ZYDIS_MNEMONIC_PMAXSB: RD(0, a); RD(1, b); for (int i = 0; i < 16; i++) r.b[i] = (int8_t)a.b[i] > (int8_t)b.b[i] ? a.b[i] : b.b[i]; WR(r, 128);
+    case ZYDIS_MNEMONIC_PMINUW: RD(0, a); RD(1, b); for (int i = 0; i < 8; i++) r.w[i] = a.w[i] < b.w[i] ? a.w[i] : b.w[i]; WR(r, 128);
+    case ZYDIS_MNEMONIC_PMAXUW: RD(0, a); RD(1, b); for (int i = 0; i < 8; i++) r.w[i] = a.w[i] > b.w[i] ? a.w[i] : b.w[i]; WR(r, 128);
+    case ZYDIS_MNEMONIC_PMINSD: RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) r.d[i] = (int32_t)a.d[i] < (int32_t)b.d[i] ? a.d[i] : b.d[i]; WR(r, 128);
+    case ZYDIS_MNEMONIC_PMAXSD: RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) r.d[i] = (int32_t)a.d[i] > (int32_t)b.d[i] ? a.d[i] : b.d[i]; WR(r, 128);
+    case ZYDIS_MNEMONIC_PMINUD: RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) r.d[i] = a.d[i] < b.d[i] ? a.d[i] : b.d[i]; WR(r, 128);
+    case ZYDIS_MNEMONIC_PMAXUD: RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) r.d[i] = a.d[i] > b.d[i] ? a.d[i] : b.d[i]; WR(r, 128);
+    case ZYDIS_MNEMONIC_PMULLD: RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) r.d[i] = a.d[i] * b.d[i]; WR(r, 128);
+    case ZYDIS_MNEMONIC_PMULDQ: RD(0, a); RD(1, b); r.q.lo = (uint64_t)((int64_t)(int32_t)a.d[0] * (int32_t)b.d[0]); r.q.hi = (uint64_t)((int64_t)(int32_t)a.d[2] * (int32_t)b.d[2]); WR(r, 128);
+    case ZYDIS_MNEMONIC_PACKUSDW: RD(0, a); RD(1, b); for (int i = 0; i < 4; i++) { r.w[i] = sat_u16((int32_t)a.d[i]); r.w[4 + i] = sat_u16((int32_t)b.d[i]); } WR(r, 128);
+    case ZYDIS_MNEMONIC_PMOVSXBW: RD(1, a); for (int i = 0; i < 8; i++) r.w[i] = (uint16_t)(int8_t)a.b[i]; WR(r, 128);
+    case ZYDIS_MNEMONIC_PMOVZXBW: RD(1, a); for (int i = 0; i < 8; i++) r.w[i] = a.b[i]; WR(r, 128);
+    case ZYDIS_MNEMONIC_PMOVSXBD: RD(1, a); for (int i = 0; i < 4; i++) r.d[i] = (uint32_t)(int8_t)a.b[i]; WR(r, 128);
+    case ZYDIS_MNEMONIC_PMOVZXBD: RD(1, a); for (int i = 0; i < 4; i++) r.d[i] = a.b[i]; WR(r, 128);
+    case ZYDIS_MNEMONIC_PMOVSXBQ: RD(1, a); r.q.lo = (uint64_t)(int64_t)(int8_t)a.b[0]; r.q.hi = (uint64_t)(int64_t)(int8_t)a.b[1]; WR(r, 128);
+    case ZYDIS_MNEMONIC_PMOVZXBQ: RD(1, a); r.q.lo = a.b[0]; r.q.hi = a.b[1]; WR(r, 128);
+    case ZYDIS_MNEMONIC_PMOVSXWD: RD(1, a); for (int i = 0; i < 4; i++) r.d[i] = (uint32_t)(int16_t)a.w[i]; WR(r, 128);
+    case ZYDIS_MNEMONIC_PMOVZXWD: RD(1, a); for (int i = 0; i < 4; i++) r.d[i] = a.w[i]; WR(r, 128);
+    case ZYDIS_MNEMONIC_PMOVSXWQ: RD(1, a); r.q.lo = (uint64_t)(int64_t)(int16_t)a.w[0]; r.q.hi = (uint64_t)(int64_t)(int16_t)a.w[1]; WR(r, 128);
+    case ZYDIS_MNEMONIC_PMOVZXWQ: RD(1, a); r.q.lo = a.w[0]; r.q.hi = a.w[1]; WR(r, 128);
+    case ZYDIS_MNEMONIC_PMOVSXDQ: RD(1, a); r.q.lo = (uint64_t)(int64_t)(int32_t)a.d[0]; r.q.hi = (uint64_t)(int64_t)(int32_t)a.d[1]; WR(r, 128);
+    case ZYDIS_MNEMONIC_PMOVZXDQ: RD(1, a); r.q.lo = a.d[0]; r.q.hi = a.d[1]; WR(r, 128);
+    case ZYDIS_MNEMONIC_PINSRB: RD(0, r); RD(1, a); r.b[IMM(2) & 15] = (uint8_t)a.q.lo; WR(r, 128);
+    case ZYDIS_MNEMONIC_PINSRD: RD(0, r); RD(1, a); r.d[IMM(2) & 3] = (uint32_t)a.q.lo; WR(r, 128);
+    case ZYDIS_MNEMONIC_PINSRQ: RD(0, r); RD(1, a); if (IMM(2) & 1) r.q.hi = a.q.lo; else r.q.lo = a.q.lo; WR(r, 128);
+    /* PEXTR* to memory writes the element's own width; to a register, 32 bits
+     * (zero-extended, as MOVD does) or 64 for PEXTRQ. */
+    case ZYDIS_MNEMONIC_PEXTRB: RD(1, a); r.q.lo = a.b[IMM(2) & 15]; WR(r, ops[0].type == XOP_MEM ? 8 : 32);
+    case ZYDIS_MNEMONIC_PEXTRD: RD(1, a); r.q.lo = a.d[IMM(2) & 3]; WR(r, 32);
+    case ZYDIS_MNEMONIC_PEXTRQ: RD(1, a); r.q.lo = (IMM(2) & 1) ? a.q.hi : a.q.lo; WR(r, 64);
+    case ZYDIS_MNEMONIC_EXTRACTPS: RD(1, a); r.q.lo = a.d[IMM(2) & 3]; WR(r, 32);
+    case ZYDIS_MNEMONIC_INSERTPS: {
+        RD(0, r); RD(1, b); int im = IMM(2);
+        uint32_t src = ops[1].type == XOP_MEM ? b.d[0] : b.d[(im >> 6) & 3];
+        r.d[(im >> 4) & 3] = src;
+        for (int i = 0; i < 4; i++) if ((im >> i) & 1) r.d[i] = 0;
+        WR(r, 128);
+    }
+    case ZYDIS_MNEMONIC_ROUNDPS: case ZYDIS_MNEMONIC_ROUNDPD: case ZYDIS_MNEMONIC_ROUNDSS: case ZYDIS_MNEMONIC_ROUNDSD: {
+        RD(0, r); RD(1, b); int im = IMM(2);
+        int mode = (im & 4) ? (int)((c->mxcsr >> 13) & 3) : (im & 3), inexact = 0;
+        if (m == ZYDIS_MNEMONIC_ROUNDPS) { for (int i = 0; i < 4; i++) { r.f[i] = (float)round_mode((double)b.f[i], mode); inexact |= r.f[i] != b.f[i]; } }
+        else if (m == ZYDIS_MNEMONIC_ROUNDPD) { for (int i = 0; i < 2; i++) { r.e[i] = round_mode(b.e[i], mode); inexact |= r.e[i] != b.e[i]; } }
+        else if (m == ZYDIS_MNEMONIC_ROUNDSS) { r.f[0] = (float)round_mode((double)b.f[0], mode); inexact = r.f[0] != b.f[0]; }
+        else { r.e[0] = round_mode(b.e[0], mode); inexact = r.e[0] != b.e[0]; }
+        /* bit 3 of the immediate suppresses the precision exception; without
+         * it, a value that moved sets PE in MXCSR as any inexact result does */
+        if (inexact && !(im & 8)) c->mxcsr |= 0x20;
+        WR(r, 128);
+    }
+    case ZYDIS_MNEMONIC_DPPS: {
+        FENV(); RD(0, a); RD(1, b); int im = IMM(2);
+        float t[4], s;
+        for (int i = 0; i < 4; i++) t[i] = (im >> (4 + i)) & 1 ? sse_fix32(a.f[i] * b.f[i], a.f[i], b.f[i]) : 0.0f;
+        { float u = sse_fix32(t[0] + t[1], t[0], t[1]), v = sse_fix32(t[2] + t[3], t[2], t[3]); s = sse_fix32(u + v, u, v); }   /* the SDM's order */
+        for (int i = 0; i < 4; i++) r.f[i] = (im >> i) & 1 ? s : 0.0f;
+        WRF(r, 128);
+    }
+    case ZYDIS_MNEMONIC_DPPD: {
+        FENV(); RD(0, a); RD(1, b); int im = IMM(2);
+        double t0 = (im & 0x10) ? sse_fix64(a.e[0] * b.e[0], a.e[0], b.e[0]) : 0.0, t1 = (im & 0x20) ? sse_fix64(a.e[1] * b.e[1], a.e[1], b.e[1]) : 0.0, s = sse_fix64(t0 + t1, t0, t1);
+        r.e[0] = (im & 1) ? s : 0.0; r.e[1] = (im & 2) ? s : 0.0;
+        WRF(r, 128);
+    }
+    case ZYDIS_MNEMONIC_PTEST: {
+        RD(0, a); RD(1, b);
+        set_flag(c, XC_ZF, ((a.q.lo & b.q.lo) | (a.q.hi & b.q.hi)) == 0);
+        set_flag(c, XC_CF, ((~a.q.lo & b.q.lo) | (~a.q.hi & b.q.hi)) == 0);
+        set_flag(c, XC_OF, 0); set_flag(c, XC_SF, 0); set_flag(c, XC_AF, 0); set_flag(c, XC_PF, 0);
+        *ok = 1; return 1;
+    }
+    case ZYDIS_MNEMONIC_PCMPEQQ: RD(0, a); RD(1, b); r.q.lo = a.q.lo == b.q.lo ? ~0ull : 0; r.q.hi = a.q.hi == b.q.hi ? ~0ull : 0; WR(r, 128);
+    case ZYDIS_MNEMONIC_MOVNTDQA: RD(1, a); WR(a, 128);
+    case ZYDIS_MNEMONIC_MPSADBW: {
+        RD(0, a); RD(1, b); int im = IMM(2);
+        int so = (im & 3) * 4, dof = ((im >> 2) & 1) * 4;
+        for (int j = 0; j < 8; j++) { int sum = 0; for (int k = 0; k < 4; k++) { int d = (int)a.b[dof + j + k] - (int)b.b[so + k]; sum += d < 0 ? -d : d; } r.w[j] = (uint16_t)sum; }
+        WR(r, 128);
+    }
+    case ZYDIS_MNEMONIC_PHMINPOSUW: { RD(1, a); int best = 0; for (int i = 1; i < 8; i++) if (a.w[i] < a.w[best]) best = i; r.w[0] = a.w[best]; r.w[1] = (uint16_t)best; WR(r, 128); }
+
+    /* ---- SSE4.2 ---- */
+    case ZYDIS_MNEMONIC_PCMPGTQ: RD(0, a); RD(1, b); r.q.lo = (int64_t)a.q.lo > (int64_t)b.q.lo ? ~0ull : 0; r.q.hi = (int64_t)a.q.hi > (int64_t)b.q.hi ? ~0ull : 0; WR(r, 128);
+    case ZYDIS_MNEMONIC_CRC32: {
+        /* CRC-32C, the Castagnoli polynomial reflected, over the source's own
+         * width; the destination is a 32-bit CRC however wide the register. */
+        uint64_t d, s; *ok = op_read(x, 0, &d) && op_read(x, 1, &s);
+        if (!*ok) return 1;
+        uint32_t crc = (uint32_t)d;
+        for (int i = 0; i < ops[1].size / 8; i++) {
+            crc ^= (uint8_t)(s >> (8 * i));
+            for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ ((crc & 1) ? 0x82F63B78u : 0);
+        }
+        *ok = op_write(x, 0, crc); return 1;
+    }
+    case ZYDIS_MNEMONIC_PCMPESTRI: case ZYDIS_MNEMONIC_PCMPESTRM:
+    case ZYDIS_MNEMONIC_PCMPISTRI: case ZYDIS_MNEMONIC_PCMPISTRM: {
+        RD(0, a); RD(1, b); int im = IMM(2);
+        int explicit = m == ZYDIS_MNEMONIC_PCMPESTRI || m == ZYDIS_MNEMONIC_PCMPESTRM;
+        int to_index = m == ZYDIS_MNEMONIC_PCMPESTRI || m == ZYDIS_MNEMONIC_PCMPISTRI;
+        int wide = im & 1, sgn = im & 2, n = wide ? 8 : 16, agg = (im >> 2) & 3, pol = (im >> 4) & 3, osel = (im >> 6) & 1;
+        int32_t ea_[16], eb_[16];
+        for (int i = 0; i < n; i++) {
+            if (wide) { ea_[i] = sgn ? (int16_t)a.w[i] : a.w[i]; eb_[i] = sgn ? (int16_t)b.w[i] : b.w[i]; }
+            else      { ea_[i] = sgn ? (int8_t)a.b[i] : a.b[i];  eb_[i] = sgn ? (int8_t)b.b[i] : b.b[i]; }
+        }
+        int la, lb;
+        if (explicit) {
+            int64_t va = (int32_t)c->gpr[XC_RAX], vb = (int32_t)c->gpr[XC_RDX];
+            if (va < 0) va = -va; if (vb < 0) vb = -vb;
+            la = va > n ? n : (int)va; lb = vb > n ? n : (int)vb;
+        } else {
+            la = n; for (int i = 0; i < n; i++) if (ea_[i] == 0) { la = i; break; }
+            lb = n; for (int i = 0; i < n; i++) if (eb_[i] == 0) { lb = i; break; }
+        }
+        uint32_t res = 0, mask = n == 16 ? 0xFFFFu : 0xFFu;
+        for (int j = 0; j < n; j++) {
+            int hit = 0;
+            switch (agg) {
+            case 0: for (int i = 0; i < la && j < lb; i++) if (ea_[i] == eb_[j]) { hit = 1; break; } break;
+            case 1: for (int i = 0; i + 1 < la && j < lb; i += 2) if (eb_[j] >= ea_[i] && eb_[j] <= ea_[i + 1]) { hit = 1; break; } break;
+            case 2: hit = (j < la && j < lb) ? ea_[j] == eb_[j] : (j >= la && j >= lb); break;
+            default: hit = 1;
+                for (int k = 0; k < n && k < la; k++) { if (j + k >= lb || ea_[k] != eb_[j + k]) { hit = 0; break; } }
+                break;
+            }
+            if (hit) res |= 1u << j;
+        }
+        if (pol == 1) res = ~res & mask;
+        else if (pol == 3) { uint32_t valid = lb >= n ? mask : ((1u << lb) - 1); res ^= valid; }
+        set_flag(c, XC_CF, res != 0);
+        set_flag(c, XC_ZF, lb < n); set_flag(c, XC_SF, la < n);
+        set_flag(c, XC_OF, res & 1); set_flag(c, XC_AF, 0); set_flag(c, XC_PF, 0);
+        if (to_index) {
+            uint32_t idx = (uint32_t)n;
+            if (res) { if (osel) { idx = 31 - (uint32_t)__builtin_clz(res); } else idx = (uint32_t)__builtin_ctz(res); }
+            reg_write(c, ZYDIS_REGISTER_RCX, idx);              /* ECX, zero-extended */
+        } else {
+            if (osel) { for (int j = 0; j < n; j++) { if (wide) r.w[j] = (res >> j) & 1 ? 0xFFFF : 0; else r.b[j] = (res >> j) & 1 ? 0xFF : 0; } }
+            else r.q.lo = res;
+            c->xmm[0] = r.q;
+        }
+        *ok = 1; return 1;
+    }
 
     default: return 0;
     }

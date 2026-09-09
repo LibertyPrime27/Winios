@@ -50,6 +50,15 @@ typedef struct w32_thread {
     int       depth;             /* w32_call_guest nesting, on this thread */
     int       used, running, finished;
     pthread_t host;
+    /* A thread-pool callback thread: what to call it with, and what to do
+     * first -- sleep for a timer, wait on a handle for a wait object. */
+    int       pool_kind;         /* 0: an ordinary thread */
+    int       pool_nargs;
+    uint64_t  pool_args[4];
+    uint64_t  pool_obj;          /* the work/timer/wait object, guest memory */
+    uint32_t  pool_delay_ms, pool_period_ms, pool_wait_ms;
+    uint64_t  pool_wait_handle;
+    uint32_t  pool_gen;          /* the object's generation when set; a later Set cancels this thread */
 } w32_thread;
 
 /* One host-implemented export. conv: 0 = stdcall/x64, callee pops (x86);
@@ -84,10 +93,12 @@ typedef struct {
     uint64_t entry;              /* DllMain, or the executable's entry point; 0 if none */
     uint32_t exp_rva, exp_size;  /* export directory, 0 if the image exports nothing */
     uint32_t res_rva, res_size;  /* resource directory: dialogs, strings, icons */
+    uint32_t pdata_rva, pdata_size; /* exception directory: x64 unwind tables, sorted by address */
     uint64_t tls_callbacks;
     int      is_exe;
     int      refs;               /* LoadLibrary count; nothing is ever unmapped */
     int      attached;           /* DllMain(DLL_PROCESS_ATTACH) has run */
+    int      no_thread_calls;    /* DisableThreadLibraryCalls: no DLL_THREAD_ATTACH/DETACH */
     int      seq;                /* order this image *finished* loading: dependency order */
 } w32_module;
 
@@ -202,6 +213,7 @@ void     w32_host_path(w32 *w, const char *win, char *out, size_t n);
 
 /* calling convention */
 uint64_t w32_arg(w32 *w, int i);
+float    w32_fargf(w32 *w, int i);                          /* a float argument: XMM on x64, four stack bytes on x86 */
 double   w32_farg(w32 *w, int i);                           /* i-th float/double argument (x64: xmm0-3) */
 void     w32_ret(w32 *w, uint64_t v);
 void     w32_ret64(w32 *w, uint64_t v);                     /* 64-bit result (edx:eax on x86) */
@@ -274,7 +286,66 @@ uint64_t w32_load_library(w32 *w, const char *name);                /* a guest D
 w32_module *w32_module_at(w32 *w, uint64_t base);                   /* the loaded image with that base, or NULL */
 uint64_t w32_module_export(w32 *w, uint64_t hmodule, const char *name, int ordinal);
 uint64_t w32_import_addr(w32 *w, const char *dll, const char *name, int ordinal, int depth);
+int      w32_dll_has(w32 *w, const char *dll, const char *name);     /* is `name` implemented for this built-in DLL? */
 void     w32_attach_modules(w32 *w);                                /* DllMain(DLL_PROCESS_ATTACH) for every new DLL */
+void     w32_thread_notify(w32 *w, int reason);                    /* DllMain(DLL_THREAD_ATTACH=2 / DETACH=3) for every attached DLL */
+/* A program this one asked to start. There is one process at a time, so it
+ * runs after this one ends; see CreateProcess in kernel32.c and the loop in
+ * winrun_main. Returns the queue index, or -1 when the queue is full. */
+int      w32_launch_queue(w32 *w, const char *host_exe, const char *args, const char *cwd_win, const char *who);
+uint64_t w32_process_handle_new(w32 *w);
+const char *w32_builtin_dll_name(w32 *w, uint64_t h);          /* the DLL a fake module handle stands for, or NULL */
+int      w32_audio_src_count(void);
+int      w32_dinput_device_count(void);                           /* a process handle that is already signalled */
+void     w32_set_cwd_win(w32 *w, const char *win);                 /* the current directory, as a Windows path */
+/* CoCreateInstance for the classes that exist here: each DLL answers for its
+ * own CLSIDs and returns 1 if it made the object. */
+int      w32_com_create(w32 *w, const uint8_t clsid[16], const uint8_t iid[16], uint64_t out);
+int      w32_dsound_create_class(w32 *w, const uint8_t clsid[16], const uint8_t iid[16], uint64_t out);
+void     w32_dsound_tick(w32 *w);                                  /* fire the position notifications that are due; guest thread */
+void     w32_event_set(w32 *w, uint64_t h);                        /* thread.c: SetEvent from host code on the guest thread */
+
+/* audio_out.c: host audio output. A source is PCM the mixer reads in place;
+ * DirectSound buffers, PlaySound clips and XAudio2 voices are all sources. */
+typedef struct {
+    const void *mem;             /* the samples, host pointer; guest memory unless `owner` is set */
+    void       *owner;           /* a malloc'd block to free with the source, or NULL */
+    uint32_t    size;            /* bytes */
+    uint32_t    freq, channels, bits;
+    int         is_float;        /* 32-bit IEEE samples */
+    int         playing, looping;
+    int32_t     vol_mB, pan_mB;  /* DirectSound units: hundredths of a decibel, 0 is full, -10000 silent */
+    uint64_t    play_ns;         /* CLOCK_MONOTONIC at Play, for syncing to the guest-visible cursor; 0 = none */
+    uint32_t    start_byte;      /* the cursor at Play */
+    uint32_t    bps;             /* bytes per second the guest-visible cursor moves at */
+} w32_audio_src;
+int  w32_audio_open(void);                                 /* start the device; 1 if sound will be heard */
+void w32_audio_close(void);                                /* stop the device and drop every source -- before guest memory goes */
+int  w32_audio_device_on(void);
+int  w32_audio_src_add(const w32_audio_src *s);            /* an id >= 0, or -1 */
+void w32_audio_src_set(int id, const w32_audio_src *s);    /* refresh; the read position survives unless play (re)starts */
+void w32_audio_src_remove(int id);
+int  w32_audio_src_playing(int id);                        /* a one-shot ends by itself */
+/* Streaming: one block may wait behind the one playing, and the mixer moves
+ * to it without a gap when the first ends. The owner keeps the rest of its
+ * queue and refills the slot at every tick; `ended` counts blocks finished
+ * since it was last asked, `frames_done` the frames played since the source
+ * was made -- what XAudio2's GetState reports. */
+int  w32_audio_src_queue_next(int id, const w32_audio_src *next);   /* 1 if taken, 0 if the slot is full */
+int  w32_audio_src_next_pending(int id);
+int  w32_audio_src_take_ended(int id);
+uint64_t w32_audio_src_frames_done(int id);
+void w32_audio_src_clear_next(int id);
+/* With no device, advance the mixer by the wall clock so sources still end and
+ * queues still drain: a game waiting on OnBufferEnd must not wait forever on a
+ * machine with no speaker. Called from the tick paths. */
+void w32_audio_pump(void);
+void w32_audio_mix(int16_t *out, int frames);              /* render stereo 44.1 kHz frames: what the device calls */
+int  w32_audio_parse_wav(const uint8_t *p, size_t n, w32_audio_src *out);   /* RIFF/WAVE -> a source over p's data */
+/* A GUID as the 16 bytes it occupies in memory, from the eleven numbers a
+ * DEFINE_GUID line spells it with -- so a header can be copied, not hand-swapped. */
+#define W32_GUID(l,a,b,c,d,e,f,g,h,i,j) { (uint8_t)((l)&0xff),(uint8_t)(((l)>>8)&0xff),(uint8_t)(((l)>>16)&0xff),(uint8_t)(((l)>>24)&0xff), \
+    (uint8_t)((a)&0xff),(uint8_t)(((a)>>8)&0xff), (uint8_t)((b)&0xff),(uint8_t)(((b)>>8)&0xff), (c),(d),(e),(f),(g),(h),(i),(j) }
 
 /* COM (com.c) */
 uint64_t w32_com_vtable(w32 *w, w32_com_class *cls);
@@ -298,6 +369,8 @@ int      w32_fault_to_exception(w32 *w);                    /* a CPU fault, as t
 const char *w32_exception_name(uint32_t code);
 uint32_t w32_last_exception(uint64_t *addr);                /* what ended the run, for the report */
 void     w32_seh_reset(void);
+void     w32_C_specific_handler(w32 *w);
+uint64_t w32_stub_return_addr(w32 *w);                              /* where a w32_call_guest returns to: no module's address */                           /* MSVC's __try/__except language handler, x64 */
 /* one int3 stub bound to `api`, or a named "not implemented" stub when it is NULL */
 uint64_t w32_stub_alloc(w32 *w, const w32_dll *dll, const w32_api *api, char *missing);
 
@@ -310,6 +383,7 @@ extern const w32_api w32_ntdll[];
 extern const w32_api w32_user32[];
 extern const w32_api w32_winmm[];
 extern const w32_api w32_dsound[];
+extern const w32_api w32_dinput8[], w32_dinput[], w32_xaudio2[];
 extern const w32_api w32_xinput[];
 extern const w32_api w32_thread_api[];      /* kernel32's threads and synchronisation */
 extern const w32_api w32_thread_crt[];      /* msvcrt's _beginthread* */
@@ -390,8 +464,24 @@ void w32_d3d11_triangle(const d3d11_target *t, const d3d11_vertex *v0,
                         const d3d11_vertex *v1, const d3d11_vertex *v2,
                         const d3d11_texture *tex, int wrap, int blend_mode);
 void w32_d3d11_clear(const d3d11_target *t, uint32_t argb);
+/* A vertex after a real vertex shader: a screen position with its w, and up to
+ * eight float4 varyings by output register, interpolated perspective-correctly
+ * and handed to a pixel function per pixel. */
+enum { D3D11_MAX_VARY = 12 };          /* enough for D3D9's two colours, eight texcoords, a normal and one more */
+typedef struct { float x, y, z, w; float var[D3D11_MAX_VARY][4]; } d3d11_svertex;
+typedef uint32_t (*d3d11_pixel_fn)(void *ctx, const float var[D3D11_MAX_VARY][4], float px, float py, float z, int *discard);
+void w32_d3d11_triangle_shaded(const d3d11_target *t, const d3d11_svertex *v0, const d3d11_svertex *v1, const d3d11_svertex *v2,
+                               d3d11_pixel_fn fn, void *ctx, int blend_mode);
+/* A draw's worth of triangles (three vertices each), rasterized across the
+ * cores; the result is the same as the loop of single triangles would give. */
+void w32_d3d11_triangles_shaded(const d3d11_target *t, const d3d11_svertex *v, int ntri, d3d11_pixel_fn fn, void *ctx, int blend_mode);
+int  w32_raster_threads(void);         /* how many the rasterizer uses, for the report */
 void w32_d3d11_reset(void);
 
+/* d3d9.c: what the draws did, and how the frames came, for the report */
+void w32_d3d9_stats(uint64_t *shaded_draws, uint64_t *shaded_tris, uint64_t *ff_draws);
+void w32_frame_presented(w32 *w);                 /* either API's Present calls this */
+void w32_frame_stats(uint64_t *frames, double *fps);
 /* d3d11.c: see the file for what is and is not implemented */
 extern const w32_api w32_d3d11[];
 extern const w32_api w32_d3d10[];
@@ -516,6 +606,10 @@ void w32_input_mouse_delta(int dx, int dy);        /* relative: mouselook, a tra
 void w32_input_mouse_button(int button, int down); /* 0 left, 1 right, 2 middle */
 void w32_input_mouse_wheel(int delta);             /* +/-120 per notch */
 void w32_input_reset(void);
+/* Running totals of relative motion and wheel, and the button bits -- a
+ * consumer that wants deltas keeps the last total it saw, so two consumers do
+ * not steal each other's motion. */
+void w32_mouse_totals(int32_t *tx, int32_t *ty, int32_t *twheel, uint32_t *buttons);
 void w32_client_size(int *cw, int *ch);
 int  w32_has_window(void);                         /* has the guest made one yet? */
 /* Whether the guest wants a pointer drawn, and where it thinks it is. A game
@@ -546,8 +640,20 @@ typedef struct {
     int      present;
 } w32_pad;
 void w32_pad_state(const w32_pad *p);
+void w32_pad_current(w32_pad *p);                   /* what XInput would report now: the host pad, or the keyboard as one */
 void w32_xinput_reset(void);
 void w32_dsound_reset(void);
+void w32_dinput_reset(void);
+void w32_xaudio2_reset(void);
+void w32_xaudio2_tick(w32 *w);
+int  w32_xaudio2_create_class(w32 *w, const uint8_t clsid[16], const uint8_t iid[16], uint64_t out);
+/* mmdevapi.c: WASAPI -- the device enumerator and IAudioClient streams over audio_out */
+extern const w32_api w32_mmdevapi[];
+void w32_mmdevapi_reset(void);
+void w32_mmdevapi_tick(w32 *w);                                    /* drain finished blocks, set the stream events; guest thread */
+int  w32_mmdevapi_create_class(w32 *w, const uint8_t clsid[16], const uint8_t iid[16], uint64_t out);
+int  w32_mmdevapi_stream_count(void);
+int  w32_dinput_create_class(w32 *w, const uint8_t clsid[16], const uint8_t iid[16], uint64_t out);
 
 /* d3d9.c: where a presented frame goes. NULL simply drops it, which is what
  * the headless test and CI want; the iOS app sets it to a Metal blit. */
