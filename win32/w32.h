@@ -454,6 +454,14 @@ void w32_d3d11_triangle(const d3d11_target *t, const d3d11_vertex *v0,
                         const d3d11_vertex *v1, const d3d11_vertex *v2,
                         const d3d11_texture *tex, int wrap, int blend_mode);
 void w32_d3d11_clear(const d3d11_target *t, uint32_t argb);
+/* A vertex after a real vertex shader: a screen position with its w, and up to
+ * eight float4 varyings by output register, interpolated perspective-correctly
+ * and handed to a pixel function per pixel. */
+enum { D3D11_MAX_VARY = 8 };
+typedef struct { float x, y, z, w; float var[D3D11_MAX_VARY][4]; } d3d11_svertex;
+typedef uint32_t (*d3d11_pixel_fn)(void *ctx, const float var[D3D11_MAX_VARY][4], float px, float py, float z, int *discard);
+void w32_d3d11_triangle_shaded(const d3d11_target *t, const d3d11_svertex *v0, const d3d11_svertex *v1, const d3d11_svertex *v2,
+                               d3d11_pixel_fn fn, void *ctx, int blend_mode);
 void w32_d3d11_reset(void);
 
 /* d3d11.c: see the file for what is and is not implemented */

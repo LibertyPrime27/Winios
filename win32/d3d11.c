@@ -51,6 +51,7 @@
 #define _GNU_SOURCE
 #include "w32.h"
 #include "dxbc.h"
+#include "dxbc_exec.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -203,11 +204,14 @@ static uint32_t pack_color(const float c[4]) {
  * than in guest memory because they are ours: the guest gave us a blob and
  * has no idea we looked inside it. */
 enum { MAX_SHADERS = 64 };
-static dxbc_info g_shaders[MAX_SHADERS];
-static char      g_shader_noted[MAX_SHADERS];
-static int       g_nshaders;
+static dxbc_info  g_shaders[MAX_SHADERS];
+static dxbc_prog *g_progs[MAX_SHADERS];         /* the decoded code, or NULL with the reason below */
+static char       g_prog_why[MAX_SHADERS][96];
+static char       g_shader_noted[MAX_SHADERS];
+static int        g_nshaders;
 
 void w32_d3d11_reset(void) {
+    for (int i = 0; i < MAX_SHADERS; i++) { dxbc_free(&g_shaders[i]); dxbc_prog_free(g_progs[i]); g_progs[i] = 0; g_prog_why[i][0] = 0; }
     memset(g_shaders, 0, sizeof g_shaders);
     memset(g_shader_noted, 0, sizeof g_shader_noted);
     g_nshaders = 0;
@@ -221,6 +225,12 @@ static int shader_record(w32 *w, uint64_t blob, uint64_t len) {
      * end of the allocation is read out of bounds before anything notices. */
     const void *p = len ? W32PN(w, blob, len) : 0;
     if (p) dxbc_parse(p, (size_t)len, &g_shaders[i]);
+    /* Decoded now, once, so a draw only runs it. A container with signatures
+     * and no code -- the hand-built ones in the tests -- has nothing to run. */
+    if (g_shaders[i].code && g_shaders[i].code_words) {
+        g_progs[i] = dxbc_prog_new(g_shaders[i].code, g_shaders[i].code_words, g_prog_why[i], sizeof g_prog_why[i]);
+        if (w->verbose) fprintf(stderr, "winrun: d3d11: shader %d: %s\n", i, g_progs[i] ? "decoded, will run" : g_prog_why[i]);
+    }
     return i;
 }
 static const dxbc_info *shader_info(int i) {
@@ -235,10 +245,14 @@ static void note_shader_not_run(w32 *w, int i) {
     g_shader_noted[i] = 1;
     static char *labels[MAX_SHADERS];
     if (!labels[i]) {
-        labels[i] = malloc(96);
+        labels[i] = malloc(200);
         if (!labels[i]) return;
-        snprintf(labels[i], 96,
-                 "d3d11: shader %d drew with the built-in pipeline, its own code was not run", i);
+        if (g_prog_why[i][0])
+            snprintf(labels[i], 200, "d3d11: shader %d uses %s, so it drew with the built-in pipeline instead of its own code", i, g_prog_why[i]);
+        else if (g_shaders[i].code_words)
+            snprintf(labels[i], 200, "d3d11: shader %d could not be paired with a runnable shader for the other stage; the built-in pipeline drew", i);
+        else
+            snprintf(labels[i], 200, "d3d11: shader %d has no code (signatures only); the built-in pipeline drew", i);
     }
     w32_note_refused(w, labels[i]);
 }
@@ -254,7 +268,9 @@ enum {
     CTX_DEV = 0, CTX_RTV, CTX_VB, CTX_VB_STRIDE, CTX_VB_OFFSET,
     CTX_IB, CTX_IB_FMT, CTX_IB_OFFSET, CTX_LAYOUT, CTX_VS, CTX_PS,
     CTX_TOPOLOGY, CTX_VSCB0, CTX_PSCB0, CTX_SRV0, CTX_SAMPLER0, CTX_BLEND,
-    CTX_VP_X, CTX_VP_Y, CTX_VP_W, CTX_VP_H, CTX_DRAWS, CTX_N
+    CTX_VP_X, CTX_VP_Y, CTX_VP_W, CTX_VP_H, CTX_DRAWS,
+    CTX_VSCB1, CTX_VSCB2, CTX_VSCB3, CTX_PSCB1, CTX_PSCB2, CTX_PSCB3,
+    CTX_SRV1, CTX_SRV2, CTX_SRV3, CTX_SAMPLER1, CTX_SAMPLER2, CTX_SAMPLER3, CTX_N
 };
 enum { SC_DEV = 0, SC_TEX, SC_W, SC_H, SC_FRAMES, SC_N };
 enum { TEX_W = 0, TEX_H, TEX_PITCH, TEX_PIXELS, TEX_FMT, TEX_BIND, TEX_USAGE, TEX_N };
@@ -611,22 +627,22 @@ static void ctx_IASetInputLayout(w32 *w) { w32_com_set(w, ARG(0), CTX_LAYOUT, AR
 static void ctx_IASetPrimitiveTopology(w32 *w) { w32_com_set(w, ARG(0), CTX_TOPOLOGY, ARG(1)); RET(0); }
 static void ctx_VSSetShader(w32 *w) { w32_com_set(w, ARG(0), CTX_VS, ARG(1)); RET(0); }
 static void ctx_PSSetShader(w32 *w) { w32_com_set(w, ARG(0), CTX_PS, ARG(1)); RET(0); }
-static void ctx_VSSetConstantBuffers(w32 *w) {
-    w32_com_set(w, ARG(0), CTX_VSCB0, first_ptr(w, ARG(3), (uint32_t)ARG(2)));
-    RET(0);
+/* Four slots of each, which is what a 2D engine's shaders reach for: the
+ * matrices in cb0, maybe a second buffer, a texture or two. (start, count,
+ * array) -> the fields for slots start..start+count-1. */
+static const int VSCB_F[4] = { CTX_VSCB0, CTX_VSCB1, CTX_VSCB2, CTX_VSCB3 }, PSCB_F[4] = { CTX_PSCB0, CTX_PSCB1, CTX_PSCB2, CTX_PSCB3 };
+static const int SRV_F[4] = { CTX_SRV0, CTX_SRV1, CTX_SRV2, CTX_SRV3 }, SMP_F[4] = { CTX_SAMPLER0, CTX_SAMPLER1, CTX_SAMPLER2, CTX_SAMPLER3 };
+static void set_slots(w32 *w, uint64_t self, const int fields[4], uint32_t start, uint32_t count, uint64_t array) {
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t slot = start + i;
+        if (slot >= 4) break;
+        w32_com_set(w, self, fields[slot], array ? w32_read(w, array + (uint64_t)i * w32_ptrsize(w), (int)w32_ptrsize(w)) : 0);
+    }
 }
-static void ctx_PSSetConstantBuffers(w32 *w) {
-    w32_com_set(w, ARG(0), CTX_PSCB0, first_ptr(w, ARG(3), (uint32_t)ARG(2)));
-    RET(0);
-}
-static void ctx_PSSetShaderResources(w32 *w) {
-    w32_com_set(w, ARG(0), CTX_SRV0, first_ptr(w, ARG(3), (uint32_t)ARG(2)));
-    RET(0);
-}
-static void ctx_PSSetSamplers(w32 *w) {
-    w32_com_set(w, ARG(0), CTX_SAMPLER0, first_ptr(w, ARG(3), (uint32_t)ARG(2)));
-    RET(0);
-}
+static void ctx_VSSetConstantBuffers(w32 *w) { set_slots(w, ARG(0), VSCB_F, (uint32_t)ARG(1), (uint32_t)ARG(2), ARG(3)); RET(0); }
+static void ctx_PSSetConstantBuffers(w32 *w) { set_slots(w, ARG(0), PSCB_F, (uint32_t)ARG(1), (uint32_t)ARG(2), ARG(3)); RET(0); }
+static void ctx_PSSetShaderResources(w32 *w) { set_slots(w, ARG(0), SRV_F, (uint32_t)ARG(1), (uint32_t)ARG(2), ARG(3)); RET(0); }
+static void ctx_PSSetSamplers(w32 *w) { set_slots(w, ARG(0), SMP_F, (uint32_t)ARG(1), (uint32_t)ARG(2), ARG(3)); RET(0); }
 static void ctx_OMSetRenderTargets(w32 *w) {
     w32_com_set(w, ARG(0), CTX_RTV, first_ptr(w, ARG(2), (uint32_t)ARG(1)));
     RET(0);
@@ -855,6 +871,102 @@ static void build_vertex(w32 *w, const draw_state *d, uint32_t idx, d3d11_vertex
     out->color = pack_color(col);
 }
 
+/* ---- running the shaders ------------------------------------------------------
+ *
+ * What a draw needs beyond the fixed-function state: the two programs, their
+ * signatures joined -- the pixel shader's inputs matched to the vertex
+ * shader's outputs by semantic, which is how the hardware joins them -- and
+ * the constant buffers, textures and samplers each stage can see. */
+typedef struct {
+    const dxbc_prog *vp, *pp;
+    const dxbc_info *vinfo, *pinfo;
+    dxbc_env venv, penv;
+    d3d11_texture ptex[DXBC_SLOTS];
+    int psmap[DXBC_REGS];          /* pixel input register -> vertex output register, or -1 */
+    int pos_in;                    /* the pixel input carrying SV_Position, or -1 */
+    int vs_pos_out;                /* the vertex output register with SV_Position */
+    int ps_out;                    /* the pixel output register for SV_Target0 */
+} shade_state;
+static int sig_is_position(const dxbc_element *e) { return e->sysvalue == 1 || !strcasecmp(e->name, "SV_Position") || !strcasecmp(e->name, "SV_POSITION"); }
+static void env_cbs(w32 *w, uint64_t self, const int fields[4], dxbc_env *env) {
+    for (int i = 0; i < 4; i++) {
+        uint64_t cb = w32_com_get(w, self, fields[i]);
+        if (!cb || w32_com_tag(w, cb) != TAG_D11_BUFFER) continue;
+        uint64_t data = w32_com_get(w, cb, BUF_DATA); uint32_t size = (uint32_t)w32_com_get(w, cb, BUF_SIZE);
+        const void *p = data && size >= 16 ? W32PN(w, data, size) : 0;
+        if (p) { env->cb[i] = p; env->cb_n[i] = size / 16; }
+    }
+}
+static void shade_setup(w32 *w, uint64_t self, shade_state *sh, const dxbc_prog *vp, const dxbc_prog *pp, const dxbc_info *vi, const dxbc_info *pi) {
+    sh->vp = vp; sh->pp = pp; sh->vinfo = vi; sh->pinfo = pi;
+    env_cbs(w, self, VSCB_F, &sh->venv);
+    env_cbs(w, self, PSCB_F, &sh->penv);
+    for (int i = 0; i < 4; i++) {
+        uint64_t stex = view_texture(w, w32_com_get(w, self, SRV_F[i]));
+        if (stex) {
+            d3d11_texture *t = &sh->ptex[i];
+            t->w = (int)w32_com_get(w, stex, TEX_W); t->h = (int)w32_com_get(w, stex, TEX_H);
+            t->pitch_px = (int)(w32_com_get(w, stex, TEX_PITCH) / 4);
+            t->pixels = W32P(w, w32_com_get(w, stex, TEX_PIXELS));
+            if (t->pixels && t->w > 0 && t->h > 0) sh->penv.tex[i] = t;
+        }
+        uint64_t smp = w32_com_get(w, self, SMP_F[i]);
+        sh->penv.wrap[i] = smp ? (w32_com_get(w, smp, SMP_ADDRU) == 1) : 1;
+        /* D3D11_FILTER: bit 2 set means the magnification filter is linear */
+        sh->penv.linear[i] = smp ? ((w32_com_get(w, smp, SMP_FILTER) & 0x4) != 0) : 0;
+    }
+    sh->vs_pos_out = 0; sh->pos_in = -1; sh->ps_out = 0;
+    if (vi) for (int k = 0; k < vi->output.n; k++) if (sig_is_position(&vi->output.e[k])) sh->vs_pos_out = (int)vi->output.e[k].reg;
+    for (int r = 0; r < DXBC_REGS; r++) sh->psmap[r] = -1;
+    if (pi && vi) for (int k = 0; k < pi->input.n; k++) {
+        const dxbc_element *e = &pi->input.e[k];
+        if (e->reg >= DXBC_REGS) continue;
+        if (sig_is_position(e)) { sh->pos_in = (int)e->reg; continue; }
+        const dxbc_element *src = dxbc_find(&vi->output, e->name, e->index);
+        if (src && src->reg < D3D11_MAX_VARY) sh->psmap[e->reg] = (int)src->reg;
+    }
+    if (pi) for (int k = 0; k < pi->output.n; k++) if (!strcasecmp(pi->output.e[k].name, "SV_Target") && pi->output.e[k].index == 0) sh->ps_out = (int)pi->output.e[k].reg;
+}
+/* One vertex through the vertex shader to a screen position and its varyings. */
+static int shade_vertex(w32 *w, const draw_state *d, const shade_state *sh, uint32_t idx, d3d11_svertex *out) {
+    static float vin[DXBC_REGS][4], vout[DXBC_REGS][4];
+    memset(vin, 0, sizeof vin);
+    uint64_t vertex = d->vb + d->vb_offset + (uint64_t)idx * d->vb_stride;
+    if (sh->vinfo) for (int k = 0; k < sh->vinfo->input.n; k++) {
+        const dxbc_element *e = &sh->vinfo->input.e[k];
+        if (e->reg >= DXBC_REGS) continue;
+        if (!strcasecmp(e->name, "SV_VertexID")) { uint32_t u = idx; memcpy(&vin[e->reg][0], &u, 4); continue; }
+        if (!strcasecmp(e->name, "SV_InstanceID")) continue;
+        float val[4] = { 0, 0, 0, 1 };
+        fetch_semantic(w, d, vertex, e->name, e->index, val);
+        memcpy(vin[e->reg], val, sizeof val);
+    }
+    if (dxbc_exec(sh->vp, &sh->venv, vin, vout) < 0) return 0;
+    const float *clip = vout[sh->vs_pos_out];
+    float iw = clip[3] != 0.0f ? 1.0f / clip[3] : 1.0f;
+    memset(out, 0, sizeof *out);
+    out->x = (float)d->target.clip_x + (clip[0] * iw * 0.5f + 0.5f) * (float)d->target.clip_w;
+    out->y = (float)d->target.clip_y + (0.5f - clip[1] * iw * 0.5f) * (float)d->target.clip_h;
+    out->z = clip[2] * iw;
+    out->w = clip[3] != 0.0f ? clip[3] : 1.0f;
+    for (int k = 0; k < D3D11_MAX_VARY; k++) memcpy(out->var[k], vout[k], sizeof out->var[k]);
+    return 1;
+}
+/* One pixel through the pixel shader. */
+static uint32_t shade_pixel(void *ctx, const float var[D3D11_MAX_VARY][4], float px, float py, float z, int *discard) {
+    const shade_state *sh = ctx;
+    static float pin[DXBC_REGS][4], pout[DXBC_REGS][4];
+    memset(pin, 0, sizeof pin);
+    for (int r = 0; r < DXBC_REGS; r++) if (sh->psmap[r] >= 0) memcpy(pin[r], var[sh->psmap[r]], 16);
+    if (sh->pos_in >= 0) { pin[sh->pos_in][0] = px; pin[sh->pos_in][1] = py; pin[sh->pos_in][2] = z; pin[sh->pos_in][3] = 1.0f; }
+    int r = dxbc_exec(sh->pp, &sh->penv, pin, pout);
+    if (r) { *discard = 1; return 0; }
+    const float *c = pout[sh->ps_out];
+    uint32_t ch[4];
+    for (int i = 0; i < 4; i++) { float v = c[i]; if (v != v || v < 0.0f) v = 0.0f; if (v > 1.0f) v = 1.0f; ch[i] = (uint32_t)(v * 255.0f + 0.5f); }
+    return (ch[3] << 24) | (ch[0] << 16) | (ch[1] << 8) | ch[2];
+}
+
 /* Assemble and draw. `base` is the first index; `indices` non-zero means the
  * indexed form, in which case `ib` is the buffer and `ifmt` its element
  * size. */
@@ -900,14 +1012,18 @@ static void draw_common(w32 *w, uint64_t self, uint32_t count, uint32_t start,
     d.vb_offset = (uint32_t)w32_com_get(w, self, CTX_VB_OFFSET);
     if (!d.vb || !d.vb_stride) return;
 
-    uint64_t vs = w32_com_get(w, self, CTX_VS);
-    if (vs) {
-        int info = (int)(int32_t)(uint32_t)w32_com_get(w, vs, SH_INFO);
-        d.vs = shader_info(info);
-        note_shader_not_run(w, info);
-    }
-    uint64_t ps = w32_com_get(w, self, CTX_PS);
-    if (ps) note_shader_not_run(w, (int)(int32_t)(uint32_t)w32_com_get(w, ps, SH_INFO));
+    uint64_t vs = w32_com_get(w, self, CTX_VS), ps = w32_com_get(w, self, CTX_PS);
+    int vs_i = vs ? (int)(int32_t)(uint32_t)w32_com_get(w, vs, SH_INFO) : -1;
+    int ps_i = ps ? (int)(int32_t)(uint32_t)w32_com_get(w, ps, SH_INFO) : -1;
+    if (vs) d.vs = shader_info(vs_i);
+    /* Both stages have code that decoded: the shaders run. Otherwise the
+     * fixed-function reading below, and the report says which shader and why. */
+    const dxbc_prog *vprog = vs_i >= 0 && vs_i < MAX_SHADERS ? g_progs[vs_i] : 0;
+    const dxbc_prog *pprog = ps_i >= 0 && ps_i < MAX_SHADERS ? g_progs[ps_i] : 0;
+    int shaded = vprog && pprog && dxbc_prog_stage(vprog) == 1 && dxbc_prog_stage(pprog) == 0;
+    if (!shaded) { if (vs) note_shader_not_run(w, vs_i); if (ps) note_shader_not_run(w, ps_i); }
+    shade_state sh; memset(&sh, 0, sizeof sh);
+    if (shaded) shade_setup(w, self, &sh, vprog, pprog, shader_info(vs_i), shader_info(ps_i));
 
     /* The transform, if the program bound a constant buffer big enough to
      * hold one. Sixteen floats at the start of the first vertex constant
@@ -1002,6 +1118,12 @@ static void draw_common(w32 *w, uint64_t self, uint32_t count, uint32_t start,
          * allocation. */
         uint64_t last = (uint64_t)d.vb_offset + (uint64_t)(ia > ib2 ? (ia > ic ? ia : ic) : (ib2 > ic ? ib2 : ic)) * d.vb_stride;
         if (last + d.vb_stride > d.vb_size) continue;
+        if (shaded) {
+            d3d11_svertex s0, s1, s2;
+            if (!shade_vertex(w, &d, &sh, ia, &s0) || !shade_vertex(w, &d, &sh, ib2, &s1) || !shade_vertex(w, &d, &sh, ic, &s2)) continue;
+            w32_d3d11_triangle_shaded(&d.target, &s0, &s1, &s2, shade_pixel, &sh, d.blend);
+            continue;
+        }
         d3d11_vertex v0, v1, v2;
         build_vertex(w, &d, ia, &v0);
         build_vertex(w, &d, ib2, &v1);

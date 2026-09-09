@@ -161,3 +161,52 @@ void w32_d3d11_clear(const d3d11_target *t, uint32_t argb) {
         for (int x = t->clip_x; x < t->clip_x + t->clip_w; x++) row[x] = argb;
     }
 }
+
+/* The same triangle, with a pixel shader deciding the colour. Coverage and
+ * the barycentric weights are the integer arithmetic above; the varyings are
+ * interpolated in float, perspective-correctly (over 1/w), with contraction
+ * off so the same triangle is the same on every machine. */
+void w32_d3d11_triangle_shaded(const d3d11_target *t, const d3d11_svertex *v0, const d3d11_svertex *v1, const d3d11_svertex *v2,
+                               d3d11_pixel_fn fn, void *ctx, int blend_mode) {
+    if (!t || !t->pixels || !fn) return;
+    if (v0->w <= 0.0f || v1->w <= 0.0f || v2->w <= 0.0f) return;   /* behind the eye: no clipping here */
+    int32_t x0 = fx(v0->x), y0 = fx(v0->y), x1 = fx(v1->x), y1 = fx(v1->y), x2 = fx(v2->x), y2 = fx(v2->y);
+    int64_t area = edge(x0, y0, x1, y1, x2, y2);
+    if (area == 0) return;
+    int flip = area < 0; if (flip) area = -area;
+    int32_t minx = x0 < x1 ? (x0 < x2 ? x0 : x2) : (x1 < x2 ? x1 : x2), maxx = x0 > x1 ? (x0 > x2 ? x0 : x2) : (x1 > x2 ? x1 : x2);
+    int32_t miny = y0 < y1 ? (y0 < y2 ? y0 : y2) : (y1 < y2 ? y1 : y2), maxy = y0 > y1 ? (y0 > y2 ? y0 : y2) : (y1 > y2 ? y1 : y2);
+    int px0 = minx >> 4, px1 = (maxx >> 4) + 1, py0 = miny >> 4, py1 = (maxy >> 4) + 1;
+    if (px0 < t->clip_x) px0 = t->clip_x;
+    if (py0 < t->clip_y) py0 = t->clip_y;
+    if (px1 > t->clip_x + t->clip_w) px1 = t->clip_x + t->clip_w;
+    if (py1 > t->clip_y + t->clip_h) py1 = t->clip_y + t->clip_h;
+    float iw0 = 1.0f / v0->w, iw1 = 1.0f / v1->w, iw2 = 1.0f / v2->w;
+    float farea = (float)area;
+    for (int py = py0; py < py1; py++) {
+        uint32_t *row = t->pixels + (size_t)py * (size_t)t->pitch_px;
+        int32_t sy = py * 16 + 8;
+        for (int px = px0; px < px1; px++) {
+            int32_t sx = px * 16 + 8;
+            int64_t w0 = edge(x1, y1, x2, y2, sx, sy), w1 = edge(x2, y2, x0, y0, sx, sy), w2 = edge(x0, y0, x1, y1, sx, sy);
+            if (flip) { w0 = -w0; w1 = -w1; w2 = -w2; }
+            if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+            float l0 = (float)w0 / farea, l1 = (float)w1 / farea, l2 = (float)w2 / farea;
+            float p0 = l0 * iw0, p1 = l1 * iw1, p2 = l2 * iw2, psum = p0 + p1 + p2;
+            if (psum > 0.0f) { p0 /= psum; p1 /= psum; p2 /= psum; }
+            float var[D3D11_MAX_VARY][4];
+            for (int k = 0; k < D3D11_MAX_VARY; k++) for (int c = 0; c < 4; c++)
+                var[k][c] = p0 * v0->var[k][c] + p1 * v1->var[k][c] + p2 * v2->var[k][c];
+            float z = l0 * v0->z + l1 * v1->z + l2 * v2->z;
+            int discard = 0;
+            uint32_t src = fn(ctx, var, (float)px + 0.5f, (float)py + 0.5f, z, &discard);
+            if (discard) continue;
+            uint32_t *dst = &row[px];
+            switch (blend_mode) {
+            case D3D11_BLEND_NONE_: *dst = src | 0xFF000000u; break;
+            case D3D11_BLEND_ADD_:  *dst = blend_add(src, *dst); break;
+            default:                *dst = blend_over(src, *dst); break;
+            }
+        }
+    }
+}

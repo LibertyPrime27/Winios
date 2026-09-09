@@ -30,12 +30,14 @@ typedef struct { int n; dxbc_element e[DXBC_MAX_SIG]; } dxbc_sig;
 typedef struct {
     int      valid;
     uint32_t version;       /* the first word of the code chunk                */
-    uint32_t code_words;    /* how much code there is, which we do not run     */
+    uint32_t code_words;    /* how much code there is                          */
+    uint32_t *code;         /* a copy of it, ours: the program may free its blob */
     dxbc_sig input, output;
 } dxbc_info;
 
 /* Returns non-zero if `blob` is a DXBC container we could walk. */
 int dxbc_parse(const void *blob, size_t len, dxbc_info *out);
+void dxbc_free(dxbc_info *info);
 
 /* An element by semantic name and index, or NULL. */
 const dxbc_element *dxbc_find(const dxbc_sig *sig, const char *semantic, uint32_t index);

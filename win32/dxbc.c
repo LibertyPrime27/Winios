@@ -27,6 +27,7 @@
 #include "dxbc.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static uint32_t rd32(const uint8_t *p) {
@@ -82,6 +83,8 @@ static int parse_signature(const uint8_t *chunk, uint32_t size, dxbc_sig *out) {
     return 1;
 }
 
+void dxbc_free(dxbc_info *info) { if (info) { free(info->code); info->code = 0; info->code_words = 0; } }
+
 int dxbc_parse(const void *blob, size_t len, dxbc_info *out) {
     memset(out, 0, sizeof *out);
     const uint8_t *p = blob;
@@ -112,6 +115,11 @@ int dxbc_parse(const void *blob, size_t len, dxbc_info *out) {
              * the person that a shader they wrote was not executed. */
             out->code_words = size / 4;
             if (size >= 4) out->version = rd32(chunk);
+            /* Kept, because it is run now (dxbc_exec.c) and the program is
+             * free to release its blob the moment CreateXShader returns. */
+            free(out->code);
+            out->code = malloc(size ? size : 4);
+            if (out->code) memcpy(out->code, chunk, size);
             break;
         default: break;
         }
