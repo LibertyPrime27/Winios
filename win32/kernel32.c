@@ -722,7 +722,10 @@ static int prot_of(uint32_t p) {
     }
 }
 static void k_VirtualProtect(w32 *w) {
-    uint64_t addr = ARG(0), size = ARG(1); uint32_t np = (uint32_t)ARG(2), old = ARG(3);
+    /* `old` is a pointer: declaring it 32-bit cut the top of every x64
+     * caller's stack address off, and the old protection went nowhere -- the
+     * "write of 4 bytes at 0x155cfe60" lines in a GameMaker runner's log. */
+    uint64_t addr = ARG(0), size = ARG(1), old = ARG(3); uint32_t np = (uint32_t)ARG(2);
     /* This is the call the crash report came from. The old-protection
      * out-parameter is written through w32_write, which is checked; the range
      * itself is checked here, because mprotect on a 64-bit guest's address is
