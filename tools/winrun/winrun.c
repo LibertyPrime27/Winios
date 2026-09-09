@@ -503,6 +503,7 @@ static const w32_dll g_dlls[] = {
     { "dwmapi.dll",   { w32_dwmapi },                                     0 },
     { "uxtheme.dll",  { w32_uxtheme },                                    0 },
     { "avrt.dll",     { w32_avrt },                                       0 },
+    { "mmdevapi.dll", { w32_mmdevapi },                                   0 },
     { "version.dll",  { w32_version },                                    0 },
     { "rpcrt4.dll",   { w32_rpcrt4 },                                     0 },
     { "gdiplus.dll",  { w32_gdiplus },                                    0 },
@@ -1069,6 +1070,7 @@ static void winrun_reset(void) {
     w32_dsound_reset();
     w32_dinput_reset();
     w32_xaudio2_reset();
+    w32_mmdevapi_reset();
     w32_xinput_reset();
     w32_thread_reset();
     g_nscript = 0; g_frame = 0;
@@ -1612,11 +1614,22 @@ int w32_crash_report(w32 *w, char *out, size_t out_len) {
         }
     }
     {
-        int ns = w32_audio_src_count(), nd = w32_dinput_device_count();
+        int ns = w32_audio_src_count(), nd = w32_dinput_device_count(), nw = w32_mmdevapi_stream_count();
         P("\n  subsystems:\n");
-        P("    audio      %s, %d sound source%s\n", w32_audio_device_on() ? "device open" : "no device (silent)", ns, ns == 1 ? "" : "s");
+        P("    audio      %s, %d sound source%s, %d WASAPI stream%s\n", w32_audio_device_on() ? "device open" : "no device (silent)", ns, ns == 1 ? "" : "s", nw, nw == 1 ? "" : "s");
         P("    dinput     %d device%s created\n", nd, nd == 1 ? "" : "s");
+        {
+            uint64_t sd, st, fd;
+            w32_d3d9_stats(&sd, &st, &fd);
+            if (sd || fd) P("    d3d9       %llu draw%s through shaders (%llu triangles), %llu fixed-function\n",
+                            (unsigned long long)sd, sd == 1 ? "" : "s", (unsigned long long)st, (unsigned long long)fd);
+        }
         P("    jit        %s\n", xc_jit_enabled() ? "on" : "off (interpreted)");
+        { int nt = w32_raster_threads(); P("    raster     %d thread%s for shaded pixels\n", nt, nt == 1 ? "" : "s"); }
+        {
+            uint64_t fr; double fps; w32_frame_stats(&fr, &fps);
+            if (fr) P("    video      %llu frame%s presented, %.1f fps over the run\n", (unsigned long long)fr, fr == 1 ? "" : "s", fps);
+        }
     }
 
     if (w->nunimpl) {

@@ -138,11 +138,17 @@ an x86 runner, qemu on aarch64 and an M3, and nothing a compiler can contract
 into an fma. `d3ddraw.exe` produces checksum `acde04d16c79039c` in all of
 them, and identically as PE32 and PE32+.
 
-What is still missing is the GPU. d12mt already compiles D3D9 SM3 shaders to
-MSL and passes 27/27 on both devices; pointing the draw path at it, so the
-back buffer becomes a Metal render target instead of memory the CPU writes, is
-the next step. The rasterizer stays as the reference the GPU path is checked
-against, and as the fallback where no GPU path is available.
+What is still missing is the GPU. The rasterizer runs on every core the
+machine has (`w32_d3d11_triangles_shaded` deals a draw's rows out in bands of
+eight, one worker per core, each walking the triangles in order, so a pixel is
+always drawn by one thread in program order and the checksum of a frame is
+the same on one core or eight), which is a multiple of the speed and not a
+change of kind. Pointing the draw path at Metal, so the back buffer becomes a
+render target instead of memory the CPU writes, is still the step after this
+one; d12mt on the submodule compiles DXIL (Direct3D 12), so the DXBC of D3D11
+and the tokens of D3D9 would need a translator in front of it. The rasterizer
+stays as the reference the GPU path is checked against, and as the fallback
+where no GPU path is available.
 
 ## d3d11.dll and dxgi.dll
 
@@ -487,10 +493,24 @@ checkerboard quad modulated by vertex colour, a triangle through the transform
 pipeline, a blended quad and an indexed draw out of real buffers; the frame is
 `4cbae1e7` on x86, under qemu on aarch64, and in both bitnesses.
 
-**Shaders are created, bound, and not executed** — the same position D3D11
-takes and for the same reason. A game with its own shaders draws with the
-fixed-function interpretation: texture 0 modulated by the vertex colour. It
-says so once rather than silently.
+**Shaders run** (since September 2026). `CreateVertexShader` and
+`CreatePixelShader` decode the token stream — vs_2_0 to vs_3_0, ps_2_0 to
+ps_3_0: the arithmetic, the matrix macros, if/ifc/else, loop/rep/break,
+call/ret, relative addressing through `a0` and `aL`, def/defi/defb, dcl,
+texld with its projected and biased forms, texldl, texkill — and a draw with
+a shader bound goes through `win32/d3d9_shader.c` per vertex and per pixel.
+The vertex is fetched element by element as its declaration says (or as the
+FVF implies), so every `D3DDECLTYPE` a declaration can name is read; the
+constants set with `Set*ShaderConstant{F,I,B}` are what the shader sees, and
+a shader's own `def`s are loaded when it is bound, as the hardware does. A
+vertex shader alone runs in front of the fixed-function texture-times-colour;
+a pixel shader alone runs behind the fixed-function transform; all sixteen
+texture stages and their sampler states are visible to it, and the alpha test
+(`D3DRS_ALPHATESTENABLE`) is honoured on this path. ps_1_x, vs_1_1 and
+predication are refused by name, in which case the fixed-function reading
+draws and the report says which shader and why. `tests/test_sm3.c` checks
+the interpreter instruction by instruction on hand-assembled tokens;
+`d3dshader.exe` draws three quads through it and is checked by frame checksum.
 
 ### Two bugs worth naming
 
@@ -1572,7 +1592,7 @@ table-driven mechanism is not — see the end of `win32/seh.c`). GDI beyond the
 stubs a message loop needs, and any window decoration: a window here is its own
 client area, which is what a fullscreen game wants and not what a windowed
 program expects. Drawing reaches the screen but goes through the reference
-rasterizer rather than Metal.
+rasterizer, on every core, rather than Metal.
 
 Installers are a partial answer rather than a missing one: silent mode works,
 and the importer runs it and keeps what it produces (see above), but an
@@ -1630,13 +1650,36 @@ where to read more.
 - **7z archives** (`tools/import/un7z.c`): LZMA, LZMA2, BCJ, BCJ2, Delta,
   stored, encoded headers, self-extractors; RAR refused with the reason.
 - **The shaders run** (above), on the CPU.
+- **DXGI as a Windows 8+ program sees it** (`d3d11.c`): `GetParent` answers
+  with the factory above an adapter or swap chain and the adapter above a
+  device (a GameMaker runner asked its adapter for the factory, took the
+  `E_NOINTERFACE` it got as "Direct3D is broken", put the HRESULT in a message
+  box and exited); the factory is `IDXGIFactory2` with
+  `CreateSwapChainForHwnd`, the swap chain `IDXGISwapChain1`, the adapter
+  `IDXGIAdapter2` with a quarter gigabyte of video memory in its description,
+  the device `IDXGIDevice2`.
+- **WASAPI** (`mmdevapi.c`): `CoCreateInstance(CLSID_MMDeviceEnumerator)`, one
+  active render endpoint with its property store, `IAudioClient` through
+  `IAudioClient3` over `audio_out.c` — shared and exclusive mode alike, event
+  driven or polled, `IAudioRenderClient`, `IAudioClock`, the volumes and the
+  session control. The event is set from the tick that runs inside every
+  wait and `Sleep`, so an audio thread paces itself the way it would on
+  Windows. `wasapitest.exe`.
+- **D3D9 shaders** (`d3d9_shader.c`, above): vs/ps 2.0 to 3.0 interpreted, the
+  declaration-driven vertex fetch, constants, sixteen stages, the alpha test.
+- **The rasterizer uses every core** (`d3d11_raster.c`): both APIs gather a
+  draw's shaded triangles and hand them over at once; rows are dealt out in
+  bands, so the result is what one thread would have drawn. `WINRUN_THREADS=1`
+  turns it off. The interpreters' scratch state is thread-local for this.
 - **For testing a build**: the run report carries the last 48 API calls before
-  the end, a subsystems block (audio device and sources, DirectInput devices,
-  JIT), stderr with stdout, and a *Detailed run log* switch in Settings that
-  adds winrun's own narration (`WINRUN_VERBOSE`).
+  the end, a subsystems block (audio device, sources and WASAPI streams,
+  DirectInput devices, JIT, rasterizer threads, D3D9 draws through shaders
+  versus fixed-function, frames presented and the average frame rate), stderr
+  with stdout, and a *Detailed run log* switch in Settings that adds winrun's
+  own narration (`WINRUN_VERBOSE`) — including, every sixtieth frame, how long
+  the last sixty took, and each shader as it is decoded or refused.
 
-Still not here, in the order it matters: the GPU (both rasterizers are CPU;
-d12mt is compiled and tested and not yet wired to the draw path), D3D9 shaders
-(the D3D9 path is fixed-function; D3D11's interpreter could be pointed at SM2/3
-with a token decoder for the older format), a depth buffer, guest threads
-running in parallel rather than in turn, instanced draws.
+Still not here, in the order it matters: the GPU (both rasterizers are CPU,
+now on every core; d12mt on the submodule takes DXIL, so a DXBC/SM3 front end
+would come first), a depth buffer, guest threads running in parallel rather
+than in turn, instanced draws, ps_1_x and vs_1_1.

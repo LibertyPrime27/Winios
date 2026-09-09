@@ -13,10 +13,11 @@
  * ends work -- the guest can lock and read it directly, and the host can hand
  * the same bytes to Metal without a copy through a second address space.
  *
- * Drawing is not here yet. DrawPrimitive and the shader entry points are
- * unimplemented slots, which report themselves rather than jumping into
- * nothing; d12mt already compiles D3D9 SM3 shaders to MSL (27/27 on both
- * devices) and joining the two is the next step, not this one.
+ * Drawing goes through the same integer rasterizer D3D11 uses, with a
+ * fixed-function reading of the vertex (texture times colour) when no shader
+ * is bound and, since September 2026, through the vs_2_0..3_0 and
+ * ps_2_0..3_0 interpreter in d3d9_shader.c when one is -- see "the
+ * programmable pipeline" below. Both run on the CPU, across its cores.
  *
  * Vtable order is load-bearing: the guest computes `lpVtbl[n]` itself, so a
  * slot in the wrong place is an indirect call to the wrong function. Every
@@ -25,9 +26,13 @@
  * slots we do not implement land somewhere that says so.
  */
 #include "w32.h"
+#include "d3d9_shader.h"
+#include "dxbc_exec.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 enum { D3DERR_NOTAVAILABLE_ = (int)0x8876086A };
 enum { S_OK_ = 0, E_FAIL_ = (int)0x80004005, D3DERR_INVALIDCALL = (int)0x8876086C,
@@ -81,6 +86,27 @@ uint32_t w32_frame_crc32(const void *data, size_t n) {
  * without the host reaching into a running guest. */
 static volatile int g_lost;
 void w32_d3d9_device_lost(int on) { g_lost = on ? 1 : 0; }
+
+/* Frames presented, by either API, and how fast they came. The report
+ * prints the totals; with the detailed log on, every sixtieth frame prints
+ * the pace, which is the number a "it runs but slowly" report needs. */
+static uint64_t g_frames_total, g_frames_first_ns, g_frames_last_ns, g_pace_mark_ns;
+static uint64_t mono_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
+void w32_frame_presented(w32 *w) {
+    uint64_t now = mono_ns();
+    if (!g_frames_total) { g_frames_first_ns = now; g_pace_mark_ns = now; }
+    g_frames_total++; g_frames_last_ns = now;
+    if (w && w->verbose && g_frames_total % 60 == 0) {
+        double ms = (double)(now - g_pace_mark_ns) / 1e6;
+        fprintf(stderr, "winrun: video: frame %llu, last 60 in %.0f ms (%.1f fps)\n", (unsigned long long)g_frames_total, ms, ms > 0 ? 60000.0 / ms : 0.0);
+        g_pace_mark_ns = now;
+    }
+}
+void w32_frame_stats(uint64_t *frames, double *fps) {
+    if (frames) *frames = g_frames_total;
+    double secs = g_frames_total > 1 ? (double)(g_frames_last_ns - g_frames_first_ns) / 1e9 : 0.0;
+    if (fps) *fps = secs > 0 ? (double)(g_frames_total - 1) / secs : 0.0;
+}
 /* The same signal, read by d3d11's Present. "The window went away, stop
  * drawing" is one fact about the display, not one per graphics API, so both
  * ask the same flag rather than each keeping its own and one being stale. */
@@ -116,19 +142,60 @@ enum { SURF_DEV = 0, SURF_BITS, SURF_W, SURF_H, SURF_PITCH, SURF_TEX, SURF_NFIEL
 enum { TEX_DEV = 0, TEX_BITS, TEX_W, TEX_H, TEX_PITCH, TEX_LEVELS, TEX_FMT, TEX_SURF,
        TEX_NFIELDS };
 enum { IB_DEV = 0, IB_BITS, IB_BYTES, IB_FMT, IB_NFIELDS };
-/* A vertex declaration, reduced to the same layout an FVF produces. */
+/* A vertex declaration, reduced to the same layout an FVF produces -- and,
+ * for the shaders, kept whole on the host side (DECL_REC is a host pointer). */
 enum { DECL_DEV = 0, DECL_STRIDE, DECL_POS, DECL_POSN, DECL_DIFFUSE, DECL_TEX0,
-       DECL_TEX0N, DECL_NFIELDS };
+       DECL_TEX0N, DECL_REC, DECL_NFIELDS };
+/* A shader: the device, and its index in g_sm3 plus one (0: not executable). */
+enum { SH_DEV = 0, SH_IDX, SH_NFIELDS };
 enum { VB_DEV = 0, VB_BITS, VB_BYTES, VB_FVF, VB_NFIELDS };
 enum { TAG_D3D9 = 1, TAG_DEVICE, TAG_SURFACE, TAG_VERTEXBUFFER,
        TAG_TEXTURE, TAG_INDEXBUFFER, TAG_DECL, TAG_SHADER };
 
 static w32_com_class cls_d3d9, cls_device, cls_surface, cls_vbuf, cls_texture, cls_ibuf,
                      cls_decl, cls_shader;
+
+/* --- the programmable pipeline's state, host side --------------------------
+ *
+ * One device at a time is the assumption, and it is the one every D3D9 game
+ * satisfies: the constant registers, the sixteen texture stages with their
+ * sampler states, the alpha test, the decoded shaders and the declarations
+ * live here rather than in the object's 64-bit fields, because 480 float4
+ * constants do not fit a field per value and a shader runs per pixel. */
+enum { MAX_SM3 = 512, MAX_STAGE = 16, VS_CONSTS = 256, PS_CONSTS = 224 };
+static sm3_prog *g_sm3[MAX_SM3];
+static char      g_sm3_why[MAX_SM3][96];
+static int       g_nsm3;
+static float     g_vsc[VS_CONSTS][4], g_psc[PS_CONSTS][4];
+static int32_t   g_vsi[16][4], g_psi[16][4];
+static uint32_t  g_vsb, g_psb;
+typedef struct { uint64_t tex; uint32_t addru, addrv, mag; } stage_state;   /* D3DTADDRESS_WRAP 1 / CLAMP 3; D3DTEXF_POINT 1 / LINEAR 2 */
+static stage_state g_stage[MAX_STAGE];
+static uint32_t  g_alpha_test, g_alpha_ref, g_alpha_func;                 /* D3DRS 15, 24, 25 */
+typedef struct { uint16_t stream, offset; uint8_t type, method, usage, index; } decl_elem;
+typedef struct decl_rec { struct decl_rec *next; int n; decl_elem e[64]; } decl_rec;
+static decl_rec *g_decls;
+/* what a draw did, for the report and the verbose log */
+static uint64_t g_shaded_draws, g_shaded_tris, g_ff_draws;
+
 void w32_d3d9_reset(void) {
     cls_d3d9.vtable = cls_device.vtable = cls_surface.vtable = cls_vbuf.vtable = 0;
     cls_texture.vtable = cls_ibuf.vtable = cls_decl.vtable = cls_shader.vtable = 0;
     g_lost = 0;
+    for (int i = 0; i < g_nsm3; i++) sm3_prog_free(g_sm3[i]);
+    memset(g_sm3, 0, sizeof g_sm3); memset(g_sm3_why, 0, sizeof g_sm3_why); g_nsm3 = 0;
+    memset(g_vsc, 0, sizeof g_vsc); memset(g_psc, 0, sizeof g_psc);
+    memset(g_vsi, 0, sizeof g_vsi); memset(g_psi, 0, sizeof g_psi); g_vsb = g_psb = 0;
+    memset(g_stage, 0, sizeof g_stage);
+    g_alpha_test = g_alpha_ref = g_alpha_func = 0;
+    while (g_decls) { decl_rec *n = g_decls->next; free(g_decls); g_decls = n; }
+    g_shaded_draws = g_shaded_tris = g_ff_draws = 0;
+    g_frames_total = g_frames_first_ns = g_frames_last_ns = g_pace_mark_ns = 0;
+}
+void w32_d3d9_stats(uint64_t *shaded_draws, uint64_t *shaded_tris, uint64_t *ff_draws) {
+    if (shaded_draws) *shaded_draws = g_shaded_draws;
+    if (shaded_tris) *shaded_tris = g_shaded_tris;
+    if (ff_draws) *ff_draws = g_ff_draws;
 }
 
 /* The display we claim to be. A game picks a back-buffer size from this when
@@ -419,6 +486,7 @@ static void d_Present(w32 *w) {
     int pitch = (int)w32_com_get(w, self, DEV_PITCH);
     w32_com_set(w, self, DEV_FRAMES, w32_com_get(w, self, DEV_FRAMES) + 1);
     w32_note_activity();          /* a frame is not idling */
+    w32_frame_presented(w);
     if (g_present) g_present(g_present_ctx, W32P(w, fb), width, h, pitch);
     RET(S_OK_);
 }
@@ -567,9 +635,8 @@ static int fetch_vertex(w32 *w, uint64_t self, uint64_t base, const fvf_layout *
     return 1;
 }
 
-/* The texture bound to stage 0, if there is one and it has pixels. */
-static int bound_texture(w32 *w, uint64_t self, d3d11_texture *t) {
-    uint64_t tex = w32_com_get(w, self, DEV_TEX0);
+/* The texture bound to a stage, if there is one and it has pixels. */
+static int stage_texture(w32 *w, uint64_t tex, d3d11_texture *t) {
     if (!tex) return 0;
     uint64_t bits = w32_com_get(w, tex, TEX_BITS);
     int tw = (int)w32_com_get(w, tex, TEX_W), th = (int)w32_com_get(w, tex, TEX_H);
@@ -580,6 +647,7 @@ static int bound_texture(w32 *w, uint64_t self, d3d11_texture *t) {
     t->w = tw; t->h = th; t->pitch_px = pitch / 4;
     return 1;
 }
+static int bound_texture(w32 *w, uint64_t self, d3d11_texture *t) { return stage_texture(w, w32_com_get(w, self, DEV_TEX0), t); }
 
 /* Which blend the render state adds up to. The rasterizer offers source-over
  * and additive, which between them cover what a 2D game does: SRCALPHA with
@@ -591,6 +659,230 @@ static int blend_mode_of(w32 *w, uint64_t self) {
     uint64_t dst = w32_com_get(w, self, DEV_DSTBLEND);
     if (dst == 2 /* D3DBLEND_ONE */) return D3D11_BLEND_ADD_;
     return D3D11_BLEND_OVER_;
+}
+
+/* --- the programmable pipeline ----------------------------------------------
+ *
+ * When a vertex shader, a pixel shader, or both are bound and decoded, the
+ * draw goes this way instead: the vertex is fetched element by element as
+ * its declaration (or the elements an FVF implies) describes, the vertex
+ * shader turns it into a clip-space position and up to twelve varyings --
+ * or, with no vertex shader, the fixed-function transform does and the
+ * diffuse colour and texture coordinates become the varyings -- and the
+ * pixel shader decides each pixel's colour from the interpolated varyings,
+ * or the fixed-function "texture times colour" does when there is none. The
+ * triangles go through the same rasterizer D3D11's shaders use.
+ */
+_Static_assert(SM3_VARY == D3D11_MAX_VARY, "one varying layout for both APIs");
+
+/* an element's value, as four floats: what a shader sees in its input register */
+static float half_to_float(uint16_t h) {
+    uint32_t s = (uint32_t)(h & 0x8000) << 16, e = (h >> 10) & 0x1F, m = h & 0x3FF, bits;
+    if (e == 0) { if (!m) bits = s; else { float f = (float)m / 1024.0f * (1.0f / 16384.0f); memcpy(&bits, &f, 4); bits |= s; } }
+    else if (e == 31) bits = s | 0x7F800000u | m << 13;
+    else bits = s | (e + 112) << 23 | m << 13;
+    float f; memcpy(&f, &bits, 4); return f;
+}
+static void read_elem(const unsigned char *p, int type, float out[4]) {
+    out[0] = out[1] = out[2] = 0.0f; out[3] = 1.0f;
+    switch (type) {
+    case 0: case 1: case 2: case 3: for (int i = 0; i <= type; i++) out[i] = rdf(p + 4 * i); break;          /* FLOATn */
+    case 4:  out[0] = p[2] / 255.0f; out[1] = p[1] / 255.0f; out[2] = p[0] / 255.0f; out[3] = p[3] / 255.0f; break;   /* D3DCOLOR: BGRA bytes */
+    case 5:  for (int i = 0; i < 4; i++) out[i] = (float)p[i]; break;                                         /* UBYTE4 */
+    case 6: case 7: for (int i = 0; i < (type == 6 ? 2 : 4); i++) { int16_t v; memcpy(&v, p + 2 * i, 2); out[i] = (float)v; } break;
+    case 8:  for (int i = 0; i < 4; i++) out[i] = p[i] / 255.0f; break;                                       /* UBYTE4N */
+    case 9: case 10: for (int i = 0; i < (type == 9 ? 2 : 4); i++) { int16_t v; memcpy(&v, p + 2 * i, 2); out[i] = v <= -32767 ? -1.0f : (float)v / 32767.0f; } break;
+    case 11: case 12: for (int i = 0; i < (type == 11 ? 2 : 4); i++) { uint16_t v; memcpy(&v, p + 2 * i, 2); out[i] = (float)v / 65535.0f; } break;
+    case 15: case 16: for (int i = 0; i < (type == 15 ? 2 : 4); i++) { uint16_t v; memcpy(&v, p + 2 * i, 2); out[i] = half_to_float(v); } break;
+    default: break;                                                                                            /* UDEC3, DEC3N: not read */
+    }
+}
+/* The elements an FVF implies, in the same shape a declaration has. */
+static int fvf_elems(uint32_t fvf, decl_elem *e) {
+    int n = 0; uint16_t at = 0;
+    #define EL(ty, sz, us, ix) do { if (n < 64) { e[n].stream = 0; e[n].offset = at; e[n].type = (ty); e[n].method = 0; e[n].usage = (us); e[n].index = (ix); n++; } at = (uint16_t)(at + (sz)); } while (0)
+    switch (fvf & FVF_POSITION_MASK) {
+    case FVF_XYZ:    EL(2, 12, 0, 0); break;
+    case FVF_XYZRHW: EL(3, 16, 9, 0); break;
+    case 0x006: EL(2, 12, 0, 0); EL(0, 4, 1, 0); break;
+    case 0x008: EL(2, 12, 0, 0); EL(1, 8, 1, 0); break;
+    case 0x00A: EL(2, 12, 0, 0); EL(2, 12, 1, 0); break;
+    case 0x00C: EL(2, 12, 0, 0); EL(3, 16, 1, 0); break;
+    case 0x00E: EL(2, 12, 0, 0); EL(3, 16, 1, 0); at = (uint16_t)(at + 4); break;
+    case 0x4002: EL(3, 16, 0, 0); break;                              /* D3DFVF_XYZW */
+    default: return 0;
+    }
+    if (fvf & 0x010) EL(2, 12, 3, 0);                                 /* NORMAL */
+    if (fvf & 0x020) EL(0, 4, 4, 0);                                  /* PSIZE */
+    if (fvf & FVF_DIFFUSE) EL(4, 4, 10, 0);
+    if (fvf & 0x080) EL(4, 4, 10, 1);                                 /* SPECULAR */
+    int ntex = fvf_tex_count(fvf);
+    for (int i = 0; i < ntex && i < 8; i++) {
+        int sz = (int)((fvf >> (16 + 2 * i)) & 3);
+        int nf = sz == 0 ? 2 : sz == 1 ? 3 : sz == 2 ? 4 : 1;
+        EL((uint8_t)(nf - 1), nf * 4, 5, (uint8_t)i);
+    }
+    #undef EL
+    return n;
+}
+static const sm3_prog *prog_of(w32 *w, uint64_t sh) {
+    if (!sh) return 0;
+    int i = (int)w32_com_get(w, sh, SH_IDX) - 1;
+    return i >= 0 && i < g_nsm3 ? g_sm3[i] : 0;
+}
+static void note_shader_not_run(w32 *w, uint64_t sh);
+
+typedef struct {
+    const sm3_prog *vp, *pp;
+    sm3_env venv, penv;
+    d3d11_texture tex[MAX_STAGE];
+    const decl_elem *e; int ne; int stride;
+    /* vertex shader input register <- element, or -1 */
+    int in_elem[16];
+    /* fixed-function vertex stage: which elements feed it */
+    int pos_e, diffuse_e, spec_e, tex_e[8];
+    int transformed;
+    float mvp[16];
+    int vx, vy, vw, vh;
+    int have_tex0;
+    uint32_t alpha_test, alpha_ref, alpha_func;
+} shade9;
+
+static int find_elem(const decl_elem *e, int ne, int usage, int index) {
+    for (int i = 0; i < ne; i++) if (e[i].stream == 0 && e[i].usage == usage && e[i].index == index) return i;
+    return -1;
+}
+static void shade9_setup(w32 *w, shade9 *sh) {
+    sh->venv.cf = g_vsc; sh->venv.cf_n = VS_CONSTS; sh->venv.ci = g_vsi; sh->venv.cb = g_vsb;
+    sh->penv.cf = g_psc; sh->penv.cf_n = PS_CONSTS; sh->penv.ci = g_psi; sh->penv.cb = g_psb;
+    for (int k = 0; k < MAX_STAGE; k++) {
+        if (stage_texture(w, g_stage[k].tex, &sh->tex[k])) { sh->penv.tex[k] = &sh->tex[k]; sh->venv.tex[k] = &sh->tex[k]; }
+        sh->penv.wrap[k] = sh->venv.wrap[k] = g_stage[k].addru != 3;
+        sh->penv.linear[k] = sh->venv.linear[k] = g_stage[k].mag == 2;
+    }
+    sh->have_tex0 = sh->penv.tex[0] != 0;
+    for (int i = 0; i < 16; i++) sh->in_elem[i] = -1;
+    if (sh->vp) {
+        const sm3_decl *d; int n = sm3_prog_inputs(sh->vp, &d);
+        for (int i = 0; i < n; i++) if (d[i].rtype == SM3_RT_INPUT && d[i].reg < 16) sh->in_elem[d[i].reg] = find_elem(sh->e, sh->ne, d[i].usage, d[i].index);
+    }
+    sh->pos_e = find_elem(sh->e, sh->ne, 0, 0);
+    int post = find_elem(sh->e, sh->ne, 9, 0);
+    sh->transformed = post >= 0;
+    if (post >= 0) sh->pos_e = post;
+    sh->diffuse_e = find_elem(sh->e, sh->ne, 10, 0);
+    sh->spec_e = find_elem(sh->e, sh->ne, 10, 1);
+    for (int k = 0; k < 8; k++) sh->tex_e[k] = find_elem(sh->e, sh->ne, 5, k);
+    sh->alpha_test = g_alpha_test; sh->alpha_ref = g_alpha_ref & 0xFF; sh->alpha_func = g_alpha_func;
+}
+/* One vertex to a screen position and its varyings. */
+static int shade9_vertex(w32 *w, const shade9 *sh, uint64_t base, int i, d3d11_svertex *out) {
+    uint64_t at = base + (uint64_t)sh->stride * (unsigned)i;
+    const unsigned char *p = (const unsigned char *)W32PN(w, at, (uint64_t)sh->stride);
+    if (!p) return 0;
+    float clip[4] = { 0, 0, 0, 1 };
+    memset(out, 0, sizeof *out);
+    if (sh->vp) {
+        static _Thread_local float vin[16][4];
+        memset(vin, 0, sizeof vin);
+        for (int r = 0; r < 16; r++) { vin[r][3] = 1.0f; if (sh->in_elem[r] >= 0) read_elem(p + sh->e[sh->in_elem[r]].offset, sh->e[sh->in_elem[r]].type, vin[r]); }
+        if (sm3_exec_vs(sh->vp, &sh->venv, vin, clip, out->var) < 0) return 0;
+    } else {
+        float pos[4] = { 0, 0, 0, 1 };
+        if (sh->pos_e >= 0) read_elem(p + sh->e[sh->pos_e].offset, sh->e[sh->pos_e].type, pos);
+        float col[4] = { 1, 1, 1, 1 };
+        if (sh->diffuse_e >= 0) read_elem(p + sh->e[sh->diffuse_e].offset, sh->e[sh->diffuse_e].type, col);
+        memcpy(out->var[0], col, 16);
+        if (sh->spec_e >= 0) read_elem(p + sh->e[sh->spec_e].offset, sh->e[sh->spec_e].type, out->var[1]);
+        for (int k = 0; k < 8; k++) if (sh->tex_e[k] >= 0) read_elem(p + sh->e[sh->tex_e[k]].offset, sh->e[sh->tex_e[k]].type, out->var[2 + k]);
+        if (sh->transformed) {
+            out->x = pos[0]; out->y = pos[1]; out->z = pos[2]; out->w = pos[3] != 0.0f ? pos[3] : 1.0f;
+            return 1;
+        }
+        const float *m = sh->mvp;
+        clip[0] = pos[0] * m[0] + pos[1] * m[4] + pos[2] * m[8]  + m[12];
+        clip[1] = pos[0] * m[1] + pos[1] * m[5] + pos[2] * m[9]  + m[13];
+        clip[2] = pos[0] * m[2] + pos[1] * m[6] + pos[2] * m[10] + m[14];
+        clip[3] = pos[0] * m[3] + pos[1] * m[7] + pos[2] * m[11] + m[15];
+    }
+    float cw = clip[3] != 0.0f ? clip[3] : 1e-6f, iw = 1.0f / cw;
+    out->x = (float)sh->vx + (clip[0] * iw * 0.5f + 0.5f) * (float)sh->vw;
+    out->y = (float)sh->vy + (0.5f - clip[1] * iw * 0.5f) * (float)sh->vh;
+    out->z = clip[2] * iw;
+    out->w = cw;
+    return 1;
+}
+static int alpha_passes(uint32_t func, uint32_t a, uint32_t ref) {
+    switch (func) {
+    case 1: return 0; case 2: return a < ref; case 3: return a == ref; case 4: return a <= ref;
+    case 5: return a > ref; case 6: return a != ref; case 7: return a >= ref;
+    default: return 1;
+    }
+}
+static uint32_t shade9_pixel(void *ctx, const float var[D3D11_MAX_VARY][4], float px, float py, float z, int *discard) {
+    const shade9 *sh = ctx;
+    float c[4];
+    if (sh->pp) {
+        float vpos[4] = { px, py, z, 1.0f };
+        int r = sm3_exec_ps(sh->pp, &sh->penv, var, vpos, c);
+        if (r) { *discard = 1; return 0; }
+    } else {
+        /* fixed function: the diffuse colour, times the texture at texcoord 0 */
+        memcpy(c, var[0], 16);
+        if (sh->have_tex0) {
+            float t[4]; dxbc_sample(sh->penv.tex[0], sh->penv.wrap[0], sh->penv.linear[0], var[2][0], var[2][1], t);
+            for (int i = 0; i < 4; i++) c[i] *= t[i];
+        }
+    }
+    uint32_t ch[4];
+    for (int i = 0; i < 4; i++) { float v = c[i]; if (v != v || v < 0.0f) v = 0.0f; if (v > 1.0f) v = 1.0f; ch[i] = (uint32_t)(v * 255.0f + 0.5f); }
+    if (sh->alpha_test && !alpha_passes(sh->alpha_func, ch[3], sh->alpha_ref)) { *discard = 1; return 0; }
+    return (ch[3] << 24) | (ch[0] << 16) | (ch[1] << 8) | ch[2];
+}
+static void draw_shaded(w32 *w, uint64_t self, uint64_t base, const decl_elem *e, int ne, int stride,
+                        const sm3_prog *vp, const sm3_prog *pp, const d3d11_target *t, int blend,
+                        int prim_type, int prim_count, const uint16_t *idx16, const uint32_t *idx32, int nindices, int base_vertex) {
+    static _Thread_local shade9 sh;
+    memset(&sh, 0, sizeof sh);
+    sh.vp = vp; sh.pp = pp; sh.e = e; sh.ne = ne; sh.stride = stride;
+    sh.vx = t->clip_x; sh.vy = t->clip_y; sh.vw = t->clip_w; sh.vh = t->clip_h;
+    shade9_setup(w, &sh);
+    if (!vp && !sh.transformed) {
+        float world[16], view[16], proj[16], wv[16];
+        read_matrix(w, self, DEV_MWORLD, world); read_matrix(w, self, DEV_MVIEW, view); read_matrix(w, self, DEV_MPROJ, proj);
+        static const float ID[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+        int wz = 1, vz = 1, pz = 1;
+        for (int i = 0; i < 16; i++) { if (world[i] != 0) wz = 0; if (view[i] != 0) vz = 0; if (proj[i] != 0) pz = 0; }
+        if (wz) memcpy(world, ID, sizeof ID);
+        if (vz) memcpy(view, ID, sizeof ID);
+        if (pz) memcpy(proj, ID, sizeof ID);
+        mat_mul(world, view, wv); mat_mul(wv, proj, sh.mvp);
+    }
+    g_shaded_draws++;
+    /* gathered, and rasterized a draw at a time across the cores */
+    static d3d11_svertex *batch; static int batch_cap;
+    enum { BATCH_TRIS = 4096 };
+    if (!batch) { batch_cap = 3 * BATCH_TRIS; batch = malloc((size_t)batch_cap * sizeof *batch); if (!batch) return; }
+    int nb = 0;
+    for (int i = 0; i < prim_count; i++) {
+        int a, b, c;
+        switch (prim_type) {
+        case PT_TRIANGLELIST:  a = 3 * i;  b = 3 * i + 1; c = 3 * i + 2; break;
+        case PT_TRIANGLESTRIP: a = i;      b = i + 1;     c = i + 2;     break;
+        case PT_TRIANGLEFAN:   a = 0;      b = i + 1;     c = i + 2;     break;
+        default: return;
+        }
+        if (idx16 || idx32) {
+            if (a >= nindices || b >= nindices || c >= nindices) break;
+            a = (int)(idx16 ? idx16[a] : idx32[a]) + base_vertex;
+            b = (int)(idx16 ? idx16[b] : idx32[b]) + base_vertex;
+            c = (int)(idx16 ? idx16[c] : idx32[c]) + base_vertex;
+        }
+        if (!shade9_vertex(w, &sh, base, a, &batch[nb]) || !shade9_vertex(w, &sh, base, b, &batch[nb + 1]) || !shade9_vertex(w, &sh, base, c, &batch[nb + 2])) break;
+        nb += 3; g_shaded_tris++;
+        if (nb == batch_cap) { w32_d3d11_triangles_shaded(t, batch, nb / 3, shade9_pixel, &sh, blend); nb = 0; }
+    }
+    if (nb) w32_d3d11_triangles_shaded(t, batch, nb / 3, shade9_pixel, &sh, blend);
 }
 
 static void draw_indexed(w32 *w, uint64_t self, uint64_t base, uint32_t fvf,
@@ -647,9 +939,32 @@ static void draw_indexed(w32 *w, uint64_t self, uint64_t base, uint32_t fvf,
     if (vw <= 0 || vh <= 0) { vx = vy = 0; vw = t.w; vh = t.h; }
     t.clip_x = vx; t.clip_y = vy; t.clip_w = vw; t.clip_h = vh;
 
+    int blend = blend_mode_of(w, self);
+
+    /* Shaders bound and decoded: the programmable pipeline. One that is
+     * bound but could not be decoded is reported, and the draw goes on
+     * without it. */
+    {
+        uint64_t vsh = w32_com_get(w, self, DEV_VSHADER), psh = w32_com_get(w, self, DEV_PSHADER);
+        const sm3_prog *vp = prog_of(w, vsh), *pp = prog_of(w, psh);
+        if (vp && !sm3_prog_is_vs(vp)) vp = 0;
+        if (pp && sm3_prog_is_vs(pp)) pp = 0;
+        if (vsh && !vp) note_shader_not_run(w, vsh);
+        if (psh && !pp) note_shader_not_run(w, psh);
+        if (vp || pp) {
+            static _Thread_local decl_elem fe[64];
+            const decl_elem *e = 0; int ne = 0;
+            const decl_rec *rec = decl ? (const decl_rec *)(uintptr_t)w32_com_get(w, decl, DECL_REC) : 0;
+            if (rec) { e = rec->e; ne = rec->n; }
+            else { ne = fvf_elems(fvf, fe); e = fe; }
+            draw_shaded(w, self, base, e, ne, L.stride, vp, pp, &t, blend, prim_type, prim_count, idx16, idx32, nindices, base_vertex);
+            return;
+        }
+    }
+    g_ff_draws++;
+
     d3d11_texture tex;
     int have_tex = L.tex0 >= 0 && bound_texture(w, self, &tex);
-    int blend = blend_mode_of(w, self);
     int wrap = w32_com_get(w, self, DEV_ADDRU) != 3;      /* 3 is D3DTADDRESS_CLAMP */
 
     /* Four position floats means the program transformed them itself -- that
@@ -766,13 +1081,15 @@ static void d_CreateIndexBuffer(w32 *w) {
  * lightmap, and refusing the call would fail a setup that then draws its base
  * texture perfectly well. */
 static void d_SetTexture(w32 *w) {
-    if ((uint32_t)ARG(1) == 0) w32_com_set(w, ARG(0), DEV_TEX0, ARG(2));
+    uint32_t stage = (uint32_t)ARG(1);
+    if (stage == 0) w32_com_set(w, ARG(0), DEV_TEX0, ARG(2));
+    if (stage < MAX_STAGE) g_stage[stage].tex = ARG(2);
     RET(S_OK_);
 }
 static void d_GetTexture(w32 *w) {
     uint64_t out = ARG(2);
-    if (out) w32_write(w, out, w32_ptrsize(w),
-                       (uint32_t)ARG(1) == 0 ? w32_com_get(w, ARG(0), DEV_TEX0) : 0);
+    uint32_t stage = (uint32_t)ARG(1);
+    if (out) w32_write(w, out, w32_ptrsize(w), stage < MAX_STAGE ? g_stage[stage].tex : 0);
     RET(S_OK_);
 }
 
@@ -807,6 +1124,11 @@ static void d_SetRenderState(w32 *w) {
     if (st == 27) w32_com_set(w, self, DEV_BLEND, v);
     else if (st == 19) w32_com_set(w, self, DEV_SRCBLEND, v);
     else if (st == 20) w32_com_set(w, self, DEV_DSTBLEND, v);
+    /* the alpha test, honoured by the programmable pipeline: a sprite sheet
+     * with hard edges is drawn with ALPHATESTENABLE and GREATER 0 */
+    else if (st == 15) g_alpha_test = v;
+    else if (st == 24) g_alpha_ref = v;
+    else if (st == 25) g_alpha_func = v;
     RET(S_OK_);
 }
 /* SetSamplerState(Sampler, Type, Value). ADDRESSU is 1 and ADDRESSV is 2;
@@ -814,10 +1136,15 @@ static void d_SetRenderState(w32 *w) {
  * the other is a visible seam. */
 static void d_SetSamplerState(w32 *w) {
     uint64_t self = ARG(0);
-    uint32_t type = (uint32_t)ARG(2), v = (uint32_t)ARG(3);
-    if ((uint32_t)ARG(1) == 0) {
+    uint32_t stage = (uint32_t)ARG(1), type = (uint32_t)ARG(2), v = (uint32_t)ARG(3);
+    if (stage == 0) {
         if (type == 1) w32_com_set(w, self, DEV_ADDRU, v);
         else if (type == 2) w32_com_set(w, self, DEV_ADDRV, v);
+    }
+    if (stage < MAX_STAGE) {
+        if (type == 1) g_stage[stage].addru = v;
+        else if (type == 2) g_stage[stage].addrv = v;
+        else if (type == 5) g_stage[stage].mag = v;            /* D3DSAMP_MAGFILTER */
     }
     RET(S_OK_);
 }
@@ -952,6 +1279,9 @@ static void d_CreateVertexDeclaration(w32 *w) {
     w32_com_set(w, d, DECL_POS, (uint64_t)(int64_t)-1);
     w32_com_set(w, d, DECL_DIFFUSE, (uint64_t)(int64_t)-1);
     w32_com_set(w, d, DECL_TEX0, (uint64_t)(int64_t)-1);
+    /* the whole declaration, for the shaders' vertex fetch */
+    decl_rec *rec = calloc(1, sizeof *rec);
+    if (rec) { rec->next = g_decls; g_decls = rec; w32_com_set(w, d, DECL_REC, (uint64_t)(uintptr_t)rec); }
     int stride = 0;
     for (int i = 0; i < 64; i++) {
         uint64_t e = elems + (uint64_t)i * 8;
@@ -962,6 +1292,11 @@ static void d_CreateVertexDeclaration(w32 *w) {
         int usage = (int)w32_read(w, e + 6, 1);
         int uidx = (int)w32_read(w, e + 7, 1);
         int sz = decl_type_size(type);
+        if (rec) {
+            decl_elem *el = &rec->e[rec->n++];
+            el->stream = (uint16_t)stream; el->offset = (uint16_t)off; el->type = (uint8_t)type;
+            el->method = (uint8_t)w32_read(w, e + 5, 1); el->usage = (uint8_t)usage; el->index = (uint8_t)uidx;
+        }
         if (stream == 0) {
             if (usage == 0 && uidx == 0) {                 /* D3DDECLUSAGE_POSITION */
                 w32_com_set(w, d, DECL_POS, off);
@@ -992,20 +1327,16 @@ static void d_GetVertexDeclaration(w32 *w) {
     RET(S_OK_);
 }
 
-/* Shaders. Accepted, stored, and not executed -- the same position D3D11
- * takes, and for the same reason: running SM2/SM3 bytecode is a project of
- * its own, and refusing to create a shader stops a game that would otherwise
- * draw its whole world with the fixed-function interpretation. Said once, so
- * a report says what is actually happening rather than leaving someone to
- * wonder why the colours are wrong. */
-static void note_shader_not_run(w32 *w, const char *which) {
-    static int said;
-    if (said) return;
-    said = 1;
-    fprintf(stderr, "winrun: d3d9: %s shaders are created and bound but not "
-                    "executed; drawing uses the fixed-function interpretation "
-                    "(texture modulated by vertex colour)\n", which);
-    (void)w;
+/* Shaders. The bytecode is decoded when the shader is created (see
+ * d3d9_shader.c) and runs when the shader is bound to a draw. One that
+ * cannot be decoded is still created -- refusing would stop a game that
+ * could otherwise draw its world with the fixed-function reading -- and the
+ * report names it and says why, once per shader, so nobody has to wonder
+ * why the colours are wrong. */
+static void note_shader_not_run(w32 *w, uint64_t sh) {
+    int i = (int)w32_com_get(w, sh, SH_IDX) - 1;
+    if (i < 0 || i >= g_nsm3) return;
+    w32_note_refused(w, g_sm3_why[i]);
 }
 static w32_com_class cls_shader;
 static const w32_api shader_methods[4] = {
@@ -1014,18 +1345,57 @@ static const w32_api shader_methods[4] = {
     [2] = { "Release",        1, 0, w32_com_Release,        0 },
     [3] = { "GetDevice",      2, 0, d_ok,                   0 },
 };
-static void make_shader(w32 *w, uint64_t out, const char *which) {
+/* CreateVertexShader / CreatePixelShader(pFunction, ppShader). The token
+ * stream has no length; it ends at the end marker, so it is walked to find
+ * one, a page at a time, and refused if none comes. */
+static void make_shader(w32 *w, uint64_t fn, uint64_t out, int want_vs) {
     if (!out) { RET(D3DERR_INVALIDCALL); return; }
-    note_shader_not_run(w, which);
-    uint64_t sh = w32_com_new(w, &cls_shader, 2);
+    if (!fn || !w32_mem_ok(w, fn, 4)) { RET(D3DERR_INVALIDCALL); return; }
+    uint32_t n = 0;
+    static _Thread_local uint32_t tokens[65536];
+    while (n < 65536 && w32_mem_ok(w, fn + 4ull * n, 4)) {
+        tokens[n] = (uint32_t)w32_read(w, fn + 4ull * n, 4);
+        n++;
+        if (tokens[n - 1] == 0x0000FFFF) break;
+        if ((tokens[n - 1] & 0xFFFF) == 0xFFFE && n > 1) {          /* a comment: skip its body whole */
+            uint32_t len = (tokens[n - 1] >> 16) & 0x7FFF;
+            for (uint32_t k = 0; k < len && n < 65536 && w32_mem_ok(w, fn + 4ull * n, 4); k++) { tokens[n] = (uint32_t)w32_read(w, fn + 4ull * n, 4); n++; }
+        }
+    }
+    uint64_t sh = w32_com_new(w, &cls_shader, SH_NFIELDS);
     if (!sh) { RET(E_FAIL_); return; }
+    w32_com_set(w, sh, SH_DEV, ARG(0));
+    if (g_nsm3 < MAX_SM3) {
+        int i = g_nsm3++;
+        char why[64];
+        g_sm3[i] = sm3_prog_new(tokens, n, why, sizeof why);
+        if (g_sm3[i] && sm3_prog_is_vs(g_sm3[i]) != want_vs) { sm3_prog_free(g_sm3[i]); g_sm3[i] = 0; snprintf(why, sizeof why, "a %s shader given to Create%sShader", want_vs ? "pixel" : "vertex", want_vs ? "Vertex" : "Pixel"); }
+        if (!g_sm3[i]) snprintf(g_sm3_why[i], sizeof g_sm3_why[i], "d3d9!Create%sShader: not executed (%s); the fixed-function reading drew instead", want_vs ? "Vertex" : "Pixel", why);
+        w32_com_set(w, sh, SH_IDX, (uint64_t)i + 1);
+        if (w->verbose) {
+            if (g_sm3[i]) fprintf(stderr, "winrun: d3d9: %s_%d_%d shader decoded (%u tokens)\n", want_vs ? "vs" : "ps", sm3_prog_version(g_sm3[i]) / 10, sm3_prog_version(g_sm3[i]) % 10, n);
+            else fprintf(stderr, "winrun: d3d9: %s shader not executable: %s\n", want_vs ? "vertex" : "pixel", why);
+        }
+    }
     w32_write(w, out, w32_ptrsize(w), sh);
     RET(S_OK_);
 }
-static void d_CreateVertexShader(w32 *w) { make_shader(w, ARG(2), "vertex"); }
-static void d_CreatePixelShader(w32 *w)  { make_shader(w, ARG(2), "pixel"); }
-static void d_SetVertexShader(w32 *w) { w32_com_set(w, ARG(0), DEV_VSHADER, ARG(1)); RET(S_OK_); }
-static void d_SetPixelShader(w32 *w)  { w32_com_set(w, ARG(0), DEV_PSHADER, ARG(1)); RET(S_OK_); }
+static void d_CreateVertexShader(w32 *w) { make_shader(w, ARG(1), ARG(2), 1); }
+static void d_CreatePixelShader(w32 *w)  { make_shader(w, ARG(1), ARG(2), 0); }
+/* Binding a shader loads its def'd constants, as the hardware does; the
+ * program's own Set*ShaderConstant calls afterwards still win. */
+static void d_SetVertexShader(w32 *w) {
+    w32_com_set(w, ARG(0), DEV_VSHADER, ARG(1));
+    const sm3_prog *p = prog_of(w, ARG(1));
+    if (p) sm3_prog_apply_defs(p, g_vsc, VS_CONSTS, g_vsi, &g_vsb);
+    RET(S_OK_);
+}
+static void d_SetPixelShader(w32 *w) {
+    w32_com_set(w, ARG(0), DEV_PSHADER, ARG(1));
+    const sm3_prog *p = prog_of(w, ARG(1));
+    if (p) sm3_prog_apply_defs(p, g_psc, PS_CONSTS, g_psi, &g_psb);
+    RET(S_OK_);
+}
 static void d_GetVertexShader(w32 *w) {
     if (ARG(1)) w32_write(w, ARG(1), w32_ptrsize(w), w32_com_get(w, ARG(0), DEV_VSHADER));
     RET(S_OK_);
@@ -1242,22 +1612,53 @@ static void d_GetRasterStatus(w32 *w) {
     if (p) { w32_write(w, p, 4, 0); w32_write(w, p + 4, 4, 0); }   /* not in vblank, scanline 0 */
     RET(S_OK_);
 }
-/* Shader constants. Stored nowhere, because no shader runs to read them --
- * but a program that sets a hundred of them at startup must not fail on the
- * first one. */
-static void d_shader_const_set(w32 *w) { RET(S_OK_); }
-static void d_shader_const_get(w32 *w) {
-    /* Zeroed rather than left alone: a caller that reads back what it never
-     * set gets a defined answer instead of its own uninitialised stack. */
-    uint64_t out = ARG(2);
-    uint32_t count = (uint32_t)ARG(3);
-    if (out && count && count < 4096) {
-        void *p = W32PN(w, out, (uint64_t)count * 16);
-        if (!p) { RET(D3DERR_INVALIDCALL); return; }
-        memset(p, 0, (size_t)count * 16);
-    }
+/* Shader constants: Set/Get{Vertex,Pixel}ShaderConstant{F,I,B}(StartRegister,
+ * pData, Count). Float and int constants are four values per register,
+ * bools one. The registers are what the shaders read. */
+static void const_set(w32 *w, void *regs, int nregs, int reg_bytes) {
+    uint32_t start = (uint32_t)ARG(1), count = (uint32_t)ARG(3);
+    uint64_t data = ARG(2);
+    if (!data || start >= (uint32_t)nregs || count > (uint32_t)nregs - start) { RET(D3DERR_INVALIDCALL); return; }
+    const void *p = W32PN(w, data, (uint64_t)count * (unsigned)reg_bytes);
+    if (!p) { RET(D3DERR_INVALIDCALL); return; }
+    memcpy((char *)regs + (size_t)start * (unsigned)reg_bytes, p, (size_t)count * (unsigned)reg_bytes);
     RET(S_OK_);
 }
+static void const_get(w32 *w, const void *regs, int nregs, int reg_bytes) {
+    uint32_t start = (uint32_t)ARG(1), count = (uint32_t)ARG(3);
+    uint64_t out = ARG(2);
+    if (!out || start >= (uint32_t)nregs || count > (uint32_t)nregs - start) { RET(D3DERR_INVALIDCALL); return; }
+    void *p = W32PN(w, out, (uint64_t)count * (unsigned)reg_bytes);
+    if (!p) { RET(D3DERR_INVALIDCALL); return; }
+    memcpy(p, (const char *)regs + (size_t)start * (unsigned)reg_bytes, (size_t)count * (unsigned)reg_bytes);
+    RET(S_OK_);
+}
+static void bools_set(w32 *w, uint32_t *bits) {
+    uint32_t start = (uint32_t)ARG(1), count = (uint32_t)ARG(3);
+    uint64_t data = ARG(2);
+    if (!data || start >= 16 || count > 16 - start || !w32_mem_ok(w, data, 4ull * count)) { RET(D3DERR_INVALIDCALL); return; }
+    for (uint32_t i = 0; i < count; i++) { if (w32_read(w, data + 4ull * i, 4)) *bits |= 1u << (start + i); else *bits &= ~(1u << (start + i)); }
+    RET(S_OK_);
+}
+static void bools_get(w32 *w, uint32_t bits) {
+    uint32_t start = (uint32_t)ARG(1), count = (uint32_t)ARG(3);
+    uint64_t out = ARG(2);
+    if (!out || start >= 16 || count > 16 - start || !w32_mem_ok(w, out, 4ull * count)) { RET(D3DERR_INVALIDCALL); return; }
+    for (uint32_t i = 0; i < count; i++) w32_write(w, out + 4ull * i, 4, (bits >> (start + i)) & 1);
+    RET(S_OK_);
+}
+static void d_SetVertexShaderConstantF(w32 *w) { const_set(w, g_vsc, VS_CONSTS, 16); }
+static void d_GetVertexShaderConstantF(w32 *w) { const_get(w, g_vsc, VS_CONSTS, 16); }
+static void d_SetVertexShaderConstantI(w32 *w) { const_set(w, g_vsi, 16, 16); }
+static void d_GetVertexShaderConstantI(w32 *w) { const_get(w, g_vsi, 16, 16); }
+static void d_SetVertexShaderConstantB(w32 *w) { bools_set(w, &g_vsb); }
+static void d_GetVertexShaderConstantB(w32 *w) { bools_get(w, g_vsb); }
+static void d_SetPixelShaderConstantF(w32 *w) { const_set(w, g_psc, PS_CONSTS, 16); }
+static void d_GetPixelShaderConstantF(w32 *w) { const_get(w, g_psc, PS_CONSTS, 16); }
+static void d_SetPixelShaderConstantI(w32 *w) { const_set(w, g_psi, 16, 16); }
+static void d_GetPixelShaderConstantI(w32 *w) { const_get(w, g_psi, 16, 16); }
+static void d_SetPixelShaderConstantB(w32 *w) { bools_set(w, &g_psb); }
+static void d_GetPixelShaderConstantB(w32 *w) { bools_get(w, g_psb); }
 
 static void d_SetFVF(w32 *w) { w32_com_set(w, ARG(0), DEV_FVF, ARG(1)); RET(S_OK_); }
 static void d_GetFVF(w32 *w) {
@@ -1456,12 +1857,12 @@ static const w32_api device_methods[119] = {
     [91 ] = { "CreateVertexShader",          3, 0, d_CreateVertexShader,      0 },
     [92 ] = { "SetVertexShader",             2, 0, d_SetVertexShader,         0 },
     [93 ] = { "GetVertexShader",             2, 0, d_GetVertexShader,         0 },
-    [94 ] = { "SetVertexShaderConstantF",    4, 0, d_shader_const_set,        0 },
-    [95 ] = { "GetVertexShaderConstantF",    4, 0, d_shader_const_get,        0 },
-    [96 ] = { "SetVertexShaderConstantI",    4, 0, d_shader_const_set,        0 },
-    [97 ] = { "GetVertexShaderConstantI",    4, 0, d_shader_const_get,        0 },
-    [98 ] = { "SetVertexShaderConstantB",    4, 0, d_shader_const_set,        0 },
-    [99 ] = { "GetVertexShaderConstantB",    4, 0, d_shader_const_get,        0 },
+    [94 ] = { "SetVertexShaderConstantF",    4, 0, d_SetVertexShaderConstantF, 0 },
+    [95 ] = { "GetVertexShaderConstantF",    4, 0, d_GetVertexShaderConstantF, 0 },
+    [96 ] = { "SetVertexShaderConstantI",    4, 0, d_SetVertexShaderConstantI, 0 },
+    [97 ] = { "GetVertexShaderConstantI",    4, 0, d_GetVertexShaderConstantI, 0 },
+    [98 ] = { "SetVertexShaderConstantB",    4, 0, d_SetVertexShaderConstantB, 0 },
+    [99 ] = { "GetVertexShaderConstantB",    4, 0, d_GetVertexShaderConstantB, 0 },
     [101] = { "GetStreamSource",             5, 0, d_GetStreamSource,         0 },
     [102] = { "SetStreamSourceFreq",         3, 0, d_ok,                      0 },
     [103] = { "GetStreamSourceFreq",         3, 0, d_ok,                      0 },
@@ -1469,12 +1870,12 @@ static const w32_api device_methods[119] = {
     [106] = { "CreatePixelShader",           3, 0, d_CreatePixelShader,       0 },
     [107] = { "SetPixelShader",              2, 0, d_SetPixelShader,          0 },
     [108] = { "GetPixelShader",              2, 0, d_GetPixelShader,          0 },
-    [109] = { "SetPixelShaderConstantF",     4, 0, d_shader_const_set,        0 },
-    [110] = { "GetPixelShaderConstantF",     4, 0, d_shader_const_get,        0 },
-    [111] = { "SetPixelShaderConstantI",     4, 0, d_shader_const_set,        0 },
-    [112] = { "GetPixelShaderConstantI",     4, 0, d_shader_const_get,        0 },
-    [113] = { "SetPixelShaderConstantB",     4, 0, d_shader_const_set,        0 },
-    [114] = { "GetPixelShaderConstantB",     4, 0, d_shader_const_get,        0 },
+    [109] = { "SetPixelShaderConstantF",     4, 0, d_SetPixelShaderConstantF, 0 },
+    [110] = { "GetPixelShaderConstantF",     4, 0, d_GetPixelShaderConstantF, 0 },
+    [111] = { "SetPixelShaderConstantI",     4, 0, d_SetPixelShaderConstantI, 0 },
+    [112] = { "GetPixelShaderConstantI",     4, 0, d_GetPixelShaderConstantI, 0 },
+    [113] = { "SetPixelShaderConstantB",     4, 0, d_SetPixelShaderConstantB, 0 },
+    [114] = { "GetPixelShaderConstantB",     4, 0, d_GetPixelShaderConstantB, 0 },
     [115] = { "DrawRectPatch",               4, 0, d_ok,                      0 },
     [116] = { "DrawTriPatch",                4, 0, d_ok,                      0 },
     [117] = { "DeletePatch",                 2, 0, d_ok,                      0 },

@@ -269,7 +269,7 @@ static float rnd_ne(float x) { float f = floorf(x), d = x - f; if (d > 0.5f || (
 #define CMP(c, cond) for (int c = 0; c < 4; c++) { d[c].u = (cond) ? 0xFFFFFFFFu : 0; }
 
 int dxbc_exec(const dxbc_prog *p, const dxbc_env *env, const float v[DXBC_REGS][4], float o[DXBC_REGS][4]) {
-    static state s;                                             /* one invocation at a time; big, so not on the stack */
+    static _Thread_local state s;                               /* big, so not on the stack; one per thread, because the rasterizer shades pixels on several */
     s.p = p; s.env = env;
     memcpy(s.v, v, sizeof s.v); memset(s.o, 0, sizeof s.o); memset(s.r, 0, sizeof s.r);
     int pc = 0, steps = 0, discarded = 0;

@@ -117,5 +117,6 @@ int w32_com_create(w32 *w, const uint8_t clsid[16], const uint8_t iid[16], uint6
     if (w32_dsound_create_class(w, clsid, iid, out)) return 1;
     if (w32_dinput_create_class(w, clsid, iid, out)) return 1;
     if (w32_xaudio2_create_class(w, clsid, iid, out)) return 1;
+    if (w32_mmdevapi_create_class(w, clsid, iid, out)) return 1;
     return 0;
 }

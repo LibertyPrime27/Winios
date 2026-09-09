@@ -457,13 +457,21 @@ void w32_d3d11_clear(const d3d11_target *t, uint32_t argb);
 /* A vertex after a real vertex shader: a screen position with its w, and up to
  * eight float4 varyings by output register, interpolated perspective-correctly
  * and handed to a pixel function per pixel. */
-enum { D3D11_MAX_VARY = 8 };
+enum { D3D11_MAX_VARY = 12 };          /* enough for D3D9's two colours, eight texcoords, a normal and one more */
 typedef struct { float x, y, z, w; float var[D3D11_MAX_VARY][4]; } d3d11_svertex;
 typedef uint32_t (*d3d11_pixel_fn)(void *ctx, const float var[D3D11_MAX_VARY][4], float px, float py, float z, int *discard);
 void w32_d3d11_triangle_shaded(const d3d11_target *t, const d3d11_svertex *v0, const d3d11_svertex *v1, const d3d11_svertex *v2,
                                d3d11_pixel_fn fn, void *ctx, int blend_mode);
+/* A draw's worth of triangles (three vertices each), rasterized across the
+ * cores; the result is the same as the loop of single triangles would give. */
+void w32_d3d11_triangles_shaded(const d3d11_target *t, const d3d11_svertex *v, int ntri, d3d11_pixel_fn fn, void *ctx, int blend_mode);
+int  w32_raster_threads(void);         /* how many the rasterizer uses, for the report */
 void w32_d3d11_reset(void);
 
+/* d3d9.c: what the draws did, and how the frames came, for the report */
+void w32_d3d9_stats(uint64_t *shaded_draws, uint64_t *shaded_tris, uint64_t *ff_draws);
+void w32_frame_presented(w32 *w);                 /* either API's Present calls this */
+void w32_frame_stats(uint64_t *frames, double *fps);
 /* d3d11.c: see the file for what is and is not implemented */
 extern const w32_api w32_d3d11[];
 extern const w32_api w32_d3d10[];
@@ -629,6 +637,12 @@ void w32_dinput_reset(void);
 void w32_xaudio2_reset(void);
 void w32_xaudio2_tick(w32 *w);
 int  w32_xaudio2_create_class(w32 *w, const uint8_t clsid[16], const uint8_t iid[16], uint64_t out);
+/* mmdevapi.c: WASAPI -- the device enumerator and IAudioClient streams over audio_out */
+extern const w32_api w32_mmdevapi[];
+void w32_mmdevapi_reset(void);
+void w32_mmdevapi_tick(w32 *w);                                    /* drain finished blocks, set the stream events; guest thread */
+int  w32_mmdevapi_create_class(w32 *w, const uint8_t clsid[16], const uint8_t iid[16], uint64_t out);
+int  w32_mmdevapi_stream_count(void);
 int  w32_dinput_create_class(w32 *w, const uint8_t clsid[16], const uint8_t iid[16], uint64_t out);
 
 /* d3d9.c: where a presented frame goes. NULL simply drops it, which is what

@@ -359,6 +359,7 @@ static uint32_t wait_one(w32 *w, uint64_t hv, uint32_t ms) {
     for (;;) {
         w32_dsound_tick(w);                 /* a wait is where a sound's position event is noticed */
         w32_xaudio2_tick(w);
+        w32_mmdevapi_tick(w);
         int r = handle_ready(w, hv, 1);
         if (r < 0) return WAIT_FAILED_;
         if (r) return WAIT_OBJECT_0_;
@@ -395,6 +396,7 @@ static void k_WaitForMultipleObjects(w32 *w) {
     for (;;) {
         w32_dsound_tick(w);
         w32_xaudio2_tick(w);
+        w32_mmdevapi_tick(w);
         if (all) {
             /* Every one has to be ready *before* any is consumed, or a
              * partial wait eats a signal it is not going to act on. */
@@ -565,10 +567,17 @@ static void k_LeaveCriticalSection(w32 *w) {
  * thread for the length of the frame. */
 static void k_Sleep(w32 *w) {
     uint32_t ms = (uint32_t)ARG(0);
-    (void)w;
     if (!ms) { w32_guest_yield(); return; }
     uint64_t until = now_ms() + ms;
     while (!g_exiting && now_ms() < until) {
+        /* A sleeping thread is as good a place as a waiting one for the
+         * sound queues to be serviced: an audio thread that paces itself
+         * with Sleep rather than an event still has to be told what the
+         * mixer finished. */
+        w32_dsound_tick(w);
+        w32_xaudio2_tick(w);
+        w32_mmdevapi_tick(w);
+        if (w->exited) return;
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         uint64_t left = until - now_ms();

@@ -126,9 +126,13 @@ if(NOT WIN32)
         win32/advapi32.c win32/seh.c win32/thread.c
         win32/user32.c win32/gdi32.c win32/gdifont.c win32/truetype.c
         win32/fontdata.c win32/image.c win32/comctl32.c
-        win32/dsound.c win32/audio_out.c win32/xinput.c win32/dinput.c win32/xaudio2.c win32/shell32.c win32/ole32.c
+        win32/dsound.c win32/audio_out.c win32/xinput.c win32/dinput.c win32/xaudio2.c win32/mmdevapi.c win32/shell32.c win32/ole32.c
         win32/misc_dlls.c win32/net_dlls.c
-        win32/d3d11.c win32/d3d11_raster.c win32/dxbc.c win32/dxbc_exec.c)
+        win32/d3d11.c win32/d3d11_raster.c win32/dxbc.c win32/dxbc_exec.c win32/d3d9_shader.c)
+    add_executable(test_sm3 tests/test_sm3.c)
+    target_link_libraries(test_sm3 PRIVATE winrun_lib m)
+    set_property(TARGET test_sm3 PROPERTY C_STANDARD 11)
+    add_test(NAME sm3 COMMAND test_sm3)
 
     add_library(winrun_lib STATIC ${WINRUN_SOURCES})
     target_link_libraries(winrun_lib PUBLIC xcore)
@@ -148,7 +152,7 @@ if(NOT WIN32)
     # The shader interpreter and the rasterizer it feeds interpolate in float: with
     # contraction off, a*b+c is two roundings on x86 and on ARM alike, and a frame
     # checksum recorded on one machine holds on the other.
-    set_source_files_properties(win32/dxbc_exec.c win32/d3d11_raster.c win32/d3d11.c PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    set_source_files_properties(win32/dxbc_exec.c win32/d3d11_raster.c win32/d3d11.c win32/d3d9_shader.c win32/d3d9.c PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 
     add_executable(test_dxbc tests/test_dxbc.c)
     target_link_libraries(test_dxbc PRIVATE winrun_lib m)

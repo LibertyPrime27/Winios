@@ -105,7 +105,13 @@ void w32_audio_src_set(int id, const w32_audio_src *s) {
                       || t->s.mem != s->mem || t->s.size != s->size;
         void *owner = t->s.owner;
         t->s = *s;
+        /* A refresh that brings its own block frees the one it replaces;
+         * one that does not keeps it. Passing the same block back is
+         * neither -- a WASAPI stream re-sets its playing block to change
+         * a gain, and freeing it under the mixer would be the last thing
+         * it did. */
         if (!t->s.owner) t->s.owner = owner;
+        else if (owner && owner != t->s.owner) free(owner);
         if (t->has_next) { t->next.playing = s->playing; t->next.vol_mB = s->vol_mB; t->next.pan_mB = s->pan_mB; t->next.freq = t->next.freq ? t->next.freq : s->freq; }
         if (restart) { uint32_t fb = frame_bytes(&t->s); t->pos_fp = (uint64_t)(fb ? s->start_byte / fb : 0) << 16; }
         set_gains(t);
