@@ -272,7 +272,7 @@ enum {
     CTX_VSCB1, CTX_VSCB2, CTX_VSCB3, CTX_PSCB1, CTX_PSCB2, CTX_PSCB3,
     CTX_SRV1, CTX_SRV2, CTX_SRV3, CTX_SAMPLER1, CTX_SAMPLER2, CTX_SAMPLER3, CTX_N
 };
-enum { SC_DEV = 0, SC_TEX, SC_W, SC_H, SC_FRAMES, SC_HWND, SC_N };
+enum { SC_DEV = 0, SC_TEX, SC_W, SC_H, SC_FRAMES, SC_HWND, SC_WAITABLE, SC_N };
 enum { TEX_W = 0, TEX_H, TEX_PITCH, TEX_PIXELS, TEX_FMT, TEX_BIND, TEX_USAGE, TEX_N };
 enum { BUF_DATA = 0, BUF_SIZE, BUF_BIND, BUF_USAGE, BUF_STRIDE, BUF_N };
 enum { VIEW_RES = 0, VIEW_FMT, VIEW_N };
@@ -1291,6 +1291,51 @@ static void sc_GetBackgroundColor(w32 *w) {
 }
 static void sc_SetRotation(w32 *w) { (void)w; RET(S_OK_); }
 static void sc_GetRotation(w32 *w) { if (ARG(1)) w32_write(w, ARG(1), 4, 1); RET(S_OK_); }   /* DXGI_MODE_ROTATION_IDENTITY */
+/* IDXGISwapChain2..4: the source size, frame latency and its waitable object,
+ * the presentation transform, the back buffer index, colour spaces, HDR. */
+static void sc_SetSourceSize(w32 *w) { (void)w; RET(S_OK_); }
+static void sc_GetSourceSize(w32 *w) {
+    uint64_t self = ARG(0);
+    if (ARG(1)) w32_write(w, ARG(1), 4, w32_com_get(w, self, SC_W));
+    if (ARG(2)) w32_write(w, ARG(2), 4, w32_com_get(w, self, SC_H));
+    RET(S_OK_);
+}
+static void sc_SetMaximumFrameLatency(w32 *w) { (void)w; RET(S_OK_); }
+static void sc_GetMaximumFrameLatency(w32 *w) { if (ARG(1)) w32_write(w, ARG(1), 4, 1); RET(S_OK_); }
+static void sc_GetFrameLatencyWaitableObject(w32 *w) {
+    /* A program made with DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
+     * waits on this before each frame: an event that is always set, because
+     * the GPU is never behind. */
+    uint64_t self = ARG(0);
+    uint64_t h = w32_com_get(w, self, SC_WAITABLE);
+    if (!h) { h = w32_handle_new(w, H_EVENT, -1); w32_handle *hh = w32_handle_get(w, h); if (hh) hh->flags = 1u | 2u; w32_com_set(w, self, SC_WAITABLE, h); }
+    RET(h);
+}
+static void sc_SetMatrixTransform(w32 *w) { (void)w; RET(S_OK_); }
+static void sc_GetMatrixTransform(w32 *w) {
+    /* DXGI_MATRIX_3X2_F: the identity */
+    uint64_t m = ARG(1);
+    if (!m || !w32_mem_ok(w, m, 24)) { RET((uint64_t)(uint32_t)E_INVALIDARG_); return; }
+    for (int i = 0; i < 6; i++) w32_write(w, m + 4u * i, 4, (i == 0 || i == 3) ? 0x3F800000u : 0);
+    RET(S_OK_);
+}
+static void sc_GetCurrentBackBufferIndex(w32 *w) { (void)w; RET(0); }
+static void sc_CheckColorSpaceSupport(w32 *w) {
+    /* (colorSpace, out): sRGB is supported and present-able; nothing else */
+    if (ARG(2)) w32_write(w, ARG(2), 4, ARG(1) == 0 ? 0x1 | 0x2 : 0);
+    RET(S_OK_);
+}
+static void sc_SetColorSpace1(w32 *w) { RET(ARG(1) == 0 ? S_OK_ : (uint64_t)(uint32_t)E_INVALIDARG_); }
+static void sc_ResizeBuffers1(w32 *w) {
+    /* (count, width, height, format, flags, nodeMasks, queues): the same
+     * answer as ResizeBuffers -- the size is fixed */
+    uint64_t self = ARG(0);
+    uint32_t nw = (uint32_t)ARG(2), nh = (uint32_t)ARG(3);
+    if (nw && nh && (nw != w32_com_get(w, self, SC_W) || nh != w32_com_get(w, self, SC_H)))
+        w32_note_refused(w, "d3d11: ResizeBuffers1 to a different size is not supported");
+    RET(S_OK_);
+}
+static void sc_SetHDRMetaData(w32 *w) { (void)w; RET(S_OK_); }
 static void sc_GetFrameStatistics(w32 *w) {
     /* DXGI_FRAME_STATISTICS: three counts, then two 64-bit times -- 32 bytes
      * in both bitnesses. */
@@ -1393,6 +1438,13 @@ static void fac_GetSharedResourceAdapterLuid(w32 *w);
 static void fac_RegisterStatusWindow(w32 *w);
 static void fac_RegisterStatusEvent(w32 *w);
 static void fac_UnregisterStatus(w32 *w);
+static void fac_GetCreationFlags(w32 *w);
+static void fac_EnumAdapterByLuid(w32 *w);
+static void fac_EnumWarpAdapter(w32 *w);
+static void fac_CheckFeatureSupport(w32 *w);
+static void fac_EnumAdapterByGpuPreference(w32 *w);
+static void fac_RegisterAdaptersChangedEvent(w32 *w);
+static void fac_UnregisterAdaptersChangedEvent(w32 *w);
 static uint64_t make_swapchain(w32 *w, uint64_t device, int width, int height);
 
 static void fac_EnumAdapters(w32 *w) {
@@ -1436,6 +1488,20 @@ static void adapter_desc(w32 *w, int extra) {
 static void adp_GetDesc(w32 *w)  { adapter_desc(w, 0); }
 static void adp_GetDesc1(w32 *w) { adapter_desc(w, 4); }
 static void adp_GetDesc2(w32 *w) { adapter_desc(w, 12); }
+static void adp_GetDesc3(w32 *w) { adapter_desc(w, 12); }        /* DESC3 is DESC2 with a wider Flags */
+/* IDXGIAdapter3: video memory accounting. QueryVideoMemoryInfo(node, segment,
+ * info): the budget is the memory the description claims, none of it used
+ * or reserved -- a program that watches its budget sees room. */
+static void adp_QueryVideoMemoryInfo(w32 *w) {
+    uint64_t p = ARG(3);
+    if (!p || !w32_mem_ok(w, p, 32)) { RET((uint64_t)(uint32_t)E_INVALIDARG_); return; }
+    w32_write(w, p, 8, ARG(2) == 0 ? 256u << 20 : 1024u << 20);   /* Budget: local, then non-local */
+    w32_write(w, p + 8, 8, 0); w32_write(w, p + 16, 8, 0); w32_write(w, p + 24, 8, 0);
+    RET(S_OK_);
+}
+static void adp_SetVideoMemoryReservation(w32 *w) { (void)w; RET(S_OK_); }
+static void adp_RegisterEvent(w32 *w) { if (ARG(2) && w32_mem_ok(w, ARG(2), 4)) w32_write(w, ARG(2), 4, 1); RET(S_OK_); }
+static void adp_UnregisterEvent(w32 *w) { (void)w; RET(0); }
 static void adp_CheckInterfaceSupport(w32 *w) { RET((uint64_t)(uint32_t)DXGI_ERROR_UNSUPPORTED_); }
 static void dxgidev_GetAdapter(w32 *w) {
     uint64_t a = w32_com_new(w, &cls_adapter, 4);
@@ -1459,6 +1525,13 @@ static void dxgidev_ReclaimResources(w32 *w) {
 static void dxgidev_EnqueueSetEvent(w32 *w) {
     /* the GPU has nothing queued, so the event is due now */
     if (ARG(1)) w32_event_set(w, ARG(1));
+    RET(S_OK_);
+}
+static void dxgidev_Trim(w32 *w) { (void)w; RET(0); }                    /* IDXGIDevice3: nothing cached to release */
+static void dxgidev_ReclaimResources1(w32 *w) {
+    /* (count, resources, results): DXGI_RECLAIM_RESOURCE_RESULT_OK for each */
+    uint32_t n = (uint32_t)ARG(1);
+    if (ARG(3) && n <= 64 && w32_mem_ok(w, ARG(3), 4ull * n)) for (uint32_t i = 0; i < n; i++) w32_write(w, ARG(3) + 4ull * i, 4, 0);
     RET(S_OK_);
 }
 
@@ -1487,11 +1560,13 @@ static void dev_QueryInterface(w32 *w) {
     /* IID_IDXGIDevice  {54ec77fa-1377-44e6-8c32-88fd5f44c84c}
      * IID_IDXGIDevice1 {77db970f-6276-48ba-ba28-070143b4392c}
      * IID_IDXGIDevice2 {05008617-fbfd-4051-a790-144884b4f6a9}
-     * IID_IDXGIDevice3 {6007896c-3244-4afd-bf18-a6d3beda5023} */
+     * IID_IDXGIDevice3 {6007896c-3244-4afd-bf18-a6d3beda5023}
+     * IID_IDXGIDevice4 {95b4f95f-d8da-4ca4-9ee6-3b76d5968a10} */
     if (iid_is(w, iid, 0x54EC77FAu, 0x44E61377u, 0xFD88328Cu, 0x4CC8445Fu) ||
         iid_is(w, iid, 0x77DB970Fu, 0x48BA6276u, 0x010728BAu, 0x2C39B443u) ||
         iid_is(w, iid, 0x05008617u, 0x4051FBFDu, 0x481490A7u, 0xA9F6B484u) ||
-        iid_is(w, iid, 0x6007896Cu, 0x4AFD3244u, 0xD3A618BFu, 0x2350DABEu)) {
+        iid_is(w, iid, 0x6007896Cu, 0x4AFD3244u, 0xD3A618BFu, 0x2350DABEu) ||
+        iid_is(w, iid, 0x95B4F95Fu, 0x4CA4D8DAu, 0x763BE69Eu, 0x108A96D5u)) {
         uint64_t obj = w32_com_new(w, &cls_dxgidev, 4);
         out_ptr(w, out, obj);
         RET(obj ? S_OK_ : (uint64_t)(uint32_t)E_OUTOFMEMORY_);
@@ -1654,6 +1729,18 @@ static const w32_api swapchain_methods[] = {
     { "GetBackgroundColor",   2, 0, sc_GetBackgroundColor, 0 },
     { "SetRotation",          2, 0, sc_SetRotation, 0 },
     { "GetRotation",          2, 0, sc_GetRotation, 0 },
+    { "SetSourceSize",        3, 0, sc_SetSourceSize, 0 },          /* 29: IDXGISwapChain2 */
+    { "GetSourceSize",        3, 0, sc_GetSourceSize, 0 },
+    { "SetMaximumFrameLatency", 2, 0, sc_SetMaximumFrameLatency, 0 },
+    { "GetMaximumFrameLatency", 2, 0, sc_GetMaximumFrameLatency, 0 },
+    { "GetFrameLatencyWaitableObject", 1, 0, sc_GetFrameLatencyWaitableObject, 0 },
+    { "SetMatrixTransform",   2, 0, sc_SetMatrixTransform, 0 },
+    { "GetMatrixTransform",   2, 0, sc_GetMatrixTransform, 0 },
+    { "GetCurrentBackBufferIndex", 1, 0, sc_GetCurrentBackBufferIndex, 0 },   /* 36: IDXGISwapChain3 */
+    { "CheckColorSpaceSupport", 3, 0, sc_CheckColorSpaceSupport, 0 },
+    { "SetColorSpace1",       2, 0, sc_SetColorSpace1, 0 },
+    { "ResizeBuffers1",       8, 0, sc_ResizeBuffers1, 0 },
+    { "SetHDRMetaData",       4, 0, sc_SetHDRMetaData, 0 },          /* 40: IDXGISwapChain4 */
 };
 
 static const w32_api texture_methods[] = {
@@ -1707,6 +1794,13 @@ static const w32_api factory_methods[] = {
     { "RegisterOcclusionStatusEvent",  3, 0, fac_RegisterStatusEvent, 0 },
     { "UnregisterOcclusionStatus",     2, 0, fac_UnregisterStatus, 0 },
     { "CreateSwapChainForComposition", 5, 0, fac_CreateSwapChainForComposition, 0 },
+    { "GetCreationFlags",              1, 0, fac_GetCreationFlags, 0 },          /* 25: IDXGIFactory3 */
+    { "EnumAdapterByLuid",             4, 0, fac_EnumAdapterByLuid, 0 },         /* 26: IDXGIFactory4 */
+    { "EnumWarpAdapter",               3, 0, fac_EnumWarpAdapter, 0 },
+    { "CheckFeatureSupport",           4, 0, fac_CheckFeatureSupport, 0 },       /* 28: IDXGIFactory5 */
+    { "EnumAdapterByGpuPreference",    5, 0, fac_EnumAdapterByGpuPreference, 0 }, /* 29: IDXGIFactory6 */
+    { "RegisterAdaptersChangedEvent",  3, 0, fac_RegisterAdaptersChangedEvent, 0 },   /* 30: IDXGIFactory7 */
+    { "UnregisterAdaptersChangedEvent", 2, 0, fac_UnregisterAdaptersChangedEvent, 0 },
 };
 static const w32_api dxgidev_methods[] = {
     IUNK, DXGIOBJ,
@@ -1719,6 +1813,9 @@ static const w32_api dxgidev_methods[] = {
     { "OfferResources",        4, 0, dxgidev_OfferResources, 0 },            /* 14: IDXGIDevice2 */
     { "ReclaimResources",      4, 0, dxgidev_ReclaimResources, 0 },
     { "EnqueueSetEvent",       2, 0, dxgidev_EnqueueSetEvent, 0 },
+    { "Trim",                  1, 0, dxgidev_Trim, 0 },                       /* 17: IDXGIDevice3 */
+    { "OfferResources1",       5, 0, dxgidev_OfferResources, 0 },            /* 18: IDXGIDevice4 */
+    { "ReclaimResources1",     4, 0, dxgidev_ReclaimResources1, 0 },
 };
 static const w32_api adapter_methods[] = {
     IUNK, DXGIOBJ,
@@ -1727,6 +1824,13 @@ static const w32_api adapter_methods[] = {
     { "CheckInterfaceSupport", 3, 0, adp_CheckInterfaceSupport, 0 },
     { "GetDesc1",              2, 0, adp_GetDesc1, 0 },     /* 10: IDXGIAdapter1 */
     { "GetDesc2",              2, 0, adp_GetDesc2, 0 },     /* 11: IDXGIAdapter2 */
+    { "RegisterHardwareContentProtectionTeardownStatusEvent", 3, 0, adp_RegisterEvent, 0 },   /* 12: IDXGIAdapter3 */
+    { "UnregisterHardwareContentProtectionTeardownStatus",    2, 0, adp_UnregisterEvent, 0 },
+    { "QueryVideoMemoryInfo",  4, 0, adp_QueryVideoMemoryInfo, 0 },
+    { "SetVideoMemoryReservation", 4, 0, adp_SetVideoMemoryReservation, 0 },
+    { "RegisterVideoMemoryBudgetChangeNotificationEvent", 3, 0, adp_RegisterEvent, 0 },
+    { "UnregisterVideoMemoryBudgetChangeNotification",    2, 0, adp_UnregisterEvent, 0 },
+    { "GetDesc3",              2, 0, adp_GetDesc3, 0 },     /* 18: IDXGIAdapter4 */
 };
 
 #define NM(a) ((int)(sizeof (a) / sizeof (a)[0]))
@@ -1741,19 +1845,19 @@ static const w32_api adapter_methods[] = {
  * as a NIL in the right place -- never to change the number here. */
 _Static_assert(NM(device_methods)    == 43, "ID3D11Device has 43 methods");
 _Static_assert(NM(context_methods)   == 115, "ID3D11DeviceContext has 115 methods");
-_Static_assert(NM(swapchain_methods) == 29, "IDXGISwapChain1 has 29 methods");
+_Static_assert(NM(swapchain_methods) == 41, "IDXGISwapChain4 has 41 methods");
 _Static_assert(NM(texture_methods)   == 11, "ID3D11Texture2D has 11 methods");
 _Static_assert(NM(buffer_methods)    == 11, "ID3D11Buffer has 11 methods");
 _Static_assert(NM(view_methods)      == 9,  "ID3D11View-derived interfaces have 9");
 _Static_assert(NM(child_methods)     == 7,  "ID3D11DeviceChild has 7 methods");
 _Static_assert(NM(state_methods)     == 8,  "a D3D11 state object has 8 methods");
 _Static_assert(NM(query_methods)     == 9,  "ID3D11Query has 9 methods");
-_Static_assert(NM(factory_methods)   == 25, "IDXGIFactory2 has 25 methods");
-_Static_assert(NM(dxgidev_methods)   == 17, "IDXGIDevice2 has 17 methods");
-_Static_assert(NM(adapter_methods)   == 12, "IDXGIAdapter2 has 12 methods");
+_Static_assert(NM(factory_methods)   == 32, "IDXGIFactory7 has 32 methods");
+_Static_assert(NM(dxgidev_methods)   == 20, "IDXGIDevice4 has 20 methods");
+_Static_assert(NM(adapter_methods)   == 19, "IDXGIAdapter4 has 19 methods");
 static w32_com_class cls_device    = { "ID3D11Device",         device_methods,    NM(device_methods),    TAG_D11_DEVICE, 0, {0} };
 static w32_com_class cls_context   = { "ID3D11DeviceContext",  context_methods,   NM(context_methods),   TAG_D11_CONTEXT, 0, {0} };
-static w32_com_class cls_swapchain = { "IDXGISwapChain1",      swapchain_methods, NM(swapchain_methods), TAG_D11_SWAPCHAIN, 0, {0} };
+static w32_com_class cls_swapchain = { "IDXGISwapChain4",      swapchain_methods, NM(swapchain_methods), TAG_D11_SWAPCHAIN, 0, {0} };
 static w32_com_class cls_texture   = { "ID3D11Texture2D",      texture_methods,   NM(texture_methods),   TAG_D11_TEXTURE, 0, {0} };
 static w32_com_class cls_buffer    = { "ID3D11Buffer",         buffer_methods,    NM(buffer_methods),    TAG_D11_BUFFER, 0, {0} };
 static w32_com_class cls_rtv       = { "ID3D11RenderTargetView", view_methods,    NM(view_methods),      TAG_D11_RTV, 0, {0} };
@@ -1767,9 +1871,9 @@ static w32_com_class cls_blend     = { "ID3D11BlendState",     state_methods,   
 static w32_com_class cls_raster    = { "ID3D11RasterizerState", state_methods,    NM(state_methods),     TAG_D11_RASTER, 0, {0} };
 static w32_com_class cls_depth     = { "ID3D11DepthStencilState", state_methods,  NM(state_methods),     TAG_D11_DEPTH, 0, {0} };
 static w32_com_class cls_query     = { "ID3D11Query",          query_methods,     NM(query_methods),     TAG_D11_QUERY, 0, {0} };
-static w32_com_class cls_factory   = { "IDXGIFactory2",        factory_methods,   NM(factory_methods),   TAG_DXGI_FACTORY, 0, {0} };
-static w32_com_class cls_dxgidev   = { "IDXGIDevice2",         dxgidev_methods,   NM(dxgidev_methods),   TAG_DXGI_DEVICE, 0, {0} };
-static w32_com_class cls_adapter   = { "IDXGIAdapter2",        adapter_methods,   NM(adapter_methods),   TAG_DXGI_ADAPTER, 0, {0} };
+static w32_com_class cls_factory   = { "IDXGIFactory7",        factory_methods,   NM(factory_methods),   TAG_DXGI_FACTORY, 0, {0} };
+static w32_com_class cls_dxgidev   = { "IDXGIDevice4",         dxgidev_methods,   NM(dxgidev_methods),   TAG_DXGI_DEVICE, 0, {0} };
+static w32_com_class cls_adapter   = { "IDXGIAdapter4",        adapter_methods,   NM(adapter_methods),   TAG_DXGI_ADAPTER, 0, {0} };
 
 
 /* -------------------------------------------------------- creating it all */
@@ -1860,6 +1964,39 @@ static void fac_GetSharedResourceAdapterLuid(w32 *w) {
 static void fac_RegisterStatusWindow(w32 *w) { if (ARG(3) && w32_mem_ok(w, ARG(3), 4)) w32_write(w, ARG(3), 4, 1); RET(S_OK_); }
 static void fac_RegisterStatusEvent(w32 *w)  { if (ARG(2) && w32_mem_ok(w, ARG(2), 4)) w32_write(w, ARG(2), 4, 1); RET(S_OK_); }
 static void fac_UnregisterStatus(w32 *w) { (void)w; RET(0); }
+/* IDXGIFactory3..7: the creation flags, adapters by LUID, the WARP adapter,
+ * feature support, adapters by GPU preference, adapter-change events. A
+ * program that has asked QueryInterface for IDXGIFactory5 to check tearing
+ * support calls slot 28, and lands here rather than off the table. */
+static void fac_GetCreationFlags(w32 *w) { (void)w; RET(0); }
+static void fac_EnumAdapterByLuid(w32 *w) {
+    /* (luid, riid, out): the one adapter, whatever LUID was asked for */
+    uint64_t a = w32_com_new(w, &cls_adapter, 4);
+    out_ptr(w, ARG(3), a);
+    RET(a ? S_OK_ : (uint64_t)(uint32_t)E_OUTOFMEMORY_);
+}
+static void fac_EnumWarpAdapter(w32 *w) {
+    /* (riid, out): a software rasterizer is exactly what this is */
+    uint64_t a = w32_com_new(w, &cls_adapter, 4);
+    out_ptr(w, ARG(2), a);
+    RET(a ? S_OK_ : (uint64_t)(uint32_t)E_OUTOFMEMORY_);
+}
+static void fac_CheckFeatureSupport(w32 *w) {
+    /* (feature, data, size): DXGI_FEATURE_PRESENT_ALLOW_TEARING is the only
+     * feature there is, and the answer is no -- there is no vsync to tear
+     * through here */
+    if (ARG(2) && ARG(3) >= 4 && w32_mem_ok(w, ARG(2), 4)) w32_write(w, ARG(2), 4, 0);
+    RET(ARG(1) == 0 ? S_OK_ : (uint64_t)(uint32_t)DXGI_ERROR_INVALID_CALL_);
+}
+static void fac_EnumAdapterByGpuPreference(w32 *w) {
+    /* (index, preference, riid, out) */
+    if (ARG(1) != 0) { out_ptr(w, ARG(4), 0); RET((uint64_t)(uint32_t)DXGI_ERROR_NOT_FOUND_); return; }
+    uint64_t a = w32_com_new(w, &cls_adapter, 4);
+    out_ptr(w, ARG(4), a);
+    RET(a ? S_OK_ : (uint64_t)(uint32_t)E_OUTOFMEMORY_);
+}
+static void fac_RegisterAdaptersChangedEvent(w32 *w) { if (ARG(2) && w32_mem_ok(w, ARG(2), 4)) w32_write(w, ARG(2), 4, 1); RET(S_OK_); }
+static void fac_UnregisterAdaptersChangedEvent(w32 *w) { (void)w; RET(S_OK_); }
 
 /* D3D11CreateDevice(adapter, driverType, software, flags, featureLevels,
  *                   numFeatureLevels, sdkVersion, ppDevice, pFeatureLevel,

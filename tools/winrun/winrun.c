@@ -675,9 +675,20 @@ static void note_unimplemented(w32 *w, const char *name) {
  * arguments, no formatting until a report is written, so it costs a few
  * stores per call. */
 enum { TRACE_N = 48 };
-typedef struct { const char *dll, *name; uint64_t a[4]; int missing; } trace_ent;
+typedef struct { const char *dll, *name; uint64_t a[4]; int missing; char str[48]; } trace_ent;
 static trace_ent g_trace[TRACE_N];
 static unsigned g_trace_n;
+/* For the calls whose one interesting argument is a string -- which library,
+ * which function -- the report is worth nothing without it, so the string is
+ * copied at call time. Everything else keeps its four raw arguments. */
+static void trace_string(w32 *w, trace_ent *t, uint64_t p, int wide) {
+    t->str[0] = 0;
+    if (!p || (p >> 16) == 0) return;                 /* an ordinal, or nothing */
+    if (wide) { w32_wtoa(w, p, t->str, sizeof t->str); return; }
+    size_t n = 0;
+    while (n + 1 < sizeof t->str && w32_mem_ok(w, p + n, 1)) { char c = (char)w32_read(w, p + n, 1); if (!c) break; t->str[n++] = c; }
+    t->str[n] = 0;
+}
 static void trace_call(w32 *w, int i) {
     trace_ent *t = &g_trace[g_trace_n++ % TRACE_N];
     const w32_api *api = w->stubs[i].api;
@@ -685,6 +696,12 @@ static void trace_call(w32 *w, int i) {
     t->name = api ? api->name : (w->stubs[i].missing ? w->stubs[i].missing : "?");
     t->missing = !api;
     for (int k = 0; k < 4; k++) t->a[k] = w32_arg(w, k);
+    t->str[0] = 0;
+    if (api && api->name) {
+        if (!strcmp(api->name, "GetProcAddress")) trace_string(w, t, t->a[1], 0);
+        else if (!strncmp(api->name, "LoadLibrary", 11)) trace_string(w, t, t->a[0], strchr(api->name, 'W') != 0);
+        else if (!strncmp(api->name, "GetModuleHandle", 15)) trace_string(w, t, t->a[0], strchr(api->name, 'W') != 0);
+    }
 }
 
 static void dispatch_inner(w32 *w, int i);
@@ -1638,8 +1655,9 @@ int w32_crash_report(w32 *w, char *out, size_t out_len) {
         unsigned from = g_trace_n > TRACE_N ? g_trace_n - TRACE_N : 0;
         for (unsigned k = from; k < g_trace_n; k++) {
             const trace_ent *t = &g_trace[k % TRACE_N];
-            P("    %s%s%s(%#llx, %#llx, %#llx, %#llx)%s\n", t->dll && !t->missing ? t->dll : "", t->dll && !t->missing ? "!" : "",
+            P("    %s%s%s(%#llx, %#llx, %#llx, %#llx)%s%s%s%s\n", t->dll && !t->missing ? t->dll : "", t->dll && !t->missing ? "!" : "",
               t->name, (unsigned long long)t->a[0], (unsigned long long)t->a[1], (unsigned long long)t->a[2], (unsigned long long)t->a[3],
+              t->str[0] ? "   \"" : "", t->str[0] ? t->str : "", t->str[0] ? "\"" : "",
               t->missing ? "   <- not implemented" : "");
         }
     }
