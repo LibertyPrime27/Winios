@@ -235,9 +235,8 @@ wi_probe_result wi_probe(const char *path) {
         /* Named, so the importer can say why rather than shrug. */
         p.src = WI_SRC_UNKNOWN;
         p.setup = sk_identify(path);
-        snprintf(p.setup.note, sizeof p.setup.note, "%s",
-                 "This is a RAR archive. RAR cannot be unpacked here (its decoder is not free to include); "
-                 "extract it on a computer and import the folder, or repack it as zip or 7z.");
+        p.setup.note = "This is a RAR archive. RAR cannot be unpacked here (its decoder is not free to include); "
+                       "extract it on a computer and import the folder, or repack it as zip or 7z.";
         return p;
     }
 

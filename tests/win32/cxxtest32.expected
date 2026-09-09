@@ -1,0 +1,10 @@
+destroyed depth3
+destroyed depth2
+no throw: 2
+destroyed depth3
+destroyed depth2
+caught: boom
+inner caught 42
+outer caught 42 again
+caught something
+three more, still running

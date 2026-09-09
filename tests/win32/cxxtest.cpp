@@ -1,4 +1,6 @@
 /* C++ exceptions, which on x86-64 Windows are structured exceptions.
+ * (sehtest.c next door is the C-level test of RaiseException and the 32-bit
+ * frame list; this is the 64-bit table-driven path, through a real personality.)
  *
  * A throw is RaiseException with a code of its own; catching it is the
  * dispatcher finding the frame's language handler in the unwind tables,

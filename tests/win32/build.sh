@@ -64,7 +64,7 @@ for a in 32 64; do
     # C++ with a static runtime: the exception personality is in the binary,
     # and on x64 it drives RtlUnwindEx and friends.
     CXX=$(echo "$CC" | sed 's/gcc$/g++/')
-    $CXX -O2 -s -static -o sehtest$a.exe sehtest.cpp
+    $CXX -O2 -s -static -o cxxtest$a.exe cxxtest.cpp
     # threads: CreateThread and the CRT's own, critical sections, events,
     # mutexes, interlocked, TLS. Written so every check is true under every
     # interleaving, so a pass means locking works rather than that the
