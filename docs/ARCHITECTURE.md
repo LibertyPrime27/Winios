@@ -130,6 +130,8 @@ Expect the *graphics path* to be where FO3/NV fail, not the frame rate. Gamebryo
 
 ## 6. Licensing
 
-Boxedwine is **GPL-2.0**; Wine is **LGPL**; DXMT is **LGPL-2.1**. A GPL-2.0 core means this project ships source and cannot go to the App Store — which is consistent with the sideload-plus-LiveContainer target, but it is a decision to make deliberately rather than discover later.
+Winios is **GPL-3.0-or-later**; see [`COPYING.md`](../COPYING.md). Wine is **LGPL**; DXMT is **LGPL-2.1**; FEX-Emu is **MIT**; d12mt is **MIT** — all combinable with it. Shipping source and staying off the App Store is unchanged, and was always the consequence of a copyleft core rather than of which version of it.
+
+This section used to say the project was GPL-2.0 because Boxedwine is. Boxedwine was dropped as the 32-bit plan — see the note at the top of this document — and its code was never in the tree, so that reasoning no longer described anything. Moving to GPL-3.0 additionally resolves a conflict that already existed: SPIRV-Cross, in d12mt's shader pipeline, is Apache-2.0, which GPL-2.0-only does not permit. It is also the prerequisite for combining with Madeira (GPL-3.0).
 
 Note in passing: the App Store app that appears to ship Boxedwine as WebAssembly is closed-source. If it does bundle Boxedwine, that is a GPL-2.0 violation, and the corresponding source is requestable under the licence. That request — not reverse engineering — is the only legitimate route to "building off" it. Everything useful about it is upstream in Boxedwine and in `andrewnakas/exebrowser` (MIT frontend) anyway.

@@ -129,7 +129,15 @@ next report can separate "this machine is slow" from "this emulator is slow".
 
 ## Licensing
 
-The 32-bit engine is built on [Boxedwine](https://github.com/danoon2/Boxedwine) (GPL-2.0). This project is therefore GPL-2.0 and ships source. See `ARCHITECTURE.md` §6.
+**GPL-3.0-or-later** — the full text is in [`LICENSE`](LICENSE), and
+[`COPYING.md`](COPYING.md) says what each component allows.
+
+This used to read GPL-2.0 "because the 32-bit engine is built on Boxedwine". It
+never was: Boxedwine is not in the tree, and the note above says we took the
+idea of a soft MMU and not the code. GPL-3.0 also settles a conflict that was
+already here — d12mt's shader pipeline links SPIRV-Cross, which is Apache-2.0
+and cannot be combined with GPL-2.0-only — and it is what lets Winios be
+combined with Madeira (GPL-3.0). See `ARCHITECTURE.md` §6.
 
 ## Credits
 
