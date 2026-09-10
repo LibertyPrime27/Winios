@@ -934,8 +934,19 @@ static void shade_setup(w32 *w, uint64_t self, shade_state *sh, const dxbc_prog 
         }
         uint64_t smp = w32_com_get(w, self, SMP_F[i]);
         sh->penv.wrap[i] = smp ? (w32_com_get(w, smp, SMP_ADDRU) == 1) : 1;
-        /* D3D11_FILTER: bit 2 set means the magnification filter is linear */
-        sh->penv.linear[i] = smp ? ((w32_com_get(w, smp, SMP_FILTER) & 0x4) != 0) : 0;
+        /* D3D11_FILTER packs three choices: bit 4 is the minification filter,
+         * bit 2 the magnification filter, bit 0 the mip filter. Only bit 2 was
+         * read, so a sampler asking for a linear *minification* -- 0x10, and
+         * 0x11 -- was point-sampled. Minification is where it matters most: a
+         * glyph drawn smaller than it is stored loses whole rows and columns
+         * to point sampling, which is a font with its thin strokes missing.
+         * There are no derivatives here to tell minifying from magnifying, so
+         * either bit asking for linear gets linear. */
+        uint32_t filt = smp ? (uint32_t)w32_com_get(w, smp, SMP_FILTER) : 0;
+        sh->penv.linear[i] = smp ? ((filt & 0x14u) != 0) : 0;
+        if (w->verbose > 1 && sh->penv.tex[i])
+            fprintf(stderr, "winrun: d3d11: slot %d texture %dx%d, filter %#x -> %s\n", i,
+                    sh->penv.tex[i]->w, sh->penv.tex[i]->h, filt, sh->penv.linear[i] ? "linear" : "point");
     }
     sh->vs_pos_out = 0; sh->pos_in = -1; sh->ps_out = 0;
     if (vi) for (int k = 0; k < vi->output.n; k++) if (sig_is_position(&vi->output.e[k])) sh->vs_pos_out = (int)vi->output.e[k].reg;

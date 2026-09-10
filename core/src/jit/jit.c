@@ -1509,10 +1509,13 @@ static void *lookup_compile(xc_cpu *c, uint32_t *site) {
     }
     if (!b->code) {
         b->code = compile(c, b);
-        if (!b->code && g_code_cap - g_code_used < 65536) {   /* code memory full: flush everything, once */
-            xc_cache_flush();
+        if (!b->code && g_code_cap - g_code_used < 65536) {
+            /* The code arena is full. Only the generated code has to go: the
+             * decoded blocks are still valid, and re-decoding them is pure
+             * waste. On a device whose blessed arena is a megabyte this runs
+             * hundreds of times a minute, so the difference is the run. */
+            xc_cache_drop_code();
             site = 0;                                           /* the site's memory went with it */
-            b = xc_cache_lookup(c);
             if (b) b->code = compile(c, b);
         }
         if (!b || !b->code) { if (c->stop == XC_STOP_NONE) c->stop = XC_STOP_UNDEFINED; return 0; }

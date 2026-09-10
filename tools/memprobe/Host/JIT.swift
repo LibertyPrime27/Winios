@@ -96,14 +96,59 @@ enum JIT {
         // later visit there finds it already made rather than making a second.
         var r = jit_result()
         var fresh: Int32 = 0
-        let kb = UserDefaults.standard.object(forKey: "arenaGoodKB") as? Int
-            ?? UserDefaults.standard.object(forKey: "arenaKB") as? Int ?? 1024
+        let kb = nextArenaKB()
         guard let arena = markerPath.withCString({ m in
             jit_arena_shared(size_t(kb * 1024), &r, m, &fresh)
         }) else { return false }
 
         installed = xc_jit_set_code(arena.pointee.rw, arena.pointee.rx,
                                     arena.pointee.size) == 1
+        if installed { arenaWorked(kb) }
         return installed
+    }
+
+    /// The ladder of arena sizes, and how far up it this launch should reach.
+    ///
+    /// One megabyte is not enough to be worth having. The dynarec's code
+    /// arena is a bump allocator: when it fills, everything compiled so far is
+    /// thrown away and compiled again. A GameMaker game measured on an iPad
+    /// filled a 1 MB arena 371 times in seventy seconds and spent most of its
+    /// time recompiling, at under three frames a second. The working set is
+    /// tens of megabytes, so the arena has to be too.
+    ///
+    /// Climbing is safe because of the breadcrumb, which is the same protocol
+    /// the JIT screen uses. The size about to be tried is written down first;
+    /// a launch that finds one still written knows that attempt never came
+    /// back, records the size as the ceiling, and drops to the largest that
+    /// has worked. So the worst a too-large arena costs is one restart, and it
+    /// is never tried twice.
+    private static let arenaLadder = [1024, 4096, 16384, 65536, 262144]   // 1 MB … 256 MB
+
+    private static func nextArenaKB() -> Int {
+        let d = UserDefaults.standard
+        var good = d.object(forKey: "arenaGoodKB") as? Int ?? 0
+        var bad = d.object(forKey: "arenaBadKB") as? Int ?? 0
+        // A size still written down is one whose attempt never finished.
+        let pending = d.object(forKey: "arenaPendingKB") as? Int ?? 0
+        if pending != 0 {
+            if bad == 0 || pending < bad { bad = pending; d.set(bad, forKey: "arenaBadKB") }
+            d.set(0, forKey: "arenaPendingKB")
+        }
+        if good == 0 { good = d.object(forKey: "arenaKB") as? Int ?? 0 }
+        // One rung above the largest that has worked, while the ceiling is
+        // still unknown; otherwise stay where it is known to work.
+        var want = good > 0 ? good : arenaLadder[0]
+        if bad == 0, let next = arenaLadder.first(where: { $0 > want }) { want = next }
+        if bad != 0, want >= bad { want = good > 0 ? good : arenaLadder[0] }
+        d.set(want, forKey: "arenaPendingKB")
+        d.synchronize()          // it has to survive a launch that does not return
+        return want
+    }
+
+    private static func arenaWorked(_ kb: Int) {
+        let d = UserDefaults.standard
+        if (d.object(forKey: "arenaGoodKB") as? Int ?? 0) < kb { d.set(kb, forKey: "arenaGoodKB") }
+        d.set(0, forKey: "arenaPendingKB")
+        d.synchronize()
     }
 }

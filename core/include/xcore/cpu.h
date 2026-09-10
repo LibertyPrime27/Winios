@@ -144,6 +144,11 @@ xc_stop xc_run(xc_cpu *c, uint64_t max_steps);
 void xc_cache_flush(void);
 void xc_cache_invalidate(uint64_t lo, uint64_t hi);
 void xc_cache_stats(uint64_t *hits, uint64_t *builds, uint64_t *flushes, uint64_t *smc);
+uint64_t xc_cache_insn_count(void);          /* instructions decoded over the run */
+uint64_t xc_cache_code_resets(void);         /* times the JIT's code arena filled and was reused */
+/* The JIT's code arena was reset: forget the compiled code, keep the decode. */
+void     xc_cache_drop_code(void);
+const uint64_t *xc_cache_flush_reasons(void);/* [1]=block table [2]=instructions [3]=operands [4]=code bytes */
 
 /* Dynarec (ARM64 hosts). xc_run uses it when available and enabled; set
  * XCORE_JIT=0 in the environment to force the interpreter. */

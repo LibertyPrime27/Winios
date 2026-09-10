@@ -1744,9 +1744,19 @@ int w32_crash_report(w32 *w, char *out, size_t out_len) {
              * holding the program's working set. A run that keeps flushing
              * recompiles everything it just compiled, and that cost does not
              * show up anywhere else. */
-            if (builds) P("    blocks     %llu decoded, %llu cache flush%s, %llu overwritten by the guest\n",
-                          (unsigned long long)builds, (unsigned long long)flushes, flushes == 1 ? "" : "es",
-                          (unsigned long long)smc);
+            if (builds) {
+                static const char *pool[5] = { "", "the block table", "instructions", "operands", "code bytes" };
+                const uint64_t *why = xc_cache_flush_reasons();
+                P("    blocks     %llu decoded (%llu instructions, %.1f per block), %llu cache flush%s, %llu overwritten by the guest\n",
+                  (unsigned long long)builds, (unsigned long long)xc_cache_insn_count(),
+                  (double)xc_cache_insn_count() / (double)builds,
+                  (unsigned long long)flushes, flushes == 1 ? "" : "es", (unsigned long long)smc);
+                for (int q = 1; q <= 4; q++)
+                    if (why[q]) P("               %llu of them because %s ran out\n", (unsigned long long)why[q], pool[q]);
+                if (xc_cache_code_resets())
+                    P("               the JIT's code arena filled %llu times (a bigger blessed arena is the fix)\n",
+                      (unsigned long long)xc_cache_code_resets());
+            }
             const char *cn[6]; uint32_t cc[6];
             int nc = jco ? xc_jit_callout_top(6, cn, cc) : 0;
             if (nc) {

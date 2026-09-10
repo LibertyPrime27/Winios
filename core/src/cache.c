@@ -40,6 +40,9 @@ static uint8_t *g_bytes; static uint32_t g_nbytes;
 static block *g_blocks;         /* open-addressed by rip */
 static uint32_t g_nblocks;
 static uint64_t g_stat_hits, g_stat_builds, g_stat_flushes, g_stat_smc;
+static uint64_t g_flush_why[5];        /* 1 block table, 2 instructions, 3 operands, 4 code bytes */
+static uint64_t g_stat_code_resets;    /* the JIT's code arena filled and was reused */
+static uint64_t g_stat_insns;          /* instructions decoded, for the average block length */
 
 static void cache_init(void) {
     if (g_insns) return;
@@ -54,6 +57,20 @@ void xc_cache_flush(void) {
     memset(g_blocks, 0, sizeof(block) * HASH_SIZE);
     g_ninsns = g_nops = g_nbytes = g_nblocks = 0;
     g_stat_flushes++;
+    xc_jit_code_reset();
+}
+
+/* The generated code is gone (its arena filled and was reset) but what was
+ * decoded is still good. Dropping only the code means the blocks are compiled
+ * again, not decoded again -- and on a device whose blessed JIT arena is a
+ * megabyte, that happens hundreds of times in a minute. */
+void xc_cache_drop_code(void) {
+    if (!g_blocks) return;
+    for (uint32_t i = 0; i < HASH_SIZE; i++) {
+        block *b = &g_blocks[i];
+        b->code = 0; b->warm = 0; b->live_in = 0; b->links = 0;
+    }
+    g_stat_code_resets++;
     xc_jit_code_reset();
 }
 
@@ -89,9 +106,14 @@ static int ends_block(const ZydisDecodedInstruction *in) {
 /* Decode a block starting at rip. Returns NULL (with c->stop set) only if the
  * very first instruction cannot be fetched or decoded. */
 static block *build(xc_cpu *c, uint64_t rip) {
-    if (g_nblocks >= HASH_SIZE * 3 / 4 || g_ninsns + MAX_BLOCK > MAX_INSNS ||
-        g_nops + MAX_BLOCK * ZYDIS_MAX_OPERAND_COUNT > MAX_OPS || g_nbytes + MAX_BLOCK * 15 > MAX_BYTES)
-        xc_cache_flush();
+    /* Which pool ran out is the whole question when a program is thrashing:
+     * they are sized in fixed ratios to each other, and the one that trips
+     * first is the one worth enlarging. */
+    int why = g_nblocks >= HASH_SIZE * 3 / 4 ? 1
+            : g_ninsns + MAX_BLOCK > MAX_INSNS ? 2
+            : g_nops + MAX_BLOCK * ZYDIS_MAX_OPERAND_COUNT > MAX_OPS ? 3
+            : g_nbytes + MAX_BLOCK * 15 > MAX_BYTES ? 4 : 0;
+    if (why) { g_flush_why[why]++; xc_cache_flush(); }
     uint32_t first = g_ninsns, count = 0, bytes = g_nbytes;
     uint64_t at = rip;
     for (; count < MAX_BLOCK; count++) {
@@ -108,7 +130,7 @@ static block *build(xc_cpu *c, uint64_t rip) {
         g_nops += d->in.operand_count;
         memcpy(g_bytes + g_nbytes, xc_mem_ptr(c->mem, at, d->in.length), d->in.length);
         g_nbytes += d->in.length;
-        g_ninsns++;
+        g_ninsns++; g_stat_insns++;
         at += d->in.length;
         if (ends_block(&d->in)) { count++; break; }
     }
@@ -169,6 +191,11 @@ xc_stop xc_run(xc_cpu *c, uint64_t max_steps) {
     return XC_STOP_STEPS;
 }
 
+/* Instructions decoded, and how many flushes each pool caused (index 1..4:
+ * block table, instructions, operands, code bytes). */
+uint64_t xc_cache_insn_count(void) { return g_stat_insns; }
+uint64_t xc_cache_code_resets(void) { return g_stat_code_resets; }
+const uint64_t *xc_cache_flush_reasons(void) { return g_flush_why; }
 void xc_cache_stats(uint64_t *hits, uint64_t *builds, uint64_t *flushes, uint64_t *smc) {
     if (hits) *hits = g_stat_hits;
     if (builds) *builds = g_stat_builds;
