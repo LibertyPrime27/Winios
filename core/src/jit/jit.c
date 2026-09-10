@@ -273,6 +273,9 @@ void xc_jit_x87_stats(uint64_t *native, uint64_t *callout) {
     if (native) *native = g_stat_x87_native;
     if (callout) *callout = g_stat_x87_callout;
 }
+#if !XC_JIT_HOST
+int xc_jit_callout_top(int n, const char **names, uint32_t *counts) { (void)n; (void)names; (void)counts; return 0; }
+#endif
 /* Where the generated code lives (execute side), for crash reports. */
 int xc_jit_code_range(uint64_t *lo, uint64_t *hi) {
 #if XC_JIT_HOST
@@ -314,24 +317,35 @@ static void fpcr_from_mxcsr(const xc_cpu *c) {
 
 /* One instruction through the interpreter. Returns 1 if the block must exit
  * afterwards (stop condition, or RIP left the straight line), else 0. */
+/* Callouts by mnemonic, always counted (one increment per callout, which is
+ * already a C call): a run that ends by the time limit can say what the
+ * dynarec kept handing to the interpreter, which is where its time went. */
 static uint32_t g_callout_hist[ZYDIS_MNEMONIC_MAX_VALUE + 1];
-static void callout_report(void) {
-    int top[12] = {0}; int n = 0;
+int xc_jit_callout_top(int n, const char **names, uint32_t *counts) {
+    int top[12] = {0}; int k = 0;
+    if (n > 12) n = 12;
     for (int m = 0; m <= ZYDIS_MNEMONIC_MAX_VALUE; m++) {
         if (!g_callout_hist[m]) continue;
-        int i = n < 12 ? n++ : 11;
-        if (i == 11 && g_callout_hist[m] <= g_callout_hist[top[11]]) continue;
+        int i = k < n ? k++ : n - 1;
+        if (i == n - 1 && k == n && g_callout_hist[m] <= g_callout_hist[top[n - 1]]) continue;
         top[i] = m;
         for (; i > 0 && g_callout_hist[top[i]] > g_callout_hist[top[i - 1]]; i--) { int t = top[i]; top[i] = top[i - 1]; top[i - 1] = t; }
     }
+    for (int i = 0; i < k; i++) { names[i] = ZydisMnemonicGetString((ZydisMnemonic)top[i]); counts[i] = g_callout_hist[top[i]]; }
+    return k;
+}
+static void callout_report(void) {
+    const char *names[12]; uint32_t counts[12];
+    int n = xc_jit_callout_top(12, names, counts);
     fprintf(stderr, "[jit] callouts by mnemonic:\n");
-    for (int i = 0; i < n; i++) fprintf(stderr, "  %10u  %s\n", g_callout_hist[top[i]], ZydisMnemonicGetString((ZydisMnemonic)top[i]));
+    for (int i = 0; i < n; i++) fprintf(stderr, "  %10u  %s\n", counts[i], names[i]);
 }
 static void x87_materialize(xc_cpu *c);
 static void x87_refresh(xc_cpu *c);
 static int jit_callout(xc_cpu *c, const dinsn *d) {
     g_stat_callouts++;
-    if (g_callout_stats) { if (!g_stat_callouts_reg) { atexit(callout_report); g_stat_callouts_reg = 1; } g_callout_hist[d->in.mnemonic]++; }
+    g_callout_hist[d->in.mnemonic]++;
+    if (g_callout_stats && !g_stat_callouts_reg) { atexit(callout_report); g_stat_callouts_reg = 1; }
     xc_flags_sync(c);
     fold_fpsr(c);
     x87_materialize(c);                     /* registers the JIT holds as doubles -> fpr[] */

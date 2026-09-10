@@ -840,9 +840,15 @@ static int run_loop(w32 *w) {
     xc_cpu *c = w32_cpu(w);
     for (;;) {
         if (w->exited || w32_exiting()) return 0;
-        if (g_stop_request) { w->stop_reason = "stopped by request"; w32_exit(w, 124); return 0; }
-        if (w->deadline_ns && now_ns_host() > w->deadline_ns) {
-            w->stop_reason = "ran past its time limit";
+        if (g_stop_request || (w->deadline_ns && now_ns_host() > w->deadline_ns)) {
+            /* Not a fault, but the same question: where was the program, and
+             * how did it get there. A run that never draws is stuck or slow
+             * somewhere, and the return addresses say where. */
+            w->stop_reason = g_stop_request ? "stopped by request" : "ran past its time limit";
+            char dis[128]; xc_disasm(c, c->rip, dis, sizeof dis);
+            g_why.valid = 1; g_why.code = 0; g_why.rip = c->rip; g_why.has_addr = 0;
+            snprintf(g_why.dis, sizeof g_why.dis, "%s", dis);
+            why_thread(w);
             w32_exit(w, 124); return 0;
         }
         xc_stop st;
@@ -1725,7 +1731,32 @@ int w32_crash_report(w32 *w, char *out, size_t out_len) {
             if (sd || fd) P("    d3d9       %llu draw%s through shaders (%llu triangles), %llu fixed-function\n",
                             (unsigned long long)sd, sd == 1 ? "" : "s", (unsigned long long)st, (unsigned long long)fd);
         }
-        P("    jit        %s\n", xc_jit_enabled() ? "on" : "off (interpreted)");
+        {
+            uint64_t jb = 0, jco = 0, jbytes = 0; xc_jit_stats(&jb, &jco, &jbytes);
+            P("    jit        %s", xc_jit_enabled() ? "on" : "off (interpreted)");
+            if (xc_jit_enabled()) P(", %llu blocks, %llu callouts", (unsigned long long)jb, (unsigned long long)jco);
+            P("\n");
+            /* what the dynarec kept handing to the interpreter: a run that is
+             * slow rather than stuck shows its hot instruction here */
+            const char *cn[6]; uint32_t cc[6];
+            int nc = jco ? xc_jit_callout_top(6, cn, cc) : 0;
+            if (nc) {
+                P("    callouts  ");
+                for (int i = 0; i < nc; i++) P(" %s %u%%", cn[i], (unsigned)(100.0 * cc[i] / (double)jco + 0.5));
+                P("\n");
+            }
+        }
+        {
+            uint64_t ne = w32_exceptions_raised();
+            if (ne) {
+                uint64_t ea = 0; uint32_t ec = w32_last_exception(&ea);
+                P("    seh        %llu exception%s dispatched to the guest, last %s (%#x) at %#llx", (unsigned long long)ne, ne == 1 ? "" : "s",
+                  w32_exception_name(ec), ec, (unsigned long long)ea);
+                for (int m = 0; m < w->nmods; m++)
+                    if (ea >= w->mods[m].base && ea < w->mods[m].base + w->mods[m].size) P(" = %s+%#llx", w->mods[m].name, (unsigned long long)(ea - w->mods[m].base));
+                P("\n");
+            }
+        }
         { int nt = w32_raster_threads(); P("    raster     %d thread%s for shaded pixels\n", nt, nt == 1 ? "" : "s"); }
         {
             uint64_t fr; double fps; w32_frame_stats(&fr, &fps);

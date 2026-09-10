@@ -269,6 +269,10 @@ check cxxtest32.exe 0
 # differently and only checking both proves the answer does not depend on it.
 check threadtest64.exe 0
 check threadtest32.exe 0
+# GameMaker's vector scan, byte for byte: a cursor and an end pointer in
+# stack slots, compared every step. It finished in the interpreter and did
+# not on the iPad, so the time limit is part of the check.
+check scanloop64.exe 0 -- -t 60
 XCORE_JIT=0; export XCORE_JIT
 check threadtest64.exe 0
 check threadtest32.exe 0

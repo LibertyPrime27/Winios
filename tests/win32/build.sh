@@ -76,6 +76,8 @@ for a in 32 64; do
     # interleaving, so a pass means locking works rather than that the
     # scheduler happened to be kind (see the file).
     $CC -O2 -s -o threadtest$a.exe threadtest.c
+    # The data.win reader's scan loop, as the compiler emitted it (x64 only).
+    [ $a = 64 ] && $CC -O2 -s -o scanloop64.exe scanloop.c
     # Not in the suite: the same increment 25000 times with no forced
     # handover. It is how the lost update was found; it is not a test,
     # because a passing run proves nothing.

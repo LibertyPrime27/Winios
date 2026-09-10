@@ -373,6 +373,7 @@ int      w32_raise(w32 *w, uint32_t code, uint32_t flags, uint64_t exc_addr,
 int      w32_fault_to_exception(w32 *w);                    /* a CPU fault, as the exception Windows would raise */
 const char *w32_exception_name(uint32_t code);
 uint32_t w32_last_exception(uint64_t *addr);                /* what ended the run, for the report */
+uint64_t w32_exceptions_raised(void);                       /* how many the guest was handed over the run */
 void     w32_seh_reset(void);
 void     w32_C_specific_handler(w32 *w);
 uint64_t w32_stub_return_addr(w32 *w);                              /* where a w32_call_guest returns to: no module's address */                           /* MSVC's __try/__except language handler, x64 */
