@@ -372,7 +372,33 @@ static void load_row(uint32_t *dst, const uint8_t *src, int n, uint32_t f) {
         else                   for (int x = 0; x < n; x++) dst[x] = 0xFF000000u | ((uint32_t)src[x] << 16);
         break;
     case 2: for (int x = 0; x < n; x++) dst[x] = 0xFF000000u | ((uint32_t)src[2 * x + 1] << 16); break;
-    default: memcpy(dst, src, (size_t)n * 4); break;
+    default:
+        /* Four bytes a pixel, and which byte is which is the whole question.
+         * Our storage is 0xAARRGGBB, so its bytes run B, G, R, A -- which is
+         * what a B8G8R8A8 source already is, and a memcpy is right for it.
+         * An R8G8B8A8 source is the other way round, and copying it puts the
+         * red channel where the blue one is read from: every texture in a
+         * game that uses format 28 comes out with red and blue exchanged.
+         * X8 has no alpha of its own, so it is opaque rather than whatever
+         * byte happened to be there. */
+        switch (f) {
+        case FMT_R8G8B8A8_UNORM: case FMT_R8G8B8A8_UNORM_SRGB: case FMT_R8G8B8A8_UINT:
+            for (int x = 0; x < n; x++) {
+                const uint8_t *p = src + 4 * x;
+                dst[x] = ((uint32_t)p[3] << 24) | ((uint32_t)p[0] << 16)
+                       | ((uint32_t)p[1] << 8)  | (uint32_t)p[2];
+            }
+            break;
+        case FMT_B8G8R8X8_UNORM:
+            for (int x = 0; x < n; x++) {
+                const uint8_t *p = src + 4 * x;
+                dst[x] = 0xFF000000u | ((uint32_t)p[2] << 16)
+                       | ((uint32_t)p[1] << 8) | (uint32_t)p[0];
+            }
+            break;
+        default: memcpy(dst, src, (size_t)n * 4); break;
+        }
+        break;
     }
 }
 
