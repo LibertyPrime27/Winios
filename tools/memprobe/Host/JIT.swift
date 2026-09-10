@@ -135,11 +135,14 @@ enum JIT {
             d.set(0, forKey: "arenaPendingKB")
         }
         if good == 0 { good = d.object(forKey: "arenaKB") as? Int ?? 0 }
-        // One rung above the largest that has worked, while the ceiling is
-        // still unknown; otherwise stay where it is known to work.
-        var want = good > 0 ? good : arenaLadder[0]
-        if bad == 0, let next = arenaLadder.first(where: { $0 > want }) { want = next }
-        if bad != 0, want >= bad { want = good > 0 ? good : arenaLadder[0] }
+        // Ask for the largest rung and come down, rather than creep up from
+        // the bottom. Creeping meant four launches to reach a useful size,
+        // and the first launch after the fix was still only 4 MB -- no help
+        // to anyone. Coming down costs at most one restart per rung that does
+        // not work, and the breadcrumb makes sure each is tried once.
+        var want = arenaLadder[arenaLadder.count - 1]
+        if bad != 0 { want = arenaLadder.last(where: { $0 < bad }) ?? arenaLadder[0] }
+        if want < good { want = good }
         d.set(want, forKey: "arenaPendingKB")
         d.synchronize()          // it has to survive a launch that does not return
         return want

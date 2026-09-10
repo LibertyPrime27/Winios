@@ -95,6 +95,10 @@ enum {
     FMT_R16_UINT           = 57,
     FMT_R32_UINT           = 42,
     FMT_R8_UNORM           = 61,
+    FMT_A8_UNORM           = 65,
+    FMT_BC1_UNORM          = 71,
+    FMT_BC2_UNORM          = 74,
+    FMT_BC3_UNORM          = 77,
 };
 
 static int format_bytes(uint32_t f) {
@@ -302,6 +306,76 @@ static int out_ptr(w32 *w, uint64_t out, uint64_t obj) {
 
 /* A texture's pixels live in guest memory: the program may Map it and write
  * to it directly, and a copy on our side would then be stale. */
+/* A texture's pixels are kept as 0xAARRGGBB whatever the guest asked for, so
+ * loading one means knowing how wide its source pixels are. 0 means the
+ * format is not understood here at all -- and reinterpreting somebody else's
+ * bytes as ours is how a font page turns into blocks, so an unknown one is
+ * reported rather than guessed at. */
+static int fmt_bytes(uint32_t f) {
+    switch (f) {
+    case FMT_R8G8B8A8_UNORM: case FMT_R8G8B8A8_UNORM_SRGB: case FMT_R8G8B8A8_UINT:
+    case FMT_B8G8R8A8_UNORM: case FMT_B8G8R8X8_UNORM:
+    case FMT_R32_FLOAT: case FMT_R32_UINT: case FMT_UNKNOWN: return 4;
+    case FMT_R8_UNORM: case FMT_A8_UNORM: return 1;
+    case FMT_R16_UINT: return 2;
+    default: return 0;
+    }
+}
+/* Which formats a run actually met, so a texture that came out wrong can be
+ * named in the report instead of found by guessing. */
+static struct { uint32_t fmt; uint32_t n; } g_fmt_seen[16];
+static void note_format(uint32_t f) {
+    for (int i = 0; i < 16; i++) {
+        if (g_fmt_seen[i].n && g_fmt_seen[i].fmt != f) continue;
+        g_fmt_seen[i].fmt = f; g_fmt_seen[i].n++; return;
+    }
+}
+int w32_d3d11_formats(uint32_t *fmt, uint32_t *count, int max) {
+    int n = 0;
+    for (int i = 0; i < 16 && n < max; i++) if (g_fmt_seen[i].n) { fmt[n] = g_fmt_seen[i].fmt; count[n] = g_fmt_seen[i].n; n++; }
+    return n;
+}
+
+/* WINRUN_TEXTURE_PPM=<prefix>: every texture that gets pixels is written out
+ * as <prefix>NNN.ppm. Looking at the font page settles in one go what no
+ * amount of reading the sampler can: whether what we hold is right. */
+static void dump_texture(w32 *w, uint64_t tex) {
+    const char *pre = getenv("WINRUN_TEXTURE_PPM");
+    if (!pre) return;
+    static int n;
+    int tw = (int)w32_com_get(w, tex, TEX_W), th = (int)w32_com_get(w, tex, TEX_H);
+    int pitch = (int)(w32_com_get(w, tex, TEX_PITCH) / 4);
+    const uint32_t *px = W32P(w, w32_com_get(w, tex, TEX_PIXELS));
+    if (!px || tw <= 0 || th <= 0) return;
+    char path[512];
+    snprintf(path, sizeof path, "%s%03d_%dx%d_fmt%u.ppm", pre, n++, tw, th, (unsigned)w32_com_get(w, tex, TEX_FMT));
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fprintf(f, "P6\n%d %d\n255\n", tw, th);
+    for (int y = 0; y < th; y++) for (int x = 0; x < tw; x++) {
+        uint32_t c = px[(size_t)y * pitch + x];
+        uint8_t rgb[3] = { (uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c };
+        fwrite(rgb, 1, 3, f);
+    }
+    fclose(f);
+}
+
+/* One row of guest pixels into the texture's own storage. */
+static void load_row(uint32_t *dst, const uint8_t *src, int n, uint32_t f) {
+    switch (fmt_bytes(f)) {
+    case 1:
+        /* A single channel. A8 is coverage with no colour of its own, which
+         * is how a font page is stored; R8 is a red channel a shader reads
+         * as .r. Either way the other channels are what the format says they
+         * are, not a copy of somebody else's bytes. */
+        if (f == FMT_A8_UNORM) for (int x = 0; x < n; x++) dst[x] = (uint32_t)src[x] << 24;
+        else                   for (int x = 0; x < n; x++) dst[x] = 0xFF000000u | ((uint32_t)src[x] << 16);
+        break;
+    case 2: for (int x = 0; x < n; x++) dst[x] = 0xFF000000u | ((uint32_t)src[2 * x + 1] << 16); break;
+    default: memcpy(dst, src, (size_t)n * 4); break;
+    }
+}
+
 static uint64_t make_texture(w32 *w, int width, int height, uint32_t fmt,
                              uint32_t bind, uint32_t usage) {
     if (width <= 0 || height <= 0 || (int64_t)width * height > 64 * 1024 * 1024) return 0;
@@ -315,6 +389,7 @@ static uint64_t make_texture(w32 *w, int width, int height, uint32_t fmt,
     w32_com_set(w, obj, TEX_PITCH, (uint64_t)width * 4);
     w32_com_set(w, obj, TEX_PIXELS, px);
     w32_com_set(w, obj, TEX_FMT, fmt);
+    note_format(fmt);
     w32_com_set(w, obj, TEX_BIND, bind);
     w32_com_set(w, obj, TEX_USAGE, usage);
     w32_com_set(w, obj, TEX_CAP, bytes);
@@ -419,17 +494,25 @@ static void dev_CreateTexture2D(w32 *w) {
         if (src) {
             uint64_t dst = w32_com_get(w, obj, TEX_PIXELS);
             uint32_t dst_pitch = (uint32_t)w32_com_get(w, obj, TEX_PITCH);
-            if (!src_pitch) src_pitch = dst_pitch;
-            uint32_t n = dst_pitch < src_pitch ? dst_pitch : src_pitch;
+            int sbpp = fmt_bytes(fmt) ? fmt_bytes(fmt) : 4;
+            if (!src_pitch) src_pitch = (uint32_t)width * (uint32_t)sbpp;
+            uint32_t n = (uint32_t)width;                      /* pixels a row, not bytes */
+            if (src_pitch / (uint32_t)sbpp < n) n = src_pitch / (uint32_t)sbpp;
             /* Every row but the last spans a whole pitch, so the span the
              * copy touches is pitch * (height - 1) + n. In 64-bit
              * arithmetic: a SysMemPitch near 2^32 multiplied out in 32 bits
              * wraps to something small and would sail through the check. */
-            const uint8_t *sp = W32PN(w, src, (uint64_t)src_pitch * (uint64_t)(height - 1) + n);
+            const uint8_t *sp = W32PN(w, src, (uint64_t)src_pitch * (uint64_t)(height - 1) + (uint64_t)n * (uint64_t)sbpp);
             if (!sp) { out_ptr(w, out, 0); RET((uint64_t)(uint32_t)E_INVALIDARG_); return; }
             for (int y = 0; y < height; y++)
-                memcpy((uint8_t *)W32P(w, dst) + (size_t)y * dst_pitch,
-                       sp + (size_t)y * src_pitch, n);
+                load_row((uint32_t *)((uint8_t *)W32P(w, dst) + (size_t)y * dst_pitch),
+                         sp + (size_t)y * src_pitch, (int)n, fmt);
+            if (!fmt_bytes(fmt)) {
+                static char msg[96];
+                snprintf(msg, sizeof msg, "d3d11: pixels in DXGI format %u are not decoded (kept as raw bytes)", fmt);
+                w32_note_refused(w, msg);
+            }
+            dump_texture(w, obj);
         }
     }
     out_ptr(w, out, obj);
@@ -739,16 +822,22 @@ static void ctx_UpdateSubresource(w32 *w) {
     } else if (tag == TAG_D11_TEXTURE) {
         uint64_t dst = w32_com_get(w, res, TEX_PIXELS);
         uint32_t dpitch = (uint32_t)w32_com_get(w, res, TEX_PITCH);
-        int h = (int)w32_com_get(w, res, TEX_H);
-        if (!row_pitch) row_pitch = dpitch;
-        uint32_t n = dpitch < row_pitch ? dpitch : row_pitch;
+        int h = (int)w32_com_get(w, res, TEX_H), tw = (int)w32_com_get(w, res, TEX_W);
+        uint32_t f = (uint32_t)w32_com_get(w, res, TEX_FMT);
+        int sbpp = fmt_bytes(f) ? fmt_bytes(f) : 4;
+        if (!row_pitch) row_pitch = (uint32_t)tw * (uint32_t)sbpp;
+        uint32_t n = (uint32_t)tw;                            /* pixels a row */
+        if (row_pitch / (uint32_t)sbpp < n) n = row_pitch / (uint32_t)sbpp;
         /* The source is h rows a row_pitch apart, of which only the last is
          * shorter than a pitch. UpdateSubresource returns void, so a source
          * that is not there can only be dropped -- there is no status word
          * for the caller to read. */
-        const uint8_t *sp = h > 0 ? W32PN(w, src, (uint64_t)row_pitch * (uint64_t)(h - 1) + n) : 0;
-        if (dst && sp) for (int y = 0; y < h; y++)
-            memcpy((uint8_t *)W32P(w, dst) + (size_t)y * dpitch, sp + (size_t)y * row_pitch, n);
+        const uint8_t *sp = h > 0 ? W32PN(w, src, (uint64_t)row_pitch * (uint64_t)(h - 1) + (uint64_t)n * (uint64_t)sbpp) : 0;
+        if (dst && sp) {
+            for (int y = 0; y < h; y++)
+                load_row((uint32_t *)((uint8_t *)W32P(w, dst) + (size_t)y * dpitch), sp + (size_t)y * row_pitch, (int)n, f);
+            dump_texture(w, res);
+        }
     }
     RET(0);
 }

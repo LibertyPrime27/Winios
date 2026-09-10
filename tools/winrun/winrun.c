@@ -1719,6 +1719,15 @@ int w32_crash_report(w32 *w, char *out, size_t out_len) {
         P("\n  subsystems:\n");
         P("    audio      %s, %d sound source%s, %d WASAPI stream%s\n", w32_audio_device_on() ? "device open" : "no device (silent)", ns, ns == 1 ? "" : "s", nw, nw == 1 ? "" : "s");
         P("    dinput     %d device%s created\n", nd, nd == 1 ? "" : "s");
+        {
+            uint32_t fm[16], fc[16];
+            int nf = w32_d3d11_formats(fm, fc, 16);
+            if (nf) {
+                P("    textures  ");
+                for (int q = 0; q < nf; q++) P(" %u x DXGI %u", fc[q], fm[q]);
+                P("\n");
+            }
+        }
         /* every image in the process, so a module handle in the calls above
          * can be named from this block alone */
         P("    modules   ");
@@ -1734,6 +1743,12 @@ int w32_crash_report(w32 *w, char *out, size_t out_len) {
         {
             uint64_t jb = 0, jco = 0, jbytes = 0; xc_jit_stats(&jb, &jco, &jbytes);
             P("    jit        %s", xc_jit_enabled() ? "on" : "off (interpreted)");
+            {   /* the size of the arena the host blessed: when it is small,
+                 * everything compiled is thrown away and compiled again, and
+                 * that is the whole performance story on a device */
+                uint64_t lo = 0, hi = 0;
+                if (xc_jit_code_range(&lo, &hi) && hi > lo) P(", %llu MB arena", (unsigned long long)((hi - lo) >> 20));
+            }
             if (xc_jit_enabled()) P(", %llu blocks, %llu callouts", (unsigned long long)jb, (unsigned long long)jco);
             P("\n");
             /* what the dynarec kept handing to the interpreter: a run that is

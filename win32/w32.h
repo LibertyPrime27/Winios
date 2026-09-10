@@ -627,6 +627,10 @@ void w32_client_size(int *cw, int *ch);
  * ResizeBuffers against the swap chain's output window. 0 if there is no
  * such window. */
 int  w32_window_client_size(uint64_t hwnd, int *cw, int *ch);
+/* The DXGI formats this run's textures were created in, and how many of each:
+ * a texture kept in a format nothing decodes is drawn as raw bytes, and that
+ * is worth naming rather than looking at. */
+int  w32_d3d11_formats(uint32_t *fmt, uint32_t *count, int max);
 int  w32_has_window(void);                         /* has the guest made one yet? */
 /* Whether the guest wants a pointer drawn, and where it thinks it is. A game
  * hides the cursor to say "I am doing mouselook now", which is exactly when a
