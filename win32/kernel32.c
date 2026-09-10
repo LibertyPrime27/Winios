@@ -2364,18 +2364,33 @@ static void k_K32GetProcessMemoryInfo(w32 *w) {
     RET(1);
 }
 static void k_FreeLibraryAndExitThread(w32 *w) { w32_thread_exit_self(w, (uint32_t)ARG(1)); }
-/* Waitable timers: a timer object that a wait can block on. Built on the
- * event machinery, because that is what one is. */
-static void k_CreateWaitableTimerW(w32 *w) { RET(w32_make_event(w, 1, 0)); }
-static void k_CreateWaitableTimerA(w32 *w) { RET(w32_make_event(w, 1, 0)); }
-static void k_CreateWaitableTimerExW(w32 *w) { RET(w32_make_event(w, 1, 0)); }
+/* Waitable timers: a timer object a wait blocks on until its due time.
+ *
+ * SetWaitableTimer(hTimer, pDueTime, lPeriod, completion, arg, fResume). The
+ * due time is a LARGE_INTEGER: negative is relative, in 100 ns units;
+ * positive is an absolute FILETIME. The delay is the whole content of the
+ * call -- a game paces its frames on one of these, and firing it immediately
+ * turns the frame loop into a spinner which, with one guest thread running at
+ * a time, starves the thread doing the work. That is what kept GameMaker's
+ * runner on a black screen. The completion APC is not run: nothing here
+ * delivers APCs, and a program that wanted one would be waiting alertably. */
+static void k_CreateWaitableTimerW(w32 *w) { RET(w32_make_timer(w, (int)ARG(1))); }
+static void k_CreateWaitableTimerA(w32 *w) { RET(w32_make_timer(w, (int)ARG(1))); }
+/* (attrs, name, flags, access): CREATE_WAITABLE_TIMER_MANUAL_RESET is 1 */
+static void k_CreateWaitableTimerExW(w32 *w) { RET(w32_make_timer(w, (int)(ARG(2) & 1))); }
 static void k_SetWaitableTimer(w32 *w) {
-    /* A due time in the past, or none, means signalled now -- which is the
-     * only case that matters here, because nothing else is going to fire it. */
-    w32_set_event(w, ARG(0), 1);
+    if (!ARG(1) || !w32_mem_ok(w, ARG(1), 8)) { w32_set_last_error(w, ERROR_NOACCESS); RET(0); return; }
+    int64_t due = (int64_t)w32_read(w, ARG(1), 8);
+    uint64_t delay_ms;
+    if (due < 0) delay_ms = (uint64_t)(-due) / 10000ull;              /* relative, 100 ns units */
+    else {                                                            /* absolute: how far ahead it is */
+        uint64_t nowft = filetime_now();
+        delay_ms = (uint64_t)due > nowft ? ((uint64_t)due - nowft) / 10000ull : 0;
+    }
+    w32_timer_set(w, ARG(0), delay_ms, (uint32_t)ARG(2));
     RET(1);
 }
-static void k_CancelWaitableTimer(w32 *w) { w32_set_event(w, ARG(0), 0); RET(1); }
+static void k_CancelWaitableTimer(w32 *w) { w32_timer_cancel(w, ARG(0)); RET(1); }
 static void k_CreateEventExA(w32 *w) {
     /* (attrs, name, flags, access): CREATE_EVENT_MANUAL_RESET is 1 and
      * CREATE_EVENT_INITIAL_SET is 2 -- not the same bits as CreateEvent's

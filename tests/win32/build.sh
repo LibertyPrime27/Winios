@@ -78,6 +78,8 @@ for a in 32 64; do
     $CC -O2 -s -o threadtest$a.exe threadtest.c
     # The data.win reader's scan loop, as the compiler emitted it (x64 only).
     [ $a = 64 ] && $CC -O2 -s -o scanloop64.exe scanloop.c
+    # Waitable timers: a wait on one has to block until the timer is due.
+    $CC -O2 -s -o timertest$a.exe timertest.c
     # Not in the suite: the same increment 25000 times with no forced
     # handover. It is how the lost update was found; it is not a test,
     # because a passing run proves nothing.

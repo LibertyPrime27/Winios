@@ -273,6 +273,11 @@ check threadtest32.exe 0
 # stack slots, compared every step. It finished in the interpreter and did
 # not on the iPad, so the time limit is part of the check.
 check scanloop64.exe 0 -- -t 60
+# Waitable timers. Every check is one-sided -- a wait may be late, never
+# early -- and the elapsed time is measured, not assumed, so a slow or busy
+# machine cannot fail it. A timer that fires the moment it is set does.
+checkrc timertest64.exe 0 "0 failures"
+checkrc timertest32.exe 0 "0 failures"
 XCORE_JIT=0; export XCORE_JIT
 check threadtest64.exe 0
 check threadtest32.exe 0

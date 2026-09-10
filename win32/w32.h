@@ -116,7 +116,8 @@ typedef struct {
 
 typedef enum { H_NONE = 0, H_FILE, H_PROCESS, H_THREAD, H_HEAP, H_EVENT, H_MUTEX,
                H_FIND,        /* a directory walk: FindFirstFile/FindNextFile */
-               H_MAPPING      /* a file mapping: CreateFileMapping/MapViewOfFile */
+               H_MAPPING,     /* a file mapping: CreateFileMapping/MapViewOfFile */
+               H_TIMER        /* a waitable timer: ready once its due time passes */
              } w32_htype;
 /* `p` and `u1`/`u2` are for the handle kinds that need more than a descriptor:
  * a directory walk carries its DIR* and the pattern it is matching, a mapping
@@ -573,6 +574,11 @@ uint64_t  w32_resource_data(w32 *w, uint64_t hrsrc, uint32_t *size);
 int       w32_cond_sleep(w32 *w, uint64_t cv, uint64_t lock, uint32_t ms, int srw);
 uint64_t  w32_make_event(w32 *w, int manual, int set);
 void      w32_set_event(w32 *w, uint64_t h, int on);
+/* Waitable timers. `delay_ms` is measured from now; `period_ms` 0 is one-shot.
+ * A wait on one blocks until it is due, which is the point of it. */
+uint64_t  w32_make_timer(w32 *w, int manual);
+void      w32_timer_set(w32 *w, uint64_t h, uint64_t delay_ms, uint32_t period_ms);
+void      w32_timer_cancel(w32 *w, uint64_t h);
 void      w32_thread_exit_self(w32 *w, uint32_t code);
 /* kernel32.c: a string out of the RT_STRING blocks, for user32's LoadString */
 int       w32_load_string(w32 *w, uint64_t inst, uint32_t id, char *out, size_t cap);
