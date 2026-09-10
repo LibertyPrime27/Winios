@@ -322,6 +322,48 @@ int main(void) {
     ID3D11DeviceContext_Draw(ctx, 4, 0);
     ok(1, "Draw a gouraud strip");
 
+    /* The same picture again, declared the other way round.
+     *
+     * The checker above is B8G8R8A8; this one is R8G8B8A8, and its words are
+     * byte-reversed to match, so the two textures hold the identical four
+     * colours -- red, green, blue, white. A backend that copies a texture in
+     * without looking at its format gets one of the two right and exchanges
+     * red and blue in the other, which is what every page of a game that
+     * uses format 28 was doing. Drawn along the bottom, so the frame
+     * checksum covers it: red and blue swapped here is a different frame. */
+    unsigned pixels_rgba[4] = { 0xFF0000FFu, 0xFF00FF00u, 0xFFFF0000u, 0xFFFFFFFFu };
+    D3D11_TEXTURE2D_DESC td2 = td;
+    td2.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    D3D11_SUBRESOURCE_DATA init2;
+    init2.pSysMem = pixels_rgba;
+    init2.SysMemPitch = 8;
+    init2.SysMemSlicePitch = 0;
+    ID3D11Texture2D *tex2 = NULL;
+    hr = ID3D11Device_CreateTexture2D(dev, &td2, &init2, &tex2);
+    ok(SUCCEEDED(hr) && tex2 != NULL, "CreateTexture2D in R8G8B8A8");
+
+    ID3D11ShaderResourceView *srv2 = NULL;
+    hr = ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)tex2, NULL, &srv2);
+    ok(SUCCEEDED(hr) && srv2 != NULL, "a view onto it");
+
+    struct vertex band[4] = {
+        { -0.9f, -0.55f, 0.0f, 0.0f, 0.0f, 255, 255, 255, 255 },
+        {  0.9f, -0.55f, 0.0f, 1.0f, 0.0f, 255, 255, 255, 255 },
+        { -0.9f, -0.95f, 0.0f, 0.0f, 1.0f, 255, 255, 255, 255 },
+        {  0.9f, -0.95f, 0.0f, 1.0f, 1.0f, 255, 255, 255, 255 },
+    };
+    D3D11_SUBRESOURCE_DATA binit;
+    binit.pSysMem = band;
+    binit.SysMemPitch = 0;
+    binit.SysMemSlicePitch = 0;
+    ID3D11Buffer *vb3 = NULL;
+    hr = ID3D11Device_CreateBuffer(dev, &vbd, &binit, &vb3);
+    ok(SUCCEEDED(hr) && vb3 != NULL, "a vertex buffer for the band");
+    ID3D11DeviceContext_IASetVertexBuffers(ctx, 0, 1, &vb3, &stride, &offset);
+    ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &srv2);
+    ID3D11DeviceContext_Draw(ctx, 4, 0);
+    ok(1, "Draw the R8G8B8A8 checker");
+
     /* Map, which is how a dynamic buffer is filled every frame. */
     D3D11_MAPPED_SUBRESOURCE mapped;
     memset(&mapped, 0, sizeof mapped);

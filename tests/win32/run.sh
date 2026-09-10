@@ -153,8 +153,8 @@ check inputtest32.exe 0 6 -- -input inputtest.script
 # register dump whose addresses move with the allocator.
 checkrc d11test64.exe 0 "0 failures"
 checkrc d11test32.exe 0 "0 failures"
-checkframe d11test64.exe 320x200 311139ad
-checkframe d11test32.exe 320x200 311139ad
+checkframe d11test64.exe 320x200 e57f3e33
+checkframe d11test32.exe 320x200 e57f3e33
 # Everything a modern game engine links against.
 #
 # A GameMaker game resolved 232 imports and was missing 114, across nineteen
@@ -193,7 +193,9 @@ for b in 64 32; do
     else echo "FAIL keepgoing$b.exe without -k exited $rcs, want 127"; fail=1; fi
 
     outk=$($emu "$winrun" -k "./keepgoing$b.exe" 2>&1); rck=$?
-    missing=$(printf '%s\n' "$outk" | grep -c 'user32.dll!\(SwitchDesktop\|LockWorkStation\|CreateDesktopW\)')
+    # counted in the "called but not implemented" list only ("N x  name"): the
+    # calls window above it now reaches back far enough to show them too
+    missing=$(printf '%s\n' "$outk" | grep -c '^ *[0-9][0-9]* x  user32.dll!\(SwitchDesktop\|LockWorkStation\|CreateDesktopW\)')
     if [ "$rck" = "0" ] && [ "$missing" = "3" ] && printf '%s\n' "$outk" | grep -q '0 failures'; then
         echo "ok   keepgoing$b.exe -k names all three and the guest survives the answers"
     else
@@ -267,6 +269,15 @@ check cxxtest32.exe 0
 # differently and only checking both proves the answer does not depend on it.
 check threadtest64.exe 0
 check threadtest32.exe 0
+# GameMaker's vector scan, byte for byte: a cursor and an end pointer in
+# stack slots, compared every step. It finished in the interpreter and did
+# not on the iPad, so the time limit is part of the check.
+check scanloop64.exe 0 -- -t 60
+# Waitable timers. Every check is one-sided -- a wait may be late, never
+# early -- and the elapsed time is measured, not assumed, so a slow or busy
+# machine cannot fail it. A timer that fires the moment it is set does.
+checkrc timertest64.exe 0 "0 failures"
+checkrc timertest32.exe 0 "0 failures"
 XCORE_JIT=0; export XCORE_JIT
 check threadtest64.exe 0
 check threadtest32.exe 0

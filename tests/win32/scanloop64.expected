@@ -1,0 +1,3 @@
+vector: 3000 slots, 2000 objects, keys 0..149 of kind 0 present once each
+lookups: 189, hits 150 (want 150), misses 39 (want 39), return codes right: 189 of 189
+every hit wrote its result into the right object: yes (150)

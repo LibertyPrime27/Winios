@@ -143,7 +143,13 @@ static int g_cur_stub = -1;            /* the API being executed, for the messag
 /* Why the run stopped, kept for the end of the report. The line that says so
  * is printed to stderr when it happens, but the device shows the tail of a
  * long log, so the same facts go at the end where they will be seen. */
-static struct { int valid, has_addr; uint32_t code; uint64_t rip, addr; char dis[128]; } g_why;
+static struct { int valid, has_addr; uint32_t code; uint64_t rip, addr; char dis[128];
+                uint32_t tid; uint64_t thread_entry; uint64_t gpr[16]; } g_why;
+static void why_thread(w32 *w) {
+    w32_thread *t = w32_self();
+    g_why.tid = t->id; g_why.thread_entry = t->entry;
+    memcpy(g_why.gpr, w32_cpu(w)->gpr, sizeof g_why.gpr);
+}
 static void note_bad_pointer(w32 *w, uint64_t addr, uint64_t len, const char *what) {
     static uint64_t seen[16];
     static int n;
@@ -684,8 +690,8 @@ static void note_unimplemented(w32 *w, const char *name) {
  * RtlAllocateHeap, then ..." says what the program was doing. Names and four
  * arguments, no formatting until a report is written, so it costs a few
  * stores per call. */
-enum { TRACE_N = 48 };
-typedef struct { const char *dll, *name; uint64_t a[4]; int missing, has_ret; uint64_t ret; char str[48]; } trace_ent;
+enum { TRACE_N = 256, TRACE_SHOW = 48 };
+typedef struct { const char *dll, *name; uint64_t a[4]; int missing, has_ret; uint64_t ret; uint32_t tid; char str[48]; } trace_ent;
 static trace_ent g_trace[TRACE_N];
 static unsigned g_trace_n;
 /* For the calls whose one interesting argument is a string -- which library,
@@ -705,7 +711,7 @@ static void trace_call(w32 *w, int i) {
     t->dll = w->stubs[i].dll ? w->stubs[i].dll->name : 0;
     t->name = api ? api->name : (w->stubs[i].missing ? w->stubs[i].missing : "?");
     t->missing = !api;
-    t->has_ret = 0; t->ret = 0;
+    t->has_ret = 0; t->ret = 0; t->tid = w32_self()->id;
     for (int k = 0; k < 4; k++) t->a[k] = w32_arg(w, k);
     t->str[0] = 0;
     if (api && api->name) {
@@ -834,9 +840,15 @@ static int run_loop(w32 *w) {
     xc_cpu *c = w32_cpu(w);
     for (;;) {
         if (w->exited || w32_exiting()) return 0;
-        if (g_stop_request) { w->stop_reason = "stopped by request"; w32_exit(w, 124); return 0; }
-        if (w->deadline_ns && now_ns_host() > w->deadline_ns) {
-            w->stop_reason = "ran past its time limit";
+        if (g_stop_request || (w->deadline_ns && now_ns_host() > w->deadline_ns)) {
+            /* Not a fault, but the same question: where was the program, and
+             * how did it get there. A run that never draws is stuck or slow
+             * somewhere, and the return addresses say where. */
+            w->stop_reason = g_stop_request ? "stopped by request" : "ran past its time limit";
+            char dis[128]; xc_disasm(c, c->rip, dis, sizeof dis);
+            g_why.valid = 1; g_why.code = 0; g_why.rip = c->rip; g_why.has_addr = 0;
+            snprintf(g_why.dis, sizeof g_why.dis, "%s", dis);
+            why_thread(w);
             w32_exit(w, 124); return 0;
         }
         xc_stop st;
@@ -883,6 +895,7 @@ static int run_loop(w32 *w) {
             g_why.valid = 1; g_why.code = code; g_why.rip = at; g_why.addr = kind == XC_STOP_FAULT && c->fault_kind == XC_FAULT_MEM ? addr : 0;
             g_why.has_addr = kind == XC_STOP_FAULT && c->fault_kind == XC_FAULT_MEM;
             snprintf(g_why.dis, sizeof g_why.dis, "%s", dis);
+            why_thread(w);
             fprintf(stderr, "winrun: unhandled %s (%#x) at rip=%#llx  [%s]",
                     w32_exception_name(code), code, (unsigned long long)at, dis);
             if (kind == XC_STOP_FAULT && c->fault_kind == XC_FAULT_MEM)
@@ -894,6 +907,7 @@ static int run_loop(w32 *w) {
         char dis[128]; xc_disasm(c, c->rip, dis, sizeof dis);
         g_why.valid = 1; g_why.code = 0; g_why.rip = c->rip; g_why.has_addr = 0;
         snprintf(g_why.dis, sizeof g_why.dis, "%s", dis);
+        why_thread(w);
         fprintf(stderr, "winrun: stopped: %s at rip=%#llx  [%s]", xc_stop_name(st), (unsigned long long)c->rip, dis);
         fprintf(stderr, "\n");
         w32_exit(w, 125); return 0;
@@ -1671,15 +1685,33 @@ int w32_crash_report(w32 *w, char *out, size_t out_len) {
               (unsigned long long)(c->rip - w->mods[i].base));
 
     if (g_trace_n) {
-        P("\n  last calls into the API layer (oldest first):\n");
+        /* The last calls, each with what it returned. A run of the same
+         * function -- a lock taken and released a hundred times, a timer
+         * read in a loop -- is one line with a count, so the window shows
+         * what the program did rather than how often it locked. The ring
+         * holds 256 calls; 48 lines are printed, from the newest back. */
+        P("\n  last calls into the API layer (oldest first, each with its result):\n");
         unsigned from = g_trace_n > TRACE_N ? g_trace_n - TRACE_N : 0;
-        for (unsigned k = from; k < g_trace_n; k++) {
+        /* find where to start so that at most TRACE_SHOW lines come out */
+        unsigned start = g_trace_n, lines = 0;
+        while (start > from && lines < TRACE_SHOW) {
+            unsigned k = start - 1;
             const trace_ent *t = &g_trace[k % TRACE_N];
+            while (k > from && g_trace[(k - 1) % TRACE_N].name == t->name) k--;
+            start = k; lines++;
+        }
+        for (unsigned k = start; k < g_trace_n;) {
+            const trace_ent *t = &g_trace[k % TRACE_N];
+            unsigned run = 1;                        /* not `n`: that is the report's own write offset */
+            while (k + run < g_trace_n && g_trace[(k + run) % TRACE_N].name == t->name) run++;
+            const trace_ent *last = &g_trace[(k + run - 1) % TRACE_N];
             P("    %s%s%s(%#llx, %#llx, %#llx, %#llx)%s%s%s", t->dll && !t->missing ? t->dll : "", t->dll && !t->missing ? "!" : "",
               t->name, (unsigned long long)t->a[0], (unsigned long long)t->a[1], (unsigned long long)t->a[2], (unsigned long long)t->a[3],
               t->str[0] ? "   \"" : "", t->str[0] ? t->str : "", t->str[0] ? "\"" : "");
-            if (t->str[0] && t->has_ret) P(" = %#llx%s", (unsigned long long)t->ret, t->ret ? "" : "  <- not found");
+            if (last->has_ret) P(" = %#llx%s", (unsigned long long)last->ret, t->str[0] && !last->ret ? "  <- not found" : "");
+            if (run > 1) P("   (x%u)", run);
             P("%s\n", t->missing ? "   <- not implemented" : "");
+            k += run;
         }
     }
     {
@@ -1687,6 +1719,15 @@ int w32_crash_report(w32 *w, char *out, size_t out_len) {
         P("\n  subsystems:\n");
         P("    audio      %s, %d sound source%s, %d WASAPI stream%s\n", w32_audio_device_on() ? "device open" : "no device (silent)", ns, ns == 1 ? "" : "s", nw, nw == 1 ? "" : "s");
         P("    dinput     %d device%s created\n", nd, nd == 1 ? "" : "s");
+        {
+            uint32_t fm[16], fc[16];
+            int nf = w32_d3d11_formats(fm, fc, 16);
+            if (nf) {
+                P("    textures  ");
+                for (int q = 0; q < nf; q++) P(" %u x DXGI %u", fc[q], fm[q]);
+                P("\n");
+            }
+        }
         /* every image in the process, so a module handle in the calls above
          * can be named from this block alone */
         P("    modules   ");
@@ -1699,7 +1740,57 @@ int w32_crash_report(w32 *w, char *out, size_t out_len) {
             if (sd || fd) P("    d3d9       %llu draw%s through shaders (%llu triangles), %llu fixed-function\n",
                             (unsigned long long)sd, sd == 1 ? "" : "s", (unsigned long long)st, (unsigned long long)fd);
         }
-        P("    jit        %s\n", xc_jit_enabled() ? "on" : "off (interpreted)");
+        {
+            uint64_t jb = 0, jco = 0, jbytes = 0; xc_jit_stats(&jb, &jco, &jbytes);
+            P("    jit        %s", xc_jit_enabled() ? "on" : "off (interpreted)");
+            {   /* the size of the arena the host blessed: when it is small,
+                 * everything compiled is thrown away and compiled again, and
+                 * that is the whole performance story on a device */
+                uint64_t lo = 0, hi = 0;
+                if (xc_jit_code_range(&lo, &hi) && hi > lo) P(", %llu MB arena", (unsigned long long)((hi - lo) >> 20));
+            }
+            if (xc_jit_enabled()) P(", %llu blocks, %llu callouts", (unsigned long long)jb, (unsigned long long)jco);
+            P("\n");
+            /* what the dynarec kept handing to the interpreter: a run that is
+             * slow rather than stuck shows its hot instruction here */
+            uint64_t hits = 0, builds = 0, flushes = 0, smc = 0;
+            xc_cache_stats(&hits, &builds, &flushes, &smc);
+            /* Blocks decoded against blocks compiled says whether the cache is
+             * holding the program's working set. A run that keeps flushing
+             * recompiles everything it just compiled, and that cost does not
+             * show up anywhere else. */
+            if (builds) {
+                static const char *pool[5] = { "", "the block table", "instructions", "operands", "code bytes" };
+                const uint64_t *why = xc_cache_flush_reasons();
+                P("    blocks     %llu decoded (%llu instructions, %.1f per block), %llu cache flush%s, %llu overwritten by the guest\n",
+                  (unsigned long long)builds, (unsigned long long)xc_cache_insn_count(),
+                  (double)xc_cache_insn_count() / (double)builds,
+                  (unsigned long long)flushes, flushes == 1 ? "" : "es", (unsigned long long)smc);
+                for (int q = 1; q <= 4; q++)
+                    if (why[q]) P("               %llu of them because %s ran out\n", (unsigned long long)why[q], pool[q]);
+                if (xc_cache_code_resets())
+                    P("               the JIT's code arena filled %llu times (a bigger blessed arena is the fix)\n",
+                      (unsigned long long)xc_cache_code_resets());
+            }
+            const char *cn[6]; uint32_t cc[6];
+            int nc = jco ? xc_jit_callout_top(6, cn, cc) : 0;
+            if (nc) {
+                P("    callouts  ");
+                for (int i = 0; i < nc; i++) P(" %s %u%%", cn[i], (unsigned)(100.0 * cc[i] / (double)jco + 0.5));
+                P("\n");
+            }
+        }
+        {
+            uint64_t ne = w32_exceptions_raised();
+            if (ne) {
+                uint64_t ea = 0; uint32_t ec = w32_last_exception(&ea);
+                P("    seh        %llu exception%s dispatched to the guest, last %s (%#x) at %#llx", (unsigned long long)ne, ne == 1 ? "" : "s",
+                  w32_exception_name(ec), ec, (unsigned long long)ea);
+                for (int m = 0; m < w->nmods; m++)
+                    if (ea >= w->mods[m].base && ea < w->mods[m].base + w->mods[m].size) P(" = %s+%#llx", w->mods[m].name, (unsigned long long)(ea - w->mods[m].base));
+                P("\n");
+            }
+        }
         { int nt = w32_raster_threads(); P("    raster     %d thread%s for shaded pixels\n", nt, nt == 1 ? "" : "s"); }
         {
             uint64_t fr; double fps; w32_frame_stats(&fr, &fps);
@@ -1725,6 +1816,67 @@ int w32_crash_report(w32 *w, char *out, size_t out_len) {
             if (g_why.rip >= w->mods[i].base && g_why.rip < w->mods[i].base + w->mods[i].size) { P("    rip is in %s, at +%#llx\n", w->mods[i].name, (unsigned long long)(g_why.rip - w->mods[i].base)); named = 1; }
         if (!named && g_why.rip < 0x10000) P("    rip is near zero: a call through a null function pointer -- look for a lookup above that found nothing\n");
         if (!named && g_why.rip >= w->stub_base && g_why.rip < w->stub_base + 0x100000) P("    rip is in the import stubs\n");
+        /* the registers, and the return addresses on the stack: where in the
+         * program the fault was reached from, as module offsets a build of
+         * that program can be read against */
+        {
+            /* the faulting thread's state -- not the reporting thread's, which
+             * is the main thread and was somewhere else entirely when a
+             * worker died; the first report of a GameMaker runner's crash
+             * showed the main thread's registers under a worker's rip */
+            if (g_why.tid) {
+                const char *tname = g_why.tid < 5000 ? "the main thread" : "a thread";
+                P("    on %s (id %u", tname, g_why.tid);
+                if (g_why.thread_entry) {
+                    for (int m = 0; m < w->nmods; m++)
+                        if (g_why.thread_entry >= w->mods[m].base && g_why.thread_entry < w->mods[m].base + w->mods[m].size)
+                            P(", started at %s+%#llx", w->mods[m].name, (unsigned long long)(g_why.thread_entry - w->mods[m].base));
+                }
+                P(")\n");
+            }
+            static const char *rn[16] = { "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15" };
+            int nregs = w->is32 ? 8 : 16;
+            P("    registers:");
+            for (int r = 0; r < nregs; r++) P("%s%s=%#llx", r % 8 == 0 ? "\n      " : " ", rn[r], (unsigned long long)g_why.gpr[r]);
+            P("\n");
+            int psz = (int)w32_ptrsize(w), shown = 0;
+            uint64_t sp = g_why.gpr[XC_RSP];
+            for (int i = 0; i < 128 && shown < 10; i++) {
+                uint64_t at = sp + (uint64_t)psz * (unsigned)i;
+                if (!w32_mem_ok(w, at, (uint64_t)psz)) break;
+                uint64_t v = w32_read(w, at, psz);
+                for (int m = 0; m < w->nmods; m++)
+                    if (v > w->mods[m].base && v < w->mods[m].base + w->mods[m].size) {
+                        /* a return address follows a call: the byte before it is the call's last byte */
+                        uint8_t prev = (uint8_t)w32_read(w, v - 1, 1), prev5 = (uint8_t)w32_read(w, v - 5, 1);
+                        if (prev5 == 0xE8 || prev == 0xD0 || prev == 0xD2 || prev == 0xD1 || (prev >= 0x10 && prev <= 0x17 && (uint8_t)w32_read(w, v - 2, 1) == 0xFF) || (uint8_t)w32_read(w, v - 6, 1) == 0xFF || (uint8_t)w32_read(w, v - 2, 1) == 0xFF || (uint8_t)w32_read(w, v - 3, 1) == 0xFF) {
+                            if (!shown++) P("    return addresses on the stack (innermost first):\n");
+                            P("      %s+%#llx  (rsp+%#x)\n", w->mods[m].name, (unsigned long long)(v - w->mods[m].base), (unsigned)(psz * i));
+                        }
+                        break;
+                    }
+            }
+            /* that thread's own last calls, which the shared list above may
+             * have lost under another thread's chatter */
+            if (g_why.tid && g_trace_n) {
+                unsigned from = g_trace_n > TRACE_N ? g_trace_n - TRACE_N : 0, cnt = 0;
+                for (unsigned k = g_trace_n; k > from && cnt < 12; k--) if (g_trace[(k - 1) % TRACE_N].tid == g_why.tid) cnt++;
+                if (cnt) {
+                    P("    that thread's last calls (oldest first):\n");
+                    unsigned k = g_trace_n, left = cnt;
+                    unsigned idx[12]; 
+                    while (k > from && left) { k--; if (g_trace[k % TRACE_N].tid == g_why.tid) idx[--left] = k; }
+                    for (unsigned q = 0; q < cnt; q++) {
+                        const trace_ent *t = &g_trace[idx[q] % TRACE_N];
+                        P("      %s%s%s(%#llx, %#llx, %#llx, %#llx)", t->dll && !t->missing ? t->dll : "", t->dll && !t->missing ? "!" : "", t->name,
+                          (unsigned long long)t->a[0], (unsigned long long)t->a[1], (unsigned long long)t->a[2], (unsigned long long)t->a[3]);
+                        if (t->str[0]) P("  \"%s\"", t->str);
+                        if (t->has_ret) P(" = %#llx", (unsigned long long)t->ret);
+                        P("%s\n", t->missing ? "   <- not implemented" : "");
+                    }
+                }
+            }
+        }
     }
     {
         /* the last lookups that answered NULL: a program that gave up usually gave up over one of these */

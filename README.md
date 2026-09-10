@@ -44,7 +44,7 @@ keep whatever appeared on the drive.
 | **JIT on iOS 26 TXM hardware** — bless protocol, `jit_arena` | **working on device** (M3 iPad): [`docs/JIT-DESIGN.md` §1a](docs/JIT-DESIGN.md) |
 | Process model | **decided**: single process, emulated Linux process model (no extension) — `ARCHITECTURE.md` top note |
 | **GPU binding probe** — d12mt's heap-is-an-argument-buffer model for D3D9, D3D11 and D3D12, tested on device | **27/27 PASS on the M3 iPad and the A19 Pro iPhone Air** — [`docs/MEMPROBE.md`](docs/MEMPROBE.md) |
-| **d12mt** — Direct3D → Metal compiler: D3D12 root signatures → argument buffers; DXIL (D3D12), SM5 (D3D11) and SM3 (D3D9) → MSL | **working**, own public repo [`LibertyPrime27/d12mt`](https://github.com/LibertyPrime27/d12mt), vendored at [`gpu/d12mt`](gpu/d12mt); CI compiles its MSL for iOS with Apple's Metal compiler |
+| **d12mt** — **Direct3D 12 on Metal**, ours, MIT, in its own public repo: [`LibertyPrime27/d12mt`](https://github.com/LibertyPrime27/d12mt), vendored here at [`gpu/d12mt`](gpu/d12mt). *Compiler:* D3D12 root signatures → argument buffers; DXIL (D3D12), SM5 (D3D11) and SM3 (D3D9) → MSL. *Runtime:* device, queue, buffers and textures, graphics and compute pipelines, recorded command lists replayed into Metal encoders, `MTLSharedEvent` fences | compiler **working**, CI compiles its MSL for iOS with Apple's Metal compiler; runtime **first slice working on a real GPU** — CI draws a triangle, runs a compute dispatch and a blit, and signals and times out a fence on the Apple-silicon runner. Still to come: descriptor heaps, swap chain, indirect draws, queries |
 
 ## The two things to know before reading anything else
 
@@ -129,7 +129,15 @@ next report can separate "this machine is slow" from "this emulator is slow".
 
 ## Licensing
 
-The 32-bit engine is built on [Boxedwine](https://github.com/danoon2/Boxedwine) (GPL-2.0). This project is therefore GPL-2.0 and ships source. See `ARCHITECTURE.md` §6.
+**GPL-3.0-or-later** — the full text is in [`LICENSE`](LICENSE), and
+[`COPYING.md`](COPYING.md) says what each component allows.
+
+This used to read GPL-2.0 "because the 32-bit engine is built on Boxedwine". It
+never was: Boxedwine is not in the tree, and the note above says we took the
+idea of a soft MMU and not the code. GPL-3.0 also settles a conflict that was
+already here — d12mt's shader pipeline links SPIRV-Cross, which is Apache-2.0
+and cannot be combined with GPL-2.0-only — and it is what lets Winios be
+combined with Madeira (GPL-3.0). See `ARCHITECTURE.md` §6.
 
 ## Credits
 

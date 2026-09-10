@@ -48,7 +48,7 @@ jobs:
           cmake -S . -B build-host -DCMAKE_BUILD_TYPE=RelWithDebInfo
           cmake --build build-host -j"$(nproc)"
           out=$(sh tests/win32/run.sh build-host/winrun tests/win32 2>&1); rc=$?
-          echo "$out" | awk '/^FAIL/{p=1} /^ok /{p=0} p' | head -400
+          echo "$out" | awk '/^FAIL/{p=1} /^ok   /{p=0} p' | head -400
           echo "::notice::guests: $(echo "$out" | grep -c '^ok') ok, $(echo "$out" | grep -c '^FAIL') failed (rc $rc)"
           echo "$out" | grep -E '^FAIL' | head -8 | while IFS= read -r l; do echo "::error::guests: ${l}"; done
           [ "$rc" -eq 0 ]
@@ -227,6 +227,23 @@ jobs:
               || { echo "::error::lib$lib.a was not built: add $lib to the cmake --build target list"; exit 1; }
           done
 
+      # d12mt's Metal runtime, on the runner's actual GPU. The shader compiler
+      # is off here: it drags in dxil-spirv and SPIRV-Cross and is already
+      # tested on the Linux job, while this step is about whether a recorded
+      # command list replays into Metal encoders and puts the right pixels in
+      # the target. A runner with no Metal device says so and passes.
+      - name: d12mt runtime on Metal
+        run: |
+          set -o pipefail
+          cmake -S gpu/d12mt -B build-d12mt-rt -DCMAKE_BUILD_TYPE=Release \
+            -DD12MT_SHADER=OFF -DD12MT_BUILD_TOOLS=OFF 2>&1 | tail -3
+          cmake --build build-d12mt-rt -j3 --target test_runtime 2>&1 | grep -E "error|warning: " | head -20 || true
+          out=$(./build-d12mt-rt/test_runtime 2>&1); rc=$?
+          echo "$out"
+          echo "$out" | while IFS= read -r l; do echo "::notice::d12mt: ${l}"; done
+          { echo "### d12mt runtime"; echo '```'; echo "$out"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+
       # Apple silicon: the dynarec natively, against the silicon recordings.
       - name: Dynarec on Apple silicon (golden replay)
         run: |
@@ -266,7 +283,7 @@ jobs:
           # anywhere else -- the summary below is not visible through the API.
           if [ "$rc5" -ne 0 ]; then
             echo "::group::win32: failing cases, expected vs got"
-            echo "$out5" | awk '/^FAIL/{p=1} /^ok /{p=0} p' | head -400
+            echo "$out5" | awk '/^FAIL/{p=1} /^ok   /{p=0} p' | head -400
             echo "::endgroup::"
           fi
           out7=$(./build-mac/test_winrun_lib tests/win32 2>&1); rc7=$?

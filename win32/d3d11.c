@@ -95,6 +95,10 @@ enum {
     FMT_R16_UINT           = 57,
     FMT_R32_UINT           = 42,
     FMT_R8_UNORM           = 61,
+    FMT_A8_UNORM           = 65,
+    FMT_BC1_UNORM          = 71,
+    FMT_BC2_UNORM          = 74,
+    FMT_BC3_UNORM          = 77,
 };
 
 static int format_bytes(uint32_t f) {
@@ -273,7 +277,7 @@ enum {
     CTX_SRV1, CTX_SRV2, CTX_SRV3, CTX_SAMPLER1, CTX_SAMPLER2, CTX_SAMPLER3, CTX_N
 };
 enum { SC_DEV = 0, SC_TEX, SC_W, SC_H, SC_FRAMES, SC_HWND, SC_WAITABLE, SC_N };
-enum { TEX_W = 0, TEX_H, TEX_PITCH, TEX_PIXELS, TEX_FMT, TEX_BIND, TEX_USAGE, TEX_N };
+enum { TEX_W = 0, TEX_H, TEX_PITCH, TEX_PIXELS, TEX_FMT, TEX_BIND, TEX_USAGE, TEX_CAP, TEX_N };
 enum { BUF_DATA = 0, BUF_SIZE, BUF_BIND, BUF_USAGE, BUF_STRIDE, BUF_N };
 enum { VIEW_RES = 0, VIEW_FMT, VIEW_N };
 enum { LAY_ELEMS = 0, LAY_COUNT, LAY_SHADER, LAY_N };
@@ -302,6 +306,102 @@ static int out_ptr(w32 *w, uint64_t out, uint64_t obj) {
 
 /* A texture's pixels live in guest memory: the program may Map it and write
  * to it directly, and a copy on our side would then be stale. */
+/* A texture's pixels are kept as 0xAARRGGBB whatever the guest asked for, so
+ * loading one means knowing how wide its source pixels are. 0 means the
+ * format is not understood here at all -- and reinterpreting somebody else's
+ * bytes as ours is how a font page turns into blocks, so an unknown one is
+ * reported rather than guessed at. */
+static int fmt_bytes(uint32_t f) {
+    switch (f) {
+    case FMT_R8G8B8A8_UNORM: case FMT_R8G8B8A8_UNORM_SRGB: case FMT_R8G8B8A8_UINT:
+    case FMT_B8G8R8A8_UNORM: case FMT_B8G8R8X8_UNORM:
+    case FMT_R32_FLOAT: case FMT_R32_UINT: case FMT_UNKNOWN: return 4;
+    case FMT_R8_UNORM: case FMT_A8_UNORM: return 1;
+    case FMT_R16_UINT: return 2;
+    default: return 0;
+    }
+}
+/* Which formats a run actually met, so a texture that came out wrong can be
+ * named in the report instead of found by guessing. */
+static struct { uint32_t fmt; uint32_t n; } g_fmt_seen[16];
+static void note_format(uint32_t f) {
+    for (int i = 0; i < 16; i++) {
+        if (g_fmt_seen[i].n && g_fmt_seen[i].fmt != f) continue;
+        g_fmt_seen[i].fmt = f; g_fmt_seen[i].n++; return;
+    }
+}
+int w32_d3d11_formats(uint32_t *fmt, uint32_t *count, int max) {
+    int n = 0;
+    for (int i = 0; i < 16 && n < max; i++) if (g_fmt_seen[i].n) { fmt[n] = g_fmt_seen[i].fmt; count[n] = g_fmt_seen[i].n; n++; }
+    return n;
+}
+
+/* WINRUN_TEXTURE_PPM=<prefix>: every texture that gets pixels is written out
+ * as <prefix>NNN.ppm. Looking at the font page settles in one go what no
+ * amount of reading the sampler can: whether what we hold is right. */
+static void dump_texture(w32 *w, uint64_t tex) {
+    const char *pre = getenv("WINRUN_TEXTURE_PPM");
+    if (!pre) return;
+    static int n;
+    int tw = (int)w32_com_get(w, tex, TEX_W), th = (int)w32_com_get(w, tex, TEX_H);
+    int pitch = (int)(w32_com_get(w, tex, TEX_PITCH) / 4);
+    const uint32_t *px = W32P(w, w32_com_get(w, tex, TEX_PIXELS));
+    if (!px || tw <= 0 || th <= 0) return;
+    char path[512];
+    snprintf(path, sizeof path, "%s%03d_%dx%d_fmt%u.ppm", pre, n++, tw, th, (unsigned)w32_com_get(w, tex, TEX_FMT));
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fprintf(f, "P6\n%d %d\n255\n", tw, th);
+    for (int y = 0; y < th; y++) for (int x = 0; x < tw; x++) {
+        uint32_t c = px[(size_t)y * pitch + x];
+        uint8_t rgb[3] = { (uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c };
+        fwrite(rgb, 1, 3, f);
+    }
+    fclose(f);
+}
+
+/* One row of guest pixels into the texture's own storage. */
+static void load_row(uint32_t *dst, const uint8_t *src, int n, uint32_t f) {
+    switch (fmt_bytes(f)) {
+    case 1:
+        /* A single channel. A8 is coverage with no colour of its own, which
+         * is how a font page is stored; R8 is a red channel a shader reads
+         * as .r. Either way the other channels are what the format says they
+         * are, not a copy of somebody else's bytes. */
+        if (f == FMT_A8_UNORM) for (int x = 0; x < n; x++) dst[x] = (uint32_t)src[x] << 24;
+        else                   for (int x = 0; x < n; x++) dst[x] = 0xFF000000u | ((uint32_t)src[x] << 16);
+        break;
+    case 2: for (int x = 0; x < n; x++) dst[x] = 0xFF000000u | ((uint32_t)src[2 * x + 1] << 16); break;
+    default:
+        /* Four bytes a pixel, and which byte is which is the whole question.
+         * Our storage is 0xAARRGGBB, so its bytes run B, G, R, A -- which is
+         * what a B8G8R8A8 source already is, and a memcpy is right for it.
+         * An R8G8B8A8 source is the other way round, and copying it puts the
+         * red channel where the blue one is read from: every texture in a
+         * game that uses format 28 comes out with red and blue exchanged.
+         * X8 has no alpha of its own, so it is opaque rather than whatever
+         * byte happened to be there. */
+        switch (f) {
+        case FMT_R8G8B8A8_UNORM: case FMT_R8G8B8A8_UNORM_SRGB: case FMT_R8G8B8A8_UINT:
+            for (int x = 0; x < n; x++) {
+                const uint8_t *p = src + 4 * x;
+                dst[x] = ((uint32_t)p[3] << 24) | ((uint32_t)p[0] << 16)
+                       | ((uint32_t)p[1] << 8)  | (uint32_t)p[2];
+            }
+            break;
+        case FMT_B8G8R8X8_UNORM:
+            for (int x = 0; x < n; x++) {
+                const uint8_t *p = src + 4 * x;
+                dst[x] = 0xFF000000u | ((uint32_t)p[2] << 16)
+                       | ((uint32_t)p[1] << 8) | (uint32_t)p[0];
+            }
+            break;
+        default: memcpy(dst, src, (size_t)n * 4); break;
+        }
+        break;
+    }
+}
+
 static uint64_t make_texture(w32 *w, int width, int height, uint32_t fmt,
                              uint32_t bind, uint32_t usage) {
     if (width <= 0 || height <= 0 || (int64_t)width * height > 64 * 1024 * 1024) return 0;
@@ -315,9 +415,32 @@ static uint64_t make_texture(w32 *w, int width, int height, uint32_t fmt,
     w32_com_set(w, obj, TEX_PITCH, (uint64_t)width * 4);
     w32_com_set(w, obj, TEX_PIXELS, px);
     w32_com_set(w, obj, TEX_FMT, fmt);
+    note_format(fmt);
     w32_com_set(w, obj, TEX_BIND, bind);
     w32_com_set(w, obj, TEX_USAGE, usage);
+    w32_com_set(w, obj, TEX_CAP, bytes);
     return obj;
+}
+
+/* Give an existing texture a new size, keeping its identity: a swap chain's
+ * back buffer is resized in place so a view or a handle the guest still holds
+ * keeps pointing at something real. The pixels are reallocated only when the
+ * new size does not fit what is already there -- guest memory here is a bump
+ * allocator that never frees, and a game that resizes every frame would eat
+ * it otherwise. */
+static int texture_resize(w32 *w, uint64_t tex, int nw, int nh) {
+    if (!tex || nw <= 0 || nh <= 0 || (int64_t)nw * nh > 64 * 1024 * 1024) return 0;
+    uint64_t bytes = (uint64_t)nw * (uint64_t)nh * 4;
+    if (bytes > w32_com_get(w, tex, TEX_CAP)) {
+        uint64_t px = w32_alloc(w, bytes + 4096, 0);
+        if (!px) return 0;
+        w32_com_set(w, tex, TEX_PIXELS, px);
+        w32_com_set(w, tex, TEX_CAP, bytes);
+    }
+    w32_com_set(w, tex, TEX_W, (uint64_t)nw);
+    w32_com_set(w, tex, TEX_H, (uint64_t)nh);
+    w32_com_set(w, tex, TEX_PITCH, (uint64_t)nw * 4);
+    return 1;
 }
 
 /* The texture behind a view, whichever kind of view it is. */
@@ -397,17 +520,25 @@ static void dev_CreateTexture2D(w32 *w) {
         if (src) {
             uint64_t dst = w32_com_get(w, obj, TEX_PIXELS);
             uint32_t dst_pitch = (uint32_t)w32_com_get(w, obj, TEX_PITCH);
-            if (!src_pitch) src_pitch = dst_pitch;
-            uint32_t n = dst_pitch < src_pitch ? dst_pitch : src_pitch;
+            int sbpp = fmt_bytes(fmt) ? fmt_bytes(fmt) : 4;
+            if (!src_pitch) src_pitch = (uint32_t)width * (uint32_t)sbpp;
+            uint32_t n = (uint32_t)width;                      /* pixels a row, not bytes */
+            if (src_pitch / (uint32_t)sbpp < n) n = src_pitch / (uint32_t)sbpp;
             /* Every row but the last spans a whole pitch, so the span the
              * copy touches is pitch * (height - 1) + n. In 64-bit
              * arithmetic: a SysMemPitch near 2^32 multiplied out in 32 bits
              * wraps to something small and would sail through the check. */
-            const uint8_t *sp = W32PN(w, src, (uint64_t)src_pitch * (uint64_t)(height - 1) + n);
+            const uint8_t *sp = W32PN(w, src, (uint64_t)src_pitch * (uint64_t)(height - 1) + (uint64_t)n * (uint64_t)sbpp);
             if (!sp) { out_ptr(w, out, 0); RET((uint64_t)(uint32_t)E_INVALIDARG_); return; }
             for (int y = 0; y < height; y++)
-                memcpy((uint8_t *)W32P(w, dst) + (size_t)y * dst_pitch,
-                       sp + (size_t)y * src_pitch, n);
+                load_row((uint32_t *)((uint8_t *)W32P(w, dst) + (size_t)y * dst_pitch),
+                         sp + (size_t)y * src_pitch, (int)n, fmt);
+            if (!fmt_bytes(fmt)) {
+                static char msg[96];
+                snprintf(msg, sizeof msg, "d3d11: pixels in DXGI format %u are not decoded (kept as raw bytes)", fmt);
+                w32_note_refused(w, msg);
+            }
+            dump_texture(w, obj);
         }
     }
     out_ptr(w, out, obj);
@@ -717,16 +848,22 @@ static void ctx_UpdateSubresource(w32 *w) {
     } else if (tag == TAG_D11_TEXTURE) {
         uint64_t dst = w32_com_get(w, res, TEX_PIXELS);
         uint32_t dpitch = (uint32_t)w32_com_get(w, res, TEX_PITCH);
-        int h = (int)w32_com_get(w, res, TEX_H);
-        if (!row_pitch) row_pitch = dpitch;
-        uint32_t n = dpitch < row_pitch ? dpitch : row_pitch;
+        int h = (int)w32_com_get(w, res, TEX_H), tw = (int)w32_com_get(w, res, TEX_W);
+        uint32_t f = (uint32_t)w32_com_get(w, res, TEX_FMT);
+        int sbpp = fmt_bytes(f) ? fmt_bytes(f) : 4;
+        if (!row_pitch) row_pitch = (uint32_t)tw * (uint32_t)sbpp;
+        uint32_t n = (uint32_t)tw;                            /* pixels a row */
+        if (row_pitch / (uint32_t)sbpp < n) n = row_pitch / (uint32_t)sbpp;
         /* The source is h rows a row_pitch apart, of which only the last is
          * shorter than a pitch. UpdateSubresource returns void, so a source
          * that is not there can only be dropped -- there is no status word
          * for the caller to read. */
-        const uint8_t *sp = h > 0 ? W32PN(w, src, (uint64_t)row_pitch * (uint64_t)(h - 1) + n) : 0;
-        if (dst && sp) for (int y = 0; y < h; y++)
-            memcpy((uint8_t *)W32P(w, dst) + (size_t)y * dpitch, sp + (size_t)y * row_pitch, n);
+        const uint8_t *sp = h > 0 ? W32PN(w, src, (uint64_t)row_pitch * (uint64_t)(h - 1) + (uint64_t)n * (uint64_t)sbpp) : 0;
+        if (dst && sp) {
+            for (int y = 0; y < h; y++)
+                load_row((uint32_t *)((uint8_t *)W32P(w, dst) + (size_t)y * dpitch), sp + (size_t)y * row_pitch, (int)n, f);
+            dump_texture(w, res);
+        }
     }
     RET(0);
 }
@@ -912,8 +1049,19 @@ static void shade_setup(w32 *w, uint64_t self, shade_state *sh, const dxbc_prog 
         }
         uint64_t smp = w32_com_get(w, self, SMP_F[i]);
         sh->penv.wrap[i] = smp ? (w32_com_get(w, smp, SMP_ADDRU) == 1) : 1;
-        /* D3D11_FILTER: bit 2 set means the magnification filter is linear */
-        sh->penv.linear[i] = smp ? ((w32_com_get(w, smp, SMP_FILTER) & 0x4) != 0) : 0;
+        /* D3D11_FILTER packs three choices: bit 4 is the minification filter,
+         * bit 2 the magnification filter, bit 0 the mip filter. Only bit 2 was
+         * read, so a sampler asking for a linear *minification* -- 0x10, and
+         * 0x11 -- was point-sampled. Minification is where it matters most: a
+         * glyph drawn smaller than it is stored loses whole rows and columns
+         * to point sampling, which is a font with its thin strokes missing.
+         * There are no derivatives here to tell minifying from magnifying, so
+         * either bit asking for linear gets linear. */
+        uint32_t filt = smp ? (uint32_t)w32_com_get(w, smp, SMP_FILTER) : 0;
+        sh->penv.linear[i] = smp ? ((filt & 0x14u) != 0) : 0;
+        if (w->verbose > 1 && sh->penv.tex[i])
+            fprintf(stderr, "winrun: d3d11: slot %d texture %dx%d, filter %#x -> %s\n", i,
+                    sh->penv.tex[i]->w, sh->penv.tex[i]->h, filt, sh->penv.linear[i] ? "linear" : "point");
     }
     sh->vs_pos_out = 0; sh->pos_in = -1; sh->ps_out = 0;
     if (vi) for (int k = 0; k < vi->output.n; k++) if (sig_is_position(&vi->output.e[k])) sh->vs_pos_out = (int)vi->output.e[k].reg;
@@ -1223,15 +1371,30 @@ static void sc_GetDesc(w32 *w) {
     w32_write(w, d + 28, 4, 1);                    /* SampleDesc.Count */
     RET(S_OK_);
 }
+/* (count, width, height, format, flags): the back buffer really is resized.
+ * Refusing used to be harmless on the reasoning that a game's window does not
+ * change size, which is wrong for any game that tracks its window -- and a
+ * game whose swap chain never matches its window asks again every frame. Zero
+ * for either dimension means "the output window's client area", as DXGI
+ * defines it. The guest has released its views by now; the texture keeps its
+ * identity so anything still pointing at it stays valid. */
+static void sc_resize_to(w32 *w, uint64_t self, uint32_t nw, uint32_t nh) {
+    if (!nw || !nh) {
+        int cw = 0, ch = 0;
+        if (w32_window_client_size(w32_com_get(w, self, SC_HWND), &cw, &ch) && cw > 0 && ch > 0) {
+            nw = (uint32_t)cw; nh = (uint32_t)ch;
+        } else { nw = (uint32_t)w32_com_get(w, self, SC_W); nh = (uint32_t)w32_com_get(w, self, SC_H); }
+    }
+    if (nw == w32_com_get(w, self, SC_W) && nh == w32_com_get(w, self, SC_H)) return;
+    if (!texture_resize(w, w32_com_get(w, self, SC_TEX), (int)nw, (int)nh)) {
+        w32_note_refused(w, "d3d11: ResizeBuffers could not allocate the new back buffer");
+        return;
+    }
+    w32_com_set(w, self, SC_W, nw);
+    w32_com_set(w, self, SC_H, nh);
+}
 static void sc_ResizeBuffers(w32 *w) {
-    /* (count, width, height, format, flags). A window here does not change
-     * size while a game runs -- the display mode is fixed before it starts
-     * -- so this is accepted and the buffer kept, which is what a program
-     * resizing to the size it already has expects. */
-    uint64_t self = ARG(0);
-    uint32_t nw = (uint32_t)ARG(2), nh = (uint32_t)ARG(3);
-    if (nw && nh && (nw != w32_com_get(w, self, SC_W) || nh != w32_com_get(w, self, SC_H)))
-        w32_note_refused(w, "d3d11: ResizeBuffers to a different size is not supported");
+    sc_resize_to(w, ARG(0), (uint32_t)ARG(2), (uint32_t)ARG(3));
     RET(S_OK_);
 }
 static void sc_SetFullscreenState(w32 *w) { (void)w; RET(S_OK_); }
@@ -1327,12 +1490,10 @@ static void sc_CheckColorSpaceSupport(w32 *w) {
 }
 static void sc_SetColorSpace1(w32 *w) { RET(ARG(1) == 0 ? S_OK_ : (uint64_t)(uint32_t)E_INVALIDARG_); }
 static void sc_ResizeBuffers1(w32 *w) {
-    /* (count, width, height, format, flags, nodeMasks, queues): the same
-     * answer as ResizeBuffers -- the size is fixed */
-    uint64_t self = ARG(0);
-    uint32_t nw = (uint32_t)ARG(2), nh = (uint32_t)ARG(3);
-    if (nw && nh && (nw != w32_com_get(w, self, SC_W) || nh != w32_com_get(w, self, SC_H)))
-        w32_note_refused(w, "d3d11: ResizeBuffers1 to a different size is not supported");
+    /* (count, width, height, format, flags, nodeMasks, queues): the extra
+     * arguments describe which GPU node and queue each buffer belongs to,
+     * and there is one of each here, so it resizes like the plain one */
+    sc_resize_to(w, ARG(0), (uint32_t)ARG(2), (uint32_t)ARG(3));
     RET(S_OK_);
 }
 static void sc_SetHDRMetaData(w32 *w) { (void)w; RET(S_OK_); }

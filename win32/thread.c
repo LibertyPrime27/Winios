@@ -462,6 +462,7 @@ static uint64_t spawn_prepare(w32 *w, uint64_t entry, uint64_t param, uint64_t s
         w32_write(w, teb + 0x48, 4, t->id);
         w32_write(w, teb + TEB64_PEB, 8, w->peb);
     }
+    w32_tls_thread_init(w, t);                         /* its own copies of every static TLS block */
 
     uint64_t h = w32_handle_new(w, H_THREAD, -1);
     w32_handle *hh = w32_handle_get(w, h);
@@ -563,14 +564,39 @@ static int handle_ready(w32 *w, uint64_t hv, int consume) {
         }
         return 0;
     }
+    if (h->type == H_TIMER) {
+        /* Ready once the due time has passed, and not before -- a timer that
+         * says "ready" the moment it is set turns a frame-paced game into a
+         * spin loop, and with one guest thread running at a time that starves
+         * every other thread. GameMaker's frame thread is exactly that loop. */
+        if (!h->u1) return 0;                           /* not armed */
+        if (now_ms() < h->u1) return 0;
+        if (consume) {
+            if (h->u2) h->u1 = now_ms() + h->u2;        /* periodic: the next tick */
+            else if (!(h->flags & 2)) h->u1 = 0;        /* a synchronisation timer is consumed */
+        }
+        return 1;                                       /* a manual-reset one stays ready until Set or Cancel */
+    }
     if (!(h->flags & 1)) return 0;
     if (consume && !(h->flags & 2)) h->flags &= ~1u;    /* auto-reset */
     return 1;
 }
 
+/* How long a wait on this handle may sleep before looking again. Everything
+ * but a timer becomes ready only when another thread signals it and
+ * broadcasts, so the poll interval is just a backstop; a timer becomes ready
+ * on its own, and sleeping past its due time is what makes it late. */
+static uint64_t wait_cap_ms(w32 *w, uint64_t hv, uint64_t cap) {
+    w32_handle *h = w32_handle_get(w, hv);
+    if (!h || h->type != H_TIMER || !h->u1) return cap;
+    uint64_t now = now_ms(), left = h->u1 > now ? h->u1 - now : 0;
+    return left < cap ? left : cap;
+}
+
 /* Wait for one handle, releasing the guest lock so whatever will signal it
  * can run. */
 static uint32_t wait_one(w32 *w, uint64_t hv, uint32_t ms) {
+    uint64_t nap;
     uint64_t deadline = ms == INFINITE_ ? 0 : now_ms() + ms;
     for (;;) {
         w32_dsound_tick(w);                 /* a wait is where a sound's position event is noticed */
@@ -588,8 +614,10 @@ static uint32_t wait_one(w32 *w, uint64_t hv, uint32_t ms) {
          * waits forever on something nothing will signal should show up as a
          * hang in the run's own deadline, not as a thread the process can
          * never join. */
-        ts.tv_nsec += 20 * 1000000L;
-        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        nap = wait_cap_ms(w, hv, 20);
+        if (!nap) nap = 1;
+        ts.tv_nsec += (long)nap * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec += ts.tv_nsec / 1000000000L; ts.tv_nsec %= 1000000000L; }
         pthread_cond_timedwait(&g_change, &g_guest, &ts);
     }
 }
@@ -634,8 +662,11 @@ static void k_WaitForMultipleObjects(w32 *w) {
         if (deadline && now_ms() >= deadline) { RET(WAIT_TIMEOUT_); return; }
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += 20 * 1000000L;
-        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        uint64_t nap = 20;
+        for (uint32_t i = 0; i < n; i++) nap = wait_cap_ms(w, hs[i], nap);
+        if (!nap) nap = 1;
+        ts.tv_nsec += (long)nap * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec += ts.tv_nsec / 1000000000L; ts.tv_nsec %= 1000000000L; }
         pthread_cond_timedwait(&g_change, &g_guest, &ts);
     }
 }
@@ -920,6 +951,26 @@ uint64_t w32_make_event(w32 *w, int manual, int set) {
 void w32_set_event(w32 *w, uint64_t h, int on) {
     w32_handle *hh = w32_handle_get(w, h);
     if (hh) { if (on) hh->flags |= 1u; else hh->flags &= ~1u; }
+    pthread_cond_broadcast(&g_change);
+}
+uint64_t w32_make_timer(w32 *w, int manual) {
+    uint64_t h = w32_handle_new(w, H_TIMER, -1);
+    w32_handle *hh = w32_handle_get(w, h);
+    if (hh) { hh->flags = manual ? 2u : 0u; hh->u1 = 0; hh->u2 = 0; }   /* created disarmed */
+    return h;
+}
+void w32_timer_set(w32 *w, uint64_t h, uint64_t delay_ms, uint32_t period_ms) {
+    w32_handle *hh = w32_handle_get(w, h);
+    if (!hh || hh->type != H_TIMER) return;
+    hh->u1 = now_ms() + delay_ms;
+    hh->u2 = period_ms;
+    hh->flags &= ~1u;
+    pthread_cond_broadcast(&g_change);
+}
+void w32_timer_cancel(w32 *w, uint64_t h) {
+    w32_handle *hh = w32_handle_get(w, h);
+    if (!hh || hh->type != H_TIMER) return;
+    hh->u1 = 0; hh->u2 = 0;
     pthread_cond_broadcast(&g_change);
 }
 /* ExitThread's body, callable from elsewhere: FreeLibraryAndExitThread is

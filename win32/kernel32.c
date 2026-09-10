@@ -722,7 +722,10 @@ static int prot_of(uint32_t p) {
     }
 }
 static void k_VirtualProtect(w32 *w) {
-    uint64_t addr = ARG(0), size = ARG(1); uint32_t np = (uint32_t)ARG(2), old = ARG(3);
+    /* `old` is a pointer: declaring it 32-bit cut the top of every x64
+     * caller's stack address off, and the old protection went nowhere -- the
+     * "write of 4 bytes at 0x155cfe60" lines in a GameMaker runner's log. */
+    uint64_t addr = ARG(0), size = ARG(1), old = ARG(3); uint32_t np = (uint32_t)ARG(2);
     /* This is the call the crash report came from. The old-protection
      * out-parameter is written through w32_write, which is checked; the range
      * itself is checked here, because mprotect on a 64-bit guest's address is
@@ -2361,18 +2364,33 @@ static void k_K32GetProcessMemoryInfo(w32 *w) {
     RET(1);
 }
 static void k_FreeLibraryAndExitThread(w32 *w) { w32_thread_exit_self(w, (uint32_t)ARG(1)); }
-/* Waitable timers: a timer object that a wait can block on. Built on the
- * event machinery, because that is what one is. */
-static void k_CreateWaitableTimerW(w32 *w) { RET(w32_make_event(w, 1, 0)); }
-static void k_CreateWaitableTimerA(w32 *w) { RET(w32_make_event(w, 1, 0)); }
-static void k_CreateWaitableTimerExW(w32 *w) { RET(w32_make_event(w, 1, 0)); }
+/* Waitable timers: a timer object a wait blocks on until its due time.
+ *
+ * SetWaitableTimer(hTimer, pDueTime, lPeriod, completion, arg, fResume). The
+ * due time is a LARGE_INTEGER: negative is relative, in 100 ns units;
+ * positive is an absolute FILETIME. The delay is the whole content of the
+ * call -- a game paces its frames on one of these, and firing it immediately
+ * turns the frame loop into a spinner which, with one guest thread running at
+ * a time, starves the thread doing the work. That is what kept GameMaker's
+ * runner on a black screen. The completion APC is not run: nothing here
+ * delivers APCs, and a program that wanted one would be waiting alertably. */
+static void k_CreateWaitableTimerW(w32 *w) { RET(w32_make_timer(w, (int)ARG(1))); }
+static void k_CreateWaitableTimerA(w32 *w) { RET(w32_make_timer(w, (int)ARG(1))); }
+/* (attrs, name, flags, access): CREATE_WAITABLE_TIMER_MANUAL_RESET is 1 */
+static void k_CreateWaitableTimerExW(w32 *w) { RET(w32_make_timer(w, (int)(ARG(2) & 1))); }
 static void k_SetWaitableTimer(w32 *w) {
-    /* A due time in the past, or none, means signalled now -- which is the
-     * only case that matters here, because nothing else is going to fire it. */
-    w32_set_event(w, ARG(0), 1);
+    if (!ARG(1) || !w32_mem_ok(w, ARG(1), 8)) { w32_set_last_error(w, ERROR_NOACCESS); RET(0); return; }
+    int64_t due = (int64_t)w32_read(w, ARG(1), 8);
+    uint64_t delay_ms;
+    if (due < 0) delay_ms = (uint64_t)(-due) / 10000ull;              /* relative, 100 ns units */
+    else {                                                            /* absolute: how far ahead it is */
+        uint64_t nowft = filetime_now();
+        delay_ms = (uint64_t)due > nowft ? ((uint64_t)due - nowft) / 10000ull : 0;
+    }
+    w32_timer_set(w, ARG(0), delay_ms, (uint32_t)ARG(2));
     RET(1);
 }
-static void k_CancelWaitableTimer(w32 *w) { w32_set_event(w, ARG(0), 0); RET(1); }
+static void k_CancelWaitableTimer(w32 *w) { w32_timer_cancel(w, ARG(0)); RET(1); }
 static void k_CreateEventExA(w32 *w) {
     /* (attrs, name, flags, access): CREATE_EVENT_MANUAL_RESET is 1 and
      * CREATE_EVENT_INITIAL_SET is 2 -- not the same bits as CreateEvent's
@@ -2568,6 +2586,9 @@ const w32_api w32_kernel32[] = {
     F(TlsAlloc, 0), F(TlsFree, 1), F(TlsGetValue, 1), F(TlsSetValue, 2), F(FlsAlloc, 1), F(FlsFree, 1), F(FlsGetValue, 1), F(FlsSetValue, 2), F(FlsGetValue2, 1), F(DisableThreadLibraryCalls, 1),
     FN(InitializeSRWLock, 1, k_nop_void), FN(AcquireSRWLockExclusive, 1, k_nop_void), FN(ReleaseSRWLockExclusive, 1, k_nop_void),
     FN(AcquireSRWLockShared, 1, k_nop_void), FN(ReleaseSRWLockShared, 1, k_nop_void), FN(InitOnceExecuteOnce, 4, k_nop_true),
+    /* one guest thread runs at a time and the handover happens at API calls
+     * and block boundaries, so an SRW lock is never contended: Try always wins */
+    FN(TryAcquireSRWLockExclusive, 1, k_nop_true), FN(TryAcquireSRWLockShared, 1, k_nop_true),
     FN(InitializeConditionVariable, 1, k_nop_void), FN(WakeAllConditionVariable, 1, k_nop_void), FN(WakeConditionVariable, 1, k_nop_void),
     F(GetStdHandle, 1), F(SetStdHandle, 2), F(WriteFile, 5), F(WriteConsoleA, 5), F(WriteConsoleW, 5), F(ReadFile, 5),
     F(CreateFileA, 7), F(CreateFileW, 7), F(CloseHandle, 1), F(GetFileType, 1), F(GetFileSize, 2), F(GetFileSizeEx, 2),

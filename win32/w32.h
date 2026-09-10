@@ -116,7 +116,8 @@ typedef struct {
 
 typedef enum { H_NONE = 0, H_FILE, H_PROCESS, H_THREAD, H_HEAP, H_EVENT, H_MUTEX,
                H_FIND,        /* a directory walk: FindFirstFile/FindNextFile */
-               H_MAPPING      /* a file mapping: CreateFileMapping/MapViewOfFile */
+               H_MAPPING,     /* a file mapping: CreateFileMapping/MapViewOfFile */
+               H_TIMER        /* a waitable timer: ready once its due time passes */
              } w32_htype;
 /* `p` and `u1`/`u2` are for the handle kinds that need more than a descriptor:
  * a directory walk carries its DIR* and the pattern it is matching, a mapping
@@ -147,8 +148,12 @@ struct w32 {
 
     /* heap: bump allocator plus a size header per block */
     uint64_t  heap_cur, heap_end;
-    uint64_t  tls_slots[W32_MAX_TLS]; uint64_t tls_used;
-    uint64_t  tls_array;         /* TEB.ThreadLocalStoragePointer: one entry per module with TLS */
+    uint64_t  tls_used;
+    /* static TLS: one entry per module with a TLS directory, in index order.
+     * Every thread gets its own copy of each module's template (raw bytes
+     * from the image, then zero fill), and its TEB.ThreadLocalStoragePointer
+     * points at an array of those copies -- see w32_tls_thread_init. */
+    struct { uint64_t raw, size; uint32_t zero_fill; } tls[W32_MAX_TLS];
     int       ntls;
 
     /* loaded images */
@@ -289,6 +294,7 @@ uint64_t w32_import_addr(w32 *w, const char *dll, const char *name, int ordinal,
 int      w32_dll_has(w32 *w, const char *dll, const char *name);     /* is `name` implemented for this built-in DLL? */
 void     w32_attach_modules(w32 *w);                                /* DllMain(DLL_PROCESS_ATTACH) for every new DLL */
 void     w32_thread_notify(w32 *w, int reason);                    /* DllMain(DLL_THREAD_ATTACH=2 / DETACH=3) for every attached DLL */
+void     w32_tls_thread_init(w32 *w, w32_thread *t);               /* a new thread's copies of every module's static TLS block */
 /* A program this one asked to start. There is one process at a time, so it
  * runs after this one ends; see CreateProcess in kernel32.c and the loop in
  * winrun_main. Returns the queue index, or -1 when the queue is full. */
@@ -368,6 +374,7 @@ int      w32_raise(w32 *w, uint32_t code, uint32_t flags, uint64_t exc_addr,
 int      w32_fault_to_exception(w32 *w);                    /* a CPU fault, as the exception Windows would raise */
 const char *w32_exception_name(uint32_t code);
 uint32_t w32_last_exception(uint64_t *addr);                /* what ended the run, for the report */
+uint64_t w32_exceptions_raised(void);                       /* how many the guest was handed over the run */
 void     w32_seh_reset(void);
 void     w32_C_specific_handler(w32 *w);
 uint64_t w32_stub_return_addr(w32 *w);                              /* where a w32_call_guest returns to: no module's address */                           /* MSVC's __try/__except language handler, x64 */
@@ -567,6 +574,11 @@ uint64_t  w32_resource_data(w32 *w, uint64_t hrsrc, uint32_t *size);
 int       w32_cond_sleep(w32 *w, uint64_t cv, uint64_t lock, uint32_t ms, int srw);
 uint64_t  w32_make_event(w32 *w, int manual, int set);
 void      w32_set_event(w32 *w, uint64_t h, int on);
+/* Waitable timers. `delay_ms` is measured from now; `period_ms` 0 is one-shot.
+ * A wait on one blocks until it is due, which is the point of it. */
+uint64_t  w32_make_timer(w32 *w, int manual);
+void      w32_timer_set(w32 *w, uint64_t h, uint64_t delay_ms, uint32_t period_ms);
+void      w32_timer_cancel(w32 *w, uint64_t h);
 void      w32_thread_exit_self(w32 *w, uint32_t code);
 /* kernel32.c: a string out of the RT_STRING blocks, for user32's LoadString */
 int       w32_load_string(w32 *w, uint64_t inst, uint32_t id, char *out, size_t cap);
@@ -611,6 +623,14 @@ void w32_input_reset(void);
  * not steal each other's motion. */
 void w32_mouse_totals(int32_t *tx, int32_t *ty, int32_t *twheel, uint32_t *buttons);
 void w32_client_size(int *cw, int *ch);
+/* One window's client size, by handle: DXGI resolves a zero-sized
+ * ResizeBuffers against the swap chain's output window. 0 if there is no
+ * such window. */
+int  w32_window_client_size(uint64_t hwnd, int *cw, int *ch);
+/* The DXGI formats this run's textures were created in, and how many of each:
+ * a texture kept in a format nothing decodes is drawn as raw bytes, and that
+ * is worth naming rather than looking at. */
+int  w32_d3d11_formats(uint32_t *fmt, uint32_t *count, int max);
 int  w32_has_window(void);                         /* has the guest made one yet? */
 /* Whether the guest wants a pointer drawn, and where it thinks it is. A game
  * hides the cursor to say "I am doing mouselook now", which is exactly when a

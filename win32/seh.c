@@ -244,10 +244,11 @@ const char *w32_exception_name(uint32_t code) {
  * duration of the dispatch, and a per-dispatch copy is what makes nesting
  * work.
  */
+static uint64_t g_raised;                  /* every exception handed to the guest, for the report */
 int w32_raise(w32 *w, uint32_t code, uint32_t flags, uint64_t exc_addr,
               int nparams, const uint64_t *params) {
     xc_cpu *c = w32_cpu(w);
-    g_last_code = code; g_last_addr = exc_addr;
+    g_last_code = code; g_last_addr = exc_addr; g_raised++;
     if (g_depth >= 8) {
         fprintf(stderr, "winrun: exception %#x while dispatching seven others; giving up\n", code);
         return 0;
@@ -343,6 +344,7 @@ uint32_t w32_last_exception(uint64_t *addr) {
     if (addr) *addr = g_last_addr;
     return g_last_code;
 }
+uint64_t w32_exceptions_raised(void) { return g_raised; }
 
 /* A CPU fault becomes the exception Windows would have raised for it. */
 int w32_fault_to_exception(w32 *w) {
