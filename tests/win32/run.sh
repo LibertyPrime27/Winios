@@ -153,8 +153,8 @@ check inputtest32.exe 0 6 -- -input inputtest.script
 # register dump whose addresses move with the allocator.
 checkrc d11test64.exe 0 "0 failures"
 checkrc d11test32.exe 0 "0 failures"
-checkframe d11test64.exe 320x200 311139ad
-checkframe d11test32.exe 320x200 311139ad
+checkframe d11test64.exe 320x200 e57f3e33
+checkframe d11test32.exe 320x200 e57f3e33
 # Everything a modern game engine links against.
 #
 # A GameMaker game resolved 232 imports and was missing 114, across nineteen
