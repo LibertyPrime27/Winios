@@ -1738,6 +1738,15 @@ int w32_crash_report(w32 *w, char *out, size_t out_len) {
             P("\n");
             /* what the dynarec kept handing to the interpreter: a run that is
              * slow rather than stuck shows its hot instruction here */
+            uint64_t hits = 0, builds = 0, flushes = 0, smc = 0;
+            xc_cache_stats(&hits, &builds, &flushes, &smc);
+            /* Blocks decoded against blocks compiled says whether the cache is
+             * holding the program's working set. A run that keeps flushing
+             * recompiles everything it just compiled, and that cost does not
+             * show up anywhere else. */
+            if (builds) P("    blocks     %llu decoded, %llu cache flush%s, %llu overwritten by the guest\n",
+                          (unsigned long long)builds, (unsigned long long)flushes, flushes == 1 ? "" : "es",
+                          (unsigned long long)smc);
             const char *cn[6]; uint32_t cc[6];
             int nc = jco ? xc_jit_callout_top(6, cn, cc) : 0;
             if (nc) {

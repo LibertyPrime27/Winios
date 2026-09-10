@@ -273,7 +273,7 @@ enum {
     CTX_SRV1, CTX_SRV2, CTX_SRV3, CTX_SAMPLER1, CTX_SAMPLER2, CTX_SAMPLER3, CTX_N
 };
 enum { SC_DEV = 0, SC_TEX, SC_W, SC_H, SC_FRAMES, SC_HWND, SC_WAITABLE, SC_N };
-enum { TEX_W = 0, TEX_H, TEX_PITCH, TEX_PIXELS, TEX_FMT, TEX_BIND, TEX_USAGE, TEX_N };
+enum { TEX_W = 0, TEX_H, TEX_PITCH, TEX_PIXELS, TEX_FMT, TEX_BIND, TEX_USAGE, TEX_CAP, TEX_N };
 enum { BUF_DATA = 0, BUF_SIZE, BUF_BIND, BUF_USAGE, BUF_STRIDE, BUF_N };
 enum { VIEW_RES = 0, VIEW_FMT, VIEW_N };
 enum { LAY_ELEMS = 0, LAY_COUNT, LAY_SHADER, LAY_N };
@@ -317,7 +317,29 @@ static uint64_t make_texture(w32 *w, int width, int height, uint32_t fmt,
     w32_com_set(w, obj, TEX_FMT, fmt);
     w32_com_set(w, obj, TEX_BIND, bind);
     w32_com_set(w, obj, TEX_USAGE, usage);
+    w32_com_set(w, obj, TEX_CAP, bytes);
     return obj;
+}
+
+/* Give an existing texture a new size, keeping its identity: a swap chain's
+ * back buffer is resized in place so a view or a handle the guest still holds
+ * keeps pointing at something real. The pixels are reallocated only when the
+ * new size does not fit what is already there -- guest memory here is a bump
+ * allocator that never frees, and a game that resizes every frame would eat
+ * it otherwise. */
+static int texture_resize(w32 *w, uint64_t tex, int nw, int nh) {
+    if (!tex || nw <= 0 || nh <= 0 || (int64_t)nw * nh > 64 * 1024 * 1024) return 0;
+    uint64_t bytes = (uint64_t)nw * (uint64_t)nh * 4;
+    if (bytes > w32_com_get(w, tex, TEX_CAP)) {
+        uint64_t px = w32_alloc(w, bytes + 4096, 0);
+        if (!px) return 0;
+        w32_com_set(w, tex, TEX_PIXELS, px);
+        w32_com_set(w, tex, TEX_CAP, bytes);
+    }
+    w32_com_set(w, tex, TEX_W, (uint64_t)nw);
+    w32_com_set(w, tex, TEX_H, (uint64_t)nh);
+    w32_com_set(w, tex, TEX_PITCH, (uint64_t)nw * 4);
+    return 1;
 }
 
 /* The texture behind a view, whichever kind of view it is. */
@@ -1223,15 +1245,30 @@ static void sc_GetDesc(w32 *w) {
     w32_write(w, d + 28, 4, 1);                    /* SampleDesc.Count */
     RET(S_OK_);
 }
+/* (count, width, height, format, flags): the back buffer really is resized.
+ * Refusing used to be harmless on the reasoning that a game's window does not
+ * change size, which is wrong for any game that tracks its window -- and a
+ * game whose swap chain never matches its window asks again every frame. Zero
+ * for either dimension means "the output window's client area", as DXGI
+ * defines it. The guest has released its views by now; the texture keeps its
+ * identity so anything still pointing at it stays valid. */
+static void sc_resize_to(w32 *w, uint64_t self, uint32_t nw, uint32_t nh) {
+    if (!nw || !nh) {
+        int cw = 0, ch = 0;
+        if (w32_window_client_size(w32_com_get(w, self, SC_HWND), &cw, &ch) && cw > 0 && ch > 0) {
+            nw = (uint32_t)cw; nh = (uint32_t)ch;
+        } else { nw = (uint32_t)w32_com_get(w, self, SC_W); nh = (uint32_t)w32_com_get(w, self, SC_H); }
+    }
+    if (nw == w32_com_get(w, self, SC_W) && nh == w32_com_get(w, self, SC_H)) return;
+    if (!texture_resize(w, w32_com_get(w, self, SC_TEX), (int)nw, (int)nh)) {
+        w32_note_refused(w, "d3d11: ResizeBuffers could not allocate the new back buffer");
+        return;
+    }
+    w32_com_set(w, self, SC_W, nw);
+    w32_com_set(w, self, SC_H, nh);
+}
 static void sc_ResizeBuffers(w32 *w) {
-    /* (count, width, height, format, flags). A window here does not change
-     * size while a game runs -- the display mode is fixed before it starts
-     * -- so this is accepted and the buffer kept, which is what a program
-     * resizing to the size it already has expects. */
-    uint64_t self = ARG(0);
-    uint32_t nw = (uint32_t)ARG(2), nh = (uint32_t)ARG(3);
-    if (nw && nh && (nw != w32_com_get(w, self, SC_W) || nh != w32_com_get(w, self, SC_H)))
-        w32_note_refused(w, "d3d11: ResizeBuffers to a different size is not supported");
+    sc_resize_to(w, ARG(0), (uint32_t)ARG(2), (uint32_t)ARG(3));
     RET(S_OK_);
 }
 static void sc_SetFullscreenState(w32 *w) { (void)w; RET(S_OK_); }
@@ -1327,12 +1364,10 @@ static void sc_CheckColorSpaceSupport(w32 *w) {
 }
 static void sc_SetColorSpace1(w32 *w) { RET(ARG(1) == 0 ? S_OK_ : (uint64_t)(uint32_t)E_INVALIDARG_); }
 static void sc_ResizeBuffers1(w32 *w) {
-    /* (count, width, height, format, flags, nodeMasks, queues): the same
-     * answer as ResizeBuffers -- the size is fixed */
-    uint64_t self = ARG(0);
-    uint32_t nw = (uint32_t)ARG(2), nh = (uint32_t)ARG(3);
-    if (nw && nh && (nw != w32_com_get(w, self, SC_W) || nh != w32_com_get(w, self, SC_H)))
-        w32_note_refused(w, "d3d11: ResizeBuffers1 to a different size is not supported");
+    /* (count, width, height, format, flags, nodeMasks, queues): the extra
+     * arguments describe which GPU node and queue each buffer belongs to,
+     * and there is one of each here, so it resizes like the plain one */
+    sc_resize_to(w, ARG(0), (uint32_t)ARG(2), (uint32_t)ARG(3));
     RET(S_OK_);
 }
 static void sc_SetHDRMetaData(w32 *w) { (void)w; RET(S_OK_); }

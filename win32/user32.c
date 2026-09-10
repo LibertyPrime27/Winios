@@ -1037,6 +1037,14 @@ static void u_GetClientRect(w32 *w) {
     put_rect(w, ARG(1), 0, 0, cw, ch);
     RET(1);
 }
+int w32_window_client_size(uint64_t hwnd, int *cw, int *ch) {
+    if (!hwnd) return 0;
+    pthread_mutex_lock(&g_lock);
+    wwin *p = win_of(hwnd);
+    if (p) { if (cw) *cw = p->cw; if (ch) *ch = p->ch; }
+    pthread_mutex_unlock(&g_lock);
+    return p != 0;
+}
 static void u_GetWindowRect(w32 *w) {
     pthread_mutex_lock(&g_lock);
     wwin *p = win_of(ARG(0));
@@ -1047,11 +1055,28 @@ static void u_GetWindowRect(w32 *w) {
 }
 /* A client point in screen space and back. The offset is the caption bar
  * when there is one, and zero when there is not. */
-/* Nothing here draws chrome around a program's own window, so the rectangle
- * a program needs for a given client area is that client area. */
-static void adjust_rect(w32 *w, uint32_t style) { (void)w; (void)style; RET(1); }
-static void u_AdjustWindowRect(w32 *w)   { adjust_rect(w, (uint32_t)ARG(1)); }
-static void u_AdjustWindowRectEx(w32 *w) { adjust_rect(w, (uint32_t)ARG(1)); }
+/* The window rectangle that leaves the given client rectangle inside it --
+ * the inverse of what apply_chrome takes away, and it has to be exactly that
+ * or the two disagree. It used to return the rectangle unchanged, from when
+ * nothing drew chrome; once captions arrived that made GetClientRect and this
+ * contradict each other, and a program that reapplies its client size as a
+ * window size then loses the caption's height every time it does. A
+ * GameMaker game does that once a frame: its window shrank a caption per
+ * frame until there was nothing left of it. */
+static void adjust_rect(w32 *w, uint32_t style, int has_menu) {
+    uint64_t r = ARG(0);
+    if (!r || !w32_mem_ok(w, r, 16)) { RET(0); return; }
+    int cyo = 0;
+    if (!(style & WS_CHILD) && (style & WS_CAPTION) == WS_CAPTION) cyo = caption_height();
+    if (has_menu) cyo += menu_bar_height();
+    /* the caption sits above the client area, so the top edge moves up */
+    int32_t t = (int32_t)(uint32_t)w32_read(w, r + 4, 4);
+    w32_write(w, r + 4, 4, (uint32_t)(t - cyo));
+    RET(1);
+}
+/* AdjustWindowRect(rect, style, bMenu); ...Ex(rect, style, bMenu, exstyle) */
+static void u_AdjustWindowRect(w32 *w)   { adjust_rect(w, (uint32_t)ARG(1), ARG(2) != 0); }
+static void u_AdjustWindowRectEx(w32 *w) { adjust_rect(w, (uint32_t)ARG(1), ARG(2) != 0); }
 
 static void u_ClientToScreen(w32 *w) {
     uint64_t pt = ARG(1);
@@ -1095,7 +1120,11 @@ static void move_window(w32 *w, uint64_t hwnd, int nx, int ny, int ncw, int nch,
         p->cw = ncw; p->ch = nch - p->cyo > 1 ? nch - p->cyo : 1;
     }
     int moved = (ox != nx || oy != ny || ow != p->w || oh != p->h);
+    int nw2 = p->w, nh2 = p->h, ncw2 = p->cw, nch2 = p->ch;
     pthread_mutex_unlock(&g_lock);
+    if (moved && w->verbose > 1)
+        fprintf(stderr, "winrun: user32: window %#llx now %dx%d (client %dx%d) at %d,%d\n",
+                (unsigned long long)hwnd, nw2, nh2, ncw2, nch2, nx, ny);
     if (!moved) { if (repaint) invalidate(hwnd); return; }
     if (was_visible) repaint_area(w, ox, oy, ow, oh);
     if (repaint) invalidate(hwnd);

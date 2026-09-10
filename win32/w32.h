@@ -623,6 +623,10 @@ void w32_input_reset(void);
  * not steal each other's motion. */
 void w32_mouse_totals(int32_t *tx, int32_t *ty, int32_t *twheel, uint32_t *buttons);
 void w32_client_size(int *cw, int *ch);
+/* One window's client size, by handle: DXGI resolves a zero-sized
+ * ResizeBuffers against the swap chain's output window. 0 if there is no
+ * such window. */
+int  w32_window_client_size(uint64_t hwnd, int *cw, int *ch);
 int  w32_has_window(void);                         /* has the guest made one yet? */
 /* Whether the guest wants a pointer drawn, and where it thinks it is. A game
  * hides the cursor to say "I am doing mouselook now", which is exactly when a
